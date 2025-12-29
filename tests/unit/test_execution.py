@@ -291,7 +291,7 @@ class TestOrderValidator:
         """Test validation of a valid order."""
         validator = OrderValidator(
             max_order_value=Decimal("100000"),
-            max_position_pct=0.10,
+            max_position_pct=0.20,  # Allow up to 20% position
         )
         request = OrderRequest(
             symbol="AAPL",
@@ -305,6 +305,7 @@ class TestOrderValidator:
             buying_power=Decimal("50000"),
         )
         result = validator.validate(request, portfolio, Decimal("150"))
+        # 100 shares * $150 = $15,000 = 15% of $100,000 portfolio < 20% max
         assert result.is_valid is True
 
     def test_validate_missing_symbol(self):
@@ -654,9 +655,12 @@ class TestOrderManagerIntegration:
         mock_client = MagicMock(spec=AlpacaClient)
         event_bus = EventBus()
 
+        # Use a validator with higher position limit
+        validator = OrderValidator(max_position_pct=0.20)
         manager = OrderManager(
             client=mock_client,
             event_bus=event_bus,
+            validator=validator,
         )
 
         request = OrderRequest(
