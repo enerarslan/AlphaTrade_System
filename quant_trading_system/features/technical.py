@@ -1,12 +1,18 @@
 """
 Technical indicators module.
 
-Implements 50+ technical indicators organized by category:
+Implements 200+ technical indicators organized by category:
 - Trend indicators (moving averages, ADX, Aroon, etc.)
 - Momentum indicators (RSI, MACD, Stochastic, etc.)
 - Volatility indicators (Bollinger Bands, ATR, Keltner, etc.)
 - Volume indicators (OBV, MFI, VWAP, etc.)
 - Price action (support/resistance, pivot points)
+- Candlestick patterns (40+ patterns)
+- Composite/derived indicators
+
+This module contains 50+ core indicators. For the full 200+ indicator set,
+use TechnicalIndicatorCalculator with include_extended=True, which combines
+this module with technical_extended.py.
 """
 
 from __future__ import annotations
@@ -175,7 +181,28 @@ class TEMA(TechnicalIndicator):
 
 
 class KAMA(TechnicalIndicator):
-    """Kaufman Adaptive Moving Average."""
+    """
+    Kaufman Adaptive Moving Average (KAMA).
+
+    KAMA adapts to price volatility by using an Efficiency Ratio (ER)
+    that measures the directional movement relative to volatility.
+
+    Algorithm:
+        1. Calculate Efficiency Ratio: ER = |Price Change| / Volatility
+           - Price Change = |Close[t] - Close[t-period]|
+           - Volatility = Sum of |Close[i] - Close[i-1]| over period
+        2. Calculate Smoothing Constant: SC = (ER * (fast_sc - slow_sc) + slow_sc)^2
+           - fast_sc = 2/(fast+1), typically 2/3
+           - slow_sc = 2/(slow+1), typically 2/31
+        3. KAMA[t] = KAMA[t-1] + SC * (Close[t] - KAMA[t-1])
+
+    Trading Interpretation:
+        - KAMA follows price closely in trending markets (high ER)
+        - KAMA moves slowly in ranging markets (low ER)
+        - Reduces whipsaws compared to simple moving averages
+
+    Complexity: O(n * period) where n is the number of data points
+    """
 
     def __init__(self, period: int = 10, fast: int = 2, slow: int = 30):
         super().__init__("KAMA")
@@ -193,7 +220,9 @@ class KAMA(TechnicalIndicator):
         if n < self.period:
             return {f"kama_{self.period}": result}
 
-        # Efficiency Ratio
+        # Efficiency Ratio: measures trend strength vs noise
+        # ER = 1 means perfect trend (all movement in one direction)
+        # ER = 0 means pure noise (price went nowhere despite movement)
         change = np.abs(close[self.period :] - close[: -self.period])
         volatility = np.zeros(n - self.period)
         for i in range(n - self.period):
@@ -203,10 +232,12 @@ class KAMA(TechnicalIndicator):
         volatility = np.where(volatility == 0, 1e-10, volatility)
         er = change / volatility
 
-        # Smoothing constant
+        # Smoothing constant: adapts based on efficiency ratio
+        # High ER -> SC approaches fast_sc^2 (responsive)
+        # Low ER -> SC approaches slow_sc^2 (smooth)
         sc = (er * (self.fast_sc - self.slow_sc) + self.slow_sc) ** 2
 
-        # KAMA calculation
+        # KAMA calculation using exponential smoothing with adaptive alpha
         result[self.period - 1] = close[self.period - 1]
         for i in range(self.period, n):
             result[i] = result[i - 1] + sc[i - self.period] * (close[i] - result[i - 1])
@@ -263,7 +294,33 @@ class VWMA(TechnicalIndicator):
 
 
 class ADX(TechnicalIndicator):
-    """Average Directional Index with DI+ and DI-."""
+    """
+    Average Directional Index (ADX) with DI+ and DI-.
+
+    ADX measures trend strength regardless of direction, while DI+/DI-
+    indicate bullish/bearish directional movement.
+
+    Algorithm:
+        1. Calculate Directional Movement:
+           - +DM = High[t] - High[t-1] if positive and > |Low[t-1] - Low[t]|
+           - -DM = Low[t-1] - Low[t] if positive and > High[t] - High[t-1]
+        2. Calculate True Range (TR):
+           - TR = max(High-Low, |High-Close[t-1]|, |Low-Close[t-1]|)
+        3. Smooth using Wilder's method (like EMA but with 1/period factor)
+        4. DI+ = 100 * Smoothed(+DM) / ATR
+        5. DI- = 100 * Smoothed(-DM) / ATR
+        6. DX = 100 * |DI+ - DI-| / (DI+ + DI-)
+        7. ADX = Wilder's smoothed average of DX
+
+    Trading Interpretation:
+        - ADX > 25: Strong trend (either direction)
+        - ADX < 20: Weak trend or ranging market
+        - DI+ > DI-: Bullish trend
+        - DI- > DI+: Bearish trend
+        - DI crossovers signal potential trend reversals
+
+    Complexity: O(n) where n is the number of data points
+    """
 
     def __init__(self, period: int = 14):
         super().__init__("ADX")
@@ -415,7 +472,35 @@ class ParabolicSAR(TechnicalIndicator):
 
 
 class Ichimoku(TechnicalIndicator):
-    """Ichimoku Cloud indicator."""
+    """
+    Ichimoku Kinko Hyo (Ichimoku Cloud) indicator.
+
+    A comprehensive trend-following system that provides support/resistance,
+    momentum, and trend direction signals in a single view.
+
+    Components:
+        1. Tenkan-sen (Conversion Line): (Highest High + Lowest Low) / 2 over 9 periods
+           - Fast-moving signal line for short-term momentum
+        2. Kijun-sen (Base Line): Same calculation over 26 periods
+           - Slower line indicating medium-term trend
+        3. Senkou Span A (Leading Span A): (Tenkan + Kijun) / 2, plotted 26 periods ahead
+           - First cloud boundary
+        4. Senkou Span B (Leading Span B): Midpoint over 52 periods, plotted 26 ahead
+           - Second cloud boundary
+        5. Chikou Span (Lagging Span): Close price plotted 26 periods back
+           - Confirms trend by comparing to past price
+
+    Trading Interpretation:
+        - Price above cloud: Bullish trend
+        - Price below cloud: Bearish trend
+        - Price in cloud: Consolidation/transition
+        - Tenkan crosses above Kijun: Bullish signal
+        - Cloud color (A vs B): Future trend sentiment
+        - Thick cloud: Strong support/resistance
+        - Thin cloud: Weak support/resistance
+
+    Complexity: O(n * max(tenkan, kijun, senkou_b))
+    """
 
     def __init__(self, tenkan: int = 9, kijun: int = 26, senkou_b: int = 52):
         super().__init__("Ichimoku")
@@ -454,7 +539,36 @@ class Ichimoku(TechnicalIndicator):
 
 
 class SuperTrend(TechnicalIndicator):
-    """SuperTrend indicator."""
+    """
+    SuperTrend indicator.
+
+    A trend-following indicator that uses ATR-based bands to identify
+    trend direction and potential reversal points.
+
+    Algorithm:
+        1. Calculate ATR over the specified period
+        2. Upper Band = (High + Low) / 2 + (multiplier * ATR)
+        3. Lower Band = (High + Low) / 2 - (multiplier * ATR)
+        4. SuperTrend follows:
+           - Lower band during uptrend (until price closes below)
+           - Upper band during downtrend (until price closes above)
+        5. Band values are "locked" to prevent whipsaws:
+           - In uptrend: Lower band can only move up, never down
+           - In downtrend: Upper band can only move down, never up
+
+    Trading Interpretation:
+        - Price above SuperTrend line: Bullish trend (go long)
+        - Price below SuperTrend line: Bearish trend (go short)
+        - SuperTrend flip: Trend reversal signal
+        - Works best in trending markets
+        - Larger multiplier = fewer signals but more reliable
+
+    Parameters:
+        - period: ATR period (default 10)
+        - multiplier: ATR multiplier for band width (default 3.0)
+
+    Complexity: O(n)
+    """
 
     def __init__(self, period: int = 10, multiplier: float = 3.0):
         super().__init__("SuperTrend")
@@ -1444,15 +1558,24 @@ class TechnicalIndicatorCalculator:
     Main calculator class that computes all technical indicators.
 
     Usage:
-        calculator = TechnicalIndicatorCalculator()
+        # Core indicators only (~50)
+        calculator = TechnicalIndicatorCalculator(include_extended=False)
+
+        # Full 200+ indicator set (default)
+        calculator = TechnicalIndicatorCalculator(include_extended=True)
+
         features = calculator.compute_all(df)  # Returns dict of all features
     """
 
-    def __init__(self, include_all: bool = True):
+    def __init__(self, include_all: bool = True, include_extended: bool = True):
         self.indicators: list[TechnicalIndicator] = []
+        self.include_extended = include_extended
 
         if include_all:
             self._add_default_indicators()
+
+        if include_extended:
+            self._add_extended_indicators()
 
     def _add_default_indicators(self) -> None:
         """Add all default indicators."""
@@ -1521,6 +1644,17 @@ class TechnicalIndicatorCalculator:
             RollingHighLow(),
             PriceDistance(),
         ])
+
+    def _add_extended_indicators(self) -> None:
+        """Add extended indicators from technical_extended module."""
+        try:
+            from .technical_extended import ExtendedTechnicalCalculator
+
+            extended_calc = ExtendedTechnicalCalculator()
+            self.indicators.extend(extended_calc.indicators)
+        except ImportError:
+            # Extended module not available, continue with core indicators
+            pass
 
     def add_indicator(self, indicator: TechnicalIndicator) -> None:
         """Add a custom indicator."""

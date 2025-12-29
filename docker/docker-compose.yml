@@ -1,0 +1,224 @@
+version: '3.8'
+
+# Quant Trading System - Docker Compose Configuration
+# Run with: docker-compose -f docker/docker-compose.yml up -d
+
+services:
+  # ==========================================================================
+  # Main Trading Application
+  # ==========================================================================
+  trading_app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: trading_app
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Application settings
+      - APP_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      # Database settings
+      - DATABASE__HOST=postgres
+      - DATABASE__PORT=5432
+      - DATABASE__NAME=quant_trading
+      - DATABASE__USER=postgres
+      - DATABASE__PASSWORD=${POSTGRES_PASSWORD:-trading_password}
+      # Redis settings
+      - REDIS__HOST=redis
+      - REDIS__PORT=6379
+      # Alpaca settings (from .env file)
+      - ALPACA__API_KEY=${ALPACA_API_KEY}
+      - ALPACA__API_SECRET=${ALPACA_API_SECRET}
+      - ALPACA__PAPER_TRADING=true
+    ports:
+      - "8000:8000"
+    volumes:
+      - trading_logs:/app/logs
+      - model_artifacts:/app/models_artifacts
+      - ./config:/app/config:ro
+    networks:
+      - trading_network
+      - monitoring_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+  # ==========================================================================
+  # PostgreSQL + TimescaleDB
+  # ==========================================================================
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: trading_postgres
+    restart: always
+    environment:
+      - POSTGRES_DB=quant_trading
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-trading_password}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db:/docker-entrypoint-initdb.d:ro
+    networks:
+      - trading_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d quant_trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  # ==========================================================================
+  # Redis - Cache and Message Queue
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: trading_redis
+    restart: always
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - trading_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ==========================================================================
+  # Prometheus - Metrics Collection
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading_prometheus
+    restart: always
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - monitoring_network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ==========================================================================
+  # Grafana - Visualization
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading_grafana
+    restart: always
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - monitoring_network
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  # ==========================================================================
+  # Alertmanager - Alert Routing
+  # ==========================================================================
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: trading_alertmanager
+    restart: always
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    networks:
+      - monitoring_network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  trading_network:
+    driver: bridge
+    name: trading_network
+  monitoring_network:
+    driver: bridge
+    name: monitoring_network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    name: trading_postgres_data
+  redis_data:
+    name: trading_redis_data
+  prometheus_data:
+    name: trading_prometheus_data
+  grafana_data:
+    name: trading_grafana_data
+  alertmanager_data:
+    name: trading_alertmanager_data
+  trading_logs:
+    name: trading_logs
+  model_artifacts:
+    name: trading_model_artifacts
