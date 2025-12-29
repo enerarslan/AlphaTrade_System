@@ -1,0 +1,696 @@
+"""
+Feature engineering pipeline orchestration module.
+
+Provides:
+- Configuration-driven feature computation
+- Dependency resolution and parallel computation
+- Feature validation (NaN detection, range checks)
+- Feature selection (variance, correlation, importance)
+- Target variable generation
+- Feature versioning and metadata
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Callable
+
+import numpy as np
+import polars as pl
+
+from .cross_sectional import CrossSectionalFeatureCalculator
+from .microstructure import MicrostructureFeatureCalculator
+from .statistical import StatisticalFeatureCalculator
+from .technical import TechnicalIndicatorCalculator
+
+
+class FeatureGroup(str, Enum):
+    """Feature group enumeration."""
+
+    TECHNICAL = "technical"
+    STATISTICAL = "statistical"
+    MICROSTRUCTURE = "microstructure"
+    CROSS_SECTIONAL = "cross_sectional"
+    ALL = "all"
+
+
+class NormalizationMethod(str, Enum):
+    """Normalization method enumeration."""
+
+    NONE = "none"
+    ZSCORE = "zscore"
+    MINMAX = "minmax"
+    ROBUST = "robust"
+    QUANTILE = "quantile"
+
+
+@dataclass
+class FeatureConfig:
+    """Configuration for feature computation."""
+
+    groups: list[FeatureGroup] = field(default_factory=lambda: [FeatureGroup.ALL])
+    normalization: NormalizationMethod = NormalizationMethod.NONE
+    normalization_window: int = 60
+    fill_nan: bool = True
+    fill_method: str = "ffill"  # 'ffill', 'bfill', 'zero', 'mean'
+    max_nan_ratio: float = 0.5  # Max allowed NaN ratio per feature
+    variance_threshold: float = 0.0  # Min variance to keep feature
+    correlation_threshold: float = 0.95  # Max correlation between features
+    include_targets: bool = False
+    target_horizons: list[int] = field(default_factory=lambda: [1, 5, 10, 20])
+
+
+@dataclass
+class FeatureMetadata:
+    """Metadata for computed features."""
+
+    name: str
+    group: FeatureGroup
+    computed_at: datetime
+    num_samples: int
+    nan_ratio: float
+    mean: float
+    std: float
+    min_val: float
+    max_val: float
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FeatureSet:
+    """Container for computed features with metadata."""
+
+    features: dict[str, np.ndarray]
+    metadata: dict[str, FeatureMetadata]
+    config: FeatureConfig
+    version: str
+    symbol: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+    def to_numpy(self, feature_names: list[str] | None = None) -> np.ndarray:
+        """Convert features to numpy array."""
+        if feature_names is None:
+            feature_names = list(self.features.keys())
+        return np.column_stack([self.features[name] for name in feature_names])
+
+    def to_polars(self, feature_names: list[str] | None = None) -> pl.DataFrame:
+        """Convert features to polars DataFrame."""
+        if feature_names is None:
+            feature_names = list(self.features.keys())
+        return pl.DataFrame({name: self.features[name] for name in feature_names})
+
+    @property
+    def feature_names(self) -> list[str]:
+        """Get list of feature names."""
+        return list(self.features.keys())
+
+    @property
+    def num_features(self) -> int:
+        """Get number of features."""
+        return len(self.features)
+
+
+class FeaturePipeline:
+    """
+    Main feature engineering pipeline.
+
+    Orchestrates computation of all feature groups with:
+    - Configuration-driven execution
+    - Validation and cleaning
+    - Normalization
+    - Feature selection
+
+    Usage:
+        pipeline = FeaturePipeline(config)
+        feature_set = pipeline.compute(df, universe_data)
+    """
+
+    def __init__(self, config: FeatureConfig | None = None):
+        self.config = config or FeatureConfig()
+        self._calculators: dict[FeatureGroup, Any] = {}
+        self._initialize_calculators()
+
+    def _initialize_calculators(self) -> None:
+        """Initialize feature calculators for each group."""
+        self._calculators[FeatureGroup.TECHNICAL] = TechnicalIndicatorCalculator()
+        self._calculators[FeatureGroup.STATISTICAL] = StatisticalFeatureCalculator()
+        self._calculators[FeatureGroup.MICROSTRUCTURE] = MicrostructureFeatureCalculator()
+        self._calculators[FeatureGroup.CROSS_SECTIONAL] = CrossSectionalFeatureCalculator()
+
+    def compute(
+        self,
+        df: pl.DataFrame,
+        symbol: str = "UNKNOWN",
+        universe_data: dict[str, pl.DataFrame] | None = None,
+    ) -> FeatureSet:
+        """
+        Compute all configured features.
+
+        Args:
+            df: Input DataFrame with OHLCV data
+            symbol: Symbol identifier
+            universe_data: Optional dict of DataFrames for cross-sectional features
+
+        Returns:
+            FeatureSet containing computed features and metadata
+        """
+        all_features: dict[str, np.ndarray] = {}
+        all_metadata: dict[str, FeatureMetadata] = {}
+
+        groups_to_compute = self._get_groups_to_compute()
+
+        for group in groups_to_compute:
+            group_features = self._compute_group(df, group, universe_data)
+
+            for name, values in group_features.items():
+                # Validate feature
+                if not self._validate_feature(values):
+                    continue
+
+                # Clean feature
+                values = self._clean_feature(values)
+
+                # Normalize if configured
+                if self.config.normalization != NormalizationMethod.NONE:
+                    values = self._normalize_feature(values)
+
+                # Compute metadata
+                metadata = self._compute_metadata(name, values, group)
+
+                all_features[name] = values
+                all_metadata[name] = metadata
+
+        # Add target variables if configured
+        if self.config.include_targets:
+            targets = self._compute_targets(df)
+            for name, values in targets.items():
+                all_features[name] = values
+                all_metadata[name] = self._compute_metadata(
+                    name, values, FeatureGroup.TECHNICAL
+                )
+
+        # Feature selection
+        if self.config.variance_threshold > 0:
+            all_features, all_metadata = self._filter_by_variance(
+                all_features, all_metadata
+            )
+
+        if self.config.correlation_threshold < 1.0:
+            all_features, all_metadata = self._filter_by_correlation(
+                all_features, all_metadata
+            )
+
+        # Generate version hash
+        version = self._generate_version(all_features)
+
+        return FeatureSet(
+            features=all_features,
+            metadata=all_metadata,
+            config=self.config,
+            version=version,
+            symbol=symbol,
+        )
+
+    def _get_groups_to_compute(self) -> list[FeatureGroup]:
+        """Get list of feature groups to compute."""
+        if FeatureGroup.ALL in self.config.groups:
+            return [
+                FeatureGroup.TECHNICAL,
+                FeatureGroup.STATISTICAL,
+                FeatureGroup.MICROSTRUCTURE,
+                FeatureGroup.CROSS_SECTIONAL,
+            ]
+        return [g for g in self.config.groups if g != FeatureGroup.ALL]
+
+    def _compute_group(
+        self,
+        df: pl.DataFrame,
+        group: FeatureGroup,
+        universe_data: dict[str, pl.DataFrame] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Compute features for a specific group."""
+        calculator = self._calculators.get(group)
+        if calculator is None:
+            return {}
+
+        if group == FeatureGroup.CROSS_SECTIONAL:
+            return calculator.compute_all(df, universe_data)
+        else:
+            return calculator.compute_all(df)
+
+    def _validate_feature(self, values: np.ndarray) -> bool:
+        """Validate feature values."""
+        if len(values) == 0:
+            return False
+
+        nan_ratio = np.sum(np.isnan(values)) / len(values)
+        if nan_ratio > self.config.max_nan_ratio:
+            return False
+
+        # Check for infinities
+        if np.any(np.isinf(values)):
+            return False
+
+        return True
+
+    def _clean_feature(self, values: np.ndarray) -> np.ndarray:
+        """Clean feature values (handle NaN)."""
+        if not self.config.fill_nan:
+            return values
+
+        values = values.copy()
+
+        if self.config.fill_method == "ffill":
+            # Forward fill
+            mask = np.isnan(values)
+            idx = np.where(~mask, np.arange(len(values)), 0)
+            np.maximum.accumulate(idx, out=idx)
+            values = values[idx]
+            # Handle leading NaNs
+            first_valid = np.argmax(~np.isnan(values))
+            values[:first_valid] = values[first_valid]
+
+        elif self.config.fill_method == "bfill":
+            # Backward fill
+            mask = np.isnan(values)
+            idx = np.where(~mask, np.arange(len(values)), len(values) - 1)
+            idx = np.minimum.accumulate(idx[::-1])[::-1]
+            values = values[idx]
+
+        elif self.config.fill_method == "zero":
+            values = np.nan_to_num(values, nan=0.0)
+
+        elif self.config.fill_method == "mean":
+            mean_val = np.nanmean(values)
+            values = np.nan_to_num(values, nan=mean_val)
+
+        return values
+
+    def _normalize_feature(self, values: np.ndarray) -> np.ndarray:
+        """Normalize feature values."""
+        method = self.config.normalization
+        window = self.config.normalization_window
+
+        if method == NormalizationMethod.NONE:
+            return values
+
+        result = np.full_like(values, np.nan)
+        n = len(values)
+
+        for i in range(window - 1, n):
+            window_data = values[i - window + 1 : i + 1]
+            valid_data = window_data[~np.isnan(window_data)]
+
+            if len(valid_data) < 2:
+                continue
+
+            if method == NormalizationMethod.ZSCORE:
+                mean = np.mean(valid_data)
+                std = np.std(valid_data, ddof=1)
+                if std > 0:
+                    result[i] = (values[i] - mean) / std
+
+            elif method == NormalizationMethod.MINMAX:
+                min_val = np.min(valid_data)
+                max_val = np.max(valid_data)
+                if max_val > min_val:
+                    result[i] = (values[i] - min_val) / (max_val - min_val)
+
+            elif method == NormalizationMethod.ROBUST:
+                median = np.median(valid_data)
+                q75, q25 = np.percentile(valid_data, [75, 25])
+                iqr = q75 - q25
+                if iqr > 0:
+                    result[i] = (values[i] - median) / iqr
+
+            elif method == NormalizationMethod.QUANTILE:
+                from scipy import stats
+
+                result[i] = stats.percentileofscore(valid_data, values[i]) / 100
+
+        return result
+
+    def _compute_metadata(
+        self, name: str, values: np.ndarray, group: FeatureGroup
+    ) -> FeatureMetadata:
+        """Compute metadata for a feature."""
+        valid_values = values[~np.isnan(values)]
+
+        return FeatureMetadata(
+            name=name,
+            group=group,
+            computed_at=datetime.utcnow(),
+            num_samples=len(values),
+            nan_ratio=np.sum(np.isnan(values)) / len(values) if len(values) > 0 else 1.0,
+            mean=float(np.mean(valid_values)) if len(valid_values) > 0 else 0.0,
+            std=float(np.std(valid_values, ddof=1)) if len(valid_values) > 1 else 0.0,
+            min_val=float(np.min(valid_values)) if len(valid_values) > 0 else 0.0,
+            max_val=float(np.max(valid_values)) if len(valid_values) > 0 else 0.0,
+        )
+
+    def _compute_targets(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
+        """Compute target variables for model training."""
+        if "close" not in df.columns:
+            return {}
+
+        close = df["close"].to_numpy().astype(np.float64)
+        targets = {}
+
+        for horizon in self.config.target_horizons:
+            # Forward returns (classification target)
+            forward_return = np.full(len(close), np.nan)
+            forward_return[:-horizon] = (close[horizon:] - close[:-horizon]) / close[:-horizon]
+            targets[f"target_return_{horizon}"] = forward_return
+
+            # Direction target (1 = up, 0 = down)
+            direction = np.full(len(close), np.nan)
+            direction[:-horizon] = np.where(forward_return[:-horizon] > 0, 1, 0)
+            targets[f"target_direction_{horizon}"] = direction
+
+            # Large move target (> 1 ATR)
+            if "high" in df.columns and "low" in df.columns:
+                high = df["high"].to_numpy().astype(np.float64)
+                low = df["low"].to_numpy().astype(np.float64)
+
+                # Simple ATR approximation
+                tr = high - low
+                atr = np.full(len(close), np.nan)
+                for i in range(13, len(close)):
+                    atr[i] = np.mean(tr[i - 13 : i + 1])
+
+                large_move = np.full(len(close), np.nan)
+                large_move[:-horizon] = np.where(
+                    np.abs(forward_return[:-horizon]) > atr[:-horizon] / close[:-horizon],
+                    1,
+                    0,
+                )
+                targets[f"target_large_move_{horizon}"] = large_move
+
+        return targets
+
+    def _filter_by_variance(
+        self,
+        features: dict[str, np.ndarray],
+        metadata: dict[str, FeatureMetadata],
+    ) -> tuple[dict[str, np.ndarray], dict[str, FeatureMetadata]]:
+        """Filter features by variance threshold."""
+        filtered_features = {}
+        filtered_metadata = {}
+
+        for name, values in features.items():
+            valid_values = values[~np.isnan(values)]
+            if len(valid_values) > 1:
+                variance = np.var(valid_values, ddof=1)
+                if variance >= self.config.variance_threshold:
+                    filtered_features[name] = values
+                    filtered_metadata[name] = metadata[name]
+
+        return filtered_features, filtered_metadata
+
+    def _filter_by_correlation(
+        self,
+        features: dict[str, np.ndarray],
+        metadata: dict[str, FeatureMetadata],
+    ) -> tuple[dict[str, np.ndarray], dict[str, FeatureMetadata]]:
+        """Filter highly correlated features."""
+        if len(features) < 2:
+            return features, metadata
+
+        feature_names = list(features.keys())
+        feature_matrix = np.column_stack([features[name] for name in feature_names])
+
+        # Handle NaNs for correlation computation
+        valid_mask = ~np.any(np.isnan(feature_matrix), axis=1)
+        if np.sum(valid_mask) < 10:
+            return features, metadata
+
+        valid_matrix = feature_matrix[valid_mask]
+
+        # Compute correlation matrix
+        corr_matrix = np.corrcoef(valid_matrix.T)
+
+        # Find features to remove (highly correlated with earlier features)
+        to_remove = set()
+        for i in range(len(feature_names)):
+            if feature_names[i] in to_remove:
+                continue
+            for j in range(i + 1, len(feature_names)):
+                if feature_names[j] in to_remove:
+                    continue
+                if abs(corr_matrix[i, j]) > self.config.correlation_threshold:
+                    # Remove the feature with higher mean NaN ratio
+                    nan_i = metadata[feature_names[i]].nan_ratio
+                    nan_j = metadata[feature_names[j]].nan_ratio
+                    if nan_j > nan_i:
+                        to_remove.add(feature_names[j])
+                    else:
+                        to_remove.add(feature_names[i])
+                        break
+
+        filtered_features = {
+            name: values
+            for name, values in features.items()
+            if name not in to_remove
+        }
+        filtered_metadata = {
+            name: meta
+            for name, meta in metadata.items()
+            if name not in to_remove
+        }
+
+        return filtered_features, filtered_metadata
+
+    def _generate_version(self, features: dict[str, np.ndarray]) -> str:
+        """Generate version hash for feature set."""
+        content = json.dumps(
+            {
+                "feature_names": sorted(features.keys()),
+                "config": {
+                    "groups": [g.value for g in self.config.groups],
+                    "normalization": self.config.normalization.value,
+                },
+            },
+            sort_keys=True,
+        )
+        return hashlib.md5(content.encode()).hexdigest()[:8]
+
+
+class FeatureSelector:
+    """
+    Feature selection utilities.
+
+    Provides methods for:
+    - Variance-based selection
+    - Correlation-based selection
+    - Mutual information selection
+    - Tree-based importance selection
+    """
+
+    @staticmethod
+    def select_by_variance(
+        features: dict[str, np.ndarray], threshold: float = 0.01
+    ) -> list[str]:
+        """Select features above variance threshold."""
+        selected = []
+        for name, values in features.items():
+            valid_values = values[~np.isnan(values)]
+            if len(valid_values) > 1:
+                variance = np.var(valid_values, ddof=1)
+                if variance >= threshold:
+                    selected.append(name)
+        return selected
+
+    @staticmethod
+    def select_by_correlation(
+        features: dict[str, np.ndarray], threshold: float = 0.95
+    ) -> list[str]:
+        """Select features with correlation below threshold."""
+        if len(features) < 2:
+            return list(features.keys())
+
+        feature_names = list(features.keys())
+        feature_matrix = np.column_stack([features[name] for name in feature_names])
+
+        valid_mask = ~np.any(np.isnan(feature_matrix), axis=1)
+        if np.sum(valid_mask) < 10:
+            return feature_names
+
+        valid_matrix = feature_matrix[valid_mask]
+        corr_matrix = np.corrcoef(valid_matrix.T)
+
+        selected = []
+        for i, name in enumerate(feature_names):
+            is_correlated = False
+            for j, selected_name in enumerate(selected):
+                selected_idx = feature_names.index(selected_name)
+                if abs(corr_matrix[i, selected_idx]) > threshold:
+                    is_correlated = True
+                    break
+            if not is_correlated:
+                selected.append(name)
+
+        return selected
+
+    @staticmethod
+    def select_by_importance(
+        features: dict[str, np.ndarray],
+        target: np.ndarray,
+        top_k: int = 50,
+        method: str = "mutual_info",
+    ) -> list[str]:
+        """Select top-k features by importance."""
+        from scipy import stats
+
+        feature_names = list(features.keys())
+        importances = []
+
+        for name in feature_names:
+            values = features[name]
+            valid_mask = ~(np.isnan(values) | np.isnan(target))
+
+            if np.sum(valid_mask) < 10:
+                importances.append(0.0)
+                continue
+
+            if method == "mutual_info":
+                # Simplified mutual information using correlation as proxy
+                corr = np.abs(np.corrcoef(values[valid_mask], target[valid_mask])[0, 1])
+                importances.append(corr if not np.isnan(corr) else 0.0)
+
+            elif method == "correlation":
+                corr = np.abs(np.corrcoef(values[valid_mask], target[valid_mask])[0, 1])
+                importances.append(corr if not np.isnan(corr) else 0.0)
+
+            elif method == "information_coefficient":
+                # Spearman rank correlation (IC)
+                ic = stats.spearmanr(values[valid_mask], target[valid_mask])[0]
+                importances.append(abs(ic) if not np.isnan(ic) else 0.0)
+
+            else:
+                importances.append(0.0)
+
+        # Select top-k
+        top_indices = np.argsort(importances)[::-1][:top_k]
+        return [feature_names[i] for i in top_indices]
+
+
+class FeatureValidator:
+    """
+    Feature validation utilities.
+
+    Provides methods for:
+    - NaN detection
+    - Range checks
+    - Temporal consistency
+    - Distribution checks
+    """
+
+    @staticmethod
+    def check_nan_ratio(
+        features: dict[str, np.ndarray], max_ratio: float = 0.5
+    ) -> dict[str, float]:
+        """Check NaN ratio for each feature."""
+        ratios = {}
+        for name, values in features.items():
+            ratio = np.sum(np.isnan(values)) / len(values) if len(values) > 0 else 1.0
+            ratios[name] = ratio
+        return ratios
+
+    @staticmethod
+    def check_infinities(features: dict[str, np.ndarray]) -> dict[str, bool]:
+        """Check for infinities in features."""
+        has_inf = {}
+        for name, values in features.items():
+            has_inf[name] = bool(np.any(np.isinf(values)))
+        return has_inf
+
+    @staticmethod
+    def check_range(
+        features: dict[str, np.ndarray],
+        expected_ranges: dict[str, tuple[float, float]] | None = None,
+    ) -> dict[str, bool]:
+        """Check if features are within expected ranges."""
+        in_range = {}
+
+        # Default ranges for common features
+        default_ranges = {
+            "rsi": (0, 100),
+            "stoch": (0, 100),
+            "mfi": (0, 100),
+            "williams": (-100, 0),
+            "bb_percent": (-1, 2),  # Can exceed 0-1 range
+        }
+
+        if expected_ranges:
+            default_ranges.update(expected_ranges)
+
+        for name, values in features.items():
+            valid_values = values[~np.isnan(values)]
+            if len(valid_values) == 0:
+                in_range[name] = True
+                continue
+
+            # Find matching range
+            range_found = False
+            for key, (min_val, max_val) in default_ranges.items():
+                if key in name.lower():
+                    in_range[name] = bool(
+                        np.min(valid_values) >= min_val and np.max(valid_values) <= max_val
+                    )
+                    range_found = True
+                    break
+
+            if not range_found:
+                in_range[name] = True  # No range specified
+
+        return in_range
+
+    @staticmethod
+    def check_temporal_consistency(
+        features: dict[str, np.ndarray], lookback: int = 5
+    ) -> dict[str, float]:
+        """Check temporal consistency (autocorrelation) of features."""
+        consistency = {}
+        for name, values in features.items():
+            valid_values = values[~np.isnan(values)]
+            if len(valid_values) < lookback + 10:
+                consistency[name] = 0.0
+                continue
+
+            # Compute lag-1 autocorrelation
+            acf = np.corrcoef(valid_values[:-1], valid_values[1:])[0, 1]
+            consistency[name] = abs(acf) if not np.isnan(acf) else 0.0
+
+        return consistency
+
+
+# Convenience function for creating pipelines
+def create_pipeline(
+    groups: list[str] | None = None,
+    normalization: str = "none",
+    include_targets: bool = False,
+    target_horizons: list[int] | None = None,
+) -> FeaturePipeline:
+    """
+    Create a feature pipeline with specified configuration.
+
+    Args:
+        groups: List of feature groups ('technical', 'statistical', 'microstructure', 'cross_sectional', 'all')
+        normalization: Normalization method ('none', 'zscore', 'minmax', 'robust', 'quantile')
+        include_targets: Whether to include target variables
+        target_horizons: List of forecast horizons for targets
+
+    Returns:
+        Configured FeaturePipeline
+    """
+    config = FeatureConfig(
+        groups=[FeatureGroup(g) for g in (groups or ["all"])],
+        normalization=NormalizationMethod(normalization),
+        include_targets=include_targets,
+        target_horizons=target_horizons or [1, 5, 10, 20],
+    )
+    return FeaturePipeline(config)

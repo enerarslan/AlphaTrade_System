@@ -1,0 +1,134 @@
+# Tradeable Universe Definition
+# 45-50 equities for the trading system
+
+# Large Cap Technology
+symbols:
+  # Technology
+  - AAPL   # Apple Inc.
+  - MSFT   # Microsoft Corporation
+  - GOOGL  # Alphabet Inc.
+  - AMZN   # Amazon.com Inc.
+  - META   # Meta Platforms Inc.
+  - NVDA   # NVIDIA Corporation
+  - TSLA   # Tesla Inc.
+  - AMD    # Advanced Micro Devices
+  - INTC   # Intel Corporation
+  - CRM    # Salesforce Inc.
+
+  # Financial Services
+  - JPM    # JPMorgan Chase & Co.
+  - BAC    # Bank of America
+  - GS     # Goldman Sachs
+  - MS     # Morgan Stanley
+  - V      # Visa Inc.
+  - MA     # Mastercard Inc.
+  - BLK    # BlackRock Inc.
+  - C      # Citigroup Inc.
+
+  # Healthcare
+  - JNJ    # Johnson & Johnson
+  - UNH    # UnitedHealth Group
+  - PFE    # Pfizer Inc.
+  - ABBV   # AbbVie Inc.
+  - MRK    # Merck & Co.
+  - LLY    # Eli Lilly and Company
+
+  # Consumer
+  - WMT    # Walmart Inc.
+  - HD     # Home Depot
+  - KO     # Coca-Cola Company
+  - PEP    # PepsiCo Inc.
+  - MCD    # McDonald's Corporation
+  - NKE    # Nike Inc.
+  - SBUX   # Starbucks Corporation
+
+  # Energy
+  - XOM    # Exxon Mobil
+  - CVX    # Chevron Corporation
+  - COP    # ConocoPhillips
+
+  # Industrial
+  - CAT    # Caterpillar Inc.
+  - BA     # Boeing Company
+  - UPS    # United Parcel Service
+  - HON    # Honeywell International
+  - GE     # General Electric
+
+  # Communication Services
+  - DIS    # Walt Disney Company
+  - NFLX   # Netflix Inc.
+  - T      # AT&T Inc.
+  - VZ     # Verizon Communications
+
+  # ETFs for Benchmarking
+  - SPY    # S&P 500 ETF
+  - QQQ    # Nasdaq 100 ETF
+  - IWM    # Russell 2000 ETF
+  - TLT    # 20+ Year Treasury Bond ETF
+  - GLD    # Gold ETF
+
+# Sector mappings
+sector_mappings:
+  technology:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - META
+    - NVDA
+    - TSLA
+    - AMD
+    - INTC
+    - CRM
+  financial:
+    - JPM
+    - BAC
+    - GS
+    - MS
+    - V
+    - MA
+    - BLK
+    - C
+  healthcare:
+    - JNJ
+    - UNH
+    - PFE
+    - ABBV
+    - MRK
+    - LLY
+  consumer:
+    - WMT
+    - HD
+    - KO
+    - PEP
+    - MCD
+    - NKE
+    - SBUX
+  energy:
+    - XOM
+    - CVX
+    - COP
+  industrial:
+    - CAT
+    - BA
+    - UPS
+    - HON
+    - GE
+  communication:
+    - DIS
+    - NFLX
+    - T
+    - VZ
+  etf:
+    - SPY
+    - QQQ
+    - IWM
+    - TLT
+    - GLD
+
+# Universe settings
+universe_settings:
+  min_market_cap: 10000000000  # $10B minimum market cap
+  min_avg_volume: 1000000      # 1M shares minimum daily volume
+  max_spread_bps: 10           # Maximum bid-ask spread in basis points
+  update_frequency: "weekly"   # Universe update frequency

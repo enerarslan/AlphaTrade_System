@@ -1,0 +1,109 @@
+# Alpaca Markets API Configuration
+
+# API Credentials (override with environment variables in production)
+# ALPACA_API_KEY and ALPACA_API_SECRET should be set as env variables
+api_key: "${ALPACA_API_KEY}"
+api_secret: "${ALPACA_API_SECRET}"
+
+# Environment Configuration
+paper_trading: true  # Set to false for live trading
+
+# API Endpoints
+endpoints:
+  paper:
+    base_url: "https://paper-api.alpaca.markets"
+    data_url: "https://data.alpaca.markets"
+    stream_url: "wss://stream.data.alpaca.markets"
+  live:
+    base_url: "https://api.alpaca.markets"
+    data_url: "https://data.alpaca.markets"
+    stream_url: "wss://stream.data.alpaca.markets"
+
+# Data Feed Configuration
+data_feed:
+  feed_type: "iex"  # Options: iex (free), sip (paid)
+  bar_timeframe: "15Min"
+  supported_timeframes:
+    - "1Min"
+    - "5Min"
+    - "15Min"
+    - "1Hour"
+    - "1Day"
+
+# WebSocket Configuration
+websocket:
+  reconnect_attempts: 5
+  reconnect_delay_seconds: 5
+  heartbeat_interval_seconds: 30
+  message_queue_size: 10000
+
+# Rate Limiting
+rate_limits:
+  requests_per_minute: 200
+  order_rate_limit: 100  # Orders per minute
+  backoff_initial_seconds: 1
+  backoff_max_seconds: 60
+  backoff_multiplier: 2
+
+# Order Configuration
+orders:
+  default_time_in_force: "day"  # Options: day, gtc, opg, cls, ioc, fok
+  default_order_type: "market"  # Options: market, limit, stop, stop_limit, trailing_stop
+  enable_fractional_shares: false
+  enable_extended_hours: false
+  max_notional_per_order: 100000  # Maximum $ per order
+
+# Order Types Supported
+order_types:
+  market:
+    enabled: true
+    max_slippage_bps: 10
+  limit:
+    enabled: true
+    default_offset_bps: 5  # Place limit X bps away from market
+  stop:
+    enabled: true
+  stop_limit:
+    enabled: true
+    default_limit_offset_bps: 10
+  trailing_stop:
+    enabled: true
+    default_trail_percent: 2.0
+
+# Position Tracking
+position_tracking:
+  sync_frequency_seconds: 60
+  reconciliation_enabled: true
+  reconciliation_frequency_minutes: 5
+
+# Account Settings
+account:
+  min_equity: 25000  # Pattern day trader minimum
+  margin_enabled: true
+  shorting_enabled: true
+  max_leverage: 4.0  # 4x day trading leverage
+
+# Data History Settings
+history:
+  max_bars_per_request: 10000
+  default_lookback_days: 365
+  cache_enabled: true
+  cache_ttl_minutes: 15
+
+# Error Handling
+error_handling:
+  retry_on_errors:
+    - 429  # Rate limit
+    - 500  # Server error
+    - 502  # Bad gateway
+    - 503  # Service unavailable
+    - 504  # Gateway timeout
+  max_retries: 3
+  log_all_requests: false  # Set to true for debugging
+
+# Monitoring
+monitoring:
+  track_latency: true
+  track_fill_quality: true
+  track_rejection_rate: true
+  alert_on_rejection_rate: 0.05  # Alert if >5% rejections

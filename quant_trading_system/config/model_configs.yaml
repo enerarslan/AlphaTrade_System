@@ -1,0 +1,192 @@
+# Machine Learning / Deep Learning Model Hyperparameters
+
+# XGBoost Configuration
+xgboost:
+  classifier:
+    n_estimators: 1000
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    min_child_weight: 5
+    objective: "binary:logistic"
+    eval_metric: "auc"
+    early_stopping_rounds: 50
+    tree_method: "hist"  # Use GPU if available: "gpu_hist"
+
+  regressor:
+    n_estimators: 1000
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    min_child_weight: 5
+    objective: "reg:squarederror"
+    eval_metric: "rmse"
+    early_stopping_rounds: 50
+
+# LightGBM Configuration
+lightgbm:
+  classifier:
+    num_leaves: 63
+    max_depth: -1
+    learning_rate: 0.05
+    n_estimators: 1000
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    lambda_l1: 0.1
+    lambda_l2: 0.1
+    min_data_in_leaf: 20
+    objective: "binary"
+    metric: "auc"
+    early_stopping_rounds: 50
+    verbose: -1
+
+  regressor:
+    num_leaves: 63
+    max_depth: -1
+    learning_rate: 0.05
+    n_estimators: 1000
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    lambda_l1: 0.1
+    lambda_l2: 0.1
+    min_data_in_leaf: 20
+    objective: "regression"
+    metric: "rmse"
+    early_stopping_rounds: 50
+    verbose: -1
+
+# CatBoost Configuration
+catboost:
+  classifier:
+    iterations: 1000
+    depth: 6
+    learning_rate: 0.05
+    l2_leaf_reg: 3
+    random_strength: 1
+    bagging_temperature: 1
+    loss_function: "Logloss"
+    eval_metric: "AUC"
+    early_stopping_rounds: 50
+    verbose: 100
+
+  regressor:
+    iterations: 1000
+    depth: 6
+    learning_rate: 0.05
+    l2_leaf_reg: 3
+    random_strength: 1
+    bagging_temperature: 1
+    loss_function: "RMSE"
+    eval_metric: "RMSE"
+    early_stopping_rounds: 50
+    verbose: 100
+
+# Random Forest Configuration
+random_forest:
+  classifier:
+    n_estimators: 500
+    max_depth: 15
+    min_samples_split: 5
+    min_samples_leaf: 2
+    max_features: "sqrt"
+    bootstrap: true
+    n_jobs: -1
+
+  regressor:
+    n_estimators: 500
+    max_depth: 15
+    min_samples_split: 5
+    min_samples_leaf: 2
+    max_features: "sqrt"
+    bootstrap: true
+    n_jobs: -1
+
+# LSTM Configuration
+lstm:
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.3
+  bidirectional: false
+  sequence_length: 60
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  max_epochs: 100
+  early_stopping_patience: 15
+  scheduler: "cosine"
+
+# Transformer Configuration
+transformer:
+  d_model: 128
+  nhead: 8
+  num_encoder_layers: 3
+  dim_feedforward: 512
+  dropout: 0.1
+  sequence_length: 60
+  batch_size: 64
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  max_epochs: 100
+  early_stopping_patience: 15
+  scheduler: "cosine"
+
+# Temporal Convolutional Network (TCN) Configuration
+tcn:
+  num_channels: [64, 128, 128, 64]
+  kernel_size: 3
+  dropout: 0.2
+  sequence_length: 60
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  max_epochs: 100
+  early_stopping_patience: 15
+  scheduler: "cosine"
+
+# Ensemble Configuration
+ensemble:
+  models:
+    - xgboost
+    - lightgbm
+    - catboost
+  weights: "adaptive"  # Options: equal, ic_weighted, sharpe_weighted, adaptive
+  meta_learner: "ridge"  # Options: ridge, xgboost, linear
+  use_stacking: true
+  use_blending: false
+  cv_folds: 5
+
+# Feature Selection
+feature_selection:
+  method: "importance"  # Options: importance, rfe, mutual_info, lasso
+  max_features: 100
+  min_importance: 0.001
+  correlation_threshold: 0.95
+
+# Training Settings
+training:
+  train_window_months: 12
+  validation_window_months: 2
+  test_window_months: 1
+  step_months: 1
+  purge_gap_bars: 5
+  target_variable: "forward_return_5"
+  sample_weights: "time_decay"  # Options: uniform, time_decay, return_weighted
+  time_decay_half_life: 252  # Trading days
+
+# Hyperparameter Optimization
+hyperopt:
+  method: "bayesian"  # Options: grid, random, bayesian
+  n_trials: 100
+  timeout: 3600  # seconds
+  metric: "sharpe"
+  direction: "maximize"
+  cv_folds: 5
+  pruning: true

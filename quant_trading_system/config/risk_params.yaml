@@ -1,0 +1,123 @@
+# Risk Management Parameters
+
+# Position Sizing
+position_sizing:
+  method: "volatility"  # Options: fixed_fractional, kelly, volatility, optimal_f
+
+  fixed_fractional:
+    risk_fraction: 0.01  # 1% risk per trade
+    max_position_pct: 0.10  # 10% max position size
+
+  kelly:
+    kelly_fraction: 0.25  # Quarter Kelly
+    lookback_trades: 100
+    min_trades: 20
+
+  volatility:
+    target_volatility: 0.15  # 15% annualized
+    volatility_lookback: 20  # bars
+    volatility_method: "atr"  # Options: atr, std, parkinson
+    max_leverage: 2.0
+
+# Position Limits
+position_limits:
+  max_position_value: 100000  # Maximum $ per position
+  max_position_pct: 0.10  # 10% of portfolio
+  max_portfolio_positions: 20
+  max_sector_exposure: 0.25  # 25% per sector
+  max_correlation_exposure: 0.30  # 30% in correlated positions
+  max_daily_turnover: 0.50  # 50% of portfolio
+  min_position_size: 100  # Minimum $ position
+
+# Loss Limits
+loss_limits:
+  per_trade_loss: 0.01  # 1% per trade
+  daily_loss: 0.02  # 2% daily
+  weekly_loss: 0.05  # 5% weekly
+  monthly_loss: 0.10  # 10% monthly
+
+# Drawdown Limits
+drawdown_limits:
+  reduce_size_at: 0.05  # Reduce at 5% drawdown
+  reduce_size_factor: 0.5  # Reduce by 50%
+  half_size_at: 0.10  # Half size at 10% drawdown
+  exit_all_at: 0.15  # Exit all at 15% drawdown
+  recovery_threshold: 0.03  # Resume normal after 3% recovery
+
+# Volatility-Based Adjustments
+volatility_adjustments:
+  high_vol_threshold: 25  # VIX level
+  high_vol_position_factor: 0.5  # Reduce positions by 50%
+  extreme_vol_threshold: 35  # VIX level
+  extreme_vol_position_factor: 0.25  # Reduce positions by 75%
+  vol_lookback_days: 20
+
+# Correlation Risk
+correlation_risk:
+  max_correlation: 0.70  # Max correlation between positions
+  correlation_lookback: 60  # bars
+  cluster_limit: 3  # Max positions in correlated cluster
+
+# Value at Risk (VaR)
+var_settings:
+  confidence_level_95: 0.95
+  confidence_level_99: 0.99
+  lookback_days: 252
+  method: "historical"  # Options: historical, parametric, monte_carlo
+  monte_carlo_simulations: 10000
+
+# Liquidity Risk
+liquidity_risk:
+  max_volume_participation: 0.05  # 5% of average volume
+  min_avg_volume: 1000000  # Minimum average daily volume
+  max_spread_bps: 20  # Maximum bid-ask spread
+
+# Kill Switch Configuration
+kill_switch:
+  enabled: true
+  triggers:
+    - type: "drawdown"
+      threshold: 0.15  # 15% max drawdown
+    - type: "daily_loss"
+      threshold: 0.05  # 5% daily loss
+    - type: "rapid_decline"
+      threshold: 0.03  # 3% in 5 minutes
+      window_minutes: 5
+    - type: "error_rate"
+      threshold: 0.05  # 5% error rate
+      window_minutes: 10
+  actions:
+    - "cancel_all_orders"
+    - "flatten_positions"
+    - "prevent_new_orders"
+    - "send_alerts"
+    - "log_state"
+  cooldown_minutes: 60  # Minimum time before resuming
+
+# Rebalancing
+rebalancing:
+  trigger: "threshold"  # Options: time, threshold, signal, hybrid
+  time_frequency: "daily"  # If time-based
+  drift_threshold: 0.05  # 5% drift triggers rebalancing
+  min_trade_size: 1000  # Minimum trade size in $
+  gradual_rebalance: true
+  gradual_steps: 3
+  transaction_cost_threshold: 0.001  # Skip if cost > 0.1% of position
+
+# Risk Metrics Monitoring
+monitoring:
+  update_frequency_seconds: 60
+  metrics:
+    - portfolio_var_95
+    - portfolio_var_99
+    - portfolio_cvar
+    - sharpe_ratio
+    - sortino_ratio
+    - max_drawdown
+    - current_drawdown
+    - beta
+    - sector_exposures
+  alert_thresholds:
+    var_breach: 0.95  # Alert if VaR exceeds 95% of limit
+    drawdown_warning: 0.08  # 8% drawdown warning
+    concentration_warning: 0.20  # 20% concentration warning
