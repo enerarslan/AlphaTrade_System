@@ -11,7 +11,7 @@ Defines all database tables including:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -48,18 +48,23 @@ class Base(DeclarativeBase):
         return "".join(["_" + c.lower() if c.isupper() else c for c in name]).lstrip("_")
 
 
+def _utc_now() -> datetime:
+    """Get current UTC time. Replaces deprecated _utc_now()."""
+    return datetime.now(timezone.utc)
+
+
 class TimestampMixin:
     """Mixin for created_at and updated_at timestamps."""
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=datetime.utcnow,
+        default=_utc_now,
         nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=_utc_now,
+        onupdate=_utc_now,
         nullable=False,
     )
 
@@ -250,8 +255,8 @@ class Position(Base):
     cost_basis: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=_utc_now,
+        onupdate=_utc_now,
     )
 
     def __repr__(self) -> str:
@@ -344,7 +349,7 @@ class ModelPrediction(Base):
     actual: Mapped[float | None] = mapped_column(Float, nullable=True)  # Filled later
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=datetime.utcnow,
+        default=_utc_now,
     )
 
     def __repr__(self) -> str:
@@ -424,7 +429,7 @@ class SystemLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=datetime.utcnow,
+        default=_utc_now,
         nullable=False,
         index=True,
     )
@@ -450,7 +455,7 @@ class Alert(Base):
     )
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=datetime.utcnow,
+        default=_utc_now,
         nullable=False,
         index=True,
     )

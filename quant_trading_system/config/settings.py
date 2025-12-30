@@ -57,7 +57,15 @@ class RedisSettings(BaseModel):
 
 
 class AlpacaSettings(BaseModel):
-    """Alpaca broker configuration settings."""
+    """Alpaca broker configuration settings.
+
+    SECURITY: Credentials should be provided via environment variables:
+    - ALPACA_API_KEY: Your Alpaca API key
+    - ALPACA_API_SECRET: Your Alpaca API secret
+
+    The settings are loaded from environment variables FIRST (secure),
+    then fall back to YAML config (less secure, for development only).
+    """
 
     api_key: str = ""
     api_secret: str = ""
@@ -70,6 +78,25 @@ class AlpacaSettings(BaseModel):
     def validate_base_url(cls, v: str, info) -> str:
         """Ensure paper trading uses paper API."""
         return v
+
+    @classmethod
+    def from_env(cls) -> "AlpacaSettings":
+        """Create settings from environment variables (SECURE method).
+
+        Environment variables:
+        - ALPACA_API_KEY: API key (required for live trading)
+        - ALPACA_API_SECRET: API secret (required for live trading)
+        - ALPACA_BASE_URL: API base URL (optional)
+        - ALPACA_DATA_URL: Data API URL (optional)
+        - ALPACA_PAPER_TRADING: Set to 'false' for live trading (optional)
+        """
+        return cls(
+            api_key=os.environ.get("ALPACA_API_KEY", ""),
+            api_secret=os.environ.get("ALPACA_API_SECRET", ""),
+            base_url=os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
+            data_url=os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets"),
+            paper_trading=os.environ.get("ALPACA_PAPER_TRADING", "true").lower() == "true",
+        )
 
 
 class RiskSettings(BaseModel):
@@ -126,6 +153,57 @@ class LoggingSettings(BaseModel):
     retention: str = Field(default="30 days", description="Log retention period")
 
 
+class SecuritySettings(BaseModel):
+    """Security configuration settings for API authentication.
+
+    CRITICAL: JWT secret key MUST be set via environment variable in production.
+    Generate a secure key with: python -c "import secrets; print(secrets.token_hex(32))"
+    """
+
+    # JWT settings
+    jwt_secret_key: str = Field(
+        default="",
+        description="JWT secret key - MUST be set via JWT_SECRET_KEY env var in production"
+    )
+    jwt_algorithm: str = Field(default="HS256", description="JWT algorithm")
+    jwt_expiration_minutes: int = Field(default=60, description="JWT token expiration in minutes")
+
+    # API key settings (alternative to JWT)
+    api_keys: list[str] = Field(
+        default_factory=list,
+        description="List of valid API keys for simple auth"
+    )
+
+    # Rate limiting
+    rate_limit_per_minute: int = Field(default=60, description="API rate limit per minute")
+
+    # Security flags
+    require_auth: bool = Field(
+        default=True,
+        description="Require authentication for API endpoints"
+    )
+    allow_public_health_check: bool = Field(
+        default=True,
+        description="Allow unauthenticated access to /health endpoint"
+    )
+
+    @classmethod
+    def from_env(cls) -> "SecuritySettings":
+        """Create settings from environment variables."""
+        api_keys_str = os.environ.get("API_KEYS", "")
+        api_keys = [k.strip() for k in api_keys_str.split(",") if k.strip()]
+
+        return cls(
+            jwt_secret_key=os.environ.get("JWT_SECRET_KEY", ""),
+            jwt_algorithm=os.environ.get("JWT_ALGORITHM", "HS256"),
+            jwt_expiration_minutes=int(os.environ.get("JWT_EXPIRATION_MINUTES", "60")),
+            api_keys=api_keys,
+            rate_limit_per_minute=int(os.environ.get("RATE_LIMIT_PER_MINUTE", "60")),
+            require_auth=os.environ.get("REQUIRE_AUTH", "true").lower() == "true",
+            allow_public_health_check=os.environ.get("ALLOW_PUBLIC_HEALTH", "true").lower() == "true",
+        )
+
+
 class Settings(BaseSettings):
     """Main application settings."""
 
@@ -150,6 +228,7 @@ class Settings(BaseSettings):
     trading: TradingSettings = Field(default_factory=TradingSettings)
     model: ModelSettings = Field(default_factory=ModelSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
 
     # Symbols configuration (loaded from YAML)
     symbols: list[str] = Field(default_factory=list)
@@ -179,21 +258,50 @@ class Settings(BaseSettings):
         return self.load_yaml_config(CONFIG_DIR / "model_configs.yaml")
 
     def load_alpaca_config(self) -> AlpacaSettings:
-        """Load Alpaca configuration from YAML."""
+        """Load Alpaca configuration with priority:
+        1. Environment variables (MOST SECURE - recommended for production)
+        2. YAML file (for development only)
+        3. Default values
+
+        SECURITY WARNING: Never commit API credentials to version control.
+        Use environment variables for production deployments.
+        """
+        # First try environment variables (SECURE)
+        env_settings = AlpacaSettings.from_env()
+        if env_settings.api_key and env_settings.api_secret:
+            return env_settings
+
+        # Fall back to YAML config (less secure, development only)
         config = self.load_yaml_config(CONFIG_DIR / "alpaca_config.yaml")
         if config:
             return AlpacaSettings(**config)
+
         return self.alpaca
 
 
-@lru_cache()
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Get cached settings instance."""
+    """Get cached settings instance with all configurations loaded.
+
+    Loads configurations in order:
+    1. Base settings from environment and .env file
+    2. Symbols from YAML
+    3. Alpaca credentials from environment variables (secure) or YAML (dev)
+    4. Security settings from environment variables
+    """
     settings = Settings()
 
     # Load symbols from YAML if available
     symbols = settings.load_symbols_config()
     if symbols:
         settings.symbols = symbols
+
+    # CRITICAL FIX: Load Alpaca config from environment variables first,
+    # falling back to YAML. This ensures credentials can be securely
+    # injected via environment variables in production.
+    settings.alpaca = settings.load_alpaca_config()
+
+    # Load security settings from environment variables
+    settings.security = SecuritySettings.from_env()
 
     return settings

@@ -65,9 +65,25 @@ class DatabaseManager:
         return self._async_engine
 
     def _create_engine(self) -> Engine:
-        """Create a new SQLAlchemy engine with connection pooling."""
+        """Create a new SQLAlchemy engine with connection pooling.
+
+        SECURITY: Supports SSL/TLS for production database connections.
+        """
         db_settings = self._settings.database
         url = db_settings.url
+
+        # SECURITY FIX: Add SSL/TLS connection options for production
+        connect_args = {}
+        if hasattr(db_settings, 'ssl_mode') and db_settings.ssl_mode:
+            # PostgreSQL SSL options
+            connect_args["sslmode"] = db_settings.ssl_mode  # 'require', 'verify-ca', 'verify-full'
+            if hasattr(db_settings, 'ssl_ca_cert') and db_settings.ssl_ca_cert:
+                connect_args["sslrootcert"] = db_settings.ssl_ca_cert
+            if hasattr(db_settings, 'ssl_client_cert') and db_settings.ssl_client_cert:
+                connect_args["sslcert"] = db_settings.ssl_client_cert
+            if hasattr(db_settings, 'ssl_client_key') and db_settings.ssl_client_key:
+                connect_args["sslkey"] = db_settings.ssl_client_key
+            logger.info(f"SSL mode enabled: {db_settings.ssl_mode}")
 
         engine = create_engine(
             url,
@@ -77,6 +93,7 @@ class DatabaseManager:
             pool_pre_ping=True,  # Enable connection health checks
             pool_recycle=3600,  # Recycle connections after 1 hour
             echo=self._settings.debug,
+            connect_args=connect_args if connect_args else {},
         )
 
         # Add event listeners for connection handling
@@ -92,10 +109,40 @@ class DatabaseManager:
         return engine
 
     def _create_async_engine(self):
-        """Create an async SQLAlchemy engine."""
+        """Create an async SQLAlchemy engine.
+
+        SECURITY: Supports SSL/TLS for production database connections.
+        """
         db_settings = self._settings.database
         # Convert to async URL (postgresql+asyncpg://)
         async_url = db_settings.url.replace("postgresql://", "postgresql+asyncpg://")
+
+        # SECURITY FIX: Add SSL/TLS connection options for production (asyncpg format)
+        connect_args = {}
+        if hasattr(db_settings, 'ssl_mode') and db_settings.ssl_mode:
+            import ssl
+            # asyncpg uses ssl context
+            ssl_context = ssl.create_default_context()
+            if db_settings.ssl_mode == 'verify-full':
+                ssl_context.check_hostname = True
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+            elif db_settings.ssl_mode == 'verify-ca':
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+            elif db_settings.ssl_mode == 'require':
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+
+            if hasattr(db_settings, 'ssl_ca_cert') and db_settings.ssl_ca_cert:
+                ssl_context.load_verify_locations(db_settings.ssl_ca_cert)
+            if hasattr(db_settings, 'ssl_client_cert') and db_settings.ssl_client_cert:
+                ssl_context.load_cert_chain(
+                    db_settings.ssl_client_cert,
+                    keyfile=getattr(db_settings, 'ssl_client_key', None)
+                )
+
+            connect_args["ssl"] = ssl_context
+            logger.info(f"Async SSL mode enabled: {db_settings.ssl_mode}")
 
         engine = create_async_engine(
             async_url,
@@ -103,6 +150,7 @@ class DatabaseManager:
             max_overflow=db_settings.max_overflow,
             pool_pre_ping=True,
             echo=self._settings.debug,
+            connect_args=connect_args if connect_args else {},
         )
 
         logger.info("Async database engine created")
@@ -238,8 +286,24 @@ class RedisManager:
         return self._client
 
     def _create_client(self) -> Any:
-        """Create a new Redis client with connection pooling."""
+        """Create a new Redis client with connection pooling.
+
+        SECURITY: Supports SSL/TLS for production Redis connections.
+        """
         redis_settings = self._settings.redis
+
+        # SECURITY FIX: Add SSL/TLS support for Redis
+        ssl_kwargs = {}
+        if hasattr(redis_settings, 'ssl') and redis_settings.ssl:
+            ssl_kwargs["ssl"] = True
+            ssl_kwargs["ssl_cert_reqs"] = "required"
+            if hasattr(redis_settings, 'ssl_ca_certs') and redis_settings.ssl_ca_certs:
+                ssl_kwargs["ssl_ca_certs"] = redis_settings.ssl_ca_certs
+            if hasattr(redis_settings, 'ssl_certfile') and redis_settings.ssl_certfile:
+                ssl_kwargs["ssl_certfile"] = redis_settings.ssl_certfile
+            if hasattr(redis_settings, 'ssl_keyfile') and redis_settings.ssl_keyfile:
+                ssl_kwargs["ssl_keyfile"] = redis_settings.ssl_keyfile
+            logger.info("Redis SSL/TLS enabled")
 
         self._pool = redis.ConnectionPool(
             host=redis_settings.host,
@@ -248,6 +312,7 @@ class RedisManager:
             password=redis_settings.password,
             max_connections=20,
             decode_responses=True,
+            **ssl_kwargs,
         )
 
         client = redis.Redis(connection_pool=self._pool)

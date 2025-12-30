@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -54,7 +54,7 @@ class MarketConditions:
     avg_daily_volume: int = 1000000
     volatility: float = 0.02  # Daily volatility
     spread_bps: float = 5.0  # Bid-ask spread in bps
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def spread(self) -> Decimal:
@@ -409,6 +409,9 @@ class FillSimulator:
     ) -> tuple[FillType, Decimal]:
         """Simulate fill type and quantity.
 
+        CRITICAL FIX: Use local variables for probability adjustments to avoid
+        mutable state bug where probabilities would permanently change between calls.
+
         Args:
             order: Order to simulate.
             conditions: Market conditions.
@@ -416,21 +419,26 @@ class FillSimulator:
         Returns:
             Tuple of (fill_type, fill_quantity).
         """
-        # Check volume constraint
+        # CRITICAL FIX: Use local variables, not instance attributes
+        # This prevents the mutable state bug where probabilities accumulate
+        fill_prob = self.fill_probability
+        partial_prob = self.partial_fill_probability
+
+        # Check volume constraint - adjust LOCAL probabilities only
         if conditions.avg_daily_volume > 0:
             participation_rate = float(order.quantity) / conditions.avg_daily_volume
             if participation_rate > 0.10:  # >10% ADV
                 # High likelihood of partial fill or rejection
-                self.fill_probability *= (1 - participation_rate)
-                self.partial_fill_probability *= 2
+                fill_prob *= (1 - participation_rate)
+                partial_prob = min(1.0, partial_prob * 2)
 
         # Determine fill type
         rand = np.random.random()
 
-        if rand > self.fill_probability:
+        if rand > fill_prob:
             return FillType.REJECTED, Decimal("0")
 
-        if np.random.random() < self.partial_fill_probability:
+        if np.random.random() < partial_prob:
             fill_pct = np.random.uniform(self.min_partial_pct, self.max_partial_pct)
             return FillType.PARTIAL, order.quantity * Decimal(str(fill_pct))
 

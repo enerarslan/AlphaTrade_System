@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -93,7 +93,7 @@ class EnrichedSignal:
 
     signal: TradeSignal
     metadata: SignalMetadata = field(default_factory=SignalMetadata)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     processed: bool = False
     executed: bool = False
 
@@ -101,7 +101,7 @@ class EnrichedSignal:
     def is_expired(self) -> bool:
         """Check if signal has expired."""
         if self.metadata.expires_at:
-            return datetime.utcnow() > self.metadata.expires_at
+            return datetime.now(timezone.utc) > self.metadata.expires_at
         return False
 
     @property
@@ -121,6 +121,7 @@ class SignalGeneratorConfig:
     dedup_window_seconds: int = 60
     min_signal_interval: int = 5  # seconds between signals per symbol
     aggregate_sources: bool = True
+    max_history_size: int = 10000  # Bound signal history to prevent memory leak
 
 
 class SignalAggregator:
@@ -405,7 +406,7 @@ class SignalGenerator:
                     self._pending_signals[symbol].append(enriched)
 
                     # Update rate limit
-                    self._last_signal_time[symbol] = datetime.utcnow()
+                    self._last_signal_time[symbol] = datetime.now(timezone.utc)
 
                     # Invoke callbacks
                     self._dispatch_signal(enriched)
@@ -474,6 +475,12 @@ class SignalGenerator:
         signal.executed = executed
         self._signal_history.append(signal)
 
+        # Bound history size to prevent memory leak
+        if len(self._signal_history) > self.config.max_history_size:
+            # Remove oldest 10% when limit exceeded
+            trim_count = self.config.max_history_size // 10
+            self._signal_history = self._signal_history[trim_count:]
+
         # Remove from pending
         symbol = signal.signal.symbol
         if symbol in self._pending_signals:
@@ -511,7 +518,28 @@ class SignalGenerator:
         self._signal_callbacks.append(callback)
 
     def _enrich_signal(self, signal: TradeSignal) -> EnrichedSignal:
-        """Enrich a signal with metadata."""
+        """Enrich a signal with metadata.
+
+        CRITICAL FIX: Validates and clamps signal bounds to prevent
+        invalid signals from corrupting position sizing.
+        """
+        # CRITICAL FIX: Validate and clamp signal bounds
+        # Confidence must be in [0, 1]
+        if not (0.0 <= signal.confidence <= 1.0):
+            logger.warning(
+                f"Signal {signal.symbol} has invalid confidence {signal.confidence}, "
+                f"clamping to [0, 1]"
+            )
+            signal.confidence = max(0.0, min(1.0, signal.confidence))
+
+        # Strength should be in [-1, 1] (allows negative for shorts)
+        if not (-1.0 <= signal.strength <= 1.0):
+            logger.warning(
+                f"Signal {signal.symbol} has invalid strength {signal.strength}, "
+                f"clamping to [-1, 1]"
+            )
+            signal.strength = max(-1.0, min(1.0, signal.strength))
+
         # Determine priority
         if signal.confidence > 0.8 and abs(signal.strength) > 0.7:
             priority = SignalPriority.HIGH
@@ -521,7 +549,7 @@ class SignalGenerator:
             priority = SignalPriority.NORMAL
 
         # Set expiration
-        expires_at = datetime.utcnow() + timedelta(seconds=self.config.default_signal_ttl)
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.config.default_signal_ttl)
 
         metadata = SignalMetadata(
             priority=priority,
@@ -598,7 +626,7 @@ class SignalGenerator:
         if last_time is None:
             return True
 
-        elapsed = (datetime.utcnow() - last_time).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
         return elapsed >= self.config.min_signal_interval
 
     def _cleanup_expired(self) -> None:

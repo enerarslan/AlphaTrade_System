@@ -229,7 +229,7 @@ class AlphaFactor(ABC):
 
         # Get timestamps
         timestamps = df["timestamp"].to_list() if "timestamp" in df.columns else [
-            datetime.utcnow() for _ in range(len(raw_alpha))
+            datetime.now() for _ in range(len(raw_alpha))
         ]
 
         # Create signals
@@ -244,7 +244,7 @@ class AlphaFactor(ABC):
                 alpha_id=self._id,
                 alpha_name=self.name,
                 symbol=symbol,
-                timestamp=ts if isinstance(ts, datetime) else datetime.utcnow(),
+                timestamp=ts if isinstance(ts, datetime) else datetime.now(),
                 value=float(val),
                 confidence=float(conf),
                 horizon=horizon_bars,
@@ -255,12 +255,19 @@ class AlphaFactor(ABC):
         return signals
 
     def _normalize(self, values: np.ndarray, window: int = 60) -> np.ndarray:
-        """Normalize values using rolling z-score."""
+        """Normalize values using rolling z-score.
+
+        CRITICAL: Uses PREVIOUS bars only to prevent look-ahead bias.
+        The window excludes the current bar from statistics calculation.
+        """
         result = np.full_like(values, np.nan)
         n = len(values)
 
-        for i in range(window - 1, n):
-            window_data = values[i - window + 1 : i + 1]
+        # Start from window index to have enough history, exclude current bar from window
+        for i in range(window, n):
+            # CRITICAL FIX: Use values[i - window : i] to exclude current bar
+            # This ensures we only use PAST data for normalization
+            window_data = values[i - window : i]
             valid_data = window_data[~np.isnan(window_data)]
 
             if len(valid_data) >= 10:
@@ -276,21 +283,25 @@ class AlphaFactor(ABC):
         Compute confidence based on signal consistency.
 
         Higher confidence when signal has been consistent over recent history.
+        CRITICAL: Uses PREVIOUS bars only to prevent look-ahead bias.
         """
         confidence = np.full_like(values, np.nan)
         n = len(values)
 
-        for i in range(window - 1, n):
-            window_data = values[i - window + 1 : i + 1]
+        # Start from window index to have enough history
+        for i in range(window, n):
+            # CRITICAL FIX: Use values[i - window : i] to exclude current bar
+            # This ensures we only use PAST data for confidence calculation
+            window_data = values[i - window : i]
             valid_data = window_data[~np.isnan(window_data)]
 
             if len(valid_data) >= 5:
-                # Confidence based on sign consistency
+                # Confidence based on sign consistency with PAST signals
                 current_sign = np.sign(values[i]) if not np.isnan(values[i]) else 0
                 same_sign = np.sum(np.sign(valid_data) == current_sign)
                 sign_consistency = same_sign / len(valid_data)
 
-                # Confidence based on magnitude relative to history
+                # Confidence based on magnitude relative to PAST history
                 abs_val = abs(values[i]) if not np.isnan(values[i]) else 0
                 max_abs = np.max(np.abs(valid_data))
                 magnitude_conf = abs_val / max_abs if max_abs > 0 else 0
@@ -308,6 +319,125 @@ class AlphaFactor(ABC):
             return 12
         else:  # LONG
             return 40
+
+    # =========================================================================
+    # MISSING FEATURE: Alpha Validation Method
+    # =========================================================================
+
+    def validate(
+        self,
+        df: pl.DataFrame,
+        features: dict[str, np.ndarray] | None = None,
+    ) -> tuple[bool, list[str]]:
+        """
+        Validate input data and parameters for alpha computation.
+
+        ARCHITECTURE REQUIREMENT: Validate data quality and parameters before
+        running alpha computations to prevent garbage-in-garbage-out.
+
+        Args:
+            df: DataFrame with OHLCV data
+            features: Optional precomputed features
+
+        Returns:
+            Tuple of (is_valid, list_of_errors)
+        """
+        errors: list[str] = []
+
+        # 1. Validate DataFrame structure
+        required_columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        if missing_cols:
+            errors.append(f"Missing required columns: {missing_cols}")
+
+        # 2. Validate minimum data length
+        min_length = self.lookback + 10  # Need lookback + some buffer
+        if len(df) < min_length:
+            errors.append(
+                f"Insufficient data: need at least {min_length} bars, got {len(df)}"
+            )
+
+        # 3. Validate OHLC relationship
+        if "open" in df.columns and "high" in df.columns and "low" in df.columns and "close" in df.columns:
+            # High should be >= Open, Close, Low
+            ohlc_valid = (
+                (df["high"] >= df["open"]).all() and
+                (df["high"] >= df["close"]).all() and
+                (df["high"] >= df["low"]).all() and
+                (df["low"] <= df["open"]).all() and
+                (df["low"] <= df["close"]).all()
+            )
+            if not ohlc_valid:
+                errors.append("OHLC data has invalid relationships (high < low, etc.)")
+
+        # 4. Validate no excessive NaN values
+        if "close" in df.columns:
+            nan_pct = df["close"].null_count() / len(df)
+            if nan_pct > 0.1:  # More than 10% NaN is suspicious
+                errors.append(f"Excessive NaN values in close: {nan_pct:.1%}")
+
+        # 5. Validate timestamps are sorted
+        if "timestamp" in df.columns:
+            timestamps = df["timestamp"].to_list()
+            if timestamps != sorted(timestamps):
+                errors.append("Timestamps are not sorted chronologically")
+
+        # 6. Validate no negative prices
+        for col in ["open", "high", "low", "close"]:
+            if col in df.columns:
+                if (df[col] < 0).any():
+                    errors.append(f"Negative values found in {col}")
+
+        # 7. Validate no zero/negative volume (suspicious)
+        if "volume" in df.columns:
+            zero_vol_pct = (df["volume"] == 0).sum() / len(df)
+            if zero_vol_pct > 0.5:  # More than 50% zero volume is suspicious
+                errors.append(f"High percentage of zero volume bars: {zero_vol_pct:.1%}")
+
+        # 8. Validate lookback parameter
+        if self.lookback < 1:
+            errors.append(f"Invalid lookback: {self.lookback} (must be >= 1)")
+
+        if self.lookback > len(df):
+            errors.append(
+                f"Lookback ({self.lookback}) exceeds data length ({len(df)})"
+            )
+
+        # 9. Validate decay parameter
+        if self.decay <= 0 or self.decay > 1:
+            errors.append(f"Invalid decay: {self.decay} (must be in (0, 1])")
+
+        # 10. Validate features if provided
+        if features:
+            for name, arr in features.items():
+                if len(arr) != len(df):
+                    errors.append(
+                        f"Feature '{name}' length ({len(arr)}) doesn't match data ({len(df)})"
+                    )
+                if np.isnan(arr).all():
+                    errors.append(f"Feature '{name}' is all NaN")
+
+        is_valid = len(errors) == 0
+        return is_valid, errors
+
+    def validate_or_raise(
+        self,
+        df: pl.DataFrame,
+        features: dict[str, np.ndarray] | None = None,
+    ) -> None:
+        """
+        Validate input data and raise exception if invalid.
+
+        Args:
+            df: DataFrame with OHLCV data
+            features: Optional precomputed features
+
+        Raises:
+            ValueError: If validation fails with list of errors.
+        """
+        is_valid, errors = self.validate(df, features)
+        if not is_valid:
+            raise ValueError(f"Alpha validation failed: {'; '.join(errors)}")
 
     def fit(
         self,
@@ -353,8 +483,8 @@ class AlphaFactor(ABC):
         if len(valid_alpha) < 20:
             return AlphaMetrics(
                 alpha_name=self.name,
-                period_start=datetime.utcnow(),
-                period_end=datetime.utcnow(),
+                period_start=datetime.now(),
+                period_end=datetime.now(),
             )
 
         # Information Coefficient (Spearman rank correlation)
@@ -390,13 +520,13 @@ class AlphaFactor(ABC):
 
         # Get timestamps
         timestamps = df["timestamp"].to_list() if "timestamp" in df.columns else []
-        period_start = timestamps[0] if timestamps else datetime.utcnow()
-        period_end = timestamps[-1] if timestamps else datetime.utcnow()
+        period_start = timestamps[0] if timestamps else datetime.now()
+        period_end = timestamps[-1] if timestamps else datetime.now()
 
         return AlphaMetrics(
             alpha_name=self.name,
-            period_start=period_start if isinstance(period_start, datetime) else datetime.utcnow(),
-            period_end=period_end if isinstance(period_end, datetime) else datetime.utcnow(),
+            period_start=period_start if isinstance(period_start, datetime) else datetime.now(),
+            period_end=period_end if isinstance(period_end, datetime) else datetime.now(),
             information_coefficient=ic,
             information_ratio=ir,
             mean_return=mean_ret,

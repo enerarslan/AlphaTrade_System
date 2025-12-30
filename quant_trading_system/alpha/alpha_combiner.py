@@ -152,18 +152,25 @@ class EqualWeighter(AlphaWeighter):
 
 
 class ICWeighter(AlphaWeighter):
-    """Weight alphas by their Information Coefficient."""
+    """Weight alphas by their Information Coefficient.
 
-    def __init__(self, lookback: int = 20, min_ic: float = 0.0):
+    CRITICAL: IC is calculated using LAGGED alpha values vs FORWARD returns
+    to avoid look-ahead bias. Alpha at time t is correlated with returns
+    at time t+1 (not contemporaneous returns).
+    """
+
+    def __init__(self, lookback: int = 20, min_ic: float = 0.0, return_lag: int = 1):
         """
         Initialize IC weighter.
 
         Args:
             lookback: Lookback period for IC calculation
             min_ic: Minimum IC to include alpha (default 0 = no threshold)
+            return_lag: Number of periods to lag returns (default 1 = forward returns)
         """
         self.lookback = lookback
         self.min_ic = min_ic
+        self.return_lag = return_lag
 
     def compute_weights(
         self,
@@ -171,20 +178,35 @@ class ICWeighter(AlphaWeighter):
         returns: np.ndarray | None = None,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Weight by rolling IC."""
+        """Weight by rolling IC.
+
+        CRITICAL FIX: Uses lagged alpha values with forward returns to prevent
+        look-ahead bias. IC(alpha[t], returns[t+lag]) instead of IC(alpha[t], returns[t]).
+        """
         if returns is None:
             return EqualWeighter().compute_weights(alpha_values)
 
         ics = {}
         for name, values in alpha_values.items():
+            # CRITICAL FIX: Align alpha values with FORWARD returns
+            # Alpha at time t should predict returns at time t+lag
+            # So we use alpha[:-lag] vs returns[lag:]
+            lag = self.return_lag
+            if lag > 0 and len(values) > lag and len(returns) > lag:
+                lagged_alpha = values[:-lag]
+                forward_returns = returns[lag:]
+            else:
+                lagged_alpha = values
+                forward_returns = returns
+
             # Compute rank IC
-            valid_mask = ~(np.isnan(values) | np.isnan(returns))
+            valid_mask = ~(np.isnan(lagged_alpha) | np.isnan(forward_returns))
             if np.sum(valid_mask) < self.lookback:
                 ics[name] = 0.0
                 continue
 
-            valid_alpha = values[valid_mask][-self.lookback :]
-            valid_returns = returns[valid_mask][-self.lookback :]
+            valid_alpha = lagged_alpha[valid_mask][-self.lookback:]
+            valid_returns = forward_returns[valid_mask][-self.lookback:]
 
             if len(valid_alpha) >= 10:
                 ic, _ = stats.spearmanr(valid_alpha, valid_returns)

@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -65,7 +65,7 @@ class OptimizationResult:
     optimization_success: bool = True
     constraints_active: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -109,7 +109,7 @@ class RebalanceResult:
     estimated_total_cost: Decimal
     should_rebalance: bool
     trigger_reason: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class OptimizationConstraints:
@@ -694,7 +694,7 @@ class PortfolioRebalancer:
         """
         # Check minimum interval
         if self._last_rebalance is not None:
-            days_since = (datetime.utcnow() - self._last_rebalance).days
+            days_since = (datetime.now(timezone.utc) - self._last_rebalance).days
             if days_since < self.min_rebalance_interval_days:
                 return False, f"Too soon since last rebalance ({days_since} days)"
 
@@ -791,7 +791,7 @@ class PortfolioRebalancer:
 
         # Update last rebalance time
         if orders:
-            self._last_rebalance = datetime.utcnow()
+            self._last_rebalance = datetime.now(timezone.utc)
 
         return RebalanceResult(
             orders=orders,

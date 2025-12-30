@@ -59,7 +59,7 @@ class RiskAlert:
     threshold_value: float
     symbol: str | None = None
     recommended_action: str | None = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     acknowledged: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -91,7 +91,7 @@ class DrawdownState:
     max_drawdown: float
     drawdown_start: datetime | None = None
     drawdown_duration_bars: int = 0
-    last_peak_date: datetime = field(default_factory=datetime.utcnow)
+    last_peak_date: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def is_in_drawdown(self) -> bool:

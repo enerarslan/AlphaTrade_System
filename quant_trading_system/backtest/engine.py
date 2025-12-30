@@ -14,7 +14,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable, Iterator
@@ -369,7 +369,7 @@ class BacktestEngine:
     def _initialize(self) -> None:
         """Initialize backtest state."""
         self._state = BacktestState(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             equity=self.config.initial_capital,
             cash=self.config.initial_capital,
             positions={},
@@ -458,12 +458,22 @@ class BacktestEngine:
             self._state.pending_orders.pop(i)
 
     def _get_fill_price(self, bar: OHLCVBar) -> Decimal | None:
-        """Get fill price based on execution config."""
+        """Get fill price based on execution config.
+
+        WARNING: 'same_close' execution has look-ahead bias and should only
+        be used for theoretical analysis. Use 'next_open' for realistic results.
+        """
         if self.config.fill_at == "next_open":
             return bar.open
         elif self.config.fill_at == "next_close":
             return bar.close
         elif self.config.fill_at == "same_close":
+            # WARNING: This introduces look-ahead bias since signal uses close data
+            # but execution happens at the same close. Only use for theoretical analysis.
+            logger.warning(
+                "Using same_close execution mode - this introduces look-ahead bias. "
+                "Use next_open for realistic backtesting results."
+            )
             return bar.close
         return bar.open
 
@@ -535,6 +545,7 @@ class BacktestEngine:
                     "entry_price": fill_price,
                     "quantity": order.quantity,
                     "bars_held": 0,
+                    "entry_side": order.side,  # Track entry side for correct P&L calculation
                 }
             else:
                 # Add to position
@@ -557,14 +568,25 @@ class BacktestEngine:
                 # Record trade
                 if order.symbol in self._open_positions:
                     open_pos = self._open_positions[order.symbol]
-                    pnl = (fill_price - open_pos["entry_price"]) * order.quantity - commission
+
+                    # CRITICAL FIX: Calculate P&L correctly based on entry side
+                    # Long position (entry_side=BUY): pnl = (exit - entry) * qty
+                    # Short position (entry_side=SELL): pnl = (entry - exit) * qty
+                    entry_side = open_pos.get("entry_side", OrderSide.BUY)
+                    if entry_side == OrderSide.BUY:
+                        # Closing a long position
+                        pnl = (fill_price - open_pos["entry_price"]) * order.quantity - commission
+                    else:
+                        # Closing a short position
+                        pnl = (open_pos["entry_price"] - fill_price) * order.quantity - commission
+
                     pnl_pct = float(pnl / (open_pos["entry_price"] * order.quantity))
 
                     trade = Trade(
                         symbol=order.symbol,
                         entry_time=open_pos["entry_time"],
                         exit_time=fill_time,
-                        side=OrderSide.BUY,  # Original entry side
+                        side=entry_side,  # Original entry side (BUY for long, SELL for short)
                         quantity=order.quantity,
                         entry_price=open_pos["entry_price"],
                         exit_price=fill_price,

@@ -13,6 +13,7 @@ Bridges signals to executable trades.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -87,20 +88,29 @@ class RebalanceConfig:
 
 @dataclass
 class TargetPosition:
-    """Target position for portfolio."""
+    """Target position for portfolio.
+
+    Supports both long and short positions:
+    - Positive target_weight = long position
+    - Negative target_weight = short position
+    """
 
     symbol: str
-    target_weight: float  # Portfolio weight (0-1)
-    target_shares: Decimal
-    target_value: Decimal
+    target_weight: float  # Portfolio weight (-1 to 1), negative for shorts
+    target_shares: Decimal  # Positive for long, negative for short
+    target_value: Decimal  # Absolute value of position
     signal: EnrichedSignal | None = None
     confidence: float = 0.0
     priority: OrderPriority = OrderPriority.NORMAL
+    is_short: bool = False  # True if this is a short position
 
 
 @dataclass
 class TargetPortfolio:
-    """Target portfolio state."""
+    """Target portfolio state.
+
+    Supports both long and short positions with separate exposure tracking.
+    """
 
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     target_positions: dict[str, TargetPosition] = field(default_factory=dict)
@@ -111,13 +121,38 @@ class TargetPortfolio:
 
     @property
     def total_target_weight(self) -> float:
-        """Get total weight of target positions."""
+        """Get net weight of target positions (long - short)."""
         return sum(tp.target_weight for tp in self.target_positions.values())
 
     @property
+    def gross_exposure(self) -> float:
+        """Get gross exposure (|long| + |short|)."""
+        return sum(abs(tp.target_weight) for tp in self.target_positions.values())
+
+    @property
+    def long_exposure(self) -> float:
+        """Get total long exposure."""
+        return sum(tp.target_weight for tp in self.target_positions.values() if tp.target_weight > 0)
+
+    @property
+    def short_exposure(self) -> float:
+        """Get total short exposure (as positive number)."""
+        return sum(abs(tp.target_weight) for tp in self.target_positions.values() if tp.target_weight < 0)
+
+    @property
     def num_positions(self) -> int:
-        """Get number of target positions."""
+        """Get total number of target positions."""
         return len(self.target_positions)
+
+    @property
+    def num_long_positions(self) -> int:
+        """Get number of long positions."""
+        return sum(1 for tp in self.target_positions.values() if not tp.is_short)
+
+    @property
+    def num_short_positions(self) -> int:
+        """Get number of short positions."""
+        return sum(1 for tp in self.target_positions.values() if tp.is_short)
 
 
 @dataclass
@@ -232,6 +267,10 @@ class PositionSizer:
     ) -> dict[str, float]:
         """Calculate target weights for signals.
 
+        Supports both LONG and SHORT positions:
+        - LONG signals return positive weights
+        - SHORT signals return negative weights
+
         Args:
             signals: List of signals.
             portfolio: Current portfolio.
@@ -239,7 +278,7 @@ class PositionSizer:
             volatilities: Optional volatilities by symbol.
 
         Returns:
-            Target weights by symbol.
+            Target weights by symbol (positive for long, negative for short).
         """
         weights: dict[str, float] = {}
         volatilities = volatilities or {}
@@ -257,12 +296,23 @@ class PositionSizer:
             if shares > 0:
                 value = shares * price
                 weight = float(value / portfolio.equity)
+
+                # Apply sign based on direction - SHORT signals get negative weight
+                if signal.signal.direction == Direction.SHORT:
+                    weight = -weight
+
                 weights[symbol] = weight
 
-        # Normalize if total exceeds 1
-        total_weight = sum(weights.values())
-        if total_weight > 1.0:
-            factor = 1.0 / total_weight
+        # Normalize if total absolute weight exceeds 1
+        # (allows for 100% long + 100% short = 200% gross exposure with 1.0 net)
+        total_long = sum(w for w in weights.values() if w > 0)
+        total_short = sum(abs(w) for w in weights.values() if w < 0)
+
+        # Cap gross exposure at 2x (100% long + 100% short max)
+        max_gross = 2.0
+        gross_exposure = total_long + total_short
+        if gross_exposure > max_gross:
+            factor = max_gross / gross_exposure
             weights = {s: w * factor for s, w in weights.items()}
 
         return weights
@@ -292,7 +342,12 @@ class PortfolioManager:
         self.rebalance_config = rebalance_config or RebalanceConfig()
         self.event_bus = event_bus
 
-        # State
+        # CRITICAL FIX: Add thread safety for shared state
+        # Multiple methods can modify _target_portfolio and _pending_trades
+        # concurrently (e.g., signal handler + main trading loop)
+        self._state_lock = threading.RLock()
+
+        # State (protected by _state_lock)
         self._target_portfolio: TargetPortfolio | None = None
         self._last_rebalance: datetime | None = None
         self._pending_trades: list[Trade] = []
@@ -305,6 +360,10 @@ class PortfolioManager:
         volatilities: dict[str, float] | None = None,
     ) -> TargetPortfolio:
         """Build target portfolio from signals.
+
+        Supports both LONG and SHORT positions:
+        - LONG signals create positive weight positions
+        - SHORT signals create negative weight positions
 
         Args:
             signals: Trading signals.
@@ -323,41 +382,49 @@ class PortfolioManager:
         # Filter to actionable signals
         active_signals = [s for s in signals if s.is_actionable]
 
-        # Only LONG signals result in positions (no shorting for simplicity)
-        long_signals = [
+        # Process both LONG and SHORT signals (full short selling support)
+        directional_signals = [
             s for s in active_signals
-            if s.signal.direction == Direction.LONG
+            if s.signal.direction in (Direction.LONG, Direction.SHORT)
         ]
 
         # Sort by priority and confidence
-        long_signals.sort(
+        directional_signals.sort(
             key=lambda s: (-s.metadata.priority.value, s.signal.confidence),
             reverse=True,
         )
 
         # Limit number of positions
         max_positions = self.position_sizer.config.max_total_positions
-        long_signals = long_signals[:max_positions]
+        directional_signals = directional_signals[:max_positions]
 
-        # Calculate weights
+        # Calculate weights (positive for longs, negative for shorts)
         weights = self.position_sizer.calculate_weights(
-            long_signals, portfolio, prices, volatilities
+            directional_signals, portfolio, prices, volatilities
         )
 
         # Build target positions
-        for signal in long_signals:
+        for signal in directional_signals:
             symbol = signal.signal.symbol
             weight = weights.get(symbol, 0.0)
 
-            if weight <= 0:
+            # Skip zero weights
+            if weight == 0.0:
                 continue
 
             price = prices.get(symbol, Decimal("0"))
             if price <= 0:
                 continue
 
-            target_value = portfolio.equity * Decimal(str(weight))
+            # For shorts, weight is negative - use absolute value for target_value
+            is_short = weight < 0
+            abs_weight = abs(weight)
+            target_value = portfolio.equity * Decimal(str(abs_weight))
             target_shares = (target_value / price).quantize(Decimal("1"))
+
+            # For short positions, shares are negative
+            if is_short:
+                target_shares = -target_shares
 
             # Determine priority
             if signal.metadata.priority == SignalPriority.CRITICAL:
@@ -369,18 +436,22 @@ class PortfolioManager:
 
             target.target_positions[symbol] = TargetPosition(
                 symbol=symbol,
-                target_weight=weight,
-                target_shares=target_shares,
-                target_value=target_value,
+                target_weight=weight,  # Negative for shorts
+                target_shares=target_shares,  # Negative for shorts
+                target_value=target_value,  # Always positive (absolute value)
                 signal=signal,
                 confidence=signal.signal.confidence,
                 priority=order_priority,
+                is_short=is_short,
             )
 
         # Calculate expected turnover
         target.expected_turnover = self._calculate_turnover(target, portfolio)
 
-        self._target_portfolio = target
+        # THREAD SAFETY: Use lock when modifying shared state
+        with self._state_lock:
+            self._target_portfolio = target
+
         return target
 
     def generate_rebalance_trades(
@@ -390,6 +461,10 @@ class PortfolioManager:
         prices: dict[str, Decimal],
     ) -> list[Trade]:
         """Generate trades to achieve target portfolio.
+
+        Handles both long and short positions:
+        - Long targets (positive shares): BUY to increase, SELL to decrease
+        - Short targets (negative shares): SELL to short, BUY to cover
 
         Args:
             target: Target portfolio state.
@@ -422,8 +497,23 @@ class PortfolioManager:
             if trade_value < self.rebalance_config.min_trade_value:
                 continue
 
-            # Create trade
+            # Create trade - handles both long and short scenarios
+            # delta_shares > 0: BUY (increase long or cover short)
+            # delta_shares < 0: SELL (decrease long or increase short)
             side = OrderSide.BUY if delta_shares > 0 else OrderSide.SELL
+
+            # Determine trade reason based on position type
+            if target_pos.is_short:
+                if side == OrderSide.SELL:
+                    reason = "short_sell"
+                else:
+                    reason = "cover_short"
+            else:
+                if side == OrderSide.BUY:
+                    reason = "buy_long"
+                else:
+                    reason = "reduce_long"
+
             trade = Trade(
                 symbol=symbol,
                 side=side,
@@ -431,7 +521,7 @@ class PortfolioManager:
                 current_price=price,
                 target_position=target_pos,
                 priority=target_pos.priority,
-                reason="rebalance_to_target",
+                reason=reason,
             )
             trades.append(trade)
 
@@ -459,7 +549,10 @@ class PortfolioManager:
         # Sort by priority
         trades.sort(key=lambda t: t.priority.value)
 
-        self._pending_trades = trades
+        # THREAD SAFETY: Use lock when modifying shared state
+        with self._state_lock:
+            self._pending_trades = trades
+
         return trades
 
     def check_rebalance_needed(
@@ -494,10 +587,10 @@ class PortfolioManager:
             drift = abs(target_pos.target_weight - current_weight)
             max_drift = max(max_drift, drift)
 
-        # Check for positions that should be closed
+        # Check for positions that should be closed (both long and short)
         for symbol in current_weights:
             if symbol not in target.target_positions:
-                if current_weights[symbol] > 0.01:  # >1% in non-target position
+                if abs(current_weights[symbol]) > 0.01:  # >1% in non-target position
                     return True, "unwanted_position"
 
         if max_drift > self.rebalance_config.threshold_pct:
@@ -548,23 +641,31 @@ class PortfolioManager:
         return requests
 
     def get_target_portfolio(self) -> TargetPortfolio | None:
-        """Get current target portfolio."""
-        return self._target_portfolio
+        """Get current target portfolio. Thread-safe."""
+        with self._state_lock:
+            return self._target_portfolio
 
     def get_pending_trades(self) -> list[Trade]:
-        """Get pending trades."""
-        return self._pending_trades
+        """Get pending trades. Thread-safe - returns a copy."""
+        with self._state_lock:
+            return self._pending_trades.copy()
 
     def clear_pending_trades(self) -> None:
-        """Clear pending trades."""
-        self._pending_trades = []
+        """Clear pending trades. Thread-safe."""
+        with self._state_lock:
+            self._pending_trades = []
 
     def _calculate_current_weights(
         self,
         portfolio: Portfolio,
         prices: dict[str, Decimal],
     ) -> dict[str, float]:
-        """Calculate current portfolio weights."""
+        """Calculate current portfolio weights.
+
+        Returns signed weights:
+        - Positive weight = long position
+        - Negative weight = short position
+        """
         weights = {}
         if portfolio.equity <= 0:
             return weights
@@ -573,7 +674,8 @@ class PortfolioManager:
             if position.is_flat:
                 continue
             price = prices.get(symbol, position.current_price)
-            value = abs(position.quantity * price)
+            # Use signed value - negative for short positions
+            value = position.quantity * price
             weights[symbol] = float(value / portfolio.equity)
 
         return weights
@@ -631,13 +733,21 @@ class PortfolioManager:
         return filtered_trades
 
     def get_statistics(self) -> dict[str, Any]:
-        """Get portfolio manager statistics."""
+        """Get portfolio manager statistics.
+
+        Returns statistics including long/short exposure breakdown.
+        """
         target = self._target_portfolio
 
         return {
             "has_target": target is not None,
             "target_positions": target.num_positions if target else 0,
-            "target_weight": target.total_target_weight if target else 0.0,
+            "num_long_positions": target.num_long_positions if target else 0,
+            "num_short_positions": target.num_short_positions if target else 0,
+            "net_weight": target.total_target_weight if target else 0.0,
+            "gross_exposure": target.gross_exposure if target else 0.0,
+            "long_exposure": target.long_exposure if target else 0.0,
+            "short_exposure": target.short_exposure if target else 0.0,
             "expected_turnover": target.expected_turnover if target else 0.0,
             "pending_trades": len(self._pending_trades),
             "pending_trade_value": float(sum(t.notional_value for t in self._pending_trades)),

@@ -38,6 +38,210 @@ UTC = ZoneInfo("UTC")
 EASTERN = ZoneInfo("America/New_York")
 
 
+# =============================================================================
+# US Market Holiday Calendar
+# =============================================================================
+
+
+def get_us_market_holidays(year: int) -> set[datetime]:
+    """Get US stock market holidays for a given year.
+
+    Includes all NYSE/NASDAQ holidays:
+    - New Year's Day
+    - Martin Luther King Jr. Day (3rd Monday in January)
+    - Presidents' Day (3rd Monday in February)
+    - Good Friday (Friday before Easter Sunday)
+    - Memorial Day (Last Monday in May)
+    - Juneteenth (June 19, observed)
+    - Independence Day (July 4, observed)
+    - Labor Day (1st Monday in September)
+    - Thanksgiving Day (4th Thursday in November)
+    - Christmas Day (December 25, observed)
+
+    Args:
+        year: Year to get holidays for.
+
+    Returns:
+        Set of holiday dates (datetime with time at midnight ET).
+    """
+    holidays = set()
+
+    # Helper to get nth weekday of month
+    def nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime:
+        """Get the nth occurrence of a weekday in a month."""
+        first_day = datetime(year, month, 1, tzinfo=EASTERN)
+        first_weekday = first_day.weekday()
+        days_until = (weekday - first_weekday) % 7
+        return first_day + timedelta(days=days_until + (n - 1) * 7)
+
+    def last_weekday(year: int, month: int, weekday: int) -> datetime:
+        """Get the last occurrence of a weekday in a month."""
+        # Start from 5th week and go back if needed
+        for n in range(5, 0, -1):
+            try:
+                date = nth_weekday(year, month, weekday, n)
+                if date.month == month:
+                    return date
+            except ValueError:
+                continue
+        return nth_weekday(year, month, weekday, 1)
+
+    def observed_holiday(date: datetime) -> datetime:
+        """Adjust for weekend observation (Friday if Saturday, Monday if Sunday)."""
+        if date.weekday() == 5:  # Saturday -> Friday
+            return date - timedelta(days=1)
+        elif date.weekday() == 6:  # Sunday -> Monday
+            return date + timedelta(days=1)
+        return date
+
+    # New Year's Day (January 1)
+    new_years = datetime(year, 1, 1, tzinfo=EASTERN)
+    holidays.add(observed_holiday(new_years))
+
+    # MLK Day (3rd Monday in January)
+    mlk_day = nth_weekday(year, 1, 0, 3)  # Monday = 0
+    holidays.add(mlk_day)
+
+    # Presidents' Day (3rd Monday in February)
+    presidents_day = nth_weekday(year, 2, 0, 3)
+    holidays.add(presidents_day)
+
+    # Good Friday (requires Easter calculation)
+    def calculate_easter(year: int) -> datetime:
+        """Calculate Easter Sunday using the Anonymous Gregorian algorithm."""
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        l = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * l) // 451
+        month = (h + l - 7 * m + 114) // 31
+        day = ((h + l - 7 * m + 114) % 31) + 1
+        return datetime(year, month, day, tzinfo=EASTERN)
+
+    easter = calculate_easter(year)
+    good_friday = easter - timedelta(days=2)
+    holidays.add(good_friday)
+
+    # Memorial Day (Last Monday in May)
+    memorial_day = last_weekday(year, 5, 0)
+    holidays.add(memorial_day)
+
+    # Juneteenth (June 19) - observed since 2021
+    if year >= 2021:
+        juneteenth = datetime(year, 6, 19, tzinfo=EASTERN)
+        holidays.add(observed_holiday(juneteenth))
+
+    # Independence Day (July 4)
+    independence_day = datetime(year, 7, 4, tzinfo=EASTERN)
+    holidays.add(observed_holiday(independence_day))
+
+    # Labor Day (1st Monday in September)
+    labor_day = nth_weekday(year, 9, 0, 1)
+    holidays.add(labor_day)
+
+    # Thanksgiving (4th Thursday in November)
+    thanksgiving = nth_weekday(year, 11, 3, 4)  # Thursday = 3
+    holidays.add(thanksgiving)
+
+    # Christmas Day (December 25)
+    christmas = datetime(year, 12, 25, tzinfo=EASTERN)
+    holidays.add(observed_holiday(christmas))
+
+    return holidays
+
+
+# Cache holidays by year
+_holiday_cache: dict[int, set[datetime]] = {}
+
+
+def is_market_holiday(dt: datetime | None = None) -> bool:
+    """Check if a date is a US market holiday.
+
+    Args:
+        dt: Date to check. If None, uses current date.
+
+    Returns:
+        True if the date is a market holiday.
+    """
+    if dt is None:
+        dt = eastern_now()
+    else:
+        dt = to_eastern(dt)
+
+    year = dt.year
+
+    # Cache holidays for the year
+    if year not in _holiday_cache:
+        _holiday_cache[year] = get_us_market_holidays(year)
+
+    # Check if date matches any holiday (compare date only, not time)
+    dt_date = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for holiday in _holiday_cache[year]:
+        holiday_date = holiday.replace(hour=0, minute=0, second=0, microsecond=0)
+        if dt_date == holiday_date:
+            return True
+
+    return False
+
+
+def get_next_trading_day(dt: datetime | None = None) -> datetime:
+    """Get the next trading day (excludes weekends and holidays).
+
+    Args:
+        dt: Starting date. If None, uses current date.
+
+    Returns:
+        Next trading day at market open time.
+    """
+    if dt is None:
+        dt = eastern_now()
+    else:
+        dt = to_eastern(dt)
+
+    # Start from next day
+    next_day = dt + timedelta(days=1)
+    next_day = next_day.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    # Skip weekends and holidays
+    while next_day.weekday() >= 5 or is_market_holiday(next_day):
+        next_day += timedelta(days=1)
+
+    return next_day
+
+
+def get_previous_trading_day(dt: datetime | None = None) -> datetime:
+    """Get the previous trading day (excludes weekends and holidays).
+
+    Args:
+        dt: Starting date. If None, uses current date.
+
+    Returns:
+        Previous trading day at market close time.
+    """
+    if dt is None:
+        dt = eastern_now()
+    else:
+        dt = to_eastern(dt)
+
+    # Start from previous day
+    prev_day = dt - timedelta(days=1)
+    prev_day = prev_day.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    # Skip weekends and holidays
+    while prev_day.weekday() >= 5 or is_market_holiday(prev_day):
+        prev_day -= timedelta(days=1)
+
+    return prev_day
+
+
 def utc_now() -> datetime:
     """Get current UTC datetime with timezone info."""
     return datetime.now(UTC)
@@ -79,11 +283,16 @@ def to_eastern(dt: datetime) -> datetime:
 def is_market_open(dt: datetime | None = None) -> bool:
     """Check if US stock market is open.
 
+    COMPLETE implementation including:
+    - Weekend check
+    - Holiday check (full NYSE/NASDAQ calendar)
+    - Trading hours check (9:30 AM - 4:00 PM ET)
+
     Args:
         dt: Datetime to check. If None, uses current time.
 
     Returns:
-        True if market is open (simplified check, no holidays).
+        True if market is currently open.
     """
     if dt is None:
         dt = eastern_now()
@@ -92,6 +301,10 @@ def is_market_open(dt: datetime | None = None) -> bool:
 
     # Weekend check
     if dt.weekday() >= 5:
+        return False
+
+    # Holiday check (uses full holiday calendar)
+    if is_market_holiday(dt):
         return False
 
     # Time check (9:30 AM - 4:00 PM ET)
@@ -360,40 +573,59 @@ def hash_string(s: str) -> str:
 # =============================================================================
 
 
-def memoize(func: F) -> F:
+def memoize(func: F, maxsize: int = 1024) -> F:
     """Simple memoization decorator for functions with hashable arguments.
+
+    Uses an LRU eviction policy to bound memory usage.
 
     Args:
         func: Function to memoize.
+        maxsize: Maximum cache size (default 1024). Oldest entries evicted when full.
 
     Returns:
         Memoized function.
     """
-    cache: dict[tuple, Any] = {}
+    from collections import OrderedDict
+    cache: OrderedDict[tuple, Any] = OrderedDict()
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         key = (args, tuple(sorted(kwargs.items())))
-        if key not in cache:
-            cache[key] = func(*args, **kwargs)
-        return cache[key]
+        if key in cache:
+            # Move to end (most recently used)
+            cache.move_to_end(key)
+            return cache[key]
+
+        result = func(*args, **kwargs)
+        cache[key] = result
+
+        # Evict oldest if over maxsize
+        while len(cache) > maxsize:
+            cache.popitem(last=False)
+
+        return result
 
     wrapper.cache = cache  # type: ignore
     wrapper.clear_cache = cache.clear  # type: ignore
+    wrapper.cache_info = lambda: {"size": len(cache), "maxsize": maxsize}  # type: ignore
     return wrapper  # type: ignore
 
 
-def timed_cache(seconds: int) -> Callable[[F], F]:
-    """Decorator for time-based caching.
+def timed_cache(seconds: int, maxsize: int = 512) -> Callable[[F], F]:
+    """Decorator for time-based caching with bounded size.
+
+    Uses LRU eviction when cache is full. Entries also expire after TTL.
 
     Args:
         seconds: Cache TTL in seconds.
+        maxsize: Maximum cache size (default 512).
 
     Returns:
         Decorator function.
     """
     def decorator(func: F) -> F:
-        cache: dict[tuple, tuple[Any, float]] = {}
+        from collections import OrderedDict
+        cache: OrderedDict[tuple, tuple[Any, float]] = OrderedDict()
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -403,14 +635,24 @@ def timed_cache(seconds: int) -> Callable[[F], F]:
             if key in cache:
                 result, timestamp = cache[key]
                 if now - timestamp < seconds:
+                    cache.move_to_end(key)  # Mark as recently used
                     return result
+                else:
+                    # Expired, remove it
+                    del cache[key]
 
             result = func(*args, **kwargs)
             cache[key] = (result, now)
+
+            # Evict oldest if over maxsize
+            while len(cache) > maxsize:
+                cache.popitem(last=False)
+
             return result
 
         wrapper.cache = cache  # type: ignore
         wrapper.clear_cache = cache.clear  # type: ignore
+        wrapper.cache_info = lambda: {"size": len(cache), "maxsize": maxsize, "ttl": seconds}  # type: ignore
         return wrapper  # type: ignore
 
     return decorator

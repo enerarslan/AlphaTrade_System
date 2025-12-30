@@ -356,17 +356,65 @@ class TradeLogger:
         self,
         log_dir: Path | None = None,
         retention_days: int = 365,
+        async_writes: bool = True,
     ) -> None:
         """Initialize the trade logger.
+
+        CRITICAL FIX: Added async_writes option to prevent blocking main trading loop.
+        File writes are now queued and handled by a background thread.
 
         Args:
             log_dir: Directory for trade logs.
             retention_days: Number of days to retain logs.
+            async_writes: Whether to use async file writes (default True).
         """
+        import queue
+        import threading
+
         self.log_dir = log_dir or Path("logs/trades")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.retention_days = retention_days
         self._logger = get_logger("trade", LogCategory.TRADING)
+
+        # CRITICAL FIX: Async write queue to avoid blocking main trading loop
+        self._async_writes = async_writes
+        self._write_queue: queue.Queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._write_thread: threading.Thread | None = None
+
+        if self._async_writes:
+            self._write_thread = threading.Thread(
+                target=self._background_writer,
+                daemon=True,
+                name="TradeLogWriter",
+            )
+            self._write_thread.start()
+
+    def _background_writer(self) -> None:
+        """Background thread for async file writes.
+
+        Processes write queue without blocking main trading loop.
+        """
+        import queue as queue_module
+
+        while not self._stop_event.is_set():
+            try:
+                # Wait for entries with timeout to allow checking stop event
+                entry = self._write_queue.get(timeout=1.0)
+                self._sync_write_to_file(entry)
+                self._write_queue.task_done()
+            except queue_module.Empty:
+                continue
+            except Exception as e:
+                self._logger.error(f"Background writer error: {e}")
+
+    def close(self) -> None:
+        """Close the trade logger and flush pending writes."""
+        if self._write_thread and self._write_thread.is_alive():
+            # Flush remaining items
+            self._write_queue.join()
+            self._stop_event.set()
+            self._write_thread.join(timeout=5.0)
 
     def log_trade_entry(
         self,
@@ -478,7 +526,22 @@ class TradeLogger:
         return updated_entry
 
     def _write_to_file(self, entry: TradeLogEntry) -> None:
-        """Write trade entry to file.
+        """Write trade entry to file (async if enabled).
+
+        CRITICAL FIX: Uses async queue to avoid blocking main trading loop.
+
+        Args:
+            entry: Trade log entry to write.
+        """
+        if self._async_writes:
+            # Non-blocking - add to queue for background processing
+            self._write_queue.put(entry)
+        else:
+            # Synchronous write (legacy behavior)
+            self._sync_write_to_file(entry)
+
+    def _sync_write_to_file(self, entry: TradeLogEntry) -> None:
+        """Synchronously write trade entry to file (internal use).
 
         Args:
             entry: Trade log entry to write.

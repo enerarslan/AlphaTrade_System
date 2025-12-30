@@ -97,7 +97,7 @@ class FeatureSet:
     config: FeatureConfig
     version: str
     symbol: str
-    timestamp: datetime = field(default_factory=datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # CRITICAL: Targets are kept SEPARATE to prevent look-ahead bias
     # These contain FUTURE information and must NEVER be used as model inputs
     targets: dict[str, np.ndarray] = field(default_factory=dict)
@@ -368,7 +368,11 @@ class FeaturePipeline:
         return values
 
     def _normalize_feature(self, values: np.ndarray) -> np.ndarray:
-        """Normalize feature values."""
+        """Normalize feature values.
+
+        CRITICAL FIX: Uses PREVIOUS bars only to prevent look-ahead bias.
+        The window excludes the current bar from statistics calculation.
+        """
         method = self.config.normalization
         window = self.config.normalization_window
 
@@ -378,8 +382,11 @@ class FeaturePipeline:
         result = np.full_like(values, np.nan)
         n = len(values)
 
-        for i in range(window - 1, n):
-            window_data = values[i - window + 1 : i + 1]
+        # CRITICAL FIX: Start from window index and use values[i - window : i]
+        # to exclude current bar from statistics calculation
+        for i in range(window, n):
+            # Use PREVIOUS bars only (exclude current bar i)
+            window_data = values[i - window : i]
             valid_data = window_data[~np.isnan(window_data)]
 
             if len(valid_data) < 2:
@@ -406,8 +413,9 @@ class FeaturePipeline:
 
             elif method == NormalizationMethod.QUANTILE:
                 from scipy import stats
-
-                result[i] = stats.percentileofscore(valid_data, values[i]) / 100
+                # CRITICAL FIX: Use searchsorted instead of percentileofscore
+                # to exclude current bar from ranking
+                result[i] = np.searchsorted(np.sort(valid_data), values[i]) / len(valid_data)
 
         return result
 
@@ -420,7 +428,7 @@ class FeaturePipeline:
         return FeatureMetadata(
             name=name,
             group=group,
-            computed_at=datetime.now(timezone.utc)(),
+            computed_at=datetime.now(timezone.utc),
             num_samples=len(values),
             nan_ratio=np.sum(np.isnan(values)) / len(values) if len(values) > 0 else 1.0,
             mean=float(np.mean(valid_values)) if len(valid_values) > 0 else 0.0,

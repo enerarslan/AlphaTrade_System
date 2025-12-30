@@ -8,7 +8,7 @@ the SQLAlchemy session management and query building.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Generic, TypeVar
 from uuid import UUID
@@ -652,7 +652,7 @@ class AlertRepository(BaseRepository[Alert]):
         alert = session.get(Alert, alert_id)
         if alert:
             alert.acknowledged = True
-            alert.acknowledged_at = datetime.utcnow()
+            alert.acknowledged_at = datetime.now(timezone.utc)
             alert.acknowledged_by = acknowledged_by
             session.flush()
         return alert

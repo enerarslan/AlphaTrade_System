@@ -46,11 +46,45 @@ class TechnicalIndicator(ABC):
         """Compute the indicator and return named arrays."""
         pass
 
-    def validate_input(self, df: pl.DataFrame, required_columns: list[str]) -> None:
-        """Validate that required columns exist."""
+    def validate_input(
+        self,
+        df: pl.DataFrame,
+        required_columns: list[str],
+        min_rows: int = 1,
+    ) -> None:
+        """Validate DataFrame input for indicator computation.
+
+        Args:
+            df: Input DataFrame.
+            required_columns: List of required column names.
+            min_rows: Minimum number of rows required.
+
+        Raises:
+            ValueError: If validation fails.
+            TypeError: If df is not a polars DataFrame.
+        """
+        # Type check
+        if not isinstance(df, pl.DataFrame):
+            raise TypeError(f"Expected pl.DataFrame, got {type(df).__name__}")
+
+        # Empty check
+        if df.is_empty():
+            raise ValueError("DataFrame is empty")
+
+        # Missing columns check
         missing = [col for col in required_columns if col not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
+
+        # Minimum rows check
+        if len(df) < min_rows:
+            raise ValueError(f"DataFrame has {len(df)} rows, minimum {min_rows} required")
+
+        # Numeric type check for required columns
+        for col in required_columns:
+            dtype = df[col].dtype
+            if dtype not in (pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+                raise ValueError(f"Column '{col}' must be numeric, got {dtype}")
 
 
 # =============================================================================
@@ -103,14 +137,47 @@ class EMA(TechnicalIndicator):
 
     @staticmethod
     def _ema(arr: np.ndarray, period: int) -> np.ndarray:
-        """Compute exponential moving average."""
-        alpha = 2.0 / (period + 1)
-        result = np.full(len(arr), np.nan)
-        if len(arr) >= period:
-            # Initialize with SMA
+        """Compute exponential moving average (optimized).
+
+        Uses pandas ewm() which has C-level optimized implementation,
+        falling back to scipy.signal.lfilter if pandas unavailable.
+        """
+        if len(arr) < period:
+            return np.full(len(arr), np.nan)
+
+        try:
+            # Pandas EWM is highly optimized (C implementation)
+            import pandas as pd
+            series = pd.Series(arr)
+            ema = series.ewm(span=period, min_periods=period, adjust=False).mean()
+            return ema.to_numpy()
+        except ImportError:
+            pass
+
+        try:
+            # scipy.signal.lfilter is vectorized
+            from scipy.signal import lfilter
+            alpha = 2.0 / (period + 1)
+            # First, compute SMA for initialization
+            result = np.full(len(arr), np.nan)
             result[period - 1] = np.mean(arr[:period])
-            for i in range(period, len(arr)):
-                result[i] = alpha * arr[i] + (1 - alpha) * result[i - 1]
+            # Use lfilter for the recursive part
+            b = [alpha]
+            a = [1, -(1 - alpha)]
+            # Apply filter starting from period
+            filtered = lfilter(b, a, arr[period:], zi=[result[period - 1] * (1 - alpha)])[0]
+            result[period:] = filtered
+            return result
+        except ImportError:
+            pass
+
+        # Pure NumPy fallback (still faster than pure Python due to array ops)
+        alpha = 2.0 / (period + 1)
+        decay = 1 - alpha
+        result = np.full(len(arr), np.nan)
+        result[period - 1] = np.mean(arr[:period])
+        for i in range(period, len(arr)):
+            result[i] = alpha * arr[i] + decay * result[i - 1]
         return result
 
 
@@ -132,12 +199,28 @@ class WMA(TechnicalIndicator):
 
     @staticmethod
     def _wma(arr: np.ndarray, period: int) -> np.ndarray:
-        """Compute weighted moving average."""
-        result = np.full(len(arr), np.nan)
+        """Compute weighted moving average (vectorized using np.convolve).
+
+        Uses numpy's optimized convolution for O(n) performance instead of O(n*period).
+        """
+        if len(arr) < period:
+            return np.full(len(arr), np.nan)
+
+        # Create linearly increasing weights [1, 2, 3, ..., period]
         weights = np.arange(1, period + 1, dtype=np.float64)
         weight_sum = weights.sum()
-        for i in range(period - 1, len(arr)):
-            result[i] = np.sum(arr[i - period + 1 : i + 1] * weights) / weight_sum
+
+        # Normalize weights for convolution
+        normalized_weights = weights / weight_sum
+
+        # Use convolution for vectorized computation
+        # 'valid' mode gives output only where full overlap occurs
+        wma_valid = np.convolve(arr, normalized_weights[::-1], mode='valid')
+
+        # Build result with NaN padding for initial period
+        result = np.full(len(arr), np.nan)
+        result[period - 1:] = wma_valid
+
         return result
 
 

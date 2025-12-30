@@ -8,7 +8,7 @@ to generate trading signals from features.
 from __future__ import annotations
 
 from abc import abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -184,7 +184,7 @@ class MLAlpha(AlphaFactor):
                 "metadata": {
                     "name": self.name,
                     "prediction_type": self.prediction_type,
-                    "saved_at": datetime.utcnow().isoformat(),
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
                 },
             },
             path / f"{self.name}.joblib",

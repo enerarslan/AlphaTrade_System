@@ -12,11 +12,13 @@ Includes kill switch functionality for emergency situations.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
@@ -257,8 +259,44 @@ class PreTradeRiskChecker:
         portfolio: Portfolio,
         current_price: Decimal,
     ) -> RiskCheckResult:
-        """Check position size limits."""
+        """Check position size limits.
+
+        CRITICAL FIX: Handle BUY and SELL orders differently.
+        - BUY: Check if new position would exceed limits
+        - SELL: Check if we're reducing position (no limit check needed for reduction)
+        """
         order_value = order.quantity * current_price
+        existing_position = portfolio.get_position(order.symbol)
+        existing_value = abs(existing_position.market_value) if existing_position else Decimal("0")
+
+        # CRITICAL FIX: For SELL orders, we're reducing the position
+        # Position limit checks only apply when INCREASING position
+        if order.side == OrderSide.SELL:
+            # For sells, check if we're closing or reducing a long position
+            if existing_position and existing_position.is_long:
+                # This is a position reduction, no limit check needed
+                return RiskCheckResult(
+                    check_name="position_limit",
+                    result=CheckResult.PASSED,
+                    message="Sell order reduces existing long position",
+                )
+            elif existing_position and existing_position.is_short:
+                # Selling while short means adding to short position - check limits
+                total_position_value = existing_value + order_value
+            else:
+                # Opening new short position
+                total_position_value = order_value
+        else:  # BUY order
+            if existing_position and existing_position.is_short:
+                # Buying while short means reducing short position - no limit check needed
+                return RiskCheckResult(
+                    check_name="position_limit",
+                    result=CheckResult.PASSED,
+                    message="Buy order reduces existing short position",
+                )
+            else:
+                # Adding to long or opening new long
+                total_position_value = existing_value + order_value
 
         # Check absolute limit
         if order_value > self.config.max_position_value:
@@ -274,9 +312,6 @@ class PreTradeRiskChecker:
 
         # Check percentage limit
         max_value_by_pct = portfolio.equity * Decimal(str(self.config.max_position_pct))
-        existing_position = portfolio.get_position(order.symbol)
-        existing_value = abs(existing_position.market_value) if existing_position else Decimal("0")
-        total_position_value = existing_value + order_value
 
         if total_position_value > max_value_by_pct:
             return RiskCheckResult(
@@ -290,7 +325,7 @@ class PreTradeRiskChecker:
                 },
             )
 
-        # Check total number of positions
+        # Check total number of positions (only for new positions)
         if existing_position is None and portfolio.position_count >= self.config.max_total_positions:
             return RiskCheckResult(
                 check_name="position_limit",
@@ -356,31 +391,50 @@ class PreTradeRiskChecker:
         )
 
     def check_trading_hours(self) -> RiskCheckResult:
-        """Check if within trading hours."""
-        now = datetime.now(timezone.utc)
-        start_time = now.replace(
+        """Check if within trading hours.
+
+        CRITICAL FIX: Trading hours are in US Eastern Time, not UTC.
+        The configured hours (9:30 AM - 4:00 PM) are Eastern Time.
+        """
+        # Convert current time to Eastern Time for proper comparison
+        eastern = ZoneInfo("America/New_York")
+        now_eastern = datetime.now(eastern)
+
+        start_time = now_eastern.replace(
             hour=self.config.trading_start_hour,
             minute=self.config.trading_start_minute,
             second=0,
             microsecond=0,
         )
-        end_time = now.replace(
+        end_time = now_eastern.replace(
             hour=self.config.trading_end_hour,
             minute=self.config.trading_end_minute,
             second=0,
             microsecond=0,
         )
 
-        # Simple check - doesn't account for weekends/holidays
-        if not (start_time <= now <= end_time):
+        # Check weekends (Saturday=5, Sunday=6)
+        if now_eastern.weekday() >= 5:
+            return RiskCheckResult(
+                check_name="trading_hours",
+                result=CheckResult.WARNING,
+                message="Market closed - weekend",
+                details={
+                    "current_time_eastern": now_eastern.isoformat(),
+                    "day_of_week": now_eastern.strftime("%A"),
+                },
+            )
+
+        # Simple check - doesn't account for holidays
+        if not (start_time <= now_eastern <= end_time):
             return RiskCheckResult(
                 check_name="trading_hours",
                 result=CheckResult.WARNING,
                 message="Outside regular trading hours",
                 details={
-                    "current_time": now.isoformat(),
-                    "trading_start": start_time.isoformat(),
-                    "trading_end": end_time.isoformat(),
+                    "current_time_eastern": now_eastern.isoformat(),
+                    "trading_start": start_time.strftime("%H:%M ET"),
+                    "trading_end": end_time.strftime("%H:%M ET"),
                 },
             )
 
@@ -685,7 +739,10 @@ class PostTradeValidator:
 
 
 class KillSwitch:
-    """Emergency kill switch for halting all trading."""
+    """Emergency kill switch for halting all trading.
+
+    THREAD-SAFE: Uses RLock to ensure atomic state transitions.
+    """
 
     def __init__(
         self,
@@ -707,6 +764,8 @@ class KillSwitch:
         self.cancel_orders_callback = cancel_orders_callback
         self.close_positions_callback = close_positions_callback
         self.state = KillSwitchState()
+        # CRITICAL: Use RLock for thread-safe atomic operations
+        self._lock = threading.RLock()
 
     def check_conditions(
         self,
@@ -757,6 +816,8 @@ class KillSwitch:
     ) -> KillSwitchState:
         """Activate the kill switch.
 
+        THREAD-SAFE: Uses lock to ensure atomic activation.
+
         Args:
             reason: Reason for activation.
             trigger_value: Value that triggered activation.
@@ -766,42 +827,49 @@ class KillSwitch:
         Returns:
             Kill switch state after activation.
         """
-        self.state.activate(reason, trigger_value, activated_by)
+        # CRITICAL FIX: Use lock for atomic state transition
+        with self._lock:
+            # Check if already active to prevent duplicate activations
+            if self.state.is_active:
+                logger.warning(f"Kill switch already active, ignoring activation request")
+                return self.state
 
-        logger.critical(f"KILL SWITCH ACTIVATED: {reason.value} by {activated_by}")
+            self.state.activate(reason, trigger_value, activated_by)
 
-        # Cancel all orders
-        if self.cancel_orders_callback:
-            try:
-                self.state.orders_cancelled = self.cancel_orders_callback()
-                logger.info(f"Cancelled {self.state.orders_cancelled} orders")
-            except Exception as e:
-                logger.error(f"Error cancelling orders: {e}")
+            logger.critical(f"KILL SWITCH ACTIVATED: {reason.value} by {activated_by}")
 
-        # Close all positions
-        if flatten_positions and self.close_positions_callback:
-            try:
-                self.state.positions_closed = self.close_positions_callback()
-                logger.info(f"Closed {self.state.positions_closed} positions")
-            except Exception as e:
-                logger.error(f"Error closing positions: {e}")
+            # Cancel all orders (inside lock to protect state updates)
+            if self.cancel_orders_callback:
+                try:
+                    self.state.orders_cancelled = self.cancel_orders_callback()
+                    logger.info(f"Cancelled {self.state.orders_cancelled} orders")
+                except Exception as e:
+                    logger.error(f"Error cancelling orders: {e}")
 
-        # Publish event
-        if self.event_bus:
-            event = create_risk_event(
-                event_type=EventType.KILL_SWITCH_TRIGGERED,
-                risk_data={
-                    "reason": reason.value,
-                    "trigger_value": trigger_value,
-                    "activated_by": activated_by,
-                    "orders_cancelled": self.state.orders_cancelled,
-                    "positions_closed": self.state.positions_closed,
-                },
-                source="KillSwitch",
-            )
-            self.event_bus.publish(event)
+            # Close all positions
+            if flatten_positions and self.close_positions_callback:
+                try:
+                    self.state.positions_closed = self.close_positions_callback()
+                    logger.info(f"Closed {self.state.positions_closed} positions")
+                except Exception as e:
+                    logger.error(f"Error closing positions: {e}")
 
-        return self.state
+            # Publish event
+            if self.event_bus:
+                event = create_risk_event(
+                    event_type=EventType.KILL_SWITCH_TRIGGERED,
+                    risk_data={
+                        "reason": reason.value,
+                        "trigger_value": trigger_value,
+                        "activated_by": activated_by,
+                        "orders_cancelled": self.state.orders_cancelled,
+                        "positions_closed": self.state.positions_closed,
+                    },
+                    source="KillSwitch",
+                )
+                self.event_bus.publish(event)
+
+            return self.state
 
     def manual_activate(self, activated_by: str = "manual") -> KillSwitchState:
         """Manually activate the kill switch.
@@ -820,18 +888,25 @@ class KillSwitch:
     def reset(self, authorized_by: str) -> None:
         """Reset the kill switch.
 
+        THREAD-SAFE: Uses lock for atomic reset.
+
         Args:
             authorized_by: Who authorized the reset.
         """
-        if not self.state.is_active:
-            return
+        with self._lock:
+            if not self.state.is_active:
+                return
 
-        logger.warning(f"Kill switch reset authorized by: {authorized_by}")
-        self.state.reset()
+            logger.warning(f"Kill switch reset authorized by: {authorized_by}")
+            self.state.reset()
 
     def is_active(self) -> bool:
-        """Check if kill switch is active."""
-        return self.state.is_active
+        """Check if kill switch is active.
+
+        THREAD-SAFE: Read-only check with lock for memory visibility.
+        """
+        with self._lock:
+            return self.state.is_active
 
     def can_trade(self) -> RiskCheckResult:
         """Check if trading is allowed.

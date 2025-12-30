@@ -9,25 +9,36 @@ Provides REST API endpoints and WebSocket streams for:
 - Signal and model status
 - Risk monitoring
 - Real-time updates
+
+SECURITY: All sensitive endpoints require JWT authentication.
+Configure via environment variables:
+- JWT_SECRET_KEY: Required for production (generate with: python -c "import secrets; print(secrets.token_hex(32))")
+- REQUIRE_AUTH: Set to 'false' to disable auth (development only)
+- API_KEYS: Comma-separated list of valid API keys (alternative to JWT)
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 import os
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .alerting import AlertSeverity, AlertStatus, get_alert_manager
 from .metrics import get_metrics_collector
 from .logger import get_logger, LogCategory
+from ..config.settings import get_settings
 
 
 logger = get_logger("dashboard", LogCategory.SYSTEM)
@@ -52,6 +63,388 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],  # Only needed methods
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
+
+
+# =============================================================================
+# JWT Authentication
+# =============================================================================
+
+# Security scheme for Swagger UI
+security_scheme = HTTPBearer(auto_error=False)
+
+
+class TokenData(BaseModel):
+    """JWT token payload data."""
+
+    username: str
+    exp: datetime
+    iat: datetime
+    jti: str  # JWT ID for token revocation
+
+
+class AuthenticationError(HTTPException):
+    """Authentication failure exception."""
+
+    def __init__(self, detail: str = "Authentication required"):
+        super().__init__(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=detail,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _get_jwt_secret() -> str:
+    """Get JWT secret key with validation.
+
+    Returns:
+        JWT secret key.
+
+    Raises:
+        RuntimeError: If secret is not configured in production.
+    """
+    settings = get_settings()
+    secret = settings.security.jwt_secret_key
+
+    if not secret:
+        # In production, require a secret key
+        if settings.environment == "production":
+            raise RuntimeError(
+                "JWT_SECRET_KEY must be set in production. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        # In development, use a warning and generate a temporary key
+        logger.warning(
+            "JWT_SECRET_KEY not set - using temporary key. "
+            "This is insecure and should not be used in production!"
+        )
+        # Generate a deterministic key for development (consistent across restarts)
+        return hashlib.sha256(b"DEVELOPMENT_ONLY_DO_NOT_USE_IN_PRODUCTION").hexdigest()
+
+    return secret
+
+
+def create_access_token(username: str, expires_delta: timedelta | None = None) -> str:
+    """Create a JWT access token.
+
+    Args:
+        username: Username to encode in token.
+        expires_delta: Optional custom expiration time.
+
+    Returns:
+        Encoded JWT token string.
+    """
+    settings = get_settings()
+    secret = _get_jwt_secret()
+    algorithm = settings.security.jwt_algorithm
+
+    now = datetime.now(timezone.utc)
+    if expires_delta:
+        expire = now + expires_delta
+    else:
+        expire = now + timedelta(minutes=settings.security.jwt_expiration_minutes)
+
+    # Create token payload
+    payload = {
+        "sub": username,
+        "exp": int(expire.timestamp()),
+        "iat": int(now.timestamp()),
+        "jti": secrets.token_hex(16),  # Unique token ID
+    }
+
+    # Manual JWT encoding (avoiding external dependency)
+    # Header
+    header = {"alg": algorithm, "typ": "JWT"}
+
+    def base64url_encode(data: bytes) -> str:
+        import base64
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+    header_b64 = base64url_encode(json.dumps(header, separators=(",", ":")).encode())
+    payload_b64 = base64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+
+    # Signature
+    message = f"{header_b64}.{payload_b64}"
+    if algorithm == "HS256":
+        signature = hmac.new(
+            secret.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).digest()
+    else:
+        raise ValueError(f"Unsupported algorithm: {algorithm}")
+
+    signature_b64 = base64url_encode(signature)
+
+    return f"{header_b64}.{payload_b64}.{signature_b64}"
+
+
+def verify_jwt_token(token: str) -> TokenData:
+    """Verify and decode a JWT token.
+
+    Args:
+        token: JWT token string.
+
+    Returns:
+        Decoded token data.
+
+    Raises:
+        AuthenticationError: If token is invalid or expired.
+    """
+    import base64
+
+    settings = get_settings()
+    secret = _get_jwt_secret()
+    algorithm = settings.security.jwt_algorithm
+
+    def base64url_decode(data: str) -> bytes:
+        # Add padding if needed
+        padding = 4 - len(data) % 4
+        if padding != 4:
+            data += "=" * padding
+        return base64.urlsafe_b64decode(data)
+
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise AuthenticationError("Invalid token format")
+
+        header_b64, payload_b64, signature_b64 = parts
+
+        # Verify signature
+        message = f"{header_b64}.{payload_b64}"
+        if algorithm == "HS256":
+            expected_signature = hmac.new(
+                secret.encode(),
+                message.encode(),
+                hashlib.sha256
+            ).digest()
+        else:
+            raise AuthenticationError(f"Unsupported algorithm: {algorithm}")
+
+        actual_signature = base64url_decode(signature_b64)
+
+        if not hmac.compare_digest(expected_signature, actual_signature):
+            raise AuthenticationError("Invalid token signature")
+
+        # Decode payload
+        payload = json.loads(base64url_decode(payload_b64).decode())
+
+        # Verify expiration
+        exp = payload.get("exp")
+        if not exp:
+            raise AuthenticationError("Token has no expiration")
+
+        if datetime.fromtimestamp(exp, tz=timezone.utc) < datetime.now(timezone.utc):
+            raise AuthenticationError("Token has expired")
+
+        return TokenData(
+            username=payload.get("sub", ""),
+            exp=datetime.fromtimestamp(exp, tz=timezone.utc),
+            iat=datetime.fromtimestamp(payload.get("iat", 0), tz=timezone.utc),
+            jti=payload.get("jti", ""),
+        )
+
+    except AuthenticationError:
+        raise
+    except Exception as e:
+        logger.warning(f"Token verification failed: {e}")
+        raise AuthenticationError("Invalid token")
+
+
+def verify_api_key(api_key: str) -> bool:
+    """Verify an API key.
+
+    Args:
+        api_key: API key to verify.
+
+    Returns:
+        True if valid, False otherwise.
+    """
+    settings = get_settings()
+    valid_keys = settings.security.api_keys
+
+    if not valid_keys:
+        return False
+
+    # Use constant-time comparison to prevent timing attacks
+    for valid_key in valid_keys:
+        if hmac.compare_digest(api_key, valid_key):
+            return True
+
+    return False
+
+
+async def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security_scheme)],
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+) -> str:
+    """Dependency to get the current authenticated user.
+
+    Supports two authentication methods:
+    1. Bearer token (JWT) in Authorization header
+    2. API key in X-API-Key header
+
+    Args:
+        credentials: Bearer token credentials from Authorization header.
+        x_api_key: API key from X-API-Key header.
+
+    Returns:
+        Username or "api_key_user" for API key auth.
+
+    Raises:
+        AuthenticationError: If authentication fails.
+    """
+    settings = get_settings()
+
+    # Check if authentication is required
+    if not settings.security.require_auth:
+        return "anonymous"
+
+    # Try Bearer token first
+    if credentials and credentials.credentials:
+        token_data = verify_jwt_token(credentials.credentials)
+        logger.debug(f"Authenticated user via JWT: {token_data.username}")
+        return token_data.username
+
+    # Try API key
+    if x_api_key:
+        if verify_api_key(x_api_key):
+            logger.debug("Authenticated user via API key")
+            return "api_key_user"
+        raise AuthenticationError("Invalid API key")
+
+    raise AuthenticationError("Authentication required")
+
+
+async def optional_auth(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security_scheme)],
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+) -> str | None:
+    """Optional authentication - returns None if not authenticated.
+
+    Used for endpoints that have different behavior based on auth status.
+    """
+    settings = get_settings()
+
+    if not settings.security.require_auth:
+        return "anonymous"
+
+    try:
+        return await get_current_user(credentials, x_api_key)
+    except AuthenticationError:
+        return None
+
+
+# Type alias for authenticated user dependency
+AuthenticatedUser = Annotated[str, Depends(get_current_user)]
+
+
+# =============================================================================
+# Authentication Endpoints
+# =============================================================================
+
+
+class LoginRequest(BaseModel):
+    """Login request body."""
+
+    username: str = Field(..., min_length=1, max_length=100)
+    password: str = Field(..., min_length=1)
+
+
+class TokenResponse(BaseModel):
+    """Token response."""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+# Simple user store for demo - in production, use a proper user database
+# WARNING: This is for demonstration only. Production should use proper auth.
+_DEMO_USERS: dict[str, str] = {}
+
+
+def _get_password_hash(password: str) -> str:
+    """Hash a password using SHA-256 with salt.
+
+    NOTE: In production, use bcrypt or argon2 instead.
+    """
+    salt = "quant_trading_salt_"  # In production, use per-user random salt
+    return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+
+
+def _init_demo_users() -> None:
+    """Initialize demo users from environment variable.
+
+    Set DASHBOARD_USERS as: username1:password1,username2:password2
+    """
+    global _DEMO_USERS
+
+    users_str = os.environ.get("DASHBOARD_USERS", "")
+    if users_str:
+        for user_pass in users_str.split(","):
+            if ":" in user_pass:
+                username, password = user_pass.split(":", 1)
+                _DEMO_USERS[username.strip()] = _get_password_hash(password.strip())
+
+    # Add default admin if no users configured (development only)
+    if not _DEMO_USERS:
+        settings = get_settings()
+        if settings.environment != "production":
+            logger.warning(
+                "No users configured - using default admin:admin. "
+                "Set DASHBOARD_USERS env var for production!"
+            )
+            _DEMO_USERS["admin"] = _get_password_hash("admin")
+
+
+# Initialize demo users on module load
+_init_demo_users()
+
+
+@app.post("/auth/login", response_model=TokenResponse, tags=["Authentication"])
+async def login(request: LoginRequest) -> TokenResponse:
+    """Authenticate and get access token.
+
+    Args:
+        request: Login credentials.
+
+    Returns:
+        JWT access token.
+    """
+    password_hash = _get_password_hash(request.password)
+
+    if request.username not in _DEMO_USERS:
+        logger.warning(f"Login attempt for unknown user: {request.username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+
+    if not hmac.compare_digest(_DEMO_USERS[request.username], password_hash):
+        logger.warning(f"Invalid password for user: {request.username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+
+    settings = get_settings()
+    expires_in = settings.security.jwt_expiration_minutes * 60
+
+    token = create_access_token(request.username)
+    logger.info(f"User logged in: {request.username}")
+
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=expires_in,
+    )
+
+
+@app.get("/auth/me", tags=["Authentication"])
+async def get_current_user_info(current_user: AuthenticatedUser) -> dict[str, str]:
+    """Get information about the current authenticated user."""
+    return {"username": current_user}
 
 
 # =============================================================================
@@ -368,9 +761,12 @@ def get_connection_manager() -> ConnectionManager:
 # =============================================================================
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, tags=["System"])
 async def get_health() -> HealthResponse:
-    """Get system health status."""
+    """Get system health status.
+
+    This endpoint is public by default (configurable via ALLOW_PUBLIC_HEALTH env var).
+    """
     state = get_dashboard_state()
     components = {k: "healthy" if v else "unhealthy" for k, v in state._components_healthy.items()}
 
@@ -384,9 +780,12 @@ async def get_health() -> HealthResponse:
     )
 
 
-@app.get("/metrics")
+@app.get("/metrics", tags=["System"])
 async def get_metrics() -> Response:
-    """Get Prometheus metrics."""
+    """Get Prometheus metrics.
+
+    This endpoint is public for Prometheus scraping.
+    """
     metrics = get_metrics_collector()
     return Response(
         content=metrics.get_metrics(),
@@ -394,9 +793,9 @@ async def get_metrics() -> Response:
     )
 
 
-@app.get("/portfolio", response_model=PortfolioResponse)
-async def get_portfolio() -> PortfolioResponse:
-    """Get current portfolio state."""
+@app.get("/portfolio", response_model=PortfolioResponse, tags=["Portfolio"])
+async def get_portfolio(current_user: AuthenticatedUser) -> PortfolioResponse:
+    """Get current portfolio state. Requires authentication."""
     state = get_dashboard_state()
     data = state._portfolio_data
 
@@ -415,9 +814,9 @@ async def get_portfolio() -> PortfolioResponse:
     )
 
 
-@app.get("/positions", response_model=list[PositionResponse])
-async def get_positions() -> list[PositionResponse]:
-    """Get current positions."""
+@app.get("/positions", response_model=list[PositionResponse], tags=["Positions"])
+async def get_positions(current_user: AuthenticatedUser) -> list[PositionResponse]:
+    """Get current positions. Requires authentication."""
     state = get_dashboard_state()
 
     return [
@@ -435,9 +834,9 @@ async def get_positions() -> list[PositionResponse]:
     ]
 
 
-@app.get("/positions/{symbol}", response_model=PositionResponse)
-async def get_position(symbol: str) -> PositionResponse:
-    """Get a specific position."""
+@app.get("/positions/{symbol}", response_model=PositionResponse, tags=["Positions"])
+async def get_position(symbol: str, current_user: AuthenticatedUser) -> PositionResponse:
+    """Get a specific position. Requires authentication."""
     state = get_dashboard_state()
     pos = state._positions.get(symbol.upper())
 
@@ -456,13 +855,14 @@ async def get_position(symbol: str) -> PositionResponse:
     )
 
 
-@app.get("/orders", response_model=list[OrderResponse])
+@app.get("/orders", response_model=list[OrderResponse], tags=["Orders"])
 async def get_orders(
+    current_user: AuthenticatedUser,
     symbol: str | None = Query(None, description="Filter by symbol"),
     status: str | None = Query(None, description="Filter by status"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum orders to return"),
 ) -> list[OrderResponse]:
-    """Get order history."""
+    """Get order history. Requires authentication."""
     state = get_dashboard_state()
     orders = state._orders
 
@@ -491,9 +891,9 @@ async def get_orders(
     ]
 
 
-@app.get("/performance", response_model=PerformanceResponse)
-async def get_performance() -> PerformanceResponse:
-    """Get performance metrics."""
+@app.get("/performance", response_model=PerformanceResponse, tags=["Performance"])
+async def get_performance(current_user: AuthenticatedUser) -> PerformanceResponse:
+    """Get performance metrics. Requires authentication."""
     state = get_dashboard_state()
     data = state._portfolio_data
 
@@ -510,12 +910,13 @@ async def get_performance() -> PerformanceResponse:
     )
 
 
-@app.get("/signals", response_model=list[SignalResponse])
+@app.get("/signals", response_model=list[SignalResponse], tags=["Signals"])
 async def get_signals(
+    current_user: AuthenticatedUser,
     symbol: str | None = Query(None, description="Filter by symbol"),
     limit: int = Query(100, ge=1, le=500, description="Maximum signals to return"),
 ) -> list[SignalResponse]:
-    """Get latest signals."""
+    """Get latest signals. Requires authentication."""
     state = get_dashboard_state()
     signals = state._signals
 
@@ -538,9 +939,9 @@ async def get_signals(
     ]
 
 
-@app.get("/models", response_model=list[ModelStatusResponse])
-async def get_model_status() -> list[ModelStatusResponse]:
-    """Get model status."""
+@app.get("/models", response_model=list[ModelStatusResponse], tags=["Models"])
+async def get_model_status(current_user: AuthenticatedUser) -> list[ModelStatusResponse]:
+    """Get model status. Requires authentication."""
     state = get_dashboard_state()
 
     return [
@@ -558,9 +959,9 @@ async def get_model_status() -> list[ModelStatusResponse]:
     ]
 
 
-@app.get("/risk", response_model=RiskMetricsResponse)
-async def get_risk_metrics() -> RiskMetricsResponse:
-    """Get risk metrics."""
+@app.get("/risk", response_model=RiskMetricsResponse, tags=["Risk"])
+async def get_risk_metrics(current_user: AuthenticatedUser) -> RiskMetricsResponse:
+    """Get risk metrics. Requires authentication."""
     state = get_dashboard_state()
     data = state._portfolio_data
 
@@ -576,13 +977,14 @@ async def get_risk_metrics() -> RiskMetricsResponse:
     )
 
 
-@app.get("/alerts", response_model=list[AlertResponse])
+@app.get("/alerts", response_model=list[AlertResponse], tags=["Alerts"])
 async def get_alerts(
+    current_user: AuthenticatedUser,
     severity: str | None = Query(None, description="Filter by severity"),
     status: str | None = Query(None, description="Filter by status"),
     limit: int = Query(100, ge=1, le=500, description="Maximum alerts to return"),
 ) -> list[AlertResponse]:
-    """Get alerts."""
+    """Get alerts. Requires authentication."""
     manager = get_alert_manager()
 
     severity_filter = None
@@ -618,9 +1020,13 @@ async def get_alerts(
     ]
 
 
-@app.post("/alerts/{alert_id}/acknowledge")
-async def acknowledge_alert(alert_id: str, acknowledged_by: str = Query(...)) -> dict[str, str]:
-    """Acknowledge an alert."""
+@app.post("/alerts/{alert_id}/acknowledge", tags=["Alerts"])
+async def acknowledge_alert(
+    alert_id: str,
+    current_user: AuthenticatedUser,
+    acknowledged_by: str = Query(...),
+) -> dict[str, str]:
+    """Acknowledge an alert. Requires authentication."""
     manager = get_alert_manager()
 
     if manager.acknowledge_alert(alert_id, acknowledged_by):
@@ -629,9 +1035,9 @@ async def acknowledge_alert(alert_id: str, acknowledged_by: str = Query(...)) ->
     raise HTTPException(status_code=404, detail="Alert not found")
 
 
-@app.post("/alerts/{alert_id}/resolve")
-async def resolve_alert(alert_id: str) -> dict[str, str]:
-    """Resolve an alert."""
+@app.post("/alerts/{alert_id}/resolve", tags=["Alerts"])
+async def resolve_alert(alert_id: str, current_user: AuthenticatedUser) -> dict[str, str]:
+    """Resolve an alert. Requires authentication."""
     manager = get_alert_manager()
 
     if manager.resolve_alert(alert_id):
@@ -640,13 +1046,14 @@ async def resolve_alert(alert_id: str) -> dict[str, str]:
     raise HTTPException(status_code=404, detail="Alert not found")
 
 
-@app.get("/logs", response_model=list[LogEntryResponse])
+@app.get("/logs", response_model=list[LogEntryResponse], tags=["Logs"])
 async def get_logs(
+    current_user: AuthenticatedUser,
     level: str | None = Query(None, description="Filter by level"),
     category: str | None = Query(None, description="Filter by category"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum logs to return"),
 ) -> list[LogEntryResponse]:
-    """Get recent logs."""
+    """Get recent logs. Requires authentication."""
     state = get_dashboard_state()
     logs = state._logs
 

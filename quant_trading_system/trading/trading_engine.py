@@ -14,12 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
+import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from quant_trading_system.core.data_types import (
     FeatureVector,
@@ -82,6 +86,10 @@ class TradingEngineConfig:
     enable_reconciliation: bool = True
     heartbeat_interval: int = 60  # seconds
     state_save_interval: int = 300  # seconds
+
+    # MISSING FEATURE: Watchdog timer configuration
+    watchdog_timeout: int = 120  # seconds - max time without heartbeat before alert
+    watchdog_enabled: bool = True  # Enable watchdog timer for detecting stuck loops
 
 
 @dataclass
@@ -194,6 +202,19 @@ class TradingEngine:
         self._bar_callbacks: list[Callable[[dict[str, OHLCVBar]], None]] = []
         self._signal_callbacks: list[Callable[[list[EnrichedSignal]], None]] = []
 
+        # CRITICAL: Thread safety for shared state modifications
+        # Order fill/rejection callbacks may be called from broker websocket threads
+        # while the main trading loop is also modifying session/metrics
+        self._state_lock = threading.RLock()
+
+        # MISSING FEATURE: Watchdog timer for detecting stuck main loop
+        self._watchdog_task: asyncio.Task | None = None
+        self._last_loop_heartbeat: datetime | None = None
+        self._shutdown_event = asyncio.Event()
+
+        # MISSING FEATURE: OS signal handlers for graceful shutdown
+        self._signal_handlers_installed = False
+
         # Register for order events
         order_manager.on_fill(self._on_order_fill)
         order_manager.on_rejection(self._on_order_rejection)
@@ -251,6 +272,14 @@ class TradingEngine:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self._state_save_task = asyncio.create_task(self._state_save_loop())
 
+            # MISSING FEATURE: Start watchdog timer
+            if self.config.watchdog_enabled:
+                self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+                logger.info(f"Watchdog timer started (timeout: {self.config.watchdog_timeout}s)")
+
+            # MISSING FEATURE: Install OS signal handlers for graceful shutdown
+            self._install_signal_handlers()
+
             # Start main trading loop
             self._main_task = asyncio.create_task(self._main_loop())
 
@@ -277,8 +306,11 @@ class TradingEngine:
             except Exception as e:
                 logger.warning(f"Error cancelling orders: {e}")
 
-        # Stop tasks
-        for task in [self._main_task, self._heartbeat_task, self._state_save_task]:
+        # Set shutdown event to signal watchdog
+        self._shutdown_event.set()
+
+        # Stop tasks (including watchdog)
+        for task in [self._main_task, self._heartbeat_task, self._state_save_task, self._watchdog_task]:
             if task:
                 task.cancel()
                 try:
@@ -312,21 +344,156 @@ class TradingEngine:
             self._state = EngineState.MARKET_HOURS
             logger.info("Trading engine resumed")
 
+    # =========================================================================
+    # MISSING FEATURE: OS Signal Handlers for Graceful Shutdown
+    # =========================================================================
+
+    def _install_signal_handlers(self) -> None:
+        """Install OS signal handlers for graceful shutdown.
+
+        Handles:
+        - SIGTERM: Graceful shutdown (used by systemd, Docker, Kubernetes)
+        - SIGINT: Keyboard interrupt (Ctrl+C)
+
+        On Windows, only SIGINT is reliably available.
+        """
+        if self._signal_handlers_installed:
+            return
+
+        def signal_handler(signum: int, frame: Any) -> None:
+            """Handle OS signals by triggering graceful shutdown."""
+            sig_name = signal.Signals(signum).name
+            logger.warning(f"Received {sig_name} signal - initiating graceful shutdown")
+
+            # Set shutdown event
+            self._shutdown_event.set()
+
+            # Create shutdown task if we have a running loop
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._graceful_shutdown(sig_name))
+            except RuntimeError:
+                # No running loop - just log
+                logger.warning("No running event loop for graceful shutdown")
+
+        # Install handlers based on platform
+        if sys.platform != "win32":
+            # Unix - handle both SIGTERM and SIGINT
+            signal.signal(signal.SIGTERM, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler)
+            logger.info("Installed signal handlers for SIGTERM and SIGINT")
+        else:
+            # Windows - only SIGINT is reliably available
+            signal.signal(signal.SIGINT, signal_handler)
+            logger.info("Installed signal handler for SIGINT (Windows)")
+
+        self._signal_handlers_installed = True
+
+    async def _graceful_shutdown(self, reason: str) -> None:
+        """Perform graceful shutdown.
+
+        1. Stop accepting new orders
+        2. Cancel pending orders
+        3. Save state
+        4. Stop engine
+
+        Args:
+            reason: Reason for shutdown.
+        """
+        logger.info(f"Graceful shutdown initiated: {reason}")
+
+        # First pause to stop new orders
+        await self.pause()
+
+        # Give pending orders time to fill (max 30 seconds)
+        await asyncio.sleep(5)
+
+        # Now fully stop
+        await self.stop()
+
+        logger.info("Graceful shutdown complete")
+
+    # =========================================================================
+    # MISSING FEATURE: Watchdog Timer for Stuck Loop Detection
+    # =========================================================================
+
+    async def _watchdog_loop(self) -> None:
+        """Watchdog timer to detect stuck main loop.
+
+        Monitors the main trading loop heartbeat and triggers alerts
+        if the loop appears stuck (no heartbeat for watchdog_timeout seconds).
+        """
+        logger.info("Watchdog timer started")
+
+        while not self._shutdown_event.is_set():
+            try:
+                # Wait for the watchdog interval
+                await asyncio.sleep(self.config.watchdog_timeout / 2)
+
+                # Check if shutdown was requested
+                if self._shutdown_event.is_set():
+                    break
+
+                # Check main loop heartbeat
+                if self._last_loop_heartbeat:
+                    elapsed = (datetime.now(timezone.utc) - self._last_loop_heartbeat).total_seconds()
+
+                    if elapsed > self.config.watchdog_timeout:
+                        logger.critical(
+                            f"WATCHDOG ALERT: Main loop stuck! "
+                            f"No heartbeat for {elapsed:.1f} seconds"
+                        )
+
+                        # Publish critical alert
+                        self._publish_event(
+                            EventType.SYSTEM_ALERT,
+                            "Main loop stuck - watchdog timeout exceeded",
+                            details={
+                                "last_heartbeat": self._last_loop_heartbeat.isoformat(),
+                                "elapsed_seconds": elapsed,
+                                "timeout_seconds": self.config.watchdog_timeout,
+                            },
+                        )
+
+                        # Trigger kill switch to prevent trading in stuck state
+                        self.trigger_kill_switch(
+                            f"Watchdog timeout - no heartbeat for {elapsed:.1f}s"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Watchdog error: {e}")
+
+        logger.info("Watchdog timer stopped")
+
+    def _update_loop_heartbeat(self) -> None:
+        """Update the main loop heartbeat timestamp.
+
+        Called at the end of each main loop iteration to signal
+        the watchdog that the loop is still running.
+        """
+        self._last_loop_heartbeat = datetime.now(timezone.utc)
+
     def trigger_kill_switch(self, reason: str) -> None:
         """Trigger kill switch to stop all trading.
+
+        THREAD SAFETY: May be called from multiple contexts (risk checks,
+        callbacks, external triggers). Uses lock for state consistency.
 
         Args:
             reason: Reason for triggering kill switch.
         """
         logger.critical(f"KILL SWITCH TRIGGERED: {reason}")
 
-        if self._session:
-            self._session.kill_switch_triggered = True
-            self._session.errors.append(f"Kill switch: {reason}")
+        with self._state_lock:
+            if self._session:
+                self._session.kill_switch_triggered = True
+                self._session.errors.append(f"Kill switch: {reason}")
 
-        self._state = EngineState.PAUSED
+            self._state = EngineState.PAUSED
 
-        # Publish critical event
+        # Publish critical event (outside lock to avoid deadlock with event handlers)
         self._publish_event(
             EventType.KILL_SWITCH_TRIGGERED,
             reason,
@@ -337,8 +504,9 @@ class TradingEngine:
         """Main trading loop."""
         while self._state not in (EngineState.STOPPED, EngineState.SHUTTING_DOWN):
             try:
-                now = datetime.now(timezone.utc)
-                current_time = now.time()
+                # CRITICAL FIX: Use Eastern Time for market hours detection
+                # US market hours are defined in Eastern Time, not UTC
+                current_time = self._get_eastern_time()
 
                 # Determine market state
                 if self._is_pre_market(current_time):
@@ -360,6 +528,9 @@ class TradingEngine:
                 else:
                     # Outside trading hours
                     await asyncio.sleep(60)
+
+                # Update watchdog heartbeat to signal loop is alive
+                self._update_loop_heartbeat()
 
                 # Short sleep between iterations
                 await asyncio.sleep(1)
@@ -739,13 +910,18 @@ class TradingEngine:
         logger.info(f"End of Day Report: {report}")
 
     def _on_order_fill(self, managed: ManagedOrder) -> None:
-        """Handle order fill event."""
-        if self._session:
-            self._session.orders_filled += 1
-            self._session.trades_today += 1
-        self._metrics.orders_filled += 1
+        """Handle order fill event.
 
-        # Update position tracker
+        THREAD SAFETY: This callback is invoked from broker websocket threads.
+        Uses lock to prevent race conditions when modifying shared state.
+        """
+        with self._state_lock:
+            if self._session:
+                self._session.orders_filled += 1
+                self._session.trades_today += 1
+            self._metrics.orders_filled += 1
+
+        # Update position tracker (has its own thread safety)
         self.position_tracker.update_from_fill(
             order=managed.order,
             fill_qty=managed.order.filled_qty,
@@ -754,15 +930,24 @@ class TradingEngine:
         )
 
     def _on_order_rejection(self, managed: ManagedOrder) -> None:
-        """Handle order rejection event."""
-        self._metrics.orders_rejected += 1
-        if self._session:
-            self._session.errors.append(
-                f"Order rejected: {managed.order.symbol} - {managed.error_message}"
-            )
+        """Handle order rejection event.
+
+        THREAD SAFETY: This callback is invoked from broker websocket threads.
+        Uses lock to prevent race conditions when modifying shared state.
+        """
+        with self._state_lock:
+            self._metrics.orders_rejected += 1
+            if self._session:
+                self._session.errors.append(
+                    f"Order rejected: {managed.order.symbol} - {managed.error_message}"
+                )
 
     def _is_pre_market(self, current_time: time) -> bool:
-        """Check if in pre-market period."""
+        """Check if in pre-market period.
+
+        CRITICAL: Trading hours are in US Eastern Time.
+        The current_time parameter is now expected to be Eastern Time.
+        """
         pre_market_start = (
             datetime.combine(datetime.today(), self.config.trading_start)
             - timedelta(minutes=self.config.pre_market_minutes)
@@ -770,16 +955,32 @@ class TradingEngine:
         return pre_market_start <= current_time < self.config.trading_start
 
     def _is_market_hours(self, current_time: time) -> bool:
-        """Check if during market hours."""
+        """Check if during market hours.
+
+        CRITICAL: Trading hours are in US Eastern Time.
+        """
         return self.config.trading_start <= current_time < self.config.trading_end
 
     def _is_post_market(self, current_time: time) -> bool:
-        """Check if in post-market period."""
+        """Check if in post-market period.
+
+        CRITICAL: Trading hours are in US Eastern Time.
+        """
         post_market_end = (
             datetime.combine(datetime.today(), self.config.trading_end)
             + timedelta(minutes=self.config.post_market_minutes)
         ).time()
         return self.config.trading_end <= current_time < post_market_end
+
+    def _get_eastern_time(self) -> time:
+        """Get current time in US Eastern timezone.
+
+        This is critical for correct trading hours detection since
+        US market hours are defined in Eastern Time.
+        """
+        eastern = ZoneInfo("America/New_York")
+        now_eastern = datetime.now(eastern)
+        return now_eastern.time()
 
     def _update_avg_latency(self, latency_ms: float) -> None:
         """Update average latency with exponential moving average."""

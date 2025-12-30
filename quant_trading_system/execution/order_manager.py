@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -387,7 +388,9 @@ class OrderManager:
         self._broker_id_map: dict[str, UUID] = {}
 
         # Thread safety - protect shared state from race conditions
-        self._lock = asyncio.Lock()
+        # Use asyncio.Lock for async methods and threading.RLock for sync callbacks
+        self._async_lock = asyncio.Lock()
+        self._sync_lock = threading.RLock()  # RLock for sync WebSocket callbacks
 
         # Callbacks
         self._fill_callbacks: list[Callable[[ManagedOrder], None]] = []
@@ -548,7 +551,7 @@ class OrderManager:
             managed.last_update = datetime.now(timezone.utc)
 
             # Track by broker ID with lock protection
-            async with self._lock:
+            async with self._async_lock:
                 self._broker_id_map[broker_order.order_id] = managed.order.order_id
 
             # Publish event
@@ -697,7 +700,7 @@ class OrderManager:
             managed.last_update = datetime.now(timezone.utc)
 
             # Update broker ID map with lock protection
-            async with self._lock:
+            async with self._async_lock:
                 self._broker_id_map[new_broker_order.order_id] = managed.order.order_id
 
             logger.info(f"Modified order {order_id}")
@@ -769,7 +772,11 @@ class OrderManager:
         self._rejection_callbacks.append(callback)
 
     def _handle_trade_update(self, data: dict[str, Any]) -> None:
-        """Handle trade update from WebSocket."""
+        """Handle trade update from WebSocket.
+
+        THREAD-SAFE: Uses RLock to prevent race conditions when
+        multiple trade updates arrive concurrently from WebSocket.
+        """
         event_type = data.get("event")
         order_data = data.get("order", {})
         broker_id = order_data.get("id")
@@ -777,28 +784,30 @@ class OrderManager:
         if not broker_id:
             return
 
-        managed = self.get_order_by_broker_id(broker_id)
-        if not managed:
-            logger.debug(f"Received update for unknown order {broker_id}")
-            return
+        # CRITICAL FIX: Acquire lock to prevent race conditions
+        with self._sync_lock:
+            managed = self.get_order_by_broker_id(broker_id)
+            if not managed:
+                logger.debug(f"Received update for unknown order {broker_id}")
+                return
 
-        # Update from broker
-        broker_order = AlpacaOrder.from_alpaca(order_data)
-        managed.broker_order = broker_order
-        managed.order = broker_order.to_order()
-        managed.last_update = datetime.now(timezone.utc)
+            # Update from broker
+            broker_order = AlpacaOrder.from_alpaca(order_data)
+            managed.broker_order = broker_order
+            managed.order = broker_order.to_order()
+            managed.last_update = datetime.now(timezone.utc)
 
-        # Handle state transitions
-        if event_type == "fill":
-            self._handle_fill(managed, data)
-        elif event_type == "partial_fill":
-            self._handle_partial_fill(managed, data)
-        elif event_type == "canceled":
-            self._handle_cancellation(managed)
-        elif event_type == "rejected":
-            self._handle_rejection(managed, data)
-        elif event_type == "expired":
-            self._handle_expiration(managed)
+            # Handle state transitions
+            if event_type == "fill":
+                self._handle_fill(managed, data)
+            elif event_type == "partial_fill":
+                self._handle_partial_fill(managed, data)
+            elif event_type == "canceled":
+                self._handle_cancellation(managed)
+            elif event_type == "rejected":
+                self._handle_rejection(managed, data)
+            elif event_type == "expired":
+                self._handle_expiration(managed)
 
     def _handle_fill(self, managed: ManagedOrder, data: dict[str, Any]) -> None:
         """Handle order fill event."""

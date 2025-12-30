@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -172,7 +173,9 @@ class PositionTracker:
         self._pnl_records: list[PnLRecord] = []
 
         # Thread safety - protect shared state from race conditions
-        self._lock = asyncio.Lock()
+        # Use asyncio.Lock for async methods and threading.RLock for sync methods
+        self._async_lock = asyncio.Lock()
+        self._sync_lock = threading.RLock()  # RLock allows reentrant locking
 
         # Callbacks
         self._position_callbacks: list[Callable[[str, Position], None]] = []
@@ -221,7 +224,7 @@ class PositionTracker:
 
             # Get positions with lock protection
             broker_positions = await self.client.get_positions()
-            async with self._lock:
+            async with self._async_lock:
                 for bp in broker_positions:
                     self._positions[bp.symbol] = PositionState(
                         position=bp.to_position(),
@@ -283,6 +286,9 @@ class PositionTracker:
     ) -> Position:
         """Update position from order fill.
 
+        THREAD-SAFE: Uses RLock to prevent race conditions when
+        multiple fills arrive concurrently from WebSocket callbacks.
+
         Args:
             order: Filled order.
             fill_qty: Quantity filled.
@@ -294,6 +300,22 @@ class PositionTracker:
         Returns:
             Updated position.
         """
+        # CRITICAL FIX: Acquire lock to prevent race conditions
+        with self._sync_lock:
+            return self._update_from_fill_impl(
+                order, fill_qty, fill_price, commission, strategy_id, model_id
+            )
+
+    def _update_from_fill_impl(
+        self,
+        order: Order,
+        fill_qty: Decimal,
+        fill_price: Decimal,
+        commission: Decimal,
+        strategy_id: str | None,
+        model_id: str | None,
+    ) -> Position:
+        """Internal implementation of update_from_fill (called with lock held)."""
         symbol = order.symbol.upper()
         state = self._positions.get(symbol)
 

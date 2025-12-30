@@ -57,7 +57,9 @@ class BollingerReversion(AlphaFactor):
         std = np.full(n, np.nan)
 
         for i in range(self.period - 1, n):
-            window = close[i - self.period + 1 : i + 1]
+            # CRITICAL FIX: Exclude current bar to prevent look-ahead bias
+            # Use previous 'period' bars, not including current bar
+            window = close[i - self.period : i]
             sma[i] = np.mean(window)
             std[i] = np.std(window, ddof=0)
 
@@ -129,7 +131,9 @@ class ZScoreReversion(AlphaFactor):
         zscore = np.full(n, np.nan)
 
         for i in range(self.lookback - 1, n):
-            window = data[i - self.lookback + 1 : i + 1]
+            # CRITICAL FIX: Exclude current bar to prevent look-ahead bias
+            # Compute statistics using only previous bars
+            window = data[i - self.lookback : i]
             mean = np.mean(window)
             std = np.std(window, ddof=1)
             if std > 0:
