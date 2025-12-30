@@ -160,7 +160,10 @@ class RiskLimitsConfig(BaseModel):
 
 
 class PreTradeRiskChecker:
-    """Pre-trade risk checks before order submission."""
+    """Pre-trade risk checks before order submission.
+
+    THREAD-SAFE: Uses RLock to protect daily counters.
+    """
 
     def __init__(
         self,
@@ -172,17 +175,23 @@ class PreTradeRiskChecker:
             config: Risk limits configuration.
         """
         self.config = config or RiskLimitsConfig()
+        # THREAD SAFETY: Use lock for daily counter operations
+        self._lock = threading.RLock()
         self._daily_trades: int = 0
         self._daily_turnover: Decimal = Decimal("0")
         self._last_reset_date: datetime = datetime.now(timezone.utc).date()  # type: ignore
 
     def _reset_daily_counters_if_needed(self) -> None:
-        """Reset daily counters if it's a new day."""
+        """Reset daily counters if it's a new day.
+
+        THREAD-SAFE: Must be called with lock held or call with lock.
+        """
         today = datetime.now(timezone.utc).date()
-        if today != self._last_reset_date:
-            self._daily_trades = 0
-            self._daily_turnover = Decimal("0")
-            self._last_reset_date = today  # type: ignore
+        with self._lock:
+            if today != self._last_reset_date:
+                self._daily_trades = 0
+                self._daily_turnover = Decimal("0")
+                self._last_reset_date = today  # type: ignore
 
     def check_all(
         self,
@@ -523,14 +532,21 @@ class PreTradeRiskChecker:
         )
 
     def record_trade(self, order_value: Decimal) -> None:
-        """Record a completed trade for daily limit tracking."""
+        """Record a completed trade for daily limit tracking.
+
+        THREAD-SAFE: Uses lock to protect counter updates.
+        """
         self._reset_daily_counters_if_needed()
-        self._daily_trades += 1
-        self._daily_turnover += order_value
+        with self._lock:
+            self._daily_trades += 1
+            self._daily_turnover += order_value
 
 
 class IntraTradeMonitor:
-    """Monitor orders during execution."""
+    """Monitor orders during execution.
+
+    THREAD-SAFE: Uses RLock to protect order tracking dictionaries.
+    """
 
     def __init__(
         self,
@@ -545,19 +561,24 @@ class IntraTradeMonitor:
         """
         self.max_slippage_bps = max_slippage_bps
         self.stuck_order_timeout_seconds = stuck_order_timeout_seconds
+        # THREAD SAFETY: Use lock for dictionary operations
+        self._lock = threading.RLock()
         self._order_submit_times: dict[str, datetime] = {}
         self._order_expected_prices: dict[str, Decimal] = {}
 
     def register_order(self, order: Order, expected_price: Decimal) -> None:
         """Register an order for monitoring.
 
+        THREAD-SAFE: Uses lock to protect dictionary updates.
+
         Args:
             order: Order to monitor.
             expected_price: Expected execution price.
         """
         order_id = str(order.order_id)
-        self._order_submit_times[order_id] = datetime.now(timezone.utc)
-        self._order_expected_prices[order_id] = expected_price
+        with self._lock:
+            self._order_submit_times[order_id] = datetime.now(timezone.utc)
+            self._order_expected_prices[order_id] = expected_price
 
     def check_slippage(
         self,
@@ -641,9 +662,13 @@ class IntraTradeMonitor:
         return results
 
     def cleanup_order(self, order_id: str) -> None:
-        """Clean up tracking data for a completed order."""
-        self._order_submit_times.pop(order_id, None)
-        self._order_expected_prices.pop(order_id, None)
+        """Clean up tracking data for a completed order.
+
+        THREAD-SAFE: Uses lock to protect dictionary updates.
+        """
+        with self._lock:
+            self._order_submit_times.pop(order_id, None)
+            self._order_expected_prices.pop(order_id, None)
 
 
 class PostTradeValidator:
@@ -911,25 +936,29 @@ class KillSwitch:
     def can_trade(self) -> RiskCheckResult:
         """Check if trading is allowed.
 
+        THREAD-SAFE: Uses lock to ensure consistent read of state.
+        CRITICAL FIX: Must use lock to prevent TOCTOU race condition.
+
         Returns:
             Check result indicating if trading is allowed.
         """
-        if self.state.is_active:
+        with self._lock:
+            if self.state.is_active:
+                return RiskCheckResult(
+                    check_name="kill_switch",
+                    result=CheckResult.FAILED,
+                    message="Trading halted - kill switch is active",
+                    details={
+                        "reason": self.state.reason.value if self.state.reason else "unknown",
+                        "activated_at": self.state.activated_at.isoformat() if self.state.activated_at else None,
+                    },
+                )
+
             return RiskCheckResult(
                 check_name="kill_switch",
-                result=CheckResult.FAILED,
-                message="Trading halted - kill switch is active",
-                details={
-                    "reason": self.state.reason.value if self.state.reason else "unknown",
-                    "activated_at": self.state.activated_at.isoformat() if self.state.activated_at else None,
-                },
+                result=CheckResult.PASSED,
+                message="Trading allowed",
             )
-
-        return RiskCheckResult(
-            check_name="kill_switch",
-            result=CheckResult.PASSED,
-            message="Trading allowed",
-        )
 
 
 class RiskLimitsManager:

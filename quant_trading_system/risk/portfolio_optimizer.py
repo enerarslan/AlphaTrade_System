@@ -466,11 +466,50 @@ class BlackLittermanOptimizer(BasePortfolioOptimizer):
 
             # Black-Litterman formula
             tau_sigma = self.tau * covariance_matrix
-            tau_sigma_inv = np.linalg.inv(tau_sigma)
-            omega_inv = np.linalg.inv(Omega)
+
+            # CRITICAL FIX: Check matrix invertibility before inversion
+            # Singular matrices will cause np.linalg.inv to fail silently
+            # with invalid results. Use pseudo-inverse as fallback.
+            try:
+                # Check condition number - high values indicate near-singularity
+                cond_tau_sigma = np.linalg.cond(tau_sigma)
+                cond_omega = np.linalg.cond(Omega)
+
+                if cond_tau_sigma > 1e10 or cond_omega > 1e10:
+                    logger.warning(
+                        f"Near-singular matrix detected in Black-Litterman. "
+                        f"Condition numbers: tau_sigma={cond_tau_sigma:.2e}, Omega={cond_omega:.2e}. "
+                        f"Using pseudo-inverse for numerical stability."
+                    )
+                    tau_sigma_inv = np.linalg.pinv(tau_sigma)
+                    omega_inv = np.linalg.pinv(Omega)
+                else:
+                    tau_sigma_inv = np.linalg.inv(tau_sigma)
+                    omega_inv = np.linalg.inv(Omega)
+
+                # Also check the combined matrix
+                combined_matrix = tau_sigma_inv + P.T @ omega_inv @ P
+                cond_combined = np.linalg.cond(combined_matrix)
+
+                if cond_combined > 1e10:
+                    logger.warning(
+                        f"Near-singular combined matrix in Black-Litterman. "
+                        f"Condition number: {cond_combined:.2e}. Using pseudo-inverse."
+                    )
+                    M1 = np.linalg.pinv(combined_matrix)
+                else:
+                    M1 = np.linalg.inv(combined_matrix)
+
+            except np.linalg.LinAlgError as e:
+                logger.error(
+                    f"Matrix inversion failed in Black-Litterman: {e}. "
+                    f"Falling back to pseudo-inverse."
+                )
+                tau_sigma_inv = np.linalg.pinv(tau_sigma)
+                omega_inv = np.linalg.pinv(Omega)
+                M1 = np.linalg.pinv(tau_sigma_inv + P.T @ omega_inv @ P)
 
             # Posterior expected returns
-            M1 = np.linalg.inv(tau_sigma_inv + P.T @ omega_inv @ P)
             M2 = tau_sigma_inv @ pi + P.T @ omega_inv @ Q
             bl_returns = M1 @ M2
         else:

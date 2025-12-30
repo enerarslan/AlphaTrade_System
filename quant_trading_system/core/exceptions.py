@@ -57,6 +57,48 @@ class TradingSystemError(Exception):
 
 
 # =============================================================================
+# Validation Errors
+# =============================================================================
+
+
+class ValidationError(TradingSystemError):
+    """Raised when parameter or input validation fails.
+
+    This is a general-purpose validation error used by validation decorators
+    and input validation throughout the system.
+
+    Examples:
+        - Invalid order parameters (negative quantity, invalid symbol)
+        - ML model input validation failures (NaN values, wrong dimensions)
+        - Configuration validation failures
+    """
+
+    def __init__(
+        self,
+        message: str,
+        field_name: str | None = None,
+        invalid_value: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the validation error.
+
+        Args:
+            message: Human-readable error message.
+            field_name: Name of the field that failed validation.
+            invalid_value: The value that failed validation.
+            **kwargs: Additional context passed to parent.
+        """
+        details = kwargs.pop("details", {})
+        if field_name:
+            details["field_name"] = field_name
+        if invalid_value is not None:
+            details["invalid_value"] = str(invalid_value)
+        super().__init__(message, details=details, **kwargs)
+        self.field_name = field_name
+        self.invalid_value = invalid_value
+
+
+# =============================================================================
 # Data Errors
 # =============================================================================
 
@@ -169,6 +211,58 @@ class DataConnectionError(DataError):
         super().__init__(message, details=details, **kwargs)
         self.source = source
         self.retry_after = retry_after
+
+
+class DataLoadError(DataError):
+    """Raised when data loading fails.
+
+    Examples:
+        - File read error
+        - API fetch failed
+        - Data format incompatible
+    """
+
+    def __init__(
+        self,
+        message: str,
+        source: str | None = None,
+        symbol: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        details = kwargs.pop("details", {})
+        if source:
+            details["source"] = source
+        if symbol:
+            details["symbol"] = symbol
+        super().__init__(message, details=details, **kwargs)
+        self.source = source
+        self.symbol = symbol
+
+
+class DataStreamError(DataError):
+    """Raised when real-time data streaming fails.
+
+    Examples:
+        - WebSocket connection dropped
+        - Stream timeout
+        - Malformed stream data
+    """
+
+    def __init__(
+        self,
+        message: str,
+        stream_type: str | None = None,
+        symbols: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        details = kwargs.pop("details", {})
+        if stream_type:
+            details["stream_type"] = stream_type
+        if symbols:
+            details["symbols"] = symbols
+        super().__init__(message, details=details, **kwargs)
+        self.stream_type = stream_type
+        self.symbols = symbols
 
 
 # =============================================================================
@@ -542,6 +636,43 @@ class MarginCallError(RiskError):
         self.margin_required = margin_required
         self.margin_available = margin_available
         self.deadline = deadline
+
+
+class KillSwitchActiveError(RiskError):
+    """Raised when trading is attempted while kill switch is active.
+
+    This is a critical safety error that prevents ALL trading operations
+    when the kill switch has been triggered due to:
+    - Maximum drawdown breach
+    - Rapid P&L decline
+    - System errors
+    - Data feed failures
+    - Manual activation
+
+    Examples:
+        - Order submission while kill switch active
+        - Position modification while halted
+    """
+
+    def __init__(
+        self,
+        message: str = "Trading halted - kill switch is active",
+        reason: str | None = None,
+        activated_at: str | None = None,
+        activated_by: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        details = kwargs.pop("details", {})
+        if reason:
+            details["reason"] = reason
+        if activated_at:
+            details["activated_at"] = activated_at
+        if activated_by:
+            details["activated_by"] = activated_by
+        super().__init__(message, error_code="KILL_SWITCH_ACTIVE", details=details, **kwargs)
+        self.reason = reason
+        self.activated_at = activated_at
+        self.activated_by = activated_by
 
 
 # =============================================================================

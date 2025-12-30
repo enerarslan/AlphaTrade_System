@@ -8,12 +8,14 @@ Implements an event-driven architecture with:
 - Dead letter queue for failed handlers
 - Event persistence for replay
 - Metrics on event processing latency
+- THREAD-SAFE singleton pattern for EventBus
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -153,13 +155,31 @@ class DeadLetterEntry:
 class EventBus:
     """Central event bus for message passing between components.
 
+    SINGLETON PATTERN: Use get_event_bus() to get the global instance.
+
     Supports:
     - Synchronous and asynchronous event handlers
     - Priority-based event processing
     - Dead letter queue for failed handlers
     - Event metrics tracking
     - Event filtering by type
+    - THREAD-SAFE operations with RLock
     """
+
+    # Singleton instance and lock
+    _instance: "EventBus | None" = None
+    _instance_lock: threading.Lock = threading.Lock()
+
+    def __new__(cls, max_queue_size: int = 10000) -> "EventBus":
+        """Ensure singleton pattern with thread-safe instantiation."""
+        if cls._instance is None:
+            with cls._instance_lock:
+                # Double-check locking pattern
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._initialized = False
+                    cls._instance = instance
+        return cls._instance
 
     def __init__(self, max_queue_size: int = 10000) -> None:
         """Initialize the event bus.
@@ -167,6 +187,13 @@ class EventBus:
         Args:
             max_queue_size: Maximum size of the event queue.
         """
+        # Prevent re-initialization of singleton
+        if getattr(self, "_initialized", False):
+            return
+
+        # THREAD SAFETY: Use RLock for all mutable state
+        self._lock = threading.RLock()
+
         self._handlers: dict[EventType, list[tuple[str, EventHandler, int]]] = defaultdict(list)
         self._queue: asyncio.PriorityQueue[tuple[int, float, Event]] = asyncio.PriorityQueue(maxsize=max_queue_size)
         self._dead_letter_queue: list[DeadLetterEntry] = []
@@ -181,6 +208,31 @@ class EventBus:
         self._event_history: list[Event] = []
         self._max_history_size = 1000
         self._global_handlers: list[tuple[str, EventHandler, int]] = []
+        self._initialized = True
+
+    @classmethod
+    def get_instance(cls, max_queue_size: int = 10000) -> "EventBus":
+        """Get the singleton EventBus instance.
+
+        Args:
+            max_queue_size: Maximum queue size (only used on first call).
+
+        Returns:
+            The singleton EventBus instance.
+        """
+        return cls(max_queue_size)
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset the singleton instance (for testing only).
+
+        WARNING: This should only be used in tests. Using this in production
+        may cause lost events and coordination failures.
+        """
+        with cls._instance_lock:
+            if cls._instance is not None:
+                cls._instance._running = False
+            cls._instance = None
 
     def subscribe(
         self,
@@ -191,6 +243,8 @@ class EventBus:
     ) -> None:
         """Subscribe a handler to an event type.
 
+        THREAD-SAFE: Uses lock to protect handler registration.
+
         Args:
             event_type: Type of event to subscribe to.
             handler: Callback function to handle the event.
@@ -198,9 +252,10 @@ class EventBus:
             priority: Handler priority (lower = called first).
         """
         name = handler_name or handler.__name__
-        self._handlers[event_type].append((name, handler, priority))
-        # Sort handlers by priority
-        self._handlers[event_type].sort(key=lambda x: x[2])
+        with self._lock:
+            self._handlers[event_type].append((name, handler, priority))
+            # Sort handlers by priority
+            self._handlers[event_type].sort(key=lambda x: x[2])
         logger.debug(f"Handler '{name}' subscribed to {event_type.value}")
 
     def subscribe_all(
@@ -211,18 +266,23 @@ class EventBus:
     ) -> None:
         """Subscribe a handler to all event types.
 
+        THREAD-SAFE: Uses lock to protect handler registration.
+
         Args:
             handler: Callback function to handle events.
             handler_name: Optional name for the handler.
             priority: Handler priority.
         """
         name = handler_name or handler.__name__
-        self._global_handlers.append((name, handler, priority))
-        self._global_handlers.sort(key=lambda x: x[2])
+        with self._lock:
+            self._global_handlers.append((name, handler, priority))
+            self._global_handlers.sort(key=lambda x: x[2])
         logger.debug(f"Global handler '{name}' subscribed to all events")
 
     def unsubscribe(self, event_type: EventType, handler: EventHandler) -> bool:
         """Unsubscribe a handler from an event type.
+
+        THREAD-SAFE: Uses lock to protect handler removal.
 
         Args:
             event_type: Type of event to unsubscribe from.
@@ -231,25 +291,28 @@ class EventBus:
         Returns:
             True if handler was found and removed, False otherwise.
         """
-        handlers = self._handlers[event_type]
-        for i, (name, h, _) in enumerate(handlers):
-            if h == handler:
-                handlers.pop(i)
-                logger.debug(f"Handler '{name}' unsubscribed from {event_type.value}")
-                return True
+        with self._lock:
+            handlers = self._handlers[event_type]
+            for i, (name, h, _) in enumerate(handlers):
+                if h == handler:
+                    handlers.pop(i)
+                    logger.debug(f"Handler '{name}' unsubscribed from {event_type.value}")
+                    return True
         return False
 
     def publish(self, event: Event) -> None:
         """Publish an event to the bus (synchronous).
 
+        THREAD-SAFE: Uses lock to protect metrics and history updates.
+
         Args:
             event: Event to publish.
         """
-        self._metrics["events_published"] += 1
-        self._add_to_history(event)
-
-        # Get all handlers for this event type
-        handlers = self._handlers.get(event.event_type, []) + self._global_handlers
+        with self._lock:
+            self._metrics["events_published"] += 1
+            self._add_to_history(event)
+            # Get snapshot of handlers under lock
+            handlers = list(self._handlers.get(event.event_type, [])) + list(self._global_handlers)
 
         for handler_name, handler, _ in handlers:
             try:
@@ -319,16 +382,20 @@ class EventBus:
             self._handle_error(event, handler_name, e)
 
     def _handle_error(self, event: Event, handler_name: str, error: Exception) -> None:
-        """Handle a handler error by logging and adding to dead letter queue."""
-        self._metrics["events_failed"] += 1
-        self._metrics["handler_errors"][handler_name] += 1
+        """Handle a handler error by logging and adding to dead letter queue.
 
-        entry = DeadLetterEntry(
-            event=event,
-            handler_name=handler_name,
-            error=error,
-        )
-        self._dead_letter_queue.append(entry)
+        THREAD-SAFE: Uses lock to protect metrics and dead letter queue.
+        """
+        with self._lock:
+            self._metrics["events_failed"] += 1
+            self._metrics["handler_errors"][handler_name] += 1
+
+            entry = DeadLetterEntry(
+                event=event,
+                handler_name=handler_name,
+                error=error,
+            )
+            self._dead_letter_queue.append(entry)
 
         logger.error(
             f"Handler '{handler_name}' failed for event {event.event_type.value}: {error}",
@@ -506,3 +573,20 @@ def create_system_event(
         source=source,
         priority=EventPriority.LOW,
     )
+
+
+def get_event_bus() -> EventBus:
+    """Get the global EventBus singleton instance.
+
+    This is the recommended way to get the EventBus in application code.
+    Using this ensures all components share the same event bus.
+
+    Returns:
+        The singleton EventBus instance.
+
+    Example:
+        >>> from quant_trading_system.core.events import get_event_bus, EventType
+        >>> bus = get_event_bus()
+        >>> bus.subscribe(EventType.ORDER_FILLED, my_handler)
+    """
+    return EventBus.get_instance()

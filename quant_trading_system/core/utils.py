@@ -16,6 +16,7 @@ import asyncio
 import functools
 import hashlib
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -36,6 +37,98 @@ F = TypeVar("F", bound=Callable[..., Any])
 # Common timezone references
 UTC = ZoneInfo("UTC")
 EASTERN = ZoneInfo("America/New_York")
+
+
+# =============================================================================
+# Backtest Mode - Prevents Look-Ahead Bias
+# =============================================================================
+
+# Thread-local storage for backtest mode state
+_backtest_mode_storage = threading.local()
+
+
+class BacktestModeError(Exception):
+    """Raised when time functions are called with None during backtest mode.
+
+    This prevents look-ahead bias by forcing explicit datetime specification
+    during backtesting instead of using real-world current time.
+    """
+    pass
+
+
+def is_backtest_mode() -> bool:
+    """Check if currently in backtest mode.
+
+    Returns:
+        True if backtest mode is active for current thread.
+    """
+    return getattr(_backtest_mode_storage, "active", False)
+
+
+def get_backtest_time() -> datetime | None:
+    """Get the current simulated time during backtest.
+
+    Returns:
+        Current simulated datetime if in backtest mode, None otherwise.
+    """
+    if not is_backtest_mode():
+        return None
+    return getattr(_backtest_mode_storage, "current_time", None)
+
+
+def set_backtest_time(dt: datetime) -> None:
+    """Set the current simulated time during backtest.
+
+    Args:
+        dt: The simulated datetime to set.
+
+    Raises:
+        RuntimeError: If not in backtest mode.
+    """
+    if not is_backtest_mode():
+        raise RuntimeError("Cannot set backtest time outside of backtest mode")
+    _backtest_mode_storage.current_time = dt
+
+
+@contextmanager
+def backtest_mode(start_time: datetime | None = None) -> Generator[None, None, None]:
+    """Context manager to enable backtest mode.
+
+    When backtest mode is active, time utility functions that would normally
+    default to current real-world time will instead:
+    1. Raise BacktestModeError if called with dt=None
+    2. Allow explicit use of set_backtest_time() to set simulated time
+
+    This CRITICAL feature prevents look-ahead bias in backtesting by ensuring
+    all time comparisons use the simulated backtest time, not real-world time.
+
+    Args:
+        start_time: Optional initial simulated time. Can be updated via set_backtest_time().
+
+    Usage:
+        with backtest_mode(start_time=datetime(2024, 1, 1)):
+            for bar in bars:
+                set_backtest_time(bar.timestamp)
+                if is_market_open():  # Uses simulated time
+                    process_bar(bar)
+
+    Yields:
+        None
+
+    Note:
+        Backtest mode is thread-local, so multiple threads can run backtests
+        independently without interference.
+    """
+    previous_active = getattr(_backtest_mode_storage, "active", False)
+    previous_time = getattr(_backtest_mode_storage, "current_time", None)
+
+    try:
+        _backtest_mode_storage.active = True
+        _backtest_mode_storage.current_time = start_time
+        yield
+    finally:
+        _backtest_mode_storage.active = previous_active
+        _backtest_mode_storage.current_time = previous_time
 
 
 # =============================================================================
@@ -157,12 +250,15 @@ def get_us_market_holidays(year: int) -> set[datetime]:
     return holidays
 
 
-# Cache holidays by year
+# Cache holidays by year with thread-safe access
 _holiday_cache: dict[int, set[datetime]] = {}
+_holiday_cache_lock = threading.RLock()
 
 
 def is_market_holiday(dt: datetime | None = None) -> bool:
     """Check if a date is a US market holiday.
+
+    THREAD-SAFE: Uses lock to protect holiday cache access.
 
     Args:
         dt: Date to check. If None, uses current date.
@@ -177,14 +273,18 @@ def is_market_holiday(dt: datetime | None = None) -> bool:
 
     year = dt.year
 
-    # Cache holidays for the year
-    if year not in _holiday_cache:
-        _holiday_cache[year] = get_us_market_holidays(year)
+    # THREAD SAFETY: Use lock to protect cache access
+    with _holiday_cache_lock:
+        # Cache holidays for the year
+        if year not in _holiday_cache:
+            _holiday_cache[year] = get_us_market_holidays(year)
+
+        holidays = _holiday_cache[year]
 
     # Check if date matches any holiday (compare date only, not time)
     dt_date = dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    for holiday in _holiday_cache[year]:
+    for holiday in holidays:
         holiday_date = holiday.replace(hour=0, minute=0, second=0, microsecond=0)
         if dt_date == holiday_date:
             return True
@@ -287,15 +387,33 @@ def is_market_open(dt: datetime | None = None) -> bool:
     - Weekend check
     - Holiday check (full NYSE/NASDAQ calendar)
     - Trading hours check (9:30 AM - 4:00 PM ET)
+    - BACKTEST MODE SUPPORT: Uses simulated time to prevent look-ahead bias
 
     Args:
-        dt: Datetime to check. If None, uses current time.
+        dt: Datetime to check. If None:
+            - In backtest mode: uses simulated backtest time
+            - Outside backtest mode: uses current real-world time
 
     Returns:
         True if market is currently open.
+
+    Raises:
+        BacktestModeError: If dt is None during backtest mode and no
+            simulated time has been set via set_backtest_time().
     """
     if dt is None:
-        dt = eastern_now()
+        # CRITICAL: Prevent look-ahead bias during backtesting
+        if is_backtest_mode():
+            backtest_time = get_backtest_time()
+            if backtest_time is None:
+                raise BacktestModeError(
+                    "is_market_open() called with dt=None during backtest mode, "
+                    "but no simulated time has been set. Either pass an explicit "
+                    "datetime or call set_backtest_time() first to prevent look-ahead bias."
+                )
+            dt = to_eastern(backtest_time)
+        else:
+            dt = eastern_now()
     else:
         dt = to_eastern(dt)
 
@@ -317,14 +435,33 @@ def is_market_open(dt: datetime | None = None) -> bool:
 def get_market_open_time(date: datetime | None = None) -> datetime:
     """Get market open time for a given date.
 
+    BACKTEST MODE SUPPORT: Uses simulated time to prevent look-ahead bias.
+
     Args:
-        date: Date to get open time for. If None, uses today.
+        date: Date to get open time for. If None:
+            - In backtest mode: uses simulated backtest date
+            - Outside backtest mode: uses today's date
 
     Returns:
-        Market open datetime in Eastern time.
+        Market open datetime in Eastern time (9:30 AM).
+
+    Raises:
+        BacktestModeError: If date is None during backtest mode and no
+            simulated time has been set via set_backtest_time().
     """
     if date is None:
-        date = eastern_now()
+        # CRITICAL: Prevent look-ahead bias during backtesting
+        if is_backtest_mode():
+            backtest_time = get_backtest_time()
+            if backtest_time is None:
+                raise BacktestModeError(
+                    "get_market_open_time() called with date=None during backtest mode, "
+                    "but no simulated time has been set. Either pass an explicit "
+                    "datetime or call set_backtest_time() first to prevent look-ahead bias."
+                )
+            date = to_eastern(backtest_time)
+        else:
+            date = eastern_now()
     else:
         date = to_eastern(date)
     return date.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -333,14 +470,33 @@ def get_market_open_time(date: datetime | None = None) -> datetime:
 def get_market_close_time(date: datetime | None = None) -> datetime:
     """Get market close time for a given date.
 
+    BACKTEST MODE SUPPORT: Uses simulated time to prevent look-ahead bias.
+
     Args:
-        date: Date to get close time for. If None, uses today.
+        date: Date to get close time for. If None:
+            - In backtest mode: uses simulated backtest date
+            - Outside backtest mode: uses today's date
 
     Returns:
-        Market close datetime in Eastern time.
+        Market close datetime in Eastern time (4:00 PM).
+
+    Raises:
+        BacktestModeError: If date is None during backtest mode and no
+            simulated time has been set via set_backtest_time().
     """
     if date is None:
-        date = eastern_now()
+        # CRITICAL: Prevent look-ahead bias during backtesting
+        if is_backtest_mode():
+            backtest_time = get_backtest_time()
+            if backtest_time is None:
+                raise BacktestModeError(
+                    "get_market_close_time() called with date=None during backtest mode, "
+                    "but no simulated time has been set. Either pass an explicit "
+                    "datetime or call set_backtest_time() first to prevent look-ahead bias."
+                )
+            date = to_eastern(backtest_time)
+        else:
+            date = eastern_now()
     else:
         date = to_eastern(date)
     return date.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -855,3 +1011,330 @@ def validate_price(price: Decimal | float | int) -> bool:
         return p >= 0
     except (ValueError, TypeError):
         return False
+
+
+# =============================================================================
+# Validation Decorators
+# =============================================================================
+
+
+# Import ValidationError from exceptions module for consistency
+# We also define it here for backward compatibility
+from quant_trading_system.core.exceptions import ValidationError
+
+
+def validate_order_params(
+    symbol_param: str = "symbol",
+    quantity_param: str | None = "quantity",
+    price_param: str | None = "price",
+    limit_price_param: str | None = "limit_price",
+    stop_price_param: str | None = "stop_price",
+    strict: bool = True,
+) -> Callable[[F], F]:
+    """Decorator to validate order parameters.
+
+    This decorator provides reusable validation for order-related methods,
+    ensuring that symbols, quantities, and prices are valid before execution.
+
+    Args:
+        symbol_param: Name of the symbol parameter to validate.
+        quantity_param: Name of the quantity parameter (None to skip).
+        price_param: Name of the price parameter (None to skip).
+        limit_price_param: Name of the limit price parameter (None to skip).
+        stop_price_param: Name of the stop price parameter (None to skip).
+        strict: If True, raise ValidationError; if False, log warning and continue.
+
+    Returns:
+        Decorator function.
+
+    Example:
+        @validate_order_params(symbol_param="ticker", quantity_param="qty")
+        def submit_order(self, ticker: str, qty: Decimal, price: Decimal):
+            ...
+
+    Raises:
+        ValidationError: If strict=True and validation fails.
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Build param dict from args and kwargs
+            import inspect
+            sig = inspect.signature(func)
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = dict(bound.arguments)
+
+            errors: list[str] = []
+
+            # Validate symbol
+            if symbol_param and symbol_param in params:
+                symbol = params[symbol_param]
+                if symbol is not None and not validate_symbol(str(symbol)):
+                    errors.append(f"Invalid symbol format: {symbol}")
+
+            # Validate quantity
+            if quantity_param and quantity_param in params:
+                quantity = params[quantity_param]
+                if quantity is not None and not validate_quantity(quantity):
+                    errors.append(f"Invalid quantity (must be positive): {quantity}")
+
+            # Validate price
+            if price_param and price_param in params:
+                price = params[price_param]
+                if price is not None and not validate_price(price):
+                    errors.append(f"Invalid price (must be non-negative): {price}")
+
+            # Validate limit price
+            if limit_price_param and limit_price_param in params:
+                limit_price = params[limit_price_param]
+                if limit_price is not None and not validate_price(limit_price):
+                    errors.append(f"Invalid limit_price (must be non-negative): {limit_price}")
+
+            # Validate stop price
+            if stop_price_param and stop_price_param in params:
+                stop_price = params[stop_price_param]
+                if stop_price is not None and not validate_price(stop_price):
+                    errors.append(f"Invalid stop_price (must be non-negative): {stop_price}")
+
+            if errors:
+                error_msg = f"Order parameter validation failed: {'; '.join(errors)}"
+                if strict:
+                    raise ValidationError(error_msg)
+                else:
+                    logger.warning(error_msg)
+
+            return func(*args, **kwargs)
+
+        return wrapper  # type: ignore
+
+    return decorator
+
+
+def validate_model_input(
+    features_param: str = "X",
+    min_samples: int = 1,
+    max_features: int | None = None,
+    check_nan: bool = True,
+    check_inf: bool = True,
+) -> Callable[[F], F]:
+    """Decorator to validate ML model input arrays.
+
+    Ensures input data meets requirements before model training/prediction,
+    preventing cryptic errors from underlying ML libraries.
+
+    Args:
+        features_param: Name of the features parameter (numpy array).
+        min_samples: Minimum number of samples required.
+        max_features: Maximum number of features allowed (None for unlimited).
+        check_nan: Check for NaN values in input.
+        check_inf: Check for infinite values in input.
+
+    Returns:
+        Decorator function.
+
+    Example:
+        @validate_model_input(features_param="X", min_samples=10)
+        def fit(self, X: np.ndarray, y: np.ndarray):
+            ...
+
+    Raises:
+        ValidationError: If validation fails.
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            import inspect
+            import numpy as np
+
+            sig = inspect.signature(func)
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = dict(bound.arguments)
+
+            if features_param not in params:
+                return func(*args, **kwargs)
+
+            X = params[features_param]
+            if X is None:
+                raise ValidationError(f"{features_param} cannot be None")
+
+            # Convert to numpy if needed
+            if hasattr(X, 'values'):  # DataFrame/Series
+                X = X.values
+
+            if not isinstance(X, np.ndarray):
+                raise ValidationError(
+                    f"{features_param} must be a numpy array, got {type(X).__name__}"
+                )
+
+            # Check dimensions
+            if X.ndim < 1:
+                raise ValidationError(f"{features_param} must have at least 1 dimension")
+
+            n_samples = X.shape[0] if X.ndim >= 1 else 1
+            n_features = X.shape[1] if X.ndim >= 2 else 1
+
+            # Check minimum samples
+            if n_samples < min_samples:
+                raise ValidationError(
+                    f"{features_param} has {n_samples} samples, "
+                    f"minimum required is {min_samples}"
+                )
+
+            # Check maximum features
+            if max_features is not None and n_features > max_features:
+                raise ValidationError(
+                    f"{features_param} has {n_features} features, "
+                    f"maximum allowed is {max_features}"
+                )
+
+            # Check for NaN
+            if check_nan and np.isnan(X).any():
+                nan_count = np.isnan(X).sum()
+                raise ValidationError(
+                    f"{features_param} contains {nan_count} NaN values. "
+                    "Please clean data before model input."
+                )
+
+            # Check for infinite values
+            if check_inf and np.isinf(X).any():
+                inf_count = np.isinf(X).sum()
+                raise ValidationError(
+                    f"{features_param} contains {inf_count} infinite values. "
+                    "Please clean data before model input."
+                )
+
+            return func(*args, **kwargs)
+
+        return wrapper  # type: ignore
+
+    return decorator
+
+
+def validate_positive(
+    *param_names: str,
+    allow_zero: bool = False,
+) -> Callable[[F], F]:
+    """Decorator to validate that parameters are positive numbers.
+
+    Args:
+        *param_names: Names of parameters that must be positive.
+        allow_zero: If True, zero values are allowed.
+
+    Returns:
+        Decorator function.
+
+    Example:
+        @validate_positive("quantity", "price", allow_zero=False)
+        def create_order(self, quantity: Decimal, price: Decimal):
+            ...
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            import inspect
+            sig = inspect.signature(func)
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = dict(bound.arguments)
+
+            errors: list[str] = []
+            for param_name in param_names:
+                if param_name not in params:
+                    continue
+                value = params[param_name]
+                if value is None:
+                    continue
+
+                try:
+                    num_value = float(value)
+                    if allow_zero:
+                        if num_value < 0:
+                            errors.append(f"{param_name} must be non-negative, got {value}")
+                    else:
+                        if num_value <= 0:
+                            errors.append(f"{param_name} must be positive, got {value}")
+                except (ValueError, TypeError):
+                    errors.append(f"{param_name} must be a number, got {type(value).__name__}")
+
+            if errors:
+                raise ValidationError(f"Validation failed: {'; '.join(errors)}")
+
+            return func(*args, **kwargs)
+
+        return wrapper  # type: ignore
+
+    return decorator
+
+
+def validate_range(
+    param_name: str,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    inclusive: bool = True,
+) -> Callable[[F], F]:
+    """Decorator to validate that a parameter is within a specified range.
+
+    Args:
+        param_name: Name of the parameter to validate.
+        min_value: Minimum allowed value (None for no minimum).
+        max_value: Maximum allowed value (None for no maximum).
+        inclusive: If True, boundary values are allowed.
+
+    Returns:
+        Decorator function.
+
+    Example:
+        @validate_range("confidence", min_value=0.0, max_value=1.0)
+        def set_signal(self, confidence: float):
+            ...
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            import inspect
+            sig = inspect.signature(func)
+            bound = sig.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
+            params = dict(bound.arguments)
+
+            if param_name not in params:
+                return func(*args, **kwargs)
+
+            value = params[param_name]
+            if value is None:
+                return func(*args, **kwargs)
+
+            try:
+                num_value = float(value)
+            except (ValueError, TypeError):
+                raise ValidationError(
+                    f"{param_name} must be a number, got {type(value).__name__}"
+                )
+
+            if min_value is not None:
+                if inclusive and num_value < min_value:
+                    raise ValidationError(
+                        f"{param_name} must be >= {min_value}, got {num_value}"
+                    )
+                elif not inclusive and num_value <= min_value:
+                    raise ValidationError(
+                        f"{param_name} must be > {min_value}, got {num_value}"
+                    )
+
+            if max_value is not None:
+                if inclusive and num_value > max_value:
+                    raise ValidationError(
+                        f"{param_name} must be <= {max_value}, got {num_value}"
+                    )
+                elif not inclusive and num_value >= max_value:
+                    raise ValidationError(
+                        f"{param_name} must be < {max_value}, got {num_value}"
+                    )
+
+            return func(*args, **kwargs)
+
+        return wrapper  # type: ignore
+
+    return decorator

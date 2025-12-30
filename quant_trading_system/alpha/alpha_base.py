@@ -278,6 +278,86 @@ class AlphaFactor(ABC):
 
         return result
 
+    def _winsorize(
+        self,
+        values: np.ndarray,
+        lower_percentile: float = 1.0,
+        upper_percentile: float = 99.0,
+    ) -> np.ndarray:
+        """Winsorize values to reduce impact of outliers.
+
+        Clips extreme values to specified percentiles to reduce
+        the impact of outliers on alpha calculations.
+
+        CRITICAL: Uses ONLY historical data to calculate percentiles
+        to prevent look-ahead bias. Percentiles are calculated from
+        all available PAST data up to but not including the current bar.
+
+        Args:
+            values: Array of values to winsorize.
+            lower_percentile: Lower percentile for clipping (default 1.0).
+            upper_percentile: Upper percentile for clipping (default 99.0).
+
+        Returns:
+            Winsorized array with extreme values clipped.
+
+        Example:
+            >>> # Values: [1, 2, 3, ..., 100]
+            >>> # With 1st and 99th percentile:
+            >>> # Values below 1st percentile clipped to 1st percentile
+            >>> # Values above 99th percentile clipped to 99th percentile
+        """
+        result = values.copy()
+        n = len(values)
+
+        # Minimum samples needed for reliable percentile calculation
+        min_samples = 30
+
+        for i in range(min_samples, n):
+            # Use ONLY historical data (exclude current bar)
+            historical = values[:i]
+            valid_historical = historical[~np.isnan(historical)]
+
+            if len(valid_historical) >= min_samples:
+                lower_bound = np.percentile(valid_historical, lower_percentile)
+                upper_bound = np.percentile(valid_historical, upper_percentile)
+
+                # Clip current value based on HISTORICAL percentiles
+                if not np.isnan(values[i]):
+                    result[i] = np.clip(values[i], lower_bound, upper_bound)
+
+        return result
+
+    def _winsorize_cross_sectional(
+        self,
+        values: np.ndarray,
+        lower_percentile: float = 2.5,
+        upper_percentile: float = 97.5,
+    ) -> np.ndarray:
+        """Cross-sectional winsorization for multi-asset alphas.
+
+        For use when values represent alpha scores across multiple assets
+        at a single point in time. This is safe for cross-sectional data
+        as it uses contemporaneous data which is legitimately available.
+
+        Args:
+            values: Array of cross-sectional values (one per asset).
+            lower_percentile: Lower percentile for clipping.
+            upper_percentile: Upper percentile for clipping.
+
+        Returns:
+            Winsorized array.
+        """
+        valid_values = values[~np.isnan(values)]
+
+        if len(valid_values) < 5:
+            return values
+
+        lower_bound = np.percentile(valid_values, lower_percentile)
+        upper_bound = np.percentile(valid_values, upper_percentile)
+
+        return np.clip(values, lower_bound, upper_bound)
+
     def _compute_confidence(self, values: np.ndarray, window: int = 20) -> np.ndarray:
         """
         Compute confidence based on signal consistency.

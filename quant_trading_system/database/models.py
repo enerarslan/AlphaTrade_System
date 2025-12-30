@@ -472,6 +472,86 @@ class Alert(Base):
         return f"<Alert({self.severity}, {self.title[:50]})>"
 
 
+class RiskEvent(Base):
+    """Risk events for audit trail and monitoring.
+
+    Records all risk-related events including:
+    - Kill switch activations/deactivations
+    - Position limit breaches
+    - Drawdown warnings
+    - Risk parameter changes
+    - Order rejections due to risk
+
+    This table is intended to be a TimescaleDB hypertable
+    partitioned by timestamp (daily) with 90-day retention.
+    """
+
+    __tablename__ = "risk_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utc_now,
+        nullable=False,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+    )  # KILL_SWITCH_ACTIVATED, POSITION_LIMIT_BREACH, DRAWDOWN_WARNING, etc.
+    severity: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        index=True,
+    )  # CRITICAL, HIGH, MEDIUM, LOW, INFO
+    symbol: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Metrics at time of event
+    metrics: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )  # Current risk metrics snapshot
+
+    # Related identifiers
+    order_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)
+    strategy_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    # Resolution tracking
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    resolution_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_risk_events_type_timestamp", "event_type", "timestamp"),
+        Index("ix_risk_events_severity_timestamp", "severity", "timestamp"),
+        Index("ix_risk_events_symbol_timestamp", "symbol", "timestamp"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<RiskEvent({self.event_type}, {self.severity}, {self.timestamp})>"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "event_type": self.event_type,
+            "severity": self.severity,
+            "symbol": self.symbol,
+            "description": self.description,
+            "metrics": self.metrics,
+            "order_id": self.order_id,
+            "strategy_name": self.strategy_name,
+            "resolved": self.resolved,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "resolved_by": self.resolved_by,
+            "resolution_notes": self.resolution_notes,
+        }
+
+
 # Export all models
 __all__ = [
     "Base",
@@ -487,4 +567,5 @@ __all__ = [
     "TradeLog",
     "SystemLog",
     "Alert",
+    "RiskEvent",
 ]

@@ -29,6 +29,12 @@ import os
 from typing import Annotated, Any
 from uuid import UUID
 
+try:
+    import bcrypt
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    BCRYPT_AVAILABLE = False
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -361,16 +367,70 @@ class TokenResponse(BaseModel):
 
 # Simple user store for demo - in production, use a proper user database
 # WARNING: This is for demonstration only. Production should use proper auth.
-_DEMO_USERS: dict[str, str] = {}
+_DEMO_USERS: dict[str, bytes] = {}  # Changed to bytes to store bcrypt hashes
 
 
-def _get_password_hash(password: str) -> str:
-    """Hash a password using SHA-256 with salt.
+def _get_password_hash(password: str) -> bytes:
+    """Hash a password using bcrypt with automatic salt generation.
 
-    NOTE: In production, use bcrypt or argon2 instead.
+    SECURITY FIX: Now uses bcrypt with random salt per password.
+    bcrypt is designed for password hashing and is resistant to:
+    - Rainbow table attacks (random salt)
+    - Brute force attacks (slow by design)
+    - GPU attacks (memory-hard)
+
+    Falls back to PBKDF2 if bcrypt is not available.
     """
-    salt = "quant_trading_salt_"  # In production, use per-user random salt
-    return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+    password_bytes = password.encode('utf-8')
+
+    if BCRYPT_AVAILABLE:
+        # bcrypt automatically generates a random salt
+        # Work factor 12 = ~250ms on modern hardware
+        return bcrypt.hashpw(password_bytes, bcrypt.gensalt(rounds=12))
+    else:
+        # Fallback to PBKDF2 with random salt if bcrypt not installed
+        import hashlib
+        salt = secrets.token_bytes(32)
+        # 100000 iterations for PBKDF2
+        derived_key = hashlib.pbkdf2_hmac(
+            'sha256',
+            password_bytes,
+            salt,
+            100000,
+            dklen=32
+        )
+        # Store salt + derived key together
+        return salt + derived_key
+
+
+def _verify_password(password: str, hashed: bytes) -> bool:
+    """Verify a password against its hash.
+
+    SECURITY FIX: Proper password verification for bcrypt or PBKDF2.
+    Uses constant-time comparison to prevent timing attacks.
+    """
+    password_bytes = password.encode('utf-8')
+
+    if BCRYPT_AVAILABLE:
+        try:
+            return bcrypt.checkpw(password_bytes, hashed)
+        except Exception:
+            return False
+    else:
+        # PBKDF2 fallback verification
+        import hashlib
+        if len(hashed) < 64:  # salt(32) + key(32)
+            return False
+        salt = hashed[:32]
+        stored_key = hashed[32:]
+        derived_key = hashlib.pbkdf2_hmac(
+            'sha256',
+            password_bytes,
+            salt,
+            100000,
+            dklen=32
+        )
+        return hmac.compare_digest(derived_key, stored_key)
 
 
 def _init_demo_users() -> None:
@@ -406,22 +466,26 @@ _init_demo_users()
 async def login(request: LoginRequest) -> TokenResponse:
     """Authenticate and get access token.
 
+    SECURITY FIX: Uses proper bcrypt password verification.
+
     Args:
         request: Login credentials.
 
     Returns:
         JWT access token.
     """
-    password_hash = _get_password_hash(request.password)
-
     if request.username not in _DEMO_USERS:
+        # SECURITY: Still hash password to prevent timing attacks
+        # that could reveal whether username exists
+        _get_password_hash(request.password)
         logger.warning(f"Login attempt for unknown user: {request.username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
         )
 
-    if not hmac.compare_digest(_DEMO_USERS[request.username], password_hash):
+    # SECURITY FIX: Use proper bcrypt verification
+    if not _verify_password(request.password, _DEMO_USERS[request.username]):
         logger.warning(f"Invalid password for user: {request.username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

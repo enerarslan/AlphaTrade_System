@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -186,6 +186,37 @@ class SecuritySettings(BaseModel):
         default=True,
         description="Allow unauthenticated access to /health endpoint"
     )
+
+    @model_validator(mode="after")
+    def validate_jwt_secret(self) -> "SecuritySettings":
+        """Validate that JWT secret is set when auth is required.
+
+        CRITICAL SECURITY FIX: Reject empty JWT secrets in production to
+        prevent authentication bypass vulnerabilities.
+        """
+        if self.require_auth and not self.jwt_secret_key:
+            # Check environment to determine severity
+            env = os.environ.get("APP_ENV", "development").lower()
+            if env in ("production", "staging"):
+                raise ValueError(
+                    "SECURITY ERROR: JWT_SECRET_KEY must be set in production/staging. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+                )
+            else:
+                import warnings
+                warnings.warn(
+                    "JWT_SECRET_KEY is empty. Authentication will fail. "
+                    "Set JWT_SECRET_KEY environment variable.",
+                    SecurityWarning,
+                    stacklevel=2,
+                )
+        # Validate minimum key length for security
+        if self.jwt_secret_key and len(self.jwt_secret_key) < 32:
+            raise ValueError(
+                "JWT_SECRET_KEY must be at least 32 characters for security. "
+                "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
+        return self
 
     @classmethod
     def from_env(cls) -> "SecuritySettings":
