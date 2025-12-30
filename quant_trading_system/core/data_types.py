@@ -96,19 +96,42 @@ class OHLCVBar(BaseModel):
         """Validate and normalize symbol."""
         return v.upper().strip()
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary with serializable types."""
-        return {
-            "symbol": self.symbol,
-            "timestamp": self.timestamp.isoformat(),
-            "open": float(self.open),
-            "high": float(self.high),
-            "low": float(self.low),
-            "close": float(self.close),
-            "volume": self.volume,
-            "vwap": float(self.vwap) if self.vwap else None,
-            "trade_count": self.trade_count,
-        }
+    def to_dict(self, preserve_decimal_precision: bool = True) -> dict[str, Any]:
+        """Convert to dictionary with serializable types.
+
+        Args:
+            preserve_decimal_precision: If True, converts Decimal to str to preserve
+                financial precision. If False, converts to float (may lose precision).
+                Default True for JPMorgan-level accuracy.
+
+        Returns:
+            Dictionary representation of the bar.
+        """
+        if preserve_decimal_precision:
+            return {
+                "symbol": self.symbol,
+                "timestamp": self.timestamp.isoformat(),
+                "open": str(self.open),
+                "high": str(self.high),
+                "low": str(self.low),
+                "close": str(self.close),
+                "volume": self.volume,
+                "vwap": str(self.vwap) if self.vwap else None,
+                "trade_count": self.trade_count,
+            }
+        else:
+            # Legacy float conversion (may lose precision)
+            return {
+                "symbol": self.symbol,
+                "timestamp": self.timestamp.isoformat(),
+                "open": float(self.open),
+                "high": float(self.high),
+                "low": float(self.low),
+                "close": float(self.close),
+                "volume": self.volume,
+                "vwap": float(self.vwap) if self.vwap else None,
+                "trade_count": self.trade_count,
+            }
 
     class Config:
         frozen = True  # Immutable

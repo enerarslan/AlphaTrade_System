@@ -25,7 +25,7 @@ torch==2.1.0
 pytorch-lightning==2.1.0
 
 # Technical Analysis
-# ta-lib==0.4.28  # Requires system library, install separately
+ta-lib==0.4.28  # TA-Lib C library installed via Dockerfile
 pandas-ta==0.3.14b
 
 # Database

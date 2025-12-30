@@ -104,19 +104,41 @@ class OHLCVBar(Base):
     def __repr__(self) -> str:
         return f"<OHLCVBar({self.symbol}, {self.timestamp}, C={self.close})>"
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
-        return {
-            "symbol": self.symbol,
-            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
-            "open": float(self.open) if self.open else None,
-            "high": float(self.high) if self.high else None,
-            "low": float(self.low) if self.low else None,
-            "close": float(self.close) if self.close else None,
-            "volume": self.volume,
-            "vwap": float(self.vwap) if self.vwap else None,
-            "trade_count": self.trade_count,
-        }
+    def to_dict(self, preserve_decimal_precision: bool = True) -> dict[str, Any]:
+        """Convert to dictionary.
+
+        Args:
+            preserve_decimal_precision: If True, converts Decimal to str to preserve
+                financial precision. If False, converts to float (may lose precision).
+                Default True for JPMorgan-level accuracy.
+
+        Returns:
+            Dictionary representation of the bar.
+        """
+        if preserve_decimal_precision:
+            return {
+                "symbol": self.symbol,
+                "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+                "open": str(self.open) if self.open else None,
+                "high": str(self.high) if self.high else None,
+                "low": str(self.low) if self.low else None,
+                "close": str(self.close) if self.close else None,
+                "volume": self.volume,
+                "vwap": str(self.vwap) if self.vwap else None,
+                "trade_count": self.trade_count,
+            }
+        else:
+            return {
+                "symbol": self.symbol,
+                "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+                "open": float(self.open) if self.open else None,
+                "high": float(self.high) if self.high else None,
+                "low": float(self.low) if self.low else None,
+                "close": float(self.close) if self.close else None,
+                "volume": self.volume,
+                "vwap": float(self.vwap) if self.vwap else None,
+                "trade_count": self.trade_count,
+            }
 
 
 class Feature(Base):
@@ -188,23 +210,49 @@ class Order(Base, TimestampMixin):
     def __repr__(self) -> str:
         return f"<Order({self.order_id[:8]}, {self.symbol}, {self.side}, {self.status})>"
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
-        return {
-            "order_id": self.order_id,
-            "client_order_id": self.client_order_id,
-            "broker_order_id": self.broker_order_id,
-            "symbol": self.symbol,
-            "side": self.side,
-            "order_type": self.order_type,
-            "quantity": float(self.quantity) if self.quantity else None,
-            "limit_price": float(self.limit_price) if self.limit_price else None,
-            "stop_price": float(self.stop_price) if self.stop_price else None,
-            "time_in_force": self.time_in_force,
-            "status": self.status,
-            "filled_qty": float(self.filled_qty) if self.filled_qty else 0,
-            "filled_avg_price": float(self.filled_avg_price) if self.filled_avg_price else None,
-        }
+    def to_dict(self, preserve_decimal_precision: bool = True) -> dict[str, Any]:
+        """Convert to dictionary.
+
+        Args:
+            preserve_decimal_precision: If True, converts Decimal to str to preserve
+                financial precision. If False, converts to float (may lose precision).
+                Default True for JPMorgan-level accuracy.
+
+        Returns:
+            Dictionary representation of the order.
+        """
+        if preserve_decimal_precision:
+            return {
+                "order_id": self.order_id,
+                "client_order_id": self.client_order_id,
+                "broker_order_id": self.broker_order_id,
+                "symbol": self.symbol,
+                "side": self.side,
+                "order_type": self.order_type,
+                "quantity": str(self.quantity) if self.quantity else None,
+                "limit_price": str(self.limit_price) if self.limit_price else None,
+                "stop_price": str(self.stop_price) if self.stop_price else None,
+                "time_in_force": self.time_in_force,
+                "status": self.status,
+                "filled_qty": str(self.filled_qty) if self.filled_qty else "0",
+                "filled_avg_price": str(self.filled_avg_price) if self.filled_avg_price else None,
+            }
+        else:
+            return {
+                "order_id": self.order_id,
+                "client_order_id": self.client_order_id,
+                "broker_order_id": self.broker_order_id,
+                "symbol": self.symbol,
+                "side": self.side,
+                "order_type": self.order_type,
+                "quantity": float(self.quantity) if self.quantity else None,
+                "limit_price": float(self.limit_price) if self.limit_price else None,
+                "stop_price": float(self.stop_price) if self.stop_price else None,
+                "time_in_force": self.time_in_force,
+                "status": self.status,
+                "filled_qty": float(self.filled_qty) if self.filled_qty else 0,
+                "filled_avg_price": float(self.filled_avg_price) if self.filled_avg_price else None,
+            }
 
 
 class Trade(Base):

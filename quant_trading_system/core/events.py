@@ -326,20 +326,25 @@ class EventBus:
                     except RuntimeError:
                         # No event loop running, run synchronously with new loop
                         asyncio.run(result)
-                self._metrics["events_processed"] += 1
+                # RACE CONDITION FIX: Update metrics inside lock
+                with self._lock:
+                    self._metrics["events_processed"] += 1
             except Exception as e:
                 self._handle_error(event, handler_name, e)
 
     async def publish_async(self, event: Event) -> None:
         """Publish an event to the bus (asynchronous).
 
+        RACE CONDITION FIX: All metrics and history updates are now inside lock.
+
         Args:
             event: Event to publish.
         """
-        self._metrics["events_published"] += 1
-        self._add_to_history(event)
-
-        handlers = self._handlers.get(event.event_type, []) + self._global_handlers
+        with self._lock:
+            self._metrics["events_published"] += 1
+            self._add_to_history(event)
+            # Get snapshot of handlers under lock
+            handlers = list(self._handlers.get(event.event_type, [])) + list(self._global_handlers)
 
         for handler_name, handler, _ in handlers:
             start_time = time.time()
@@ -348,8 +353,10 @@ class EventBus:
                 if asyncio.iscoroutine(result):
                     await result
                 latency_ms = (time.time() - start_time) * 1000
-                self._metrics["total_latency_ms"] += latency_ms
-                self._metrics["events_processed"] += 1
+                # RACE CONDITION FIX: Update metrics inside lock
+                with self._lock:
+                    self._metrics["total_latency_ms"] += latency_ms
+                    self._metrics["events_processed"] += 1
             except Exception as e:
                 self._handle_error(event, handler_name, e)
 
@@ -361,7 +368,9 @@ class EventBus:
         """
         # Priority queue ordering: (priority, timestamp, event)
         await self._queue.put((event.priority.value, event.timestamp.timestamp(), event))
-        self._metrics["events_published"] += 1
+        # RACE CONDITION FIX: Update metrics inside lock
+        with self._lock:
+            self._metrics["events_published"] += 1
 
     async def _run_async_handler(
         self,
@@ -369,15 +378,20 @@ class EventBus:
         handler: EventHandler,
         event: Event,
     ) -> None:
-        """Run an async handler and handle errors."""
+        """Run an async handler and handle errors.
+
+        RACE CONDITION FIX: Metrics updates are now inside lock.
+        """
         start_time = time.time()
         try:
             result = handler(event)
             if asyncio.iscoroutine(result):
                 await result
             latency_ms = (time.time() - start_time) * 1000
-            self._metrics["total_latency_ms"] += latency_ms
-            self._metrics["events_processed"] += 1
+            # RACE CONDITION FIX: Update metrics inside lock
+            with self._lock:
+                self._metrics["total_latency_ms"] += latency_ms
+                self._metrics["events_processed"] += 1
         except Exception as e:
             self._handle_error(event, handler_name, e)
 
