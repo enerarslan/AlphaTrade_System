@@ -510,6 +510,82 @@ class TestPerformanceAnalyzer:
         assert "Sharpe Ratio" in summary
 
 
+class TestSortinoRatioCalculation:
+    """Tests for correct Sortino ratio downside deviation calculation."""
+
+    @pytest.fixture
+    def analyzer(self) -> PerformanceAnalyzer:
+        """Create a performance analyzer."""
+        return PerformanceAnalyzer(risk_free_rate=0.0)  # 0% for simpler calculation
+
+    def test_sortino_uses_all_samples_for_downside_deviation(self, analyzer):
+        """Test that downside deviation uses ALL samples, not just negative returns.
+
+        The correct formula: sqrt(mean(min(0, return - threshold)^2))
+        NOT: std(negative_returns_only)
+        """
+        # Simple case: 5 returns with 2 negative
+        returns = np.array([0.05, -0.02, 0.03, -0.01, 0.02])
+
+        # Correct downside deviation (threshold = 0):
+        # min(0, 0.05), min(0, -0.02), min(0, 0.03), min(0, -0.01), min(0, 0.02)
+        # = [0, -0.02, 0, -0.01, 0]
+        # squared = [0, 0.0004, 0, 0.0001, 0]
+        # mean = 0.0001
+        # sqrt = 0.01
+
+        # Wrong way (std of only negative returns):
+        # std([-0.02, -0.01]) ≈ 0.005
+
+        metrics = analyzer._calculate_risk_adjusted_metrics(returns)
+
+        # Annualized downside vol should be sqrt(0.0001) * sqrt(252) ≈ 0.159
+        # Using threshold=0 (risk_free_rate=0)
+        expected_downside_std = np.sqrt(0.0001)  # 0.01
+        expected_downside_vol = expected_downside_std * np.sqrt(252)  # ~0.159
+
+        assert metrics.downside_volatility == pytest.approx(expected_downside_vol, rel=0.05)
+
+    def test_sortino_all_positive_returns_gives_zero_downside(self, analyzer):
+        """Test that all positive returns give zero downside deviation."""
+        returns = np.array([0.01, 0.02, 0.03, 0.01, 0.02])
+
+        metrics = analyzer._calculate_risk_adjusted_metrics(returns)
+
+        # With all positive returns and threshold=0, downside deviation should be 0
+        assert metrics.downside_volatility == pytest.approx(0.0, abs=1e-10)
+
+    def test_sortino_all_negative_returns(self, analyzer):
+        """Test Sortino calculation with all negative returns."""
+        returns = np.array([-0.01, -0.02, -0.03, -0.01, -0.02])
+
+        metrics = analyzer._calculate_risk_adjusted_metrics(returns)
+
+        # All returns are below threshold, so downside deviation = sqrt(mean(returns^2))
+        expected_downside_variance = np.mean(returns ** 2)
+        expected_downside_std = np.sqrt(expected_downside_variance)
+        expected_downside_vol = expected_downside_std * np.sqrt(252)
+
+        assert metrics.downside_volatility == pytest.approx(expected_downside_vol, rel=0.01)
+
+    def test_sortino_with_risk_free_rate(self):
+        """Test Sortino uses risk-free rate as threshold."""
+        analyzer = PerformanceAnalyzer(risk_free_rate=0.05)  # 5% annual = 0.0002 daily
+        daily_rf = 0.05 / 252  # ~0.0002
+
+        # Returns that are positive but below daily rf should count as downside
+        returns = np.array([0.0001, 0.0001, 0.0001, 0.0001, 0.0001])  # All below daily rf
+
+        metrics = analyzer._calculate_risk_adjusted_metrics(returns)
+
+        # All returns are below threshold (daily_rf), so all count toward downside
+        downside_returns = returns - daily_rf  # All negative
+        expected_downside_variance = np.mean(downside_returns ** 2)
+        expected_downside_vol = np.sqrt(expected_downside_variance) * np.sqrt(252)
+
+        assert metrics.downside_volatility == pytest.approx(expected_downside_vol, rel=0.01)
+
+
 class TestVisualizationData:
     """Tests for VisualizationData."""
 

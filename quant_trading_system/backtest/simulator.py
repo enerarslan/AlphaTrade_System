@@ -183,13 +183,20 @@ class VolumeBasedSlippageModel(BaseSlippageModel):
     ) -> Decimal:
         """Calculate volume-based slippage.
 
-        Formula: slippage = base + (order_size / avg_volume) × factor
+        Formula: slippage_bps = base + (order_size / avg_volume) × factor
+
+        Example: For volume_factor=10 and 1% of daily volume:
+        slippage_bps = 5 + 0.01 × 10 = 5.1 bps
+
+        BUG FIX: Removed erroneous *10000 multiplier which caused
+        slippage to be 10000x too large (e.g., 1005 bps instead of 5.1 bps).
         """
         if conditions.avg_daily_volume <= 0:
             return conditions.price * Decimal(str(self.base_slippage_bps / 10000))
 
         volume_ratio = float(order.quantity) / conditions.avg_daily_volume
-        slippage_bps = self.base_slippage_bps + volume_ratio * self.volume_factor * 10000
+        # BUG FIX: Removed *10000 multiplier - slippage_bps already in basis points
+        slippage_bps = self.base_slippage_bps + volume_ratio * self.volume_factor
         slippage_bps = min(slippage_bps, self.max_slippage_bps)
 
         return conditions.price * Decimal(str(slippage_bps / 10000))

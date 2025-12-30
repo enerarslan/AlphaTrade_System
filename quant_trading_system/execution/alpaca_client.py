@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -250,8 +250,8 @@ class AlpacaOrder:
             limit_price=Decimal(data["limit_price"]) if data.get("limit_price") else None,
             stop_price=Decimal(data["stop_price"]) if data.get("stop_price") else None,
             status=data["status"],
-            created_at=parse_time(data["created_at"]) or datetime.utcnow(),
-            updated_at=parse_time(data["updated_at"]) or datetime.utcnow(),
+            created_at=parse_time(data["created_at"]) or datetime.now(timezone.utc),
+            updated_at=parse_time(data["updated_at"]) or datetime.now(timezone.utc),
             submitted_at=parse_time(data.get("submitted_at")),
             filled_at=parse_time(data.get("filled_at")),
             expired_at=parse_time(data.get("expired_at")),

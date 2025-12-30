@@ -18,7 +18,7 @@ import logging
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -61,7 +61,7 @@ class SliceOrder:
 
     slice_id: UUID = field(default_factory=uuid4)
     quantity: Decimal = Decimal("0")
-    scheduled_time: datetime = field(default_factory=datetime.utcnow)
+    scheduled_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     executed_time: datetime | None = None
     executed_qty: Decimal = Decimal("0")
     executed_price: Decimal | None = None
@@ -203,7 +203,7 @@ class ExecutionAlgorithm(ABC):
                     logger.warning(f"Failed to cancel slice: {e}")
 
         state.status = AlgoStatus.CANCELLED
-        state.end_time = datetime.utcnow()
+        state.end_time = datetime.now(timezone.utc)
         return state
 
     async def _submit_slice(
@@ -260,8 +260,8 @@ class ExecutionAlgorithm(ABC):
         Returns:
             True if filled, False otherwise.
         """
-        start = datetime.utcnow()
-        while (datetime.utcnow() - start).total_seconds() < timeout_seconds:
+        start = datetime.now(timezone.utc)
+        while (datetime.now(timezone.utc) - start).total_seconds() < timeout_seconds:
             # Refresh order state
             current = self.order_manager.get_order(managed.order.order_id)
             if current and current.is_terminal:
@@ -279,7 +279,7 @@ class ExecutionAlgorithm(ABC):
         if managed and managed.order.filled_qty > 0:
             slice_order.executed_qty = managed.order.filled_qty
             slice_order.executed_price = managed.order.filled_avg_price
-            slice_order.executed_time = datetime.utcnow()
+            slice_order.executed_time = datetime.now(timezone.utc)
             slice_order.status = "filled"
 
             state.filled_quantity += managed.order.filled_qty
@@ -344,7 +344,7 @@ class TWAPAlgorithm(ExecutionAlgorithm):
         remainder = total_quantity % num_slices
 
         slices = []
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
 
         for i in range(num_slices):
             # Distribute remainder across first few slices
@@ -384,7 +384,7 @@ class TWAPAlgorithm(ExecutionAlgorithm):
         """
         self._running = True
         state.status = AlgoStatus.RUNNING
-        state.start_time = datetime.utcnow()
+        state.start_time = datetime.now(timezone.utc)
 
         # Get benchmark price
         try:
@@ -405,7 +405,7 @@ class TWAPAlgorithm(ExecutionAlgorithm):
                     break
 
                 # Wait until scheduled time
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 if slice_order.scheduled_time > now:
                     wait_time = (slice_order.scheduled_time - now).total_seconds()
                     await asyncio.sleep(wait_time)
@@ -442,7 +442,7 @@ class TWAPAlgorithm(ExecutionAlgorithm):
             state.status = AlgoStatus.FAILED
             state.error_message = str(e)
 
-        state.end_time = datetime.utcnow()
+        state.end_time = datetime.now(timezone.utc)
         self._running = False
 
         # Calculate metrics
@@ -548,7 +548,7 @@ class VWAPAlgorithm(ExecutionAlgorithm):
             profile_normalized = [w / total_weight for w in profile_normalized]
 
         slices = []
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
 
         for i, weight in enumerate(profile_normalized):
             qty = Decimal(str(float(total_quantity) * weight)).quantize(Decimal("1"))
@@ -578,7 +578,7 @@ class VWAPAlgorithm(ExecutionAlgorithm):
         """
         self._running = True
         state.status = AlgoStatus.RUNNING
-        state.start_time = datetime.utcnow()
+        state.start_time = datetime.now(timezone.utc)
 
         # Get benchmark price
         try:
@@ -599,7 +599,7 @@ class VWAPAlgorithm(ExecutionAlgorithm):
                     break
 
                 # Wait until scheduled time
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 if slice_order.scheduled_time > now:
                     wait_time = (slice_order.scheduled_time - now).total_seconds()
                     await asyncio.sleep(wait_time)
@@ -652,7 +652,7 @@ class VWAPAlgorithm(ExecutionAlgorithm):
             state.status = AlgoStatus.FAILED
             state.error_message = str(e)
 
-        state.end_time = datetime.utcnow()
+        state.end_time = datetime.now(timezone.utc)
         self._running = False
 
         # Calculate metrics
@@ -749,7 +749,7 @@ class ImplementationShortfallAlgorithm(ExecutionAlgorithm):
         tau = duration_minutes / (6.5 * 60)  # Fraction of trading day
 
         slices = []
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         remaining = float(total_quantity)
 
         for i in range(num_intervals):
@@ -800,7 +800,7 @@ class ImplementationShortfallAlgorithm(ExecutionAlgorithm):
         """
         self._running = True
         state.status = AlgoStatus.RUNNING
-        state.start_time = datetime.utcnow()
+        state.start_time = datetime.now(timezone.utc)
 
         # Get benchmark price (decision price for IS)
         try:
@@ -821,7 +821,7 @@ class ImplementationShortfallAlgorithm(ExecutionAlgorithm):
                     break
 
                 # Wait until scheduled time
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 if slice_order.scheduled_time > now:
                     wait_time = (slice_order.scheduled_time - now).total_seconds()
                     await asyncio.sleep(wait_time)
@@ -859,7 +859,7 @@ class ImplementationShortfallAlgorithm(ExecutionAlgorithm):
             state.status = AlgoStatus.FAILED
             state.error_message = str(e)
 
-        state.end_time = datetime.utcnow()
+        state.end_time = datetime.now(timezone.utc)
         self._running = False
 
         # Calculate IS metrics
@@ -923,6 +923,9 @@ class AlgoExecutionEngine:
         self._executions: dict[UUID, AlgoExecutionState] = {}
         self._tasks: dict[UUID, asyncio.Task] = {}
 
+        # Thread safety - protect shared state from race conditions
+        self._lock = asyncio.Lock()
+
     async def start_execution(
         self,
         symbol: str,
@@ -976,7 +979,9 @@ class AlgoExecutionEngine:
             },
         )
 
-        self._executions[state.algo_id] = state
+        # Track with lock protection
+        async with self._lock:
+            self._executions[state.algo_id] = state
 
         # Start execution in background
         async def run_algo():
@@ -986,7 +991,8 @@ class AlgoExecutionEngine:
             return result
 
         task = asyncio.create_task(run_algo())
-        self._tasks[state.algo_id] = task
+        async with self._lock:
+            self._tasks[state.algo_id] = task
 
         logger.info(
             f"Started {algo_type.value} execution {state.algo_id}: "

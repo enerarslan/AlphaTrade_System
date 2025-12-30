@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
 
@@ -82,36 +82,104 @@ class FeatureMetadata:
 
 @dataclass
 class FeatureSet:
-    """Container for computed features with metadata."""
+    """Container for computed features with metadata.
+
+    IMPORTANT: Features and targets are kept SEPARATE to prevent look-ahead bias.
+    - `features`: Point-in-time features that use only past/current data
+    - `targets`: Forward-looking labels that use FUTURE data (for training only!)
+
+    WARNING: Never use `targets` as model inputs during training or inference.
+    Targets contain future information and are ONLY for use as training labels.
+    """
 
     features: dict[str, np.ndarray]
     metadata: dict[str, FeatureMetadata]
     config: FeatureConfig
     version: str
     symbol: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=datetime.now(timezone.utc))
+    # CRITICAL: Targets are kept SEPARATE to prevent look-ahead bias
+    # These contain FUTURE information and must NEVER be used as model inputs
+    targets: dict[str, np.ndarray] = field(default_factory=dict)
+    target_metadata: dict[str, FeatureMetadata] = field(default_factory=dict)
 
     def to_numpy(self, feature_names: list[str] | None = None) -> np.ndarray:
-        """Convert features to numpy array."""
+        """Convert features to numpy array.
+
+        NOTE: This only returns features, NOT targets. Use get_targets_numpy() for targets.
+        """
         if feature_names is None:
             feature_names = list(self.features.keys())
+        # SAFETY CHECK: Ensure no targets are accidentally included
+        for name in feature_names:
+            if name.startswith("target_"):
+                raise ValueError(
+                    f"LOOK-AHEAD BIAS DETECTED: '{name}' is a target variable containing "
+                    f"future information. Do not include targets in feature matrix. "
+                    f"Use get_targets_numpy() instead for training labels."
+                )
         return np.column_stack([self.features[name] for name in feature_names])
 
     def to_polars(self, feature_names: list[str] | None = None) -> pl.DataFrame:
-        """Convert features to polars DataFrame."""
+        """Convert features to polars DataFrame.
+
+        NOTE: This only returns features, NOT targets. Use get_targets_polars() for targets.
+        """
         if feature_names is None:
             feature_names = list(self.features.keys())
+        # SAFETY CHECK: Ensure no targets are accidentally included
+        for name in feature_names:
+            if name.startswith("target_"):
+                raise ValueError(
+                    f"LOOK-AHEAD BIAS DETECTED: '{name}' is a target variable containing "
+                    f"future information. Do not include targets in feature matrix. "
+                    f"Use get_targets_polars() instead for training labels."
+                )
         return pl.DataFrame({name: self.features[name] for name in feature_names})
+
+    def get_targets_numpy(self, target_names: list[str] | None = None) -> np.ndarray:
+        """Get target variables as numpy array (for training labels ONLY).
+
+        WARNING: Targets contain FUTURE information. Only use as training labels,
+        never as model inputs.
+        """
+        if target_names is None:
+            target_names = list(self.targets.keys())
+        if not target_names:
+            return np.array([])
+        return np.column_stack([self.targets[name] for name in target_names])
+
+    def get_targets_polars(self, target_names: list[str] | None = None) -> pl.DataFrame:
+        """Get target variables as polars DataFrame (for training labels ONLY).
+
+        WARNING: Targets contain FUTURE information. Only use as training labels,
+        never as model inputs.
+        """
+        if target_names is None:
+            target_names = list(self.targets.keys())
+        if not target_names:
+            return pl.DataFrame()
+        return pl.DataFrame({name: self.targets[name] for name in target_names})
 
     @property
     def feature_names(self) -> list[str]:
-        """Get list of feature names."""
+        """Get list of feature names (excludes targets)."""
         return list(self.features.keys())
 
     @property
+    def target_names(self) -> list[str]:
+        """Get list of target names."""
+        return list(self.targets.keys())
+
+    @property
     def num_features(self) -> int:
-        """Get number of features."""
+        """Get number of features (excludes targets)."""
         return len(self.features)
+
+    @property
+    def num_targets(self) -> int:
+        """Get number of target variables."""
+        return len(self.targets)
 
 
 class FeaturePipeline:
@@ -184,16 +252,7 @@ class FeaturePipeline:
                 all_features[name] = values
                 all_metadata[name] = metadata
 
-        # Add target variables if configured
-        if self.config.include_targets:
-            targets = self._compute_targets(df)
-            for name, values in targets.items():
-                all_features[name] = values
-                all_metadata[name] = self._compute_metadata(
-                    name, values, FeatureGroup.TECHNICAL
-                )
-
-        # Feature selection
+        # Feature selection (applied ONLY to features, NOT targets)
         if self.config.variance_threshold > 0:
             all_features, all_metadata = self._filter_by_variance(
                 all_features, all_metadata
@@ -204,7 +263,23 @@ class FeaturePipeline:
                 all_features, all_metadata
             )
 
-        # Generate version hash
+        # Compute target variables SEPARATELY (CRITICAL: prevents look-ahead bias)
+        # Targets contain FUTURE information and must NEVER be mixed with features
+        target_features: dict[str, np.ndarray] = {}
+        target_metadata: dict[str, FeatureMetadata] = {}
+
+        if self.config.include_targets:
+            targets = self._compute_targets(df)
+            for name, values in targets.items():
+                # Store targets in separate dict, NOT in all_features
+                target_features[name] = values
+                target_metadata[name] = self._compute_metadata(
+                    name, values, FeatureGroup.TECHNICAL
+                )
+            # NOTE: Targets are NOT filtered by variance/correlation
+            # (they contain future info and filtering them would be inappropriate)
+
+        # Generate version hash (based on features only, not targets)
         version = self._generate_version(all_features)
 
         return FeatureSet(
@@ -213,6 +288,8 @@ class FeaturePipeline:
             config=self.config,
             version=version,
             symbol=symbol,
+            targets=target_features,  # SEPARATE from features to prevent look-ahead bias
+            target_metadata=target_metadata,
         )
 
     def _get_groups_to_compute(self) -> list[FeatureGroup]:
@@ -343,7 +420,7 @@ class FeaturePipeline:
         return FeatureMetadata(
             name=name,
             group=group,
-            computed_at=datetime.utcnow(),
+            computed_at=datetime.now(timezone.utc)(),
             num_samples=len(values),
             nan_ratio=np.sum(np.isnan(values)) / len(values) if len(values) > 0 else 1.0,
             mean=float(np.mean(valid_values)) if len(valid_values) > 0 else 0.0,
@@ -353,7 +430,26 @@ class FeaturePipeline:
         )
 
     def _compute_targets(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
-        """Compute target variables for model training."""
+        """Compute target variables for model training.
+
+        CRITICAL WARNING - LOOK-AHEAD BIAS:
+        =====================================
+        These target variables use FUTURE price information!
+        They are computed using prices at time T+horizon to create labels for time T.
+
+        CORRECT USAGE:
+        - Use ONLY as training labels (y_train)
+        - NEVER include in feature matrix (X_train)
+        - NEVER use during live inference
+
+        INCORRECT USAGE (causes look-ahead bias):
+        - Including targets in feature matrix
+        - Using targets as model inputs
+        - Not properly masking the last `horizon` rows (which are NaN)
+
+        The last `horizon` rows of each target will be NaN because
+        we cannot know future returns for those rows.
+        """
         if "close" not in df.columns:
             return {}
 

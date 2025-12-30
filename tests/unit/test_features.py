@@ -606,3 +606,221 @@ class TestFeaturePipeline:
 
         # Should remove highly correlated features
         assert len(selected) <= len(features)
+
+
+class TestLookAheadBiasPrevention:
+    """Tests for look-ahead bias prevention in feature pipeline.
+
+    Bug Fix Tests: Targets (which contain future data) must be kept
+    SEPARATE from features to prevent data leakage during model training.
+    """
+
+    def test_targets_separate_from_features(self, sample_ohlcv_df):
+        """Test that targets are stored separately from features.
+
+        Bug Fix Test: Previously, targets were mixed into features dict,
+        potentially causing look-ahead bias.
+        """
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL],
+            include_targets=True,
+            target_horizons=[1, 5],
+        )
+
+        pipeline = FeaturePipeline(config)
+        result = pipeline.compute(sample_ohlcv_df)
+
+        # Targets should be in separate dict
+        assert hasattr(result, 'targets')
+        assert hasattr(result, 'target_metadata')
+
+        # Targets should NOT be in features dict
+        for name in result.features.keys():
+            assert not name.startswith("target_"), \
+                f"Target '{name}' found in features dict - LOOK-AHEAD BIAS!"
+
+        # Targets should be in targets dict
+        assert len(result.targets) > 0
+        for name in result.targets.keys():
+            assert name.startswith("target_"), \
+                f"Non-target '{name}' found in targets dict"
+
+    def test_to_numpy_rejects_targets(self, sample_ohlcv_df):
+        """Test that to_numpy() raises error if targets are requested.
+
+        Bug Fix Test: Prevents accidental inclusion of future data in feature matrix.
+        """
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL],
+            include_targets=True,
+            target_horizons=[1],
+        )
+
+        pipeline = FeaturePipeline(config)
+        result = pipeline.compute(sample_ohlcv_df)
+
+        # to_numpy() without args should work
+        feature_matrix = result.to_numpy()
+        assert feature_matrix is not None
+
+        # to_numpy() with target name should raise ValueError
+        with pytest.raises(ValueError, match="LOOK-AHEAD BIAS"):
+            result.to_numpy(feature_names=["target_return_1"])
+
+    def test_to_polars_rejects_targets(self, sample_ohlcv_df):
+        """Test that to_polars() raises error if targets are requested.
+
+        Bug Fix Test: Prevents accidental inclusion of future data in feature DataFrame.
+        """
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL],
+            include_targets=True,
+            target_horizons=[1],
+        )
+
+        pipeline = FeaturePipeline(config)
+        result = pipeline.compute(sample_ohlcv_df)
+
+        # to_polars() without args should work
+        feature_df = result.to_polars()
+        assert feature_df is not None
+
+        # to_polars() with target name should raise ValueError
+        with pytest.raises(ValueError, match="LOOK-AHEAD BIAS"):
+            result.to_polars(feature_names=["target_direction_1"])
+
+    def test_get_targets_numpy_works(self, sample_ohlcv_df):
+        """Test that get_targets_numpy() returns targets correctly."""
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL],
+            include_targets=True,
+            target_horizons=[1, 5],
+        )
+
+        pipeline = FeaturePipeline(config)
+        result = pipeline.compute(sample_ohlcv_df)
+
+        # get_targets_numpy() should work
+        targets_matrix = result.get_targets_numpy()
+        assert targets_matrix is not None
+        assert len(targets_matrix) > 0
+
+    def test_feature_set_properties(self, sample_ohlcv_df):
+        """Test FeatureSet properties for targets."""
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL],
+            include_targets=True,
+            target_horizons=[1, 5],
+        )
+
+        pipeline = FeaturePipeline(config)
+        result = pipeline.compute(sample_ohlcv_df)
+
+        # Check new properties
+        assert result.num_features > 0
+        assert result.num_targets > 0
+        assert len(result.feature_names) == result.num_features
+        assert len(result.target_names) == result.num_targets
+
+        # feature_names should not contain targets
+        for name in result.feature_names:
+            assert not name.startswith("target_")
+
+        # target_names should all be targets
+        for name in result.target_names:
+            assert name.startswith("target_")
+
+    def test_targets_not_filtered(self, sample_ohlcv_df):
+        """Test that targets are not affected by variance/correlation filtering.
+
+        Bug Fix Test: Targets should not go through feature filtering as
+        this could incorrectly remove valid training labels.
+        """
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL],
+            include_targets=True,
+            target_horizons=[1, 5, 10],
+            variance_threshold=0.01,  # Would filter low-variance features
+            correlation_threshold=0.90,  # Would filter highly correlated features
+        )
+
+        pipeline = FeaturePipeline(config)
+        result = pipeline.compute(sample_ohlcv_df)
+
+        # All configured targets should be present (not filtered)
+        expected_targets = [
+            "target_return_1", "target_direction_1",
+            "target_return_5", "target_direction_5",
+            "target_return_10", "target_direction_10",
+        ]
+
+        for expected in expected_targets:
+            assert expected in result.targets, \
+                f"Target '{expected}' was incorrectly filtered out"
+
+    def test_targets_contain_nans_at_end(self, sample_ohlcv_df):
+        """Test that targets have NaN values at the end (no future data available).
+
+        This verifies the targets are correctly computed - the last 'horizon'
+        rows should be NaN because we cannot compute forward returns for them.
+        """
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL],
+            include_targets=True,
+            target_horizons=[5],
+        )
+
+        pipeline = FeaturePipeline(config)
+        result = pipeline.compute(sample_ohlcv_df)
+
+        target_5 = result.targets["target_return_5"]
+
+        # Last 5 values should be NaN (horizon=5)
+        assert np.all(np.isnan(target_5[-5:])), \
+            "Last 5 values of target_return_5 should be NaN"
+
+        # Some earlier values should be valid
+        valid_values = target_5[~np.isnan(target_5)]
+        assert len(valid_values) > 0, "Should have some valid target values"

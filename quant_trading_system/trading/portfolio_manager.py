@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -102,7 +102,7 @@ class TargetPosition:
 class TargetPortfolio:
     """Target portfolio state."""
 
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     target_positions: dict[str, TargetPosition] = field(default_factory=dict)
     target_cash_pct: float = 0.0
     total_equity: Decimal = Decimal("0")
@@ -675,9 +675,10 @@ class PortfolioOptimizer:
         symbols: list[str],
         target_return: float | None = None,
     ) -> dict[str, float]:
-        """Optimize portfolio weights.
+        """Optimize portfolio weights using mean-variance optimization.
 
-        Uses mean-variance optimization to find optimal weights.
+        Uses scipy to find optimal weights that maximize Sharpe ratio
+        (or minimize variance for a target return).
 
         Args:
             expected_returns: Expected returns by symbol.
@@ -694,14 +695,64 @@ class PortfolioOptimizer:
 
         returns = np.array([expected_returns.get(s, 0.0) for s in symbols])
 
-        # Simple equal weight as baseline
+        # Check if scipy is available for optimization
+        try:
+            from scipy.optimize import minimize
+
+            # Objective: Negative Sharpe ratio (we minimize, so negate to maximize)
+            def neg_sharpe(w: np.ndarray) -> float:
+                port_return = np.dot(w, returns)
+                port_var = np.dot(w.T, np.dot(covariance_matrix, w))
+                port_std = np.sqrt(port_var) if port_var > 0 else 1e-10
+                sharpe = (port_return - self.risk_free_rate) / port_std
+                return -sharpe
+
+            # Constraints: weights sum to 1
+            constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
+            # Add target return constraint if specified
+            if target_return is not None:
+                constraints.append({
+                    "type": "eq",
+                    "fun": lambda w: np.dot(w, returns) - target_return
+                })
+
+            # Bounds: each weight between min and max
+            bounds = [(self.min_weight, self.max_weight) for _ in range(n)]
+
+            # Initial guess: equal weights
+            w0 = np.ones(n) / n
+
+            # Optimize
+            result = minimize(
+                neg_sharpe,
+                w0,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={"maxiter": 1000, "ftol": 1e-10},
+            )
+
+            if result.success:
+                weights = result.x
+                # Ensure non-negative and normalized
+                weights = np.clip(weights, 0, self.max_weight)
+                weights = weights / weights.sum() if weights.sum() > 0 else w0
+                return {symbols[i]: float(weights[i]) for i in range(n)}
+            else:
+                logger.warning(f"Optimization failed: {result.message}, using equal weights")
+
+        except ImportError:
+            logger.warning("scipy not available, using equal-weight fallback")
+        except Exception as e:
+            logger.warning(f"Optimization error: {e}, using equal weights")
+
+        # Fallback: equal weights
         weights = np.ones(n) / n
-
-        # Constrain weights
         weights = np.clip(weights, self.min_weight, self.max_weight)
-        weights = weights / weights.sum()  # Renormalize
+        weights = weights / weights.sum()
 
-        return {symbols[i]: weights[i] for i in range(n)}
+        return {symbols[i]: float(weights[i]) for i in range(n)}
 
     def calculate_portfolio_stats(
         self,

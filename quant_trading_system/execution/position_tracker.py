@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -76,7 +76,7 @@ class CashState:
     buying_power: Decimal = Decimal("0")
     margin_used: Decimal = Decimal("0")
     margin_available: Decimal = Decimal("0")
-    last_updated: datetime = field(default_factory=datetime.utcnow)
+    last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -106,7 +106,7 @@ class PositionState:
     position: Position
     strategy_id: str | None = None
     model_id: str | None = None
-    entry_time: datetime = field(default_factory=datetime.utcnow)
+    entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     trade_count: int = 0
     total_commission: Decimal = Decimal("0")
     high_water_mark: Decimal = Decimal("0")  # Best unrealized P&L
@@ -118,7 +118,7 @@ class PositionState:
 class ReconciliationResult:
     """Result of position reconciliation."""
 
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     matches: int = 0
     discrepancies: list[dict[str, Any]] = field(default_factory=list)
     missing_internal: list[str] = field(default_factory=list)
@@ -171,6 +171,9 @@ class PositionTracker:
         self._trades: list[TradeRecord] = []
         self._pnl_records: list[PnLRecord] = []
 
+        # Thread safety - protect shared state from race conditions
+        self._lock = asyncio.Lock()
+
         # Callbacks
         self._position_callbacks: list[Callable[[str, Position], None]] = []
 
@@ -213,15 +216,16 @@ class PositionTracker:
                 buying_power=account.buying_power,
                 margin_used=account.initial_margin,
                 margin_available=account.buying_power,
-                last_updated=datetime.utcnow(),
+                last_updated=datetime.now(timezone.utc),
             )
 
-            # Get positions
+            # Get positions with lock protection
             broker_positions = await self.client.get_positions()
-            for bp in broker_positions:
-                self._positions[bp.symbol] = PositionState(
-                    position=bp.to_position(),
-                )
+            async with self._lock:
+                for bp in broker_positions:
+                    self._positions[bp.symbol] = PositionState(
+                        position=bp.to_position(),
+                    )
 
             logger.info(f"Synced with broker: {len(self._positions)} positions, ${self._cash.total_cash} cash")
 
@@ -362,7 +366,7 @@ class PositionTracker:
         # Update state
         state.trade_count += 1
         state.total_commission += commission
-        state.last_trade = datetime.utcnow()
+        state.last_trade = datetime.now(timezone.utc)
 
         # Track water marks
         if position.unrealized_pnl > state.high_water_mark:
@@ -379,10 +383,10 @@ class PositionTracker:
             side=order.side,
             quantity=fill_qty,
             price=fill_price,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             order_id=order.order_id,
             commission=commission,
-            settlement_date=datetime.utcnow() + timedelta(days=self.settlement_days),
+            settlement_date=datetime.now(timezone.utc) + timedelta(days=self.settlement_days),
             strategy_id=strategy_id,
             model_id=model_id,
         )

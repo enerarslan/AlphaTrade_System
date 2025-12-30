@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -125,7 +125,9 @@ class EngineMetrics:
     orders_filled: int = 0
     orders_rejected: int = 0
     total_pnl: Decimal = Decimal("0")
-    max_drawdown: float = 0.0
+    max_drawdown: float = 0.0  # Peak-to-trough drawdown (updated continuously)
+    current_drawdown: float = 0.0  # Current drawdown from peak
+    peak_equity: Decimal = Decimal("0")  # Highest equity level observed
     avg_latency_ms: float = 0.0
     errors_count: int = 0
     last_heartbeat: datetime | None = None
@@ -218,7 +220,7 @@ class TradingEngine:
 
         logger.info(f"Starting trading engine in {self.config.mode.value} mode")
         self._state = EngineState.STARTING
-        self._start_time = datetime.utcnow()
+        self._start_time = datetime.now(timezone.utc)
 
         try:
             # Connect to broker
@@ -230,14 +232,20 @@ class TradingEngine:
 
             # Initialize session
             self._session = TradingSession(
-                session_id=f"SESSION-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}",
-                date=datetime.utcnow().date(),
+                session_id=f"SESSION-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+                date=datetime.now(timezone.utc).date(),
             )
 
             # Get initial portfolio state
             portfolio = self.position_tracker.get_portfolio()
             self._session.start_equity = portfolio.equity
             self._session.current_equity = portfolio.equity
+
+            # Initialize drawdown tracking with starting equity as peak
+            self._metrics.peak_equity = portfolio.equity
+            self._metrics.current_drawdown = 0.0
+            self._metrics.max_drawdown = 0.0
+            logger.info(f"Initialized drawdown tracking with peak equity: ${portfolio.equity:.2f}")
 
             # Start background tasks
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -285,7 +293,7 @@ class TradingEngine:
 
         # Finalize session
         if self._session:
-            self._session.end_time = datetime.utcnow()
+            self._session.end_time = datetime.now(timezone.utc)
             self._session.state = EngineState.STOPPED
 
         self._state = EngineState.STOPPED
@@ -322,14 +330,14 @@ class TradingEngine:
         self._publish_event(
             EventType.KILL_SWITCH_TRIGGERED,
             reason,
-            details={"timestamp": datetime.utcnow().isoformat()},
+            details={"timestamp": datetime.now(timezone.utc).isoformat()},
         )
 
     async def _main_loop(self) -> None:
         """Main trading loop."""
         while self._state not in (EngineState.STOPPED, EngineState.SHUTTING_DOWN):
             try:
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 current_time = now.time()
 
                 # Determine market state
@@ -371,7 +379,7 @@ class TradingEngine:
         self._state = EngineState.PRE_MARKET
         if self._session:
             self._session.state = EngineState.PRE_MARKET
-            self._session.start_time = datetime.utcnow()
+            self._session.start_time = datetime.now(timezone.utc)
 
     async def _pre_market_tasks(self) -> None:
         """Execute pre-market tasks."""
@@ -405,7 +413,7 @@ class TradingEngine:
 
     async def _market_hours_iteration(self) -> None:
         """Single iteration of market hours trading loop."""
-        iteration_start = datetime.utcnow()
+        iteration_start = datetime.now(timezone.utc)
 
         try:
             # 1. Get latest market data
@@ -459,7 +467,7 @@ class TradingEngine:
             self._metrics.bars_processed += len(self._latest_bars)
 
             # Calculate latency
-            latency_ms = (datetime.utcnow() - iteration_start).total_seconds() * 1000
+            latency_ms = (datetime.now(timezone.utc) - iteration_start).total_seconds() * 1000
             self._update_avg_latency(latency_ms)
 
         except Exception as e:
@@ -622,6 +630,10 @@ class TradingEngine:
                 self._session.daily_pnl / self._session.start_equity
             )
 
+        # UPDATE DRAWDOWN METRICS (Critical fix: max_drawdown was never calculated before)
+        # This must be called BEFORE checking drawdown limit
+        self._update_drawdown(portfolio.equity)
+
         # Check daily loss limit
         if self._session.daily_pnl_pct < -self.config.max_daily_loss_pct:
             self.trigger_kill_switch(
@@ -629,10 +641,11 @@ class TradingEngine:
             )
             return False
 
-        # Check drawdown limit
+        # Check drawdown limit (now actually works since max_drawdown is calculated)
         if self._metrics.max_drawdown > self.config.kill_switch_drawdown:
             self.trigger_kill_switch(
-                f"Max drawdown exceeded: {self._metrics.max_drawdown:.2%}"
+                f"Max drawdown exceeded: {self._metrics.max_drawdown:.2%} "
+                f"(threshold: {self.config.kill_switch_drawdown:.2%})"
             )
             return False
 
@@ -648,7 +661,7 @@ class TradingEngine:
         }
         interval_seconds = interval_map.get(self.config.bar_interval, 60)
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         seconds_into_interval = now.timestamp() % interval_seconds
         wait_time = interval_seconds - seconds_into_interval
 
@@ -660,10 +673,10 @@ class TradingEngine:
             try:
                 await asyncio.sleep(self.config.heartbeat_interval)
 
-                self._metrics.last_heartbeat = datetime.utcnow()
+                self._metrics.last_heartbeat = datetime.now(timezone.utc)
                 if self._start_time:
                     self._metrics.uptime_seconds = (
-                        datetime.utcnow() - self._start_time
+                        datetime.now(timezone.utc) - self._start_time
                     ).total_seconds()
 
                 self._publish_event(EventType.HEARTBEAT, "Engine heartbeat")
@@ -699,7 +712,7 @@ class TradingEngine:
                 "signals_generated": self._metrics.signals_generated,
                 "orders_submitted": self._metrics.orders_submitted,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         # In production, would persist to file/database
         logger.debug(f"State saved: {state}")
@@ -778,6 +791,42 @@ class TradingEngine:
                 alpha * latency_ms + (1 - alpha) * self._metrics.avg_latency_ms
             )
 
+    def _update_drawdown(self, current_equity: Decimal) -> None:
+        """Update drawdown metrics based on current equity.
+
+        Calculates:
+        - peak_equity: Highest equity observed during session
+        - current_drawdown: Current drawdown from peak (as decimal, e.g., 0.05 = 5%)
+        - max_drawdown: Maximum drawdown observed during session
+
+        Args:
+            current_equity: Current portfolio equity value.
+        """
+        if current_equity <= 0:
+            # Avoid division by zero or negative equity edge cases
+            logger.warning(f"Invalid equity value for drawdown calculation: {current_equity}")
+            return
+
+        # Update peak equity if current equity is higher
+        if current_equity > self._metrics.peak_equity:
+            self._metrics.peak_equity = current_equity
+
+        # Calculate current drawdown from peak
+        # Drawdown = (Peak - Current) / Peak
+        if self._metrics.peak_equity > 0:
+            drawdown = float(
+                (self._metrics.peak_equity - current_equity) / self._metrics.peak_equity
+            )
+            self._metrics.current_drawdown = max(0.0, drawdown)  # Ensure non-negative
+
+            # Update max drawdown if current is higher
+            if self._metrics.current_drawdown > self._metrics.max_drawdown:
+                self._metrics.max_drawdown = self._metrics.current_drawdown
+                logger.info(
+                    f"New max drawdown: {self._metrics.max_drawdown:.2%} "
+                    f"(Peak: ${self._metrics.peak_equity:.2f}, Current: ${current_equity:.2f})"
+                )
+
     def _publish_event(
         self,
         event_type: EventType,
@@ -827,6 +876,9 @@ class TradingEngine:
                 "orders_rejected": self._metrics.orders_rejected,
                 "avg_latency_ms": self._metrics.avg_latency_ms,
                 "errors_count": self._metrics.errors_count,
+                "max_drawdown": self._metrics.max_drawdown,
+                "current_drawdown": self._metrics.current_drawdown,
+                "peak_equity": str(self._metrics.peak_equity),
             },
             "components": {
                 "order_manager": self.order_manager.get_statistics(),

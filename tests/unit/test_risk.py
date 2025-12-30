@@ -149,6 +149,76 @@ class TestFixedFractionalSizer:
                 entry_price=Decimal("0"),
             )
 
+    def test_long_stop_loss_below_entry(self, sizer, portfolio):
+        """Test LONG position stop loss is BELOW entry price."""
+        signal = TradeSignal(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            strength=0.8,
+            confidence=0.7,
+            horizon=5,
+            model_source="test_model",
+        )
+
+        result = sizer.calculate_size(
+            signal=signal,
+            portfolio=portfolio,
+            entry_price=Decimal("100"),
+            stop_loss_price=None,  # Let sizer calculate default stop
+        )
+
+        # For LONG: stop should be below entry (100 * (1 - 0.02) = 98)
+        assert result.stop_loss_price < result.entry_price
+        assert result.stop_loss_price == Decimal("98")
+
+    def test_short_stop_loss_above_entry(self, sizer, portfolio):
+        """Test SHORT position stop loss is ABOVE entry price.
+
+        BUG FIX: Previously, stop loss was always calculated as entry * (1 - stop_pct),
+        which is wrong for SHORT positions. For SHORT, stop should be ABOVE entry.
+        """
+        signal = TradeSignal(
+            symbol="AAPL",
+            direction=Direction.SHORT,
+            strength=0.8,
+            confidence=0.7,
+            horizon=5,
+            model_source="test_model",
+        )
+
+        result = sizer.calculate_size(
+            signal=signal,
+            portfolio=portfolio,
+            entry_price=Decimal("100"),
+            stop_loss_price=None,  # Let sizer calculate default stop
+        )
+
+        # For SHORT: stop should be above entry (100 * (1 + 0.02) = 102)
+        assert result.stop_loss_price > result.entry_price
+        assert result.stop_loss_price == Decimal("102")
+
+    def test_explicit_stop_loss_not_recalculated(self, sizer, portfolio):
+        """Test that explicitly provided stop loss is used as-is."""
+        signal = TradeSignal(
+            symbol="AAPL",
+            direction=Direction.SHORT,
+            strength=0.8,
+            confidence=0.7,
+            horizon=5,
+            model_source="test_model",
+        )
+
+        explicit_stop = Decimal("105")
+        result = sizer.calculate_size(
+            signal=signal,
+            portfolio=portfolio,
+            entry_price=Decimal("100"),
+            stop_loss_price=explicit_stop,  # Explicitly provided
+        )
+
+        # When stop is explicitly provided, it should be used as-is
+        assert result.stop_loss_price == explicit_stop
+
 
 class TestKellyCriterionSizer:
     """Tests for KellyCriterionSizer."""

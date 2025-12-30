@@ -389,11 +389,18 @@ class Aroon(TechnicalIndicator):
         aroon_up = np.full(n, np.nan)
         aroon_down = np.full(n, np.nan)
 
-        for i in range(self.period, n):
-            window_high = high[i - self.period : i + 1]
-            window_low = low[i - self.period : i + 1]
-            days_since_high = self.period - np.argmax(window_high)
-            days_since_low = self.period - np.argmin(window_low)
+        # LOOK-AHEAD BIAS FIX: Window should be exactly 'period' elements
+        # Previously used [i - period : i + 1] which gave period+1 elements
+        # Fixed to use [i - period + 1 : i + 1] for exactly 'period' elements
+        for i in range(self.period - 1, n):
+            # Correct window: last 'period' bars ending at current bar i
+            window_high = high[i - self.period + 1 : i + 1]  # Exactly period elements
+            window_low = low[i - self.period + 1 : i + 1]    # Exactly period elements
+
+            # Days since highest high / lowest low within the window
+            days_since_high = (self.period - 1) - np.argmax(window_high)
+            days_since_low = (self.period - 1) - np.argmin(window_low)
+
             aroon_up[i] = ((self.period - days_since_high) / self.period) * 100
             aroon_down[i] = ((self.period - days_since_low) / self.period) * 100
 

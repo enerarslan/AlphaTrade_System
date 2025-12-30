@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel, Field
 
-from quant_trading_system.core.data_types import Portfolio, Position, TradeSignal
+from quant_trading_system.core.data_types import Direction, Portfolio, Position, TradeSignal
 from quant_trading_system.core.exceptions import RiskError
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class PositionSizeResult:
     stop_loss_price: Decimal | None = None
     confidence: float = 1.0
     metadata: dict[str, Any] = field(default_factory=dict)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def was_constrained(self) -> bool:
@@ -232,7 +232,13 @@ class FixedFractionalSizer(BasePositionSizer):
             stop_pct = float(stop_distance / entry_price)
         else:
             stop_pct = self.default_stop_pct
-            stop_loss_price = entry_price * Decimal(str(1 - stop_pct))
+            # BUG FIX: Stop loss direction depends on position direction
+            # LONG: stop is BELOW entry (1 - stop_pct)
+            # SHORT: stop is ABOVE entry (1 + stop_pct)
+            if signal.direction == Direction.SHORT:
+                stop_loss_price = entry_price * Decimal(str(1 + stop_pct))
+            else:
+                stop_loss_price = entry_price * Decimal(str(1 - stop_pct))
 
         # Calculate risk amount
         risk_amount = portfolio.equity * Decimal(str(self.risk_fraction))

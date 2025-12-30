@@ -1041,3 +1041,153 @@ class TestTradingEngine:
         result = engine._check_risk_limits()
         assert result is False
         assert engine._session.kill_switch_triggered is True
+
+    def test_update_drawdown_tracks_peak_equity(self):
+        """Test that _update_drawdown correctly tracks peak equity.
+
+        Bug Fix Test: max_drawdown was never calculated before this fix.
+        """
+        engine = self.create_mock_engine()
+
+        # Initialize metrics with starting equity
+        engine._metrics.peak_equity = Decimal("100000")
+        engine._metrics.max_drawdown = 0.0
+        engine._metrics.current_drawdown = 0.0
+
+        # Equity increases - peak should update
+        engine._update_drawdown(Decimal("105000"))
+        assert engine._metrics.peak_equity == Decimal("105000")
+        assert engine._metrics.current_drawdown == 0.0
+        assert engine._metrics.max_drawdown == 0.0
+
+        # Equity decreases - drawdown should be calculated
+        engine._update_drawdown(Decimal("100000"))
+        # Drawdown = (105000 - 100000) / 105000 = ~4.76%
+        expected_drawdown = (105000 - 100000) / 105000
+        assert abs(engine._metrics.current_drawdown - expected_drawdown) < 0.001
+        assert engine._metrics.max_drawdown == engine._metrics.current_drawdown
+        assert engine._metrics.peak_equity == Decimal("105000")  # Peak unchanged
+
+    def test_update_drawdown_max_drawdown_is_persistent(self):
+        """Test that max_drawdown tracks the highest drawdown observed.
+
+        Bug Fix Test: max_drawdown should persist even when equity recovers.
+        """
+        engine = self.create_mock_engine()
+
+        # Initialize
+        engine._metrics.peak_equity = Decimal("100000")
+        engine._metrics.max_drawdown = 0.0
+        engine._metrics.current_drawdown = 0.0
+
+        # First drawdown of 10%
+        engine._update_drawdown(Decimal("90000"))
+        assert engine._metrics.max_drawdown == 0.1  # 10%
+
+        # Partial recovery - current drawdown decreases but max stays
+        engine._update_drawdown(Decimal("95000"))
+        expected_current = (100000 - 95000) / 100000  # 5%
+        assert abs(engine._metrics.current_drawdown - expected_current) < 0.001
+        assert engine._metrics.max_drawdown == 0.1  # Still 10%
+
+        # New peak - current drawdown becomes 0
+        engine._update_drawdown(Decimal("105000"))
+        assert engine._metrics.current_drawdown == 0.0
+        assert engine._metrics.max_drawdown == 0.1  # Still 10%
+        assert engine._metrics.peak_equity == Decimal("105000")
+
+        # Deeper drawdown from new peak
+        engine._update_drawdown(Decimal("89250"))  # 15% from 105000
+        expected_new = (105000 - 89250) / 105000  # 15%
+        assert abs(engine._metrics.current_drawdown - expected_new) < 0.001
+        assert abs(engine._metrics.max_drawdown - expected_new) < 0.001  # Updated to 15%
+
+    def test_check_risk_limits_triggers_on_max_drawdown(self):
+        """Test that kill switch triggers when max_drawdown exceeds threshold.
+
+        Bug Fix Test: This is the CRITICAL fix - kill switch was disabled before
+        because max_drawdown was never calculated.
+        """
+        engine = self.create_mock_engine()
+        engine.config.kill_switch_drawdown = 0.05  # 5% threshold
+
+        # Set up session and metrics
+        engine._session = TradingSession(
+            session_id="test",
+            date=datetime.utcnow().date(),
+            state=EngineState.MARKET_HOURS,
+            start_equity=Decimal("100000"),
+            current_equity=Decimal("100000"),
+        )
+        engine._metrics.peak_equity = Decimal("100000")
+
+        # Mock portfolio with 6% drawdown (exceeds 5% threshold)
+        mock_portfolio = Portfolio(
+            equity=Decimal("94000"),  # 6% below peak
+            cash=Decimal("94000"),
+            buying_power=Decimal("94000"),
+        )
+        engine.position_tracker.get_portfolio = MagicMock(return_value=mock_portfolio)
+
+        # This should trigger the kill switch due to drawdown
+        result = engine._check_risk_limits()
+
+        assert result is False
+        assert engine._session.kill_switch_triggered is True
+        assert engine._metrics.max_drawdown > 0.05  # Drawdown was calculated
+        assert "drawdown" in str(engine._session.errors[-1]).lower()
+
+    def test_update_drawdown_handles_zero_equity(self):
+        """Test that _update_drawdown handles edge case of zero equity."""
+        engine = self.create_mock_engine()
+
+        engine._metrics.peak_equity = Decimal("100000")
+        engine._metrics.max_drawdown = 0.0
+
+        # Should not crash on zero equity
+        engine._update_drawdown(Decimal("0"))
+
+        # Values should remain unchanged (invalid input ignored)
+        assert engine._metrics.peak_equity == Decimal("100000")
+
+    def test_update_drawdown_handles_negative_equity(self):
+        """Test that _update_drawdown handles edge case of negative equity."""
+        engine = self.create_mock_engine()
+
+        engine._metrics.peak_equity = Decimal("100000")
+        engine._metrics.max_drawdown = 0.0
+
+        # Should not crash on negative equity
+        engine._update_drawdown(Decimal("-5000"))
+
+        # Values should remain unchanged (invalid input ignored)
+        assert engine._metrics.peak_equity == Decimal("100000")
+
+    def test_engine_metrics_has_drawdown_fields(self):
+        """Test that EngineMetrics has the new drawdown tracking fields."""
+        metrics = EngineMetrics()
+
+        # New fields added in fix
+        assert hasattr(metrics, 'max_drawdown')
+        assert hasattr(metrics, 'current_drawdown')
+        assert hasattr(metrics, 'peak_equity')
+
+        # Default values
+        assert metrics.max_drawdown == 0.0
+        assert metrics.current_drawdown == 0.0
+        assert metrics.peak_equity == Decimal("0")
+
+    def test_get_statistics_includes_drawdown_metrics(self):
+        """Test that get_statistics exposes drawdown metrics."""
+        engine = self.create_mock_engine()
+
+        # Set some drawdown values
+        engine._metrics.max_drawdown = 0.05
+        engine._metrics.current_drawdown = 0.03
+        engine._metrics.peak_equity = Decimal("100000")
+
+        stats = engine.get_statistics()
+
+        assert stats["metrics"]["max_drawdown"] == 0.05
+        assert stats["metrics"]["current_drawdown"] == 0.03
+        assert stats["metrics"]["peak_equity"] == "100000"

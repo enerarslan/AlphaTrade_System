@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -319,8 +319,8 @@ class PerformanceAnalyzer:
             trade_metrics=trade_metrics,
             benchmark_metrics=benchmark_metrics,
             statistical_tests=statistical_tests,
-            start_date=timestamps[0] if timestamps else datetime.utcnow(),
-            end_date=timestamps[-1] if timestamps else datetime.utcnow(),
+            start_date=timestamps[0] if timestamps else datetime.now(timezone.utc),
+            end_date=timestamps[-1] if timestamps else datetime.now(timezone.utc),
             trading_days=len(returns),
         )
 
@@ -387,8 +387,13 @@ class PerformanceAnalyzer:
         sharpe = np.mean(excess_returns) / np.std(excess_returns) * np.sqrt(self.periods_per_year) if std_return > 0 else 0
 
         # Sortino ratio (downside deviation)
-        negative_returns = returns[returns < 0]
-        downside_std = np.std(negative_returns) if len(negative_returns) > 0 else std_return
+        # BUG FIX: Correct downside deviation formula uses ALL samples
+        # Formula: sqrt(mean(min(0, return - threshold)^2))
+        # NOT the std of only negative returns
+        threshold = daily_rf  # Use risk-free rate as threshold
+        downside_returns = np.minimum(returns - threshold, 0)  # Negative deviations only
+        downside_variance = np.mean(downside_returns ** 2)  # Mean of squared deviations
+        downside_std = np.sqrt(downside_variance) if downside_variance > 0 else 0
         downside_vol = downside_std * np.sqrt(self.periods_per_year)
         sortino = (annual_return - self.risk_free_rate) / downside_vol if downside_vol > 0 else 0
 

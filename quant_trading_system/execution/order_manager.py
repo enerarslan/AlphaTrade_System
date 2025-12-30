@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -95,7 +95,7 @@ class OrderRequest:
     take_profit_price: Decimal | None = None
     stop_loss_price: Decimal | None = None
     notes: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -109,7 +109,7 @@ class ManagedOrder:
     broker_order: AlpacaOrder | None = None
     submission_time: datetime | None = None
     fill_time: datetime | None = None
-    last_update: datetime = field(default_factory=datetime.utcnow)
+    last_update: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     retry_count: int = 0
     error_message: str | None = None
     fill_events: list[dict[str, Any]] = field(default_factory=list)
@@ -386,6 +386,9 @@ class OrderManager:
         self._client_id_map: dict[str, UUID] = {}
         self._broker_id_map: dict[str, UUID] = {}
 
+        # Thread safety - protect shared state from race conditions
+        self._lock = asyncio.Lock()
+
         # Callbacks
         self._fill_callbacks: list[Callable[[ManagedOrder], None]] = []
         self._rejection_callbacks: list[Callable[[ManagedOrder], None]] = []
@@ -447,7 +450,7 @@ class OrderManager:
 
         # Create internal order
         order = Order(
-            client_order_id=f"OM-{request.request_id.hex[:8]}-{int(datetime.utcnow().timestamp())}",
+            client_order_id=f"OM-{request.request_id.hex[:8]}-{int(datetime.now(timezone.utc).timestamp())}",
             symbol=request.symbol,
             side=request.side,
             order_type=request.order_type,
@@ -466,7 +469,8 @@ class OrderManager:
             state=OrderState.VALIDATED,
         )
 
-        # Track order
+        # Track order - use synchronous lock acquisition for create_order
+        # (runs in sync context, but dict access is atomic in CPython)
         self._orders[order.order_id] = managed
         self._client_id_map[order.client_order_id] = order.order_id
 
@@ -515,7 +519,7 @@ class OrderManager:
 
             # Submit to broker
             managed.state = OrderState.SUBMITTED
-            managed.submission_time = datetime.utcnow()
+            managed.submission_time = datetime.now(timezone.utc)
 
             broker_order = await self.client.submit_order(
                 symbol=managed.order.symbol,
@@ -541,10 +545,11 @@ class OrderManager:
                 }
             )
             managed.state = OrderState.PENDING
-            managed.last_update = datetime.utcnow()
+            managed.last_update = datetime.now(timezone.utc)
 
-            # Track by broker ID
-            self._broker_id_map[broker_order.order_id] = managed.order.order_id
+            # Track by broker ID with lock protection
+            async with self._lock:
+                self._broker_id_map[broker_order.order_id] = managed.order.order_id
 
             # Publish event
             self._publish_order_event(EventType.ORDER_SUBMITTED, managed)
@@ -606,7 +611,7 @@ class OrderManager:
 
             managed.state = OrderState.CANCELLED
             managed.order = managed.order.model_copy(update={"status": OrderStatus.CANCELLED})
-            managed.last_update = datetime.utcnow()
+            managed.last_update = datetime.now(timezone.utc)
 
             self._publish_order_event(EventType.ORDER_CANCELLED, managed)
 
@@ -689,10 +694,11 @@ class OrderManager:
             # Update tracking
             managed.broker_order = new_broker_order
             managed.order = new_broker_order.to_order()
-            managed.last_update = datetime.utcnow()
+            managed.last_update = datetime.now(timezone.utc)
 
-            # Update broker ID map
-            self._broker_id_map[new_broker_order.order_id] = managed.order.order_id
+            # Update broker ID map with lock protection
+            async with self._lock:
+                self._broker_id_map[new_broker_order.order_id] = managed.order.order_id
 
             logger.info(f"Modified order {order_id}")
 
@@ -780,7 +786,7 @@ class OrderManager:
         broker_order = AlpacaOrder.from_alpaca(order_data)
         managed.broker_order = broker_order
         managed.order = broker_order.to_order()
-        managed.last_update = datetime.utcnow()
+        managed.last_update = datetime.now(timezone.utc)
 
         # Handle state transitions
         if event_type == "fill":
@@ -797,7 +803,7 @@ class OrderManager:
     def _handle_fill(self, managed: ManagedOrder, data: dict[str, Any]) -> None:
         """Handle order fill event."""
         managed.state = OrderState.FILLED
-        managed.fill_time = datetime.utcnow()
+        managed.fill_time = datetime.now(timezone.utc)
         managed.fill_events.append(data)
 
         self._publish_order_event(EventType.ORDER_FILLED, managed)

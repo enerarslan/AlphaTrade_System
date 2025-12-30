@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+import os
 from typing import Any
 from uuid import UUID
 
@@ -39,12 +40,17 @@ app = FastAPI(
 )
 
 # CORS middleware for frontend access
+# SECURITY: Restrict CORS to specific origins instead of "*"
+# Get allowed origins from environment variable or use safe defaults
+_allowed_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+_allowed_origins = [origin.strip() for origin in _allowed_origins if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],  # Only needed methods
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 
@@ -196,7 +202,7 @@ class DashboardState:
 
     def __init__(self) -> None:
         """Initialize dashboard state."""
-        self.start_time = datetime.utcnow()
+        self.start_time = datetime.now(timezone.utc)
         self._portfolio_data: dict[str, Any] = {}
         self._positions: dict[str, dict[str, Any]] = {}
         self._orders: list[dict[str, Any]] = []
@@ -213,7 +219,7 @@ class DashboardState:
 
     def get_uptime(self) -> float:
         """Get uptime in seconds."""
-        return (datetime.utcnow() - self.start_time).total_seconds()
+        return (datetime.now(timezone.utc) - self.start_time).total_seconds()
 
     def update_portfolio(self, data: dict[str, Any]) -> None:
         """Update portfolio data."""
@@ -372,7 +378,7 @@ async def get_health() -> HealthResponse:
 
     return HealthResponse(
         status=overall_status,
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         uptime_seconds=state.get_uptime(),
         components=components,
     )
@@ -395,7 +401,7 @@ async def get_portfolio() -> PortfolioResponse:
     data = state._portfolio_data
 
     return PortfolioResponse(
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         equity=data.get("equity", 0.0),
         cash=data.get("cash", 0.0),
         buying_power=data.get("buying_power", 0.0),

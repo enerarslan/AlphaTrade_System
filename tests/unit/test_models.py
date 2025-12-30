@@ -569,6 +569,188 @@ class TestDeepLearningModelsCPU:
         assert model.is_fitted
 
 
+class TestDeepLearningModelSerialization:
+    """Tests for deep learning model save/load functionality.
+
+    Bug Fix Tests: Previously, deep learning models only saved state_dict
+    but not network architecture, causing load() to fail.
+    """
+
+    def test_lstm_save_load_roundtrip(self, sample_time_series_data, temp_model_dir):
+        """Test LSTM model can be saved and loaded correctly.
+
+        Bug Fix Test: Previously, loaded model had self._network=None,
+        causing predict() to crash with AttributeError.
+        """
+        from quant_trading_system.models.deep_learning import LSTMModel
+
+        X, y = sample_time_series_data
+
+        # Train model
+        model = LSTMModel(
+            lookback_window=10,
+            hidden_size=16,
+            num_layers=1,
+            epochs=2,
+            batch_size=32,
+            device="cpu",
+        )
+        model.fit(X, y)
+        original_predictions = model.predict(X)
+
+        # Save model
+        save_path = temp_model_dir / "lstm_test"
+        model.save(str(save_path))
+
+        # Verify files were created
+        assert (save_path.with_suffix(".pkl")).exists()
+        assert (save_path.with_suffix(".json")).exists()
+
+        # Load model
+        loaded_model = LSTMModel(device="cpu")
+        loaded_model.load(str(save_path))
+
+        # CRITICAL: This would crash before the fix
+        loaded_predictions = loaded_model.predict(X)
+
+        # Predictions should match
+        np.testing.assert_array_almost_equal(
+            original_predictions, loaded_predictions, decimal=5
+        )
+
+    def test_lstm_load_preserves_architecture_params(self, sample_time_series_data, temp_model_dir):
+        """Test that load() restores network architecture parameters."""
+        from quant_trading_system.models.deep_learning import LSTMModel
+
+        X, y = sample_time_series_data
+
+        model = LSTMModel(
+            lookback_window=10,
+            hidden_size=32,  # Non-default
+            num_layers=3,    # Non-default
+            epochs=2,
+            device="cpu",
+        )
+        model.fit(X, y)
+
+        save_path = temp_model_dir / "lstm_params_test"
+        model.save(str(save_path))
+
+        loaded_model = LSTMModel(device="cpu")
+        loaded_model.load(str(save_path))
+
+        # Architecture params should be preserved
+        assert loaded_model._params["hidden_size"] == 32
+        assert loaded_model._params["num_layers"] == 3
+        assert loaded_model._params["_network_input_size"] is not None
+        assert loaded_model._params["_network_output_size"] is not None
+
+    def test_transformer_save_load_roundtrip(self, sample_time_series_data, temp_model_dir):
+        """Test Transformer model can be saved and loaded correctly.
+
+        Bug Fix Test: Previously, loaded model had self._network=None.
+        """
+        from quant_trading_system.models.deep_learning import TransformerModel
+
+        X, y = sample_time_series_data
+
+        model = TransformerModel(
+            lookback_window=10,
+            d_model=16,
+            nhead=2,
+            num_layers=1,
+            epochs=2,
+            device="cpu",
+        )
+        model.fit(X, y)
+        original_predictions = model.predict(X)
+
+        save_path = temp_model_dir / "transformer_test"
+        model.save(str(save_path))
+
+        loaded_model = TransformerModel(device="cpu")
+        loaded_model.load(str(save_path))
+
+        # CRITICAL: This would crash before the fix
+        loaded_predictions = loaded_model.predict(X)
+
+        np.testing.assert_array_almost_equal(
+            original_predictions, loaded_predictions, decimal=5
+        )
+
+    def test_tcn_save_load_roundtrip(self, sample_time_series_data, temp_model_dir):
+        """Test TCN model can be saved and loaded correctly.
+
+        Bug Fix Test: Previously, loaded model had self._network=None.
+        """
+        from quant_trading_system.models.deep_learning import TCNModel
+
+        X, y = sample_time_series_data
+
+        model = TCNModel(
+            lookback_window=10,
+            num_channels=[16, 16],
+            epochs=2,
+            device="cpu",
+        )
+        model.fit(X, y)
+        original_predictions = model.predict(X)
+
+        save_path = temp_model_dir / "tcn_test"
+        model.save(str(save_path))
+
+        loaded_model = TCNModel(device="cpu")
+        loaded_model.load(str(save_path))
+
+        # CRITICAL: This would crash before the fix
+        loaded_predictions = loaded_model.predict(X)
+
+        np.testing.assert_array_almost_equal(
+            original_predictions, loaded_predictions, decimal=5
+        )
+
+    def test_load_without_architecture_params_fails(self, temp_model_dir):
+        """Test that loading a model without architecture params fails gracefully.
+
+        This tests backward compatibility - old models won't have the new params.
+        """
+        import json
+        import pickle
+        import torch
+
+        from quant_trading_system.models.deep_learning import LSTMModel, LSTMNetwork
+
+        # Manually create a model file WITHOUT architecture params (simulating old format)
+        network = LSTMNetwork(input_size=5, hidden_size=16, output_size=1)
+        state_dict = network.state_dict()
+
+        save_path = temp_model_dir / "old_format_model"
+
+        # Save state_dict only (old format)
+        with open(save_path.with_suffix(".pkl"), "wb") as f:
+            pickle.dump(state_dict, f)
+
+        # Save metadata WITHOUT architecture params
+        metadata = {
+            "name": "test",
+            "version": "1.0.0",
+            "model_type": "REGRESSOR",
+            "is_fitted": True,
+            "feature_names": ["f0", "f1", "f2", "f3", "f4"],
+            "training_timestamp": None,
+            "training_metrics": {},
+            "params": {},  # No _network_input_size or _network_output_size!
+            "checksum": None,
+        }
+        with open(save_path.with_suffix(".json"), "w") as f:
+            json.dump(metadata, f)
+
+        # Attempt to load should fail with helpful error
+        model = LSTMModel(device="cpu")
+        with pytest.raises(ValueError, match="missing architecture parameters"):
+            model.load(str(save_path))
+
+
 # ==================== Ensemble Tests ====================
 
 

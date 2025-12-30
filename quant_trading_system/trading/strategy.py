@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -188,7 +188,7 @@ class Strategy(ABC):
         self._last_signals[signal.symbol] = signal
         self._signal_cooldowns[signal.symbol] = self.config.cooldown_bars
         self.metrics.signals_generated += 1
-        self.metrics.last_signal_time = datetime.utcnow()
+        self.metrics.last_signal_time = datetime.now(timezone.utc)
 
     def start(self) -> None:
         """Start the strategy."""

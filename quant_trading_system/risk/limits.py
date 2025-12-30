@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -61,7 +61,7 @@ class RiskCheckResult:
     result: CheckResult
     message: str
     details: dict[str, Any] = field(default_factory=dict)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def passed(self) -> bool:
@@ -99,7 +99,7 @@ class KillSwitchState:
     ) -> None:
         """Activate the kill switch."""
         self.is_active = True
-        self.activated_at = datetime.utcnow()
+        self.activated_at = datetime.now(timezone.utc)
         self.reason = reason
         self.trigger_value = trigger_value
         self.activated_by = activated_by
@@ -172,11 +172,11 @@ class PreTradeRiskChecker:
         self.config = config or RiskLimitsConfig()
         self._daily_trades: int = 0
         self._daily_turnover: Decimal = Decimal("0")
-        self._last_reset_date: datetime = datetime.utcnow().date()  # type: ignore
+        self._last_reset_date: datetime = datetime.now(timezone.utc).date()  # type: ignore
 
     def _reset_daily_counters_if_needed(self) -> None:
         """Reset daily counters if it's a new day."""
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         if today != self._last_reset_date:
             self._daily_trades = 0
             self._daily_turnover = Decimal("0")
@@ -357,7 +357,7 @@ class PreTradeRiskChecker:
 
     def check_trading_hours(self) -> RiskCheckResult:
         """Check if within trading hours."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         start_time = now.replace(
             hour=self.config.trading_start_hour,
             minute=self.config.trading_start_minute,
@@ -502,7 +502,7 @@ class IntraTradeMonitor:
             expected_price: Expected execution price.
         """
         order_id = str(order.order_id)
-        self._order_submit_times[order_id] = datetime.utcnow()
+        self._order_submit_times[order_id] = datetime.now(timezone.utc)
         self._order_expected_prices[order_id] = expected_price
 
     def check_slippage(
@@ -560,7 +560,7 @@ class IntraTradeMonitor:
             List of check results for stuck orders.
         """
         results = []
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         for order in active_orders:
             order_id = str(order.order_id)

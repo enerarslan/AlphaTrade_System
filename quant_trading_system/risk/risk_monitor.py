@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -104,7 +104,7 @@ class DrawdownState:
 
         if new_equity > self.peak_equity:
             self.peak_equity = new_equity
-            self.last_peak_date = datetime.utcnow()
+            self.last_peak_date = datetime.now(timezone.utc)
             self.drawdown_start = None
             self.drawdown_duration_bars = 0
             self.current_drawdown = 0.0
@@ -112,7 +112,7 @@ class DrawdownState:
             self.current_drawdown = float(1 - new_equity / self.peak_equity)
             self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
             if self.drawdown_start is None:
-                self.drawdown_start = datetime.utcnow()
+                self.drawdown_start = datetime.now(timezone.utc)
             self.drawdown_duration_bars += 1
 
 
@@ -565,7 +565,7 @@ class RiskMonitor:
         metrics = self.update(portfolio, returns_array)
 
         return {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "portfolio_value": float(portfolio.equity),
             "var_95": float(metrics.portfolio_var_95),
             "var_99": float(metrics.portfolio_var_99),

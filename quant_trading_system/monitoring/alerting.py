@@ -16,7 +16,7 @@ import json
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
@@ -117,7 +117,7 @@ class Alert(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
     suggested_action: str | None = None
     runbook_link: str | None = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     status: AlertStatus = AlertStatus.FIRING
     acknowledged_by: str | None = None
     acknowledged_at: datetime | None = None
@@ -142,12 +142,12 @@ class Alert(BaseModel):
         """
         self.status = AlertStatus.ACKNOWLEDGED
         self.acknowledged_by = acknowledged_by
-        self.acknowledged_at = datetime.utcnow()
+        self.acknowledged_at = datetime.now(timezone.utc)
 
     def resolve(self) -> None:
         """Resolve the alert."""
         self.status = AlertStatus.RESOLVED
-        self.resolved_at = datetime.utcnow()
+        self.resolved_at = datetime.now(timezone.utc)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert alert to dictionary."""
@@ -436,8 +436,8 @@ class RateLimitEntry:
     """Rate limit tracking entry."""
 
     count: int = 0
-    first_seen: datetime = field(default_factory=datetime.utcnow)
-    last_seen: datetime = field(default_factory=datetime.utcnow)
+    first_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class AlertManager:
@@ -547,7 +547,7 @@ class AlertManager:
         Returns:
             True if rate limited.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         entry = self._rate_limits[fingerprint]
 
         # Reset if window expired
@@ -590,7 +590,7 @@ class AlertManager:
         if rule.quiet_hours_start is None or rule.quiet_hours_end is None:
             return False
 
-        current_hour = datetime.utcnow().hour
+        current_hour = datetime.now(timezone.utc).hour
         start = rule.quiet_hours_start
         end = rule.quiet_hours_end
 
