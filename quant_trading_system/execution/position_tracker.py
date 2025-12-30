@@ -324,6 +324,9 @@ class PositionTracker:
             old_qty = position.quantity
             old_cost = position.cost_basis
 
+            # BUG FIX: Initialize realized_pnl to avoid undefined variable issue
+            realized_pnl = Decimal("0")
+
             if order.side == OrderSide.BUY:
                 new_qty = old_qty + fill_qty
                 new_cost = old_cost + (fill_qty * fill_price)
@@ -334,9 +337,8 @@ class PositionTracker:
                     # Partial or full close
                     realized_pnl = fill_qty * (fill_price - position.avg_entry_price)
                     if old_qty < 0:
+                        # SHORT position: profit when exit < entry
                         realized_pnl = -realized_pnl
-                else:
-                    realized_pnl = Decimal("0")
 
                 new_cost = new_qty * position.avg_entry_price if new_qty != 0 else Decimal("0")
 
@@ -359,7 +361,7 @@ class PositionTracker:
                 cost_basis=abs(new_qty * new_avg_price) if new_qty != 0 else Decimal("0"),
                 market_value=new_qty * fill_price,
                 unrealized_pnl=(fill_price - new_avg_price) * new_qty if new_qty != 0 else Decimal("0"),
-                realized_pnl=state.position.realized_pnl + (realized_pnl if 'realized_pnl' in dir() else Decimal("0")),
+                realized_pnl=state.position.realized_pnl + realized_pnl,
             )
             state.position = position
 

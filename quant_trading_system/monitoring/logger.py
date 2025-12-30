@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -97,7 +97,7 @@ class TradeLogEntry(BaseModel):
 class StructuredLogRecord(BaseModel):
     """Structured log record with metadata."""
 
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     level: str
     category: LogCategory
     message: str
@@ -166,7 +166,7 @@ class JsonFormatter(logging.Formatter):
             JSON formatted string.
         """
         log_data = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
             "category": getattr(record, "category", self.category.value),
             "message": record.getMessage(),
@@ -216,7 +216,7 @@ class TextFormatter(logging.Formatter):
         Returns:
             Formatted string.
         """
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         category = getattr(record, "category", self.category.value)
         level = record.levelname
 
@@ -395,7 +395,7 @@ class TradeLogger:
             TradeLogEntry for tracking.
         """
         entry = TradeLogEntry(
-            entry_time=datetime.utcnow(),
+            entry_time=datetime.now(timezone.utc),
             symbol=symbol,
             side=side,
             quantity=quantity,
@@ -447,7 +447,7 @@ class TradeLogger:
 
         updated_entry = TradeLogEntry(
             entry_time=entry.entry_time,
-            exit_time=datetime.utcnow(),
+            exit_time=datetime.now(timezone.utc),
             symbol=entry.symbol,
             side=entry.side,
             quantity=entry.quantity,
@@ -483,7 +483,7 @@ class TradeLogger:
         Args:
             entry: Trade log entry to write.
         """
-        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         file_path = self.log_dir / f"trades_{date_str}.jsonl"
 
         with open(file_path, "a") as f:

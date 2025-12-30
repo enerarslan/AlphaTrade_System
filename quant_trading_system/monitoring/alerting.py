@@ -431,6 +431,134 @@ class DashboardNotifier(AlertNotifier):
         return alerts[-limit:]
 
 
+class PagerDutyNotifier(AlertNotifier):
+    """PagerDuty alert notifier for critical incident management."""
+
+    def __init__(
+        self,
+        routing_key: str,
+        api_url: str = "https://events.pagerduty.com/v2/enqueue",
+    ) -> None:
+        """Initialize PagerDuty notifier.
+
+        Args:
+            routing_key: PagerDuty Events API v2 routing key (integration key).
+            api_url: PagerDuty Events API endpoint.
+        """
+        self.routing_key = routing_key
+        self.api_url = api_url
+
+    async def send(self, alert: Alert) -> bool:
+        """Send PagerDuty notification."""
+        try:
+            import aiohttp
+
+            severity_map = {
+                AlertSeverity.CRITICAL: "critical",
+                AlertSeverity.WARNING: "warning",
+                AlertSeverity.INFO: "info",
+            }
+
+            payload = {
+                "routing_key": self.routing_key,
+                "event_action": "trigger",
+                "dedup_key": alert.fingerprint,
+                "payload": {
+                    "summary": f"[{alert.severity.value}] {alert.title}",
+                    "source": "AlphaTrade Trading System",
+                    "severity": severity_map.get(alert.severity, "warning"),
+                    "timestamp": alert.timestamp.isoformat(),
+                    "custom_details": {
+                        "message": alert.message,
+                        "alert_type": alert.alert_type.value,
+                        "context": alert.context,
+                        "suggested_action": alert.suggested_action,
+                        "runbook_link": alert.runbook_link,
+                    },
+                },
+                "links": [{"href": alert.runbook_link, "text": "Runbook"}] if alert.runbook_link else [],
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.api_url, json=payload) as response:
+                    return response.status in (200, 201, 202)
+
+        except Exception as e:
+            logger.error(f"Failed to send PagerDuty alert: {e}")
+            return False
+
+    def get_channel(self) -> AlertChannel:
+        return AlertChannel.PAGERDUTY
+
+
+class SMSNotifier(AlertNotifier):
+    """SMS alert notifier using Twilio."""
+
+    def __init__(
+        self,
+        account_sid: str,
+        auth_token: str,
+        from_number: str,
+        to_numbers: list[str],
+    ) -> None:
+        """Initialize SMS notifier.
+
+        Args:
+            account_sid: Twilio account SID.
+            auth_token: Twilio auth token.
+            from_number: Twilio phone number to send from.
+            to_numbers: List of phone numbers to send to.
+        """
+        self.account_sid = account_sid
+        self.auth_token = auth_token
+        self.from_number = from_number
+        self.to_numbers = to_numbers
+
+    async def send(self, alert: Alert) -> bool:
+        """Send SMS notification via Twilio."""
+        try:
+            import aiohttp
+            from base64 import b64encode
+
+            # Construct SMS message (limited to 160 chars for single SMS)
+            message = f"[{alert.severity.value}] {alert.title[:80]}"
+            if alert.suggested_action:
+                remaining = 155 - len(message)
+                if remaining > 10:
+                    message += f" - {alert.suggested_action[:remaining]}"
+
+            url = f"https://api.twilio.com/2010-04-01/Accounts/{self.account_sid}/Messages.json"
+            auth = b64encode(f"{self.account_sid}:{self.auth_token}".encode()).decode()
+
+            success_count = 0
+            async with aiohttp.ClientSession() as session:
+                for to_number in self.to_numbers:
+                    data = {
+                        "From": self.from_number,
+                        "To": to_number,
+                        "Body": message,
+                    }
+                    headers = {
+                        "Authorization": f"Basic {auth}",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    }
+
+                    async with session.post(url, data=data, headers=headers) as response:
+                        if response.status in (200, 201):
+                            success_count += 1
+                        else:
+                            logger.warning(f"Failed to send SMS to {to_number}: {response.status}")
+
+            return success_count > 0
+
+        except Exception as e:
+            logger.error(f"Failed to send SMS alert: {e}")
+            return False
+
+    def get_channel(self) -> AlertChannel:
+        return AlertChannel.SMS
+
+
 @dataclass
 class RateLimitEntry:
     """Rate limit tracking entry."""
