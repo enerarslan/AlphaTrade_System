@@ -172,9 +172,10 @@ class TestLoggingSettings:
 class TestSettings:
     """Tests for main Settings class."""
 
+    @patch.dict("os.environ", {"DEBUG": "false"}, clear=False)
     def test_default_values(self):
         """Test default settings."""
-        settings = Settings()
+        settings = Settings(_env_file=None)  # Ignore .env file for test
         assert settings.app_name == "Quant Trading System"
         assert settings.debug is False
         assert settings.environment == "development"

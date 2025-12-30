@@ -1,0 +1,13 @@
+{
+  "strategy": "Trend Following Momentum",
+  "initial_capital": 100000,
+  "final_equity": 49380.64401140513,
+  "total_return_pct": -50.61935598859487,
+  "sharpe_ratio": -3.2017278759014145,
+  "max_drawdown_pct": 52.580613142082925,
+  "total_trades": 3080,
+  "win_rate_pct": 39.87012987012987,
+  "profit_factor": 1.1440105781467709,
+  "wins": 1228,
+  "losses": 1852
+}
