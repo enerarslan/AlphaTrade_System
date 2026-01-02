@@ -71,8 +71,9 @@ data/
 *.csv
 *.parquet
 
-# Models
-models/
+# Trained model artifacts (root-level models/ directory only)
+# Note: /models/ only matches root, not quant_trading_system/models/ (source code)
+/models/
 *.pkl
 *.joblib
 *.h5

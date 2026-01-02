@@ -72,8 +72,9 @@ AlphaTrade_System/
 ├── pyproject.toml                   # Project dependencies (Poetry)
 ├── requirements.txt                 # Pip requirements
 ├── alembic.ini                      # Database migrations config
-├── .env                             # Environment variables (API keys, DB config)
-├── .gitignore                       # Git ignore patterns
+├── .env                             # Environment variables (API keys, DB config) - NOT in git
+├── .gitignore                       # Git ignore patterns (security-hardened)
+├── ACTION_PLAN_JPMORGAN.md          # Production readiness action plan
 │
 ├── docker/                          # Docker infrastructure
 │   ├── Dockerfile                   # Multi-stage build (93 lines)
@@ -108,6 +109,7 @@ AlphaTrade_System/
 │   │
 │   ├── config/                      # Configuration management
 │   │   ├── settings.py              # Pydantic settings (455 lines)
+│   │   ├── secure_config.py         # Secrets manager (AWS/Vault/env support)
 │   │   ├── alpaca_config.yaml       # Broker credentials
 │   │   ├── risk_params.yaml         # Risk limits configuration
 │   │   ├── model_configs.yaml       # ML model hyperparameters
@@ -868,25 +870,48 @@ Latest backtest (Trend Following Momentum strategy):
 
 ### 10.4 Stub/Placeholder Code
 
-| Location | Description |
-|----------|-------------|
-| `main.py:121-138` | Component initialization is placeholder (TODO: connect DB, broker, load models) |
-| `scripts/run_backtest.py:133-152` | Backtest results are hardcoded in script (use backtest engine instead) |
-| `trading/trading_engine.py` | Full integration between components needs completion |
+| Location | Description | Status |
+|----------|-------------|--------|
+| `main.py:121-323` | **FIXED** - Full 8-step component initialization implemented | Complete |
+| `scripts/run_backtest.py:133-152` | Backtest results are hardcoded in script (use backtest engine instead) | Active |
+| `trading/trading_engine.py` | Risk checks now mandatory (non-bypassable) | Complete |
 
 ### 10.5 Known Issues & Gaps
 
 1. **Celery task queue** - Task queue mentioned but not fully implemented
 2. **Dashboard UI** - State management exists but no frontend (use Grafana instead)
-3. **Alerting channels** - Alert manager configured but notification backends commented out (Slack, email, PagerDuty templates exist)
+3. **Alerting channels** - **FIXED** - Alert manager setup now part of main.py initialization
 4. **Model versioning** - Registry filesystem-based, consider MLflow for production
 
 ### 10.6 Technical Debt
 
 1. Some duplicate code between `classical_ml.py` models (`_compute_metrics`)
 2. RL agents have unused imports (`from datetime import datetime, timezone`)
-3. Test coverage varies - core modules well tested, trading engine less so
+3. Test coverage expanded - core modules well tested, risk and execution tests comprehensive
 4. Backtest strategy parameters need optimization (current results show -50% return)
+
+### 10.7 Production Readiness Improvements (2026-01-02)
+
+**Security Hardening:**
+- `.env.example` template created (credentials documented securely)
+- `.gitignore` updated with security patterns
+- `SecureConfigManager` implemented (supports AWS Secrets Manager, HashiCorp Vault)
+- Kill switch requires 2-factor authorization for force reset
+
+**ML Data Integrity:**
+- Training data leakage fixed (gap parameter in time-series splits)
+- Proper holdout test sets before hyperparameter optimization
+- Numerical precision fixes in feature calculations
+
+**Operational Readiness:**
+- 8-step component initialization in main.py
+- Order validation requires portfolio (no optional bypass)
+- Risk checks mandatory (cannot be disabled via config)
+
+**Testing:**
+- Dashboard auth bypassed for tests (REQUIRE_AUTH=false)
+- Settings cache clearing between tests
+- MockLiveFeed callback test fixed
 
 ---
 
