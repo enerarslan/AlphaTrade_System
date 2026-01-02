@@ -134,9 +134,24 @@ class TradingSystemApp:
         logger.info("Initializing system components")
         initialization_errors: list[str] = []
 
+        # 0. Initialize audit logging (first, to capture all initialization events)
+        try:
+            logger.info("Step 0/9: Initializing audit logging")
+            from quant_trading_system.monitoring.audit import AuditLogger, AuditEventType
+            self.audit_logger = AuditLogger(log_dir="logs/audit")
+            self.audit_logger.log_event(
+                AuditEventType.SYSTEM_START,
+                description=f"Trading system starting in {mode} mode",
+                details={"mode": mode, "environment": self.settings.environment},
+            )
+            logger.info("Audit logging initialized")
+        except Exception as e:
+            logger.warning(f"Audit logging initialization failed (non-critical): {e}")
+            self.audit_logger = None
+
         # 1. Verify secure configuration
         try:
-            logger.info("Step 1/7: Verifying secure configuration")
+            logger.info("Step 1/10: Verifying secure configuration")
             from quant_trading_system.config.secure_config import SecureConfigManager
             self.secure_config = SecureConfigManager.get_instance()
             config_status = self.secure_config.get_configuration_status()
@@ -155,7 +170,7 @@ class TradingSystemApp:
         # 2. Configure alerting channels
         self.alerting_channels = []
         try:
-            logger.info("Step 2/8: Configuring alerting channels")
+            logger.info("Step 2/10: Configuring alerting channels")
             alerting_status = self.alert_manager.setup_notifiers_from_config()
             self.alerting_channels = [ch for ch, ok in alerting_status.items() if ok]
             if self.alerting_channels:
@@ -170,7 +185,7 @@ class TradingSystemApp:
 
         # 3. Initialize database connection
         try:
-            logger.info("Step 3/8: Initializing database connection")
+            logger.info("Step 3/10: Initializing database connection")
             from quant_trading_system.database.connection import DatabaseManager
             self.database = DatabaseManager()
             await self.database.initialize()
@@ -186,7 +201,7 @@ class TradingSystemApp:
 
         # 4. Initialize Redis/Feature Store
         try:
-            logger.info("Step 4/8: Initializing feature store (Redis)")
+            logger.info("Step 4/10: Initializing feature store (Redis)")
             from quant_trading_system.data.feature_store import FeatureStore, FeatureStoreConfig
             redis_url = self.settings.redis.url if hasattr(self.settings, 'redis') else None
             if redis_url:
@@ -204,7 +219,7 @@ class TradingSystemApp:
         # 5. Initialize broker client (if trading mode)
         if mode in ("live", "paper"):
             try:
-                logger.info("Step 5/8: Initializing broker client (Alpaca)")
+                logger.info("Step 5/10: Initializing broker client (Alpaca)")
                 from quant_trading_system.execution.alpaca_client import AlpacaClient
 
                 api_key = self.secure_config.get_credential("ALPACA_API_KEY", required=False)
@@ -234,11 +249,11 @@ class TradingSystemApp:
                 self.broker_client = None
         else:
             self.broker_client = None
-            logger.info("Step 5/8: Skipping broker (backtest mode)")
+            logger.info("Step 5/10: Skipping broker (backtest mode)")
 
         # 6. Initialize risk management
         try:
-            logger.info("Step 6/8: Initializing risk management")
+            logger.info("Step 6/10: Initializing risk management")
             from quant_trading_system.risk.limits import (
                 RiskLimitsConfig,
                 PreTradeRiskChecker,
@@ -255,7 +270,7 @@ class TradingSystemApp:
 
         # 7. Load trained models
         try:
-            logger.info("Step 7/8: Loading trained models")
+            logger.info("Step 7/10: Loading trained models")
             from quant_trading_system.models.model_manager import ModelManager
 
             self.model_manager = ModelManager(registry_path="models/registry")
@@ -291,7 +306,7 @@ class TradingSystemApp:
         # 8. Initialize data feeds (if trading mode)
         if mode in ("live", "paper") and self.broker_client:
             try:
-                logger.info("Step 8/8: Initializing data feeds")
+                logger.info("Step 8/10: Initializing data feeds")
                 from quant_trading_system.data.live_feed import LiveFeed, LiveFeedConfig
 
                 feed_config = LiveFeedConfig(
@@ -307,13 +322,27 @@ class TradingSystemApp:
                 self.data_feed = None
         else:
             self.data_feed = None
-            logger.info("Step 8/8: Skipping data feeds (backtest mode or no broker)")
+            logger.info("Step 8/10: Skipping data feeds (backtest mode or no broker)")
+
+        # 9. Initialize data lineage tracking
+        try:
+            logger.info("Step 9/10: Initializing data lineage tracking")
+            from quant_trading_system.data.data_lineage import DataLineageTracker
+            self.lineage_tracker = DataLineageTracker(
+                persist_path="logs/lineage/lineage_data.json",
+                auto_persist=True,
+            )
+            logger.info("Data lineage tracking initialized")
+        except Exception as e:
+            logger.warning(f"Data lineage initialization failed (non-critical): {e}")
+            self.lineage_tracker = None
 
         # Report initialization summary
         logger.info("=" * 60)
         logger.info("COMPONENT INITIALIZATION SUMMARY")
         logger.info("=" * 60)
         logger.info(f"  Mode: {mode}")
+        logger.info(f"  Audit Logging: {'OK' if hasattr(self, 'audit_logger') and self.audit_logger else 'DISABLED'}")
         alerting_str = ', '.join(self.alerting_channels) if self.alerting_channels else 'NONE'
         logger.info(f"  Alerting: {alerting_str}")
         logger.info(f"  Database: {'OK' if self.database else 'DISABLED'}")
@@ -322,6 +351,7 @@ class TradingSystemApp:
         logger.info(f"  Risk Management: {'OK' if hasattr(self, 'risk_checker') else 'DISABLED'}")
         logger.info(f"  Models: {'OK' if self.model_manager else 'DISABLED'}")
         logger.info(f"  Data Feed: {'OK' if self.data_feed else 'DISABLED'}")
+        logger.info(f"  Data Lineage: {'OK' if hasattr(self, 'lineage_tracker') and self.lineage_tracker else 'DISABLED'}")
         logger.info("=" * 60)
 
         # Check for critical initialization errors
