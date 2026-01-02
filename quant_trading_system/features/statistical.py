@@ -583,60 +583,291 @@ class HurstExponent(StatisticalFeature):
 
 
 class ADFStatistic(StatisticalFeature):
-    """Augmented Dickey-Fuller test statistic (rolling)."""
+    """
+    JPMORGAN FIX: Complete Augmented Dickey-Fuller test implementation.
 
-    def __init__(self, window: int = 60):
+    Implements the full ADF test as per MacKinnon (1994, 2010) with:
+    1. Automatic lag selection using AIC/BIC
+    2. Different regression specifications (constant, trend, none)
+    3. P-value calculation using MacKinnon critical values
+    4. Critical values for 1%, 5%, 10% significance levels
+
+    The ADF test is essential for:
+    - Testing stationarity of price series
+    - Mean reversion strategy identification
+    - Cointegration analysis in pairs trading
+    - Feature engineering for ML models
+
+    Reference:
+        MacKinnon, J.G. (2010). "Critical Values for Cointegration Tests"
+    """
+
+    # MacKinnon (2010) critical values for 'c' (constant) case
+    # Format: [1%, 5%, 10%] for different sample sizes
+    MACKINNON_CRITICAL_VALUES = {
+        "c": {
+            25: [-3.75, -3.00, -2.62],
+            50: [-3.58, -2.93, -2.60],
+            100: [-3.51, -2.89, -2.58],
+            250: [-3.46, -2.87, -2.57],
+            500: [-3.44, -2.86, -2.57],
+            1000: [-3.43, -2.86, -2.57],
+        },
+        "ct": {  # constant + trend
+            25: [-4.38, -3.60, -3.24],
+            50: [-4.15, -3.50, -3.18],
+            100: [-4.04, -3.45, -3.15],
+            250: [-3.99, -3.43, -3.13],
+            500: [-3.98, -3.42, -3.13],
+            1000: [-3.96, -3.41, -3.12],
+        },
+        "n": {  # no constant
+            25: [-2.66, -1.95, -1.60],
+            50: [-2.62, -1.95, -1.61],
+            100: [-2.60, -1.95, -1.61],
+            250: [-2.58, -1.95, -1.62],
+            500: [-2.58, -1.95, -1.62],
+            1000: [-2.58, -1.95, -1.62],
+        },
+    }
+
+    def __init__(
+        self,
+        window: int = 60,
+        max_lag: int | None = None,
+        regression: str = "c",
+        autolag: str = "AIC",
+    ):
+        """
+        Initialize ADF test calculator.
+
+        Args:
+            window: Rolling window size for calculation
+            max_lag: Maximum number of lags to consider (None = auto)
+            regression: Type of regression - 'c' (constant), 'ct' (constant+trend), 'n' (none)
+            autolag: Method for automatic lag selection - 'AIC', 'BIC', or None for fixed
+        """
         super().__init__("ADF")
         self.window = window
+        self.max_lag = max_lag
+        self.regression = regression
+        self.autolag = autolag
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
         close = df["close"].to_numpy().astype(np.float64)
         results = {}
 
-        adf_stat = np.full(len(close), np.nan)
-        for i in range(self.window - 1, len(close)):
+        n = len(close)
+        adf_stat = np.full(n, np.nan)
+        adf_pvalue = np.full(n, np.nan)
+        adf_lags = np.full(n, np.nan)
+        adf_is_stationary = np.zeros(n)  # 1 if stationary at 5% level
+
+        for i in range(self.window - 1, n):
             data = close[i - self.window + 1 : i + 1]
-            adf_stat[i] = self._adf_statistic(data)
+            stat, pvalue, used_lag, is_stat = self._adf_test(data)
+            adf_stat[i] = stat
+            adf_pvalue[i] = pvalue
+            adf_lags[i] = used_lag
+            adf_is_stationary[i] = is_stat
 
         results[f"adf_stat_{self.window}"] = adf_stat
+        results[f"adf_pvalue_{self.window}"] = adf_pvalue
+        results[f"adf_lags_{self.window}"] = adf_lags
+        results[f"adf_is_stationary_{self.window}"] = adf_is_stationary
 
         return results
 
-    def _adf_statistic(self, ts: np.ndarray) -> float:
-        """Compute simplified ADF test statistic."""
-        if len(ts) < 10:
-            return np.nan
+    def _adf_test(self, ts: np.ndarray) -> tuple[float, float, int, int]:
+        """
+        Compute complete ADF test.
 
-        # Simple ADF: regress diff(y) on y_lag1
+        Returns:
+            Tuple of (test_statistic, p_value, used_lags, is_stationary)
+        """
+        n = len(ts)
+        if n < 12:
+            return np.nan, np.nan, 0, 0
+
+        # Calculate max lag if not specified
+        # Schwert (1989) formula: floor(12 * (n/100)^(1/4))
+        if self.max_lag is None:
+            max_lag = int(np.floor(12 * (n / 100) ** 0.25))
+        else:
+            max_lag = min(self.max_lag, n // 4)
+
+        max_lag = max(1, min(max_lag, n // 4 - 1))
+
+        # Select optimal lag using information criterion
+        if self.autolag:
+            best_lag, best_ic = 0, np.inf
+            for lag in range(max_lag + 1):
+                try:
+                    stat, _, ic = self._adf_regression(ts, lag)
+                    if not np.isnan(ic) and ic < best_ic:
+                        best_ic = ic
+                        best_lag = lag
+                except Exception:
+                    continue
+            used_lag = best_lag
+        else:
+            used_lag = max_lag
+
+        # Compute final ADF statistic
+        try:
+            adf_stat, gamma, _ = self._adf_regression(ts, used_lag)
+        except Exception:
+            return np.nan, np.nan, used_lag, 0
+
+        if np.isnan(adf_stat):
+            return np.nan, np.nan, used_lag, 0
+
+        # Get p-value and check stationarity
+        pvalue = self._get_pvalue(adf_stat, n)
+        is_stationary = 1 if pvalue < 0.05 else 0
+
+        return adf_stat, pvalue, used_lag, is_stationary
+
+    def _adf_regression(self, ts: np.ndarray, nlags: int) -> tuple[float, float, float]:
+        """
+        Perform ADF regression with specified lags.
+
+        Δy_t = α + β*t + γ*y_{t-1} + Σ(δ_i * Δy_{t-i}) + ε_t
+
+        Returns:
+            Tuple of (t_statistic_for_gamma, gamma_coefficient, information_criterion)
+        """
+        n = len(ts)
+
+        # First difference
         y_diff = np.diff(ts)
+
+        # Lagged level
         y_lag = ts[:-1]
 
-        if len(y_diff) < 2:
-            return np.nan
+        # Create lagged differences matrix
+        if nlags > 0:
+            diff_lags = np.column_stack([
+                np.roll(y_diff, i)[nlags:] for i in range(1, nlags + 1)
+            ])
+            y_diff = y_diff[nlags:]
+            y_lag = y_lag[nlags:]
+        else:
+            diff_lags = None
 
-        # Add intercept
-        X = np.column_stack([np.ones(len(y_lag)), y_lag])
+        n_obs = len(y_diff)
+        if n_obs < 10:
+            return np.nan, np.nan, np.nan
+
+        # Build design matrix based on regression type
+        if self.regression == "c":
+            # Constant only
+            if diff_lags is not None:
+                X = np.column_stack([np.ones(n_obs), y_lag, diff_lags])
+            else:
+                X = np.column_stack([np.ones(n_obs), y_lag])
+            gamma_idx = 1
+        elif self.regression == "ct":
+            # Constant + trend
+            trend = np.arange(n_obs)
+            if diff_lags is not None:
+                X = np.column_stack([np.ones(n_obs), trend, y_lag, diff_lags])
+            else:
+                X = np.column_stack([np.ones(n_obs), trend, y_lag])
+            gamma_idx = 2
+        else:  # 'n' - no constant
+            if diff_lags is not None:
+                X = np.column_stack([y_lag, diff_lags])
+            else:
+                X = y_lag.reshape(-1, 1)
+            gamma_idx = 0
+
         y = y_diff
 
         try:
-            # OLS regression
-            coeffs = np.linalg.lstsq(X, y, rcond=None)[0]
-            gamma = coeffs[1]
+            # OLS regression using QR decomposition for numerical stability
+            Q, R = np.linalg.qr(X)
+            coeffs = np.linalg.solve(R, Q.T @ y)
 
-            # Calculate standard error
+            gamma = coeffs[gamma_idx]
+
+            # Calculate residuals and standard errors
             residuals = y - X @ coeffs
-            n = len(y)
-            k = 2
-            sigma2 = np.sum(residuals**2) / (n - k)
-            var_beta = sigma2 * np.linalg.inv(X.T @ X)
-            se_gamma = np.sqrt(var_beta[1, 1])
+            n_params = X.shape[1]
+            sigma2 = np.sum(residuals**2) / (n_obs - n_params)
 
-            if se_gamma > 0:
-                return gamma / se_gamma
-            return np.nan
+            # Variance-covariance matrix
+            try:
+                R_inv = np.linalg.inv(R)
+                var_beta = sigma2 * (R_inv @ R_inv.T)
+                se_gamma = np.sqrt(var_beta[gamma_idx, gamma_idx])
+            except np.linalg.LinAlgError:
+                return np.nan, np.nan, np.nan
+
+            if se_gamma <= 0:
+                return np.nan, np.nan, np.nan
+
+            t_stat = gamma / se_gamma
+
+            # Information criterion for lag selection
+            if self.autolag == "AIC":
+                ic = n_obs * np.log(sigma2) + 2 * n_params
+            elif self.autolag == "BIC":
+                ic = n_obs * np.log(sigma2) + n_params * np.log(n_obs)
+            else:
+                ic = np.nan
+
+            return t_stat, gamma, ic
+
         except (np.linalg.LinAlgError, ValueError):
+            return np.nan, np.nan, np.nan
+
+    def _get_pvalue(self, stat: float, n: int) -> float:
+        """
+        Get approximate p-value using MacKinnon critical values.
+
+        Uses linear interpolation between critical values.
+        """
+        if np.isnan(stat):
             return np.nan
+
+        # Get critical values for sample size
+        cv_dict = self.MACKINNON_CRITICAL_VALUES.get(self.regression, self.MACKINNON_CRITICAL_VALUES["c"])
+
+        # Find appropriate sample size bucket
+        sizes = sorted(cv_dict.keys())
+        if n <= sizes[0]:
+            cv = cv_dict[sizes[0]]
+        elif n >= sizes[-1]:
+            cv = cv_dict[sizes[-1]]
+        else:
+            # Interpolate between two nearest sizes
+            for i in range(len(sizes) - 1):
+                if sizes[i] <= n < sizes[i + 1]:
+                    cv_low = cv_dict[sizes[i]]
+                    cv_high = cv_dict[sizes[i + 1]]
+                    weight = (n - sizes[i]) / (sizes[i + 1] - sizes[i])
+                    cv = [
+                        cv_low[j] + weight * (cv_high[j] - cv_low[j])
+                        for j in range(3)
+                    ]
+                    break
+            else:
+                cv = cv_dict[sizes[-1]]
+
+        # Approximate p-value from critical values
+        # cv = [1%, 5%, 10%] => p = [0.01, 0.05, 0.10]
+        if stat < cv[0]:  # More negative than 1% critical value
+            # Extrapolate below 1%
+            return 0.001
+        elif stat < cv[1]:  # Between 1% and 5%
+            return 0.01 + (stat - cv[0]) / (cv[1] - cv[0]) * 0.04
+        elif stat < cv[2]:  # Between 5% and 10%
+            return 0.05 + (stat - cv[1]) / (cv[2] - cv[1]) * 0.05
+        else:  # Above 10% critical value (not stationary)
+            # Simple extrapolation for p > 0.10
+            return min(0.10 + (stat - cv[2]) * 0.10, 0.99)
 
 
 # =============================================================================

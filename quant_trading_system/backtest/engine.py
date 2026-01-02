@@ -34,6 +34,15 @@ from quant_trading_system.core.data_types import (
     TradeSignal,
 )
 from quant_trading_system.core.events import Event, EventBus, EventPriority, EventType
+from quant_trading_system.backtest.simulator import (
+    MarketSimulator,
+    MarketConditions,
+    FillType,
+    FillResult,
+    create_realistic_simulator,
+    create_optimistic_simulator,
+    create_pessimistic_simulator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +87,12 @@ class BacktestConfig:
     # Time filters
     start_date: datetime | None = None
     end_date: datetime | None = None
+
+    # JPMORGAN FIX: Market simulation settings
+    use_market_simulator: bool = True  # Enable realistic market simulation
+    simulate_partial_fills: bool = True  # Allow partial order fills
+    simulate_latency: bool = True  # Simulate execution latency
+    avg_daily_volume: int = 1000000  # Default ADV for volume-based slippage
 
 
 @dataclass
@@ -314,6 +329,7 @@ class BacktestEngine:
         data_handler: DataHandler,
         strategy: Strategy,
         config: BacktestConfig | None = None,
+        market_simulator: MarketSimulator | None = None,
     ) -> None:
         """Initialize backtesting engine.
 
@@ -321,10 +337,19 @@ class BacktestEngine:
             data_handler: Data handler for market data.
             strategy: Trading strategy to test.
             config: Backtest configuration.
+            market_simulator: Optional custom market simulator.
         """
         self.data_handler = data_handler
         self.strategy = strategy
         self.config = config or BacktestConfig()
+
+        # JPMORGAN FIX: Initialize market simulator based on execution mode
+        if market_simulator is not None:
+            self.market_simulator = market_simulator
+        elif self.config.use_market_simulator:
+            self.market_simulator = self._create_market_simulator()
+        else:
+            self.market_simulator = None
 
         # Initialize state
         self._state: BacktestState | None = None
@@ -334,10 +359,30 @@ class BacktestEngine:
         # Position tracking for trade calculation
         self._open_positions: dict[str, dict[str, Any]] = {}
 
+        # JPMORGAN FIX: Track market conditions per symbol
+        self._market_conditions: dict[str, MarketConditions] = {}
+        self._volatility_window: int = 20  # Bars for volatility calculation
+        self._price_history: dict[str, deque] = {}
+
         # Callbacks
         self._on_bar_callbacks: list[Callable] = []
         self._on_signal_callbacks: list[Callable] = []
         self._on_fill_callbacks: list[Callable] = []
+
+    def _create_market_simulator(self) -> MarketSimulator:
+        """Create market simulator based on execution mode."""
+        if self.config.execution_mode == ExecutionMode.OPTIMISTIC:
+            return create_optimistic_simulator()
+        elif self.config.execution_mode == ExecutionMode.PESSIMISTIC:
+            return create_pessimistic_simulator(
+                commission_bps=self.config.commission_bps * 2,
+                base_slippage_bps=self.config.slippage_bps * 2,
+            )
+        else:
+            return create_realistic_simulator(
+                commission_bps=self.config.commission_bps,
+                base_slippage_bps=self.config.slippage_bps,
+            )
 
     def run(self) -> BacktestState:
         """Run the backtest.
@@ -378,6 +423,13 @@ class BacktestEngine:
             trades=[],
         )
         self._open_positions = {}
+
+        # JPMORGAN FIX: Initialize price history for volatility calculation
+        self._price_history = {
+            s: deque(maxlen=self._volatility_window)
+            for s in self.data_handler.get_symbols()
+        }
+        self._market_conditions = {}
 
         # Reset data handler if supported
         if hasattr(self.data_handler, 'reset'):
@@ -428,6 +480,44 @@ class BacktestEngine:
             position = self._state.positions[symbol]
             self._state.positions[symbol] = position.update_price(bar.close)
 
+        # JPMORGAN FIX: Update market conditions for realistic simulation
+        self._update_market_conditions(symbol, bar)
+
+    def _update_market_conditions(self, symbol: str, bar: OHLCVBar) -> None:
+        """Update market conditions for a symbol based on current bar."""
+        # Update price history for volatility calculation
+        if symbol not in self._price_history:
+            self._price_history[symbol] = deque(maxlen=self._volatility_window)
+        self._price_history[symbol].append(float(bar.close))
+
+        # Calculate realized volatility
+        volatility = 0.02  # Default
+        if len(self._price_history[symbol]) >= 2:
+            prices = list(self._price_history[symbol])
+            returns = [
+                (prices[i] - prices[i-1]) / prices[i-1]
+                for i in range(1, len(prices))
+            ]
+            if returns:
+                volatility = float(np.std(returns) * np.sqrt(252))  # Annualized
+
+        # Estimate bid/ask from high/low
+        spread = bar.high - bar.low
+        half_spread = spread / Decimal("4")  # Conservative estimate
+        bid = bar.close - half_spread
+        ask = bar.close + half_spread
+
+        self._market_conditions[symbol] = MarketConditions(
+            price=bar.close,
+            bid=bid,
+            ask=ask,
+            volume=bar.volume,
+            avg_daily_volume=self.config.avg_daily_volume,
+            volatility=volatility,
+            spread_bps=float(spread / bar.close * 10000) if bar.close > 0 else 5.0,
+            timestamp=bar.timestamp,
+        )
+
     def _process_pending_orders(self, symbol: str, bar: OHLCVBar) -> None:
         """Process pending orders for a symbol."""
         orders_to_remove = []
@@ -436,26 +526,230 @@ class BacktestEngine:
             if order.symbol != symbol:
                 continue
 
-            # Determine fill price based on config
-            fill_price = self._get_fill_price(bar)
-            if fill_price is None:
-                continue
-
-            # Apply slippage
-            slippage = self._calculate_slippage(order, fill_price)
-            if order.side == OrderSide.BUY:
-                fill_price += slippage
+            # JPMORGAN FIX: Use MarketSimulator for realistic execution
+            if self.market_simulator is not None and symbol in self._market_conditions:
+                fill_result = self._simulate_order_execution(order, symbol, bar)
+                if fill_result is not None:
+                    self._fill_order_with_result(order, fill_result, bar.timestamp)
+                    orders_to_remove.append(i)
             else:
-                fill_price -= slippage
+                # Fallback to simple execution
+                fill_price = self._get_fill_price(bar)
+                if fill_price is None:
+                    continue
 
-            # Check if order can be filled
-            if self._can_fill_order(order, fill_price):
-                self._fill_order(order, fill_price, bar.timestamp)
-                orders_to_remove.append(i)
+                # Apply slippage
+                slippage = self._calculate_slippage(order, fill_price)
+                if order.side == OrderSide.BUY:
+                    fill_price += slippage
+                else:
+                    fill_price -= slippage
+
+                # Check if order can be filled
+                if self._can_fill_order(order, fill_price):
+                    self._fill_order(order, fill_price, bar.timestamp)
+                    orders_to_remove.append(i)
 
         # Remove filled orders
         for i in sorted(orders_to_remove, reverse=True):
             self._state.pending_orders.pop(i)
+
+    def _simulate_order_execution(
+        self,
+        order: Order,
+        symbol: str,
+        bar: OHLCVBar,
+    ) -> FillResult | None:
+        """Simulate order execution using MarketSimulator.
+
+        Returns FillResult if order should be filled, None otherwise.
+        """
+        conditions = self._market_conditions.get(symbol)
+        if conditions is None:
+            return None
+
+        # Update conditions with execution bar price
+        execution_price = self._get_fill_price(bar)
+        if execution_price is None:
+            return None
+
+        conditions = MarketConditions(
+            price=execution_price,
+            bid=conditions.bid,
+            ask=conditions.ask,
+            volume=bar.volume,
+            avg_daily_volume=conditions.avg_daily_volume,
+            volatility=conditions.volatility,
+            spread_bps=conditions.spread_bps,
+            timestamp=bar.timestamp,
+        )
+
+        # Simulate execution
+        fill_result = self.market_simulator.simulate_execution(order, conditions)
+
+        # Check rejection
+        if fill_result.fill_type == FillType.REJECTED:
+            logger.debug(
+                f"Order rejected: {order.symbol} - {fill_result.rejection_reason}"
+            )
+            return None
+
+        # Check if we can afford the fill
+        if not self._can_fill_order_amount(
+            order,
+            fill_result.fill_price,
+            fill_result.fill_quantity,
+            fill_result.commission,
+        ):
+            return None
+
+        return fill_result
+
+    def _can_fill_order_amount(
+        self,
+        order: Order,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        commission: Decimal,
+    ) -> bool:
+        """Check if order can be filled with given amount."""
+        trade_value = fill_quantity * fill_price
+
+        if order.side == OrderSide.BUY:
+            return self._state.cash >= trade_value + commission
+
+        # For sells, check position
+        position = self._state.positions.get(order.symbol)
+        if position is None:
+            return self.config.allow_short
+        return position.quantity >= fill_quantity or self.config.allow_short
+
+    def _fill_order_with_result(
+        self,
+        order: Order,
+        fill_result: FillResult,
+        fill_time: datetime,
+    ) -> None:
+        """Fill an order using MarketSimulator result."""
+        fill_price = fill_result.fill_price
+        fill_quantity = fill_result.fill_quantity
+        commission = fill_result.commission
+        trade_value = fill_quantity * fill_price
+
+        # Update position
+        position = self._state.positions.get(order.symbol)
+
+        if order.side == OrderSide.BUY:
+            self._state.cash -= trade_value + commission
+
+            if position is None:
+                # New position
+                self._state.positions[order.symbol] = Position(
+                    symbol=order.symbol,
+                    quantity=fill_quantity,
+                    avg_entry_price=fill_price,
+                    current_price=fill_price,
+                    cost_basis=trade_value,
+                    market_value=trade_value,
+                )
+                self._open_positions[order.symbol] = {
+                    "entry_time": fill_time,
+                    "entry_price": fill_price,
+                    "quantity": fill_quantity,
+                    "bars_held": 0,
+                    "entry_side": order.side,
+                    "total_slippage": fill_result.slippage,
+                    "total_commission": commission,
+                }
+            else:
+                # Add to position
+                new_qty = position.quantity + fill_quantity
+                new_cost = position.cost_basis + trade_value
+                new_avg = new_cost / new_qty
+                self._state.positions[order.symbol] = Position(
+                    symbol=order.symbol,
+                    quantity=new_qty,
+                    avg_entry_price=new_avg,
+                    current_price=fill_price,
+                    cost_basis=new_cost,
+                    market_value=new_qty * fill_price,
+                )
+                # Update open position tracking
+                if order.symbol in self._open_positions:
+                    self._open_positions[order.symbol]["total_slippage"] += fill_result.slippage
+                    self._open_positions[order.symbol]["total_commission"] += commission
+        else:
+            # Sell
+            self._state.cash += trade_value - commission
+
+            if position is not None:
+                # Record trade
+                if order.symbol in self._open_positions:
+                    open_pos = self._open_positions[order.symbol]
+                    entry_side = open_pos.get("entry_side", OrderSide.BUY)
+
+                    if entry_side == OrderSide.BUY:
+                        pnl = (fill_price - open_pos["entry_price"]) * fill_quantity - commission
+                    else:
+                        pnl = (open_pos["entry_price"] - fill_price) * fill_quantity - commission
+
+                    pnl_pct = float(pnl / (open_pos["entry_price"] * fill_quantity))
+
+                    trade = Trade(
+                        symbol=order.symbol,
+                        entry_time=open_pos["entry_time"],
+                        exit_time=fill_time,
+                        side=entry_side,
+                        quantity=fill_quantity,
+                        entry_price=open_pos["entry_price"],
+                        exit_price=fill_price,
+                        pnl=pnl,
+                        pnl_pct=pnl_pct,
+                        commission=commission + open_pos.get("total_commission", Decimal("0")),
+                        slippage=fill_result.slippage + open_pos.get("total_slippage", Decimal("0")),
+                        holding_period_bars=open_pos["bars_held"],
+                        metadata={
+                            "fill_type": fill_result.fill_type.value,
+                            "latency_ms": fill_result.latency_ms,
+                            "market_impact": float(fill_result.market_impact),
+                        },
+                    )
+                    self._state.trades.append(trade)
+
+                new_qty = position.quantity - fill_quantity
+                if new_qty <= 0:
+                    del self._state.positions[order.symbol]
+                    self._open_positions.pop(order.symbol, None)
+                else:
+                    self._state.positions[order.symbol] = Position(
+                        symbol=order.symbol,
+                        quantity=new_qty,
+                        avg_entry_price=position.avg_entry_price,
+                        current_price=fill_price,
+                        cost_basis=position.avg_entry_price * new_qty,
+                        market_value=new_qty * fill_price,
+                    )
+
+        # Handle partial fills - re-queue remaining
+        if fill_result.fill_type == FillType.PARTIAL and fill_result.partial_remaining > 0:
+            remaining_order = Order(
+                symbol=order.symbol,
+                side=order.side,
+                order_type=order.order_type,
+                quantity=fill_result.partial_remaining,
+                signal_id=order.signal_id,
+            )
+            self._state.pending_orders.append(remaining_order)
+            logger.debug(
+                f"Partial fill for {order.symbol}: {fill_quantity} filled, "
+                f"{fill_result.partial_remaining} remaining"
+            )
+
+        self._state.orders_filled += 1
+        self.strategy.on_fill(order)
+
+        for callback in self._on_fill_callbacks:
+            callback(order, fill_price)
 
     def _get_fill_price(self, bar: OHLCVBar) -> Decimal | None:
         """Get fill price based on execution config.

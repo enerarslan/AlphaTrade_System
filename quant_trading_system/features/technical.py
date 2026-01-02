@@ -497,7 +497,30 @@ class Aroon(TechnicalIndicator):
 
 
 class ParabolicSAR(TechnicalIndicator):
-    """Parabolic SAR indicator."""
+    """
+    JPMORGAN FIX: Parabolic SAR indicator with proper state machine.
+
+    Fixed issues:
+    1. Proper state machine with explicit UPTREND/DOWNTREND states
+    2. Correct initialization based on initial price action
+    3. Proper boundary conditions for SAR constraints
+    4. Fixed AF reset logic on reversals
+    5. Correct EP update logic
+    6. Added reversal signal output for trading
+
+    The Parabolic SAR (Stop and Reverse) is a trend-following indicator that:
+    - Provides potential entry/exit points
+    - Trails price during a trend
+    - Reverses when price crosses the SAR
+
+    State machine states:
+    - UPTREND (1): SAR below price, trailing up
+    - DOWNTREND (-1): SAR above price, trailing down
+    """
+
+    # State constants for clarity
+    UPTREND = 1
+    DOWNTREND = -1
 
     def __init__(self, af_start: float = 0.02, af_increment: float = 0.02, af_max: float = 0.2):
         super().__init__("PSAR")
@@ -511,54 +534,137 @@ class ParabolicSAR(TechnicalIndicator):
         low = df["low"].to_numpy().astype(np.float64)
 
         n = len(high)
+        if n < 2:
+            return {
+                "psar": np.full(n, np.nan),
+                "psar_trend": np.zeros(n),
+                "psar_reversal": np.zeros(n),
+            }
+
         psar = np.zeros(n)
         trend = np.zeros(n)  # 1 for uptrend, -1 for downtrend
         ep = np.zeros(n)  # Extreme point
-        af = np.zeros(n)
+        af = np.zeros(n)  # Acceleration factor
+        reversal = np.zeros(n)  # Signal when reversal occurs
 
-        # Initialize
-        trend[0] = 1
-        psar[0] = low[0]
-        ep[0] = high[0]
+        # JPMORGAN FIX: Proper initialization based on initial price action
+        # Determine initial trend from first two bars
+        if high[1] > high[0] and low[1] >= low[0]:
+            # Higher high and higher/equal low = uptrend
+            initial_trend = self.UPTREND
+        elif low[1] < low[0] and high[1] <= high[0]:
+            # Lower low and lower/equal high = downtrend
+            initial_trend = self.DOWNTREND
+        else:
+            # Mixed signals - default to uptrend
+            initial_trend = self.UPTREND
+
+        # Initialize first bar
+        trend[0] = initial_trend
         af[0] = self.af_start
 
+        if initial_trend == self.UPTREND:
+            psar[0] = low[0]  # SAR starts below price
+            ep[0] = high[0]   # EP is highest high
+        else:
+            psar[0] = high[0]  # SAR starts above price
+            ep[0] = low[0]     # EP is lowest low
+
+        # State machine processing
         for i in range(1, n):
-            if trend[i - 1] == 1:  # Uptrend
-                psar[i] = psar[i - 1] + af[i - 1] * (ep[i - 1] - psar[i - 1])
-                psar[i] = min(psar[i], low[i - 1], low[i - 2] if i > 1 else low[i - 1])
+            prev_trend = trend[i - 1]
+            prev_psar = psar[i - 1]
+            prev_ep = ep[i - 1]
+            prev_af = af[i - 1]
 
-                if low[i] < psar[i]:  # Reversal
-                    trend[i] = -1
-                    psar[i] = ep[i - 1]
+            if prev_trend == self.UPTREND:
+                # ===== UPTREND STATE =====
+
+                # Step 1: Calculate new SAR
+                new_psar = prev_psar + prev_af * (prev_ep - prev_psar)
+
+                # Step 2: SAR cannot be above prior two lows (support constraint)
+                # This prevents SAR from entering the price range prematurely
+                prior_low_1 = low[i - 1]
+                prior_low_2 = low[i - 2] if i >= 2 else low[i - 1]
+                sar_constraint = min(prior_low_1, prior_low_2)
+                new_psar = min(new_psar, sar_constraint)
+
+                # Step 3: Check for reversal
+                if low[i] < new_psar:
+                    # REVERSAL: Switch to downtrend
+                    trend[i] = self.DOWNTREND
+                    reversal[i] = -1  # Bearish reversal signal
+
+                    # New SAR is the previous EP (highest high of uptrend)
+                    psar[i] = prev_ep
+
+                    # New EP is current low
                     ep[i] = low[i]
+
+                    # Reset AF
                     af[i] = self.af_start
                 else:
-                    trend[i] = 1
-                    if high[i] > ep[i - 1]:
+                    # Continue uptrend
+                    trend[i] = self.UPTREND
+                    psar[i] = new_psar
+
+                    # Update EP if new high made
+                    if high[i] > prev_ep:
                         ep[i] = high[i]
-                        af[i] = min(af[i - 1] + self.af_increment, self.af_max)
+                        # Increment AF (capped at max)
+                        af[i] = min(prev_af + self.af_increment, self.af_max)
                     else:
-                        ep[i] = ep[i - 1]
-                        af[i] = af[i - 1]
-            else:  # Downtrend
-                psar[i] = psar[i - 1] - af[i - 1] * (psar[i - 1] - ep[i - 1])
-                psar[i] = max(psar[i], high[i - 1], high[i - 2] if i > 1 else high[i - 1])
+                        ep[i] = prev_ep
+                        af[i] = prev_af
 
-                if high[i] > psar[i]:  # Reversal
-                    trend[i] = 1
-                    psar[i] = ep[i - 1]
+            else:
+                # ===== DOWNTREND STATE =====
+
+                # Step 1: Calculate new SAR
+                new_psar = prev_psar - prev_af * (prev_psar - prev_ep)
+
+                # Step 2: SAR cannot be below prior two highs (resistance constraint)
+                # This prevents SAR from entering the price range prematurely
+                prior_high_1 = high[i - 1]
+                prior_high_2 = high[i - 2] if i >= 2 else high[i - 1]
+                sar_constraint = max(prior_high_1, prior_high_2)
+                new_psar = max(new_psar, sar_constraint)
+
+                # Step 3: Check for reversal
+                if high[i] > new_psar:
+                    # REVERSAL: Switch to uptrend
+                    trend[i] = self.UPTREND
+                    reversal[i] = 1  # Bullish reversal signal
+
+                    # New SAR is the previous EP (lowest low of downtrend)
+                    psar[i] = prev_ep
+
+                    # New EP is current high
                     ep[i] = high[i]
+
+                    # Reset AF
                     af[i] = self.af_start
                 else:
-                    trend[i] = -1
-                    if low[i] < ep[i - 1]:
-                        ep[i] = low[i]
-                        af[i] = min(af[i - 1] + self.af_increment, self.af_max)
-                    else:
-                        ep[i] = ep[i - 1]
-                        af[i] = af[i - 1]
+                    # Continue downtrend
+                    trend[i] = self.DOWNTREND
+                    psar[i] = new_psar
 
-        return {"psar": psar, "psar_trend": trend}
+                    # Update EP if new low made
+                    if low[i] < prev_ep:
+                        ep[i] = low[i]
+                        # Increment AF (capped at max)
+                        af[i] = min(prev_af + self.af_increment, self.af_max)
+                    else:
+                        ep[i] = prev_ep
+                        af[i] = prev_af
+
+        return {
+            "psar": psar,
+            "psar_trend": trend,
+            "psar_reversal": reversal,  # JPMORGAN FIX: Added reversal signals
+            "psar_af": af,  # JPMORGAN FIX: Added AF for debugging/analysis
+        }
 
 
 class Ichimoku(TechnicalIndicator):

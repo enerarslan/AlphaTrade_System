@@ -380,6 +380,100 @@ class ModelRegistry:
         self._save_registry()
 
 
+class OverfittingDetector:
+    """
+    JPMORGAN FIX: Detect overfitting by comparing in-sample and out-of-sample metrics.
+
+    Critical for institutional trading where overfitted models can cause significant losses.
+    """
+
+    def __init__(
+        self,
+        max_is_oos_ratio: float = 2.0,
+        min_oos_sharpe: float = 0.3,
+        max_oos_drawdown: float = 0.30,
+        min_oos_win_rate: float = 0.40,
+    ):
+        """
+        Initialize overfitting detector.
+
+        Args:
+            max_is_oos_ratio: Maximum acceptable ratio of IS to OOS performance.
+                              Values > 2.0 strongly indicate overfitting.
+            min_oos_sharpe: Minimum acceptable Sharpe ratio on OOS data
+            max_oos_drawdown: Maximum acceptable drawdown on OOS data
+            min_oos_win_rate: Minimum acceptable win rate on OOS data
+        """
+        self.max_is_oos_ratio = max_is_oos_ratio
+        self.min_oos_sharpe = min_oos_sharpe
+        self.max_oos_drawdown = max_oos_drawdown
+        self.min_oos_win_rate = min_oos_win_rate
+
+    def check_overfitting(
+        self,
+        is_score: float,
+        oos_metrics: dict[str, float],
+    ) -> tuple[bool, list[str]]:
+        """
+        Check if model shows signs of overfitting.
+
+        Args:
+            is_score: In-sample (CV) optimization score
+            oos_metrics: Out-of-sample holdout metrics
+
+        Returns:
+            Tuple of (is_acceptable, list of warning messages)
+        """
+        warnings = []
+        is_acceptable = True
+
+        # Check IS/OOS ratio (score degradation)
+        oos_sharpe = oos_metrics.get("sharpe_ratio", 0.0)
+        if is_score > 0 and oos_sharpe > 0:
+            is_oos_ratio = is_score / oos_sharpe
+            if is_oos_ratio > self.max_is_oos_ratio:
+                warnings.append(
+                    f"OVERFITTING WARNING: IS/OOS ratio {is_oos_ratio:.2f} > {self.max_is_oos_ratio}. "
+                    f"In-sample: {is_score:.2f}, Out-of-sample: {oos_sharpe:.2f}"
+                )
+                is_acceptable = False
+
+        # Check minimum OOS Sharpe
+        if oos_sharpe < self.min_oos_sharpe:
+            warnings.append(
+                f"LOW OOS PERFORMANCE: Sharpe {oos_sharpe:.2f} < {self.min_oos_sharpe}"
+            )
+            is_acceptable = False
+
+        # Check maximum OOS drawdown
+        oos_drawdown = oos_metrics.get("max_drawdown", 0.0)
+        if oos_drawdown > self.max_oos_drawdown:
+            warnings.append(
+                f"HIGH OOS DRAWDOWN: {oos_drawdown:.1%} > {self.max_oos_drawdown:.1%}"
+            )
+            is_acceptable = False
+
+        # Check minimum OOS win rate
+        oos_win_rate = oos_metrics.get("win_rate", 0.0)
+        if oos_win_rate < self.min_oos_win_rate:
+            warnings.append(
+                f"LOW OOS WIN RATE: {oos_win_rate:.1%} < {self.min_oos_win_rate:.1%}"
+            )
+            is_acceptable = False
+
+        return is_acceptable, warnings
+
+    def compute_is_oos_ratio(
+        self,
+        is_score: float,
+        oos_score: float,
+    ) -> float:
+        """Compute IS/OOS performance ratio."""
+        if oos_score <= 0:
+            return float("inf") if is_score > 0 else 1.0
+        return is_score / oos_score
+
+
 class HyperparameterOptimizer:
     """
     Hyperparameter optimization using various methods.
@@ -791,12 +885,16 @@ class ModelManager:
         register: bool = True,
         holdout_fraction: float = 0.15,
         gap: int = 5,
+        reject_overfitted: bool = True,
+        overfitting_config: dict[str, float] | None = None,
     ) -> tuple[TradingModel, dict[str, float]]:
         """
         Optimize hyperparameters and train final model.
 
-        CRITICAL FIX: Now properly holds out test data BEFORE optimization
+        JPMORGAN FIX: Now properly holds out test data BEFORE optimization
         to prevent optimistic bias from training on data used for HP selection.
+        Also includes overfitting detection to reject models that show
+        significant performance degradation on holdout data.
 
         The data is split as follows:
         1. [0, train_val_end) - Used for HP optimization via cross-validation
@@ -816,9 +914,14 @@ class ModelManager:
             register: Whether to register the model
             holdout_fraction: Fraction of data to hold out for final testing
             gap: Gap between train/val and holdout to prevent leakage
+            reject_overfitted: If True, raise error for overfitted models
+            overfitting_config: Configuration for OverfittingDetector
 
         Returns:
             Tuple of (trained model, holdout test metrics)
+
+        Raises:
+            OverfittingError: If reject_overfitted=True and model shows overfitting
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -842,7 +945,7 @@ class ModelManager:
         y_holdout = y[train_val_end + gap:]
 
         logger.info(
-            f"Data split: train_val={len(X_train_val)}, gap={gap}, "
+            f"JPMORGAN DATA SPLIT: train_val={len(X_train_val)}, gap={gap}, "
             f"holdout={len(X_holdout)}, total={n_samples}"
         )
 
@@ -858,7 +961,7 @@ class ModelManager:
         best_params = optimizer.optimize(X_train_val, y_train_val, cv_splitter)
 
         logger.info(f"Best hyperparameters: {best_params}")
-        logger.info(f"CV optimization score: {optimizer.best_score:.4f}")
+        logger.info(f"CV optimization score (in-sample): {optimizer.best_score:.4f}")
 
         # Train final model on train+val data ONLY (not holdout)
         model = model_class(**best_params)
@@ -870,18 +973,54 @@ class ModelManager:
             y_holdout, holdout_predictions, model.model_type
         )
 
-        logger.info(f"Holdout test metrics: {holdout_metrics}")
+        logger.info(f"Holdout test metrics (out-of-sample): {holdout_metrics}")
+
+        # JPMORGAN FIX: Overfitting detection
+        detector_config = overfitting_config or {}
+        detector = OverfittingDetector(**detector_config)
+        is_acceptable, warnings = detector.check_overfitting(
+            optimizer.best_score, holdout_metrics
+        )
+
+        # Compute and log IS/OOS ratio
+        oos_sharpe = holdout_metrics.get("sharpe_ratio", 0.0)
+        is_oos_ratio = detector.compute_is_oos_ratio(optimizer.best_score, oos_sharpe)
+        holdout_metrics["is_oos_ratio"] = is_oos_ratio
+
+        for warning in warnings:
+            logger.warning(warning)
+
+        if not is_acceptable:
+            if reject_overfitted:
+                from quant_trading_system.core.exceptions import ModelValidationError
+                raise ModelValidationError(
+                    f"Model rejected due to overfitting. Warnings: {warnings}"
+                )
+            else:
+                logger.error(
+                    "MODEL SHOWS OVERFITTING but reject_overfitted=False. "
+                    "Proceeding with registration but exercise caution!"
+                )
+                holdout_metrics["overfitting_detected"] = True
+        else:
+            logger.info("Model passed overfitting validation checks")
+            holdout_metrics["overfitting_detected"] = False
 
         # Register if requested
         if register:
+            tags = ["optimized", "holdout_validated"]
+            if not is_acceptable:
+                tags.append("overfitting_warning")
+
             self.registry.register(
                 model,
                 metrics={
                     "optimization_score": optimizer.best_score,
+                    "is_oos_ratio": is_oos_ratio,
                     **{f"holdout_{k}": v for k, v in holdout_metrics.items()},
                 },
-                tags=["optimized", "holdout_validated"],
-                description=f"Optimized with {optimization_method} search, holdout validated",
+                tags=tags,
+                description=f"Optimized with {optimization_method} search, holdout validated, IS/OOS ratio: {is_oos_ratio:.2f}",
             )
 
         return model, holdout_metrics
@@ -892,7 +1031,11 @@ class ModelManager:
         y_pred: np.ndarray,
         model_type: "ModelType",
     ) -> dict[str, float]:
-        """Calculate metrics on holdout test set."""
+        """
+        JPMORGAN FIX: Calculate comprehensive metrics on holdout test set.
+
+        Includes trading-specific metrics for institutional-grade evaluation.
+        """
         from sklearn.metrics import (
             accuracy_score,
             f1_score,
@@ -907,6 +1050,7 @@ class ModelManager:
             metrics["mse"] = float(mean_squared_error(y_true, y_pred))
             metrics["mae"] = float(mean_absolute_error(y_true, y_pred))
             metrics["r2"] = float(r2_score(y_true, y_pred))
+
             # Directional accuracy for trading
             if len(y_true) > 1:
                 direction_true = np.sign(np.diff(y_true))
@@ -914,6 +1058,42 @@ class ModelManager:
                 metrics["directional_accuracy"] = float(
                     np.mean(direction_true == direction_pred)
                 )
+
+            # JPMORGAN FIX: Trading-specific holdout metrics
+            # Simulated returns based on predictions
+            if len(y_true) > 1:
+                # Assume y_pred is return prediction, trade in direction of prediction
+                simulated_returns = np.sign(y_pred[:-1]) * y_true[1:]
+
+                if len(simulated_returns) > 0 and np.std(simulated_returns) > 1e-10:
+                    # Sharpe ratio (annualized assuming 15-min bars, ~26 bars/day, 252 days/year)
+                    annualization_factor = np.sqrt(26 * 252)
+                    metrics["sharpe_ratio"] = float(
+                        np.mean(simulated_returns) / np.std(simulated_returns) * annualization_factor
+                    )
+
+                    # Maximum drawdown
+                    cumulative_returns = np.cumprod(1 + simulated_returns)
+                    running_max = np.maximum.accumulate(cumulative_returns)
+                    drawdown = (running_max - cumulative_returns) / running_max
+                    metrics["max_drawdown"] = float(np.max(drawdown))
+
+                    # Win rate
+                    winning_trades = np.sum(simulated_returns > 0)
+                    total_trades = len(simulated_returns)
+                    metrics["win_rate"] = float(winning_trades / total_trades) if total_trades > 0 else 0.0
+
+                    # Profit factor
+                    gross_profit = np.sum(simulated_returns[simulated_returns > 0])
+                    gross_loss = abs(np.sum(simulated_returns[simulated_returns < 0]))
+                    metrics["profit_factor"] = float(
+                        gross_profit / gross_loss if gross_loss > 1e-10 else float("inf")
+                    )
+                else:
+                    metrics["sharpe_ratio"] = 0.0
+                    metrics["max_drawdown"] = 0.0
+                    metrics["win_rate"] = 0.0
+                    metrics["profit_factor"] = 0.0
         else:
             metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
             metrics["f1"] = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))

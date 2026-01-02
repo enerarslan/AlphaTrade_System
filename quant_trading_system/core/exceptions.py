@@ -380,6 +380,45 @@ class TrainingError(ModelError):
         self.epoch = epoch
 
 
+class ModelValidationError(ModelError):
+    """JPMORGAN FIX: Raised when model fails validation gates.
+
+    This exception is raised when a model fails institutional-grade validation
+    checks that are designed to prevent deployment of unreliable models.
+
+    Examples:
+        - Model shows significant overfitting (IS/OOS ratio too high)
+        - Holdout Sharpe ratio below minimum threshold
+        - Maximum drawdown on holdout exceeds limit
+        - Win rate below acceptable threshold
+        - Model fails backtesting performance gates
+    """
+
+    def __init__(
+        self,
+        message: str,
+        model_name: str | None = None,
+        validation_type: str | None = None,
+        is_oos_ratio: float | None = None,
+        failed_gates: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        details = kwargs.pop("details", {})
+        if model_name:
+            details["model_name"] = model_name
+        if validation_type:
+            details["validation_type"] = validation_type
+        if is_oos_ratio is not None:
+            details["is_oos_ratio"] = is_oos_ratio
+        if failed_gates:
+            details["failed_gates"] = failed_gates
+        super().__init__(message, error_code="MODEL_VALIDATION_FAILED", details=details, **kwargs)
+        self.model_name = model_name
+        self.validation_type = validation_type
+        self.is_oos_ratio = is_oos_ratio
+        self.failed_gates = failed_gates or []
+
+
 # =============================================================================
 # Execution Errors
 # =============================================================================
