@@ -1,84 +1,341 @@
-# Alertmanager configuration for Quant Trading System
+# =============================================================================
+# Alertmanager Configuration for AlphaTrade Trading System
+# =============================================================================
+#
+# This configuration implements production-ready alert routing for an
+# institutional trading system with the following severity-based routing:
+#
+#   CRITICAL -> PagerDuty + Slack (#trading-critical) + Email
+#   HIGH     -> Slack (#trading-alerts) + Email
+#   MEDIUM   -> Slack (#trading-alerts) only
+#   LOW      -> Email only (batched/digested)
+#
+# Environment Variables Required:
+#   - SLACK_WEBHOOK_URL: Slack incoming webhook URL
+#   - SLACK_CHANNEL: Default Slack channel (default: #trading-alerts)
+#   - SMTP_HOST: SMTP server hostname
+#   - SMTP_PORT: SMTP port (default: 587)
+#   - SMTP_FROM: Sender email address
+#   - SMTP_TO: Recipient email address(es)
+#   - SMTP_AUTH_USER: SMTP username (optional)
+#   - SMTP_AUTH_PASSWORD: SMTP password (optional)
+#   - PAGERDUTY_SERVICE_KEY: PagerDuty Events API v2 integration key
+#
+# =============================================================================
 
 global:
-  # Global SMTP settings (configure for your environment)
-  # smtp_smarthost: 'smtp.example.com:587'
-  # smtp_from: 'alertmanager@example.com'
-  # smtp_auth_username: 'alertmanager@example.com'
-  # smtp_auth_password: 'password'
+  # Global SMTP settings for email notifications
+  smtp_smarthost: '${SMTP_HOST}:${SMTP_PORT}'
+  smtp_from: '${SMTP_FROM}'
+  smtp_auth_username: '${SMTP_AUTH_USER}'
+  smtp_auth_password: '${SMTP_AUTH_PASSWORD}'
+  smtp_require_tls: true
 
-  # Global Slack settings
-  # slack_api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
+  # Global Slack webhook URL
+  slack_api_url: '${SLACK_WEBHOOK_URL}'
 
-# Route tree for alert routing
+  # Resolve timeout - how long to wait before declaring an alert resolved
+  resolve_timeout: 5m
+
+# =============================================================================
+# Alert Templates
+# =============================================================================
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# =============================================================================
+# Route Tree - Determines how alerts are routed to receivers
+# =============================================================================
 route:
-  # Default receiver
+  # Default receiver for unmatched alerts
   receiver: 'default-receiver'
 
-  # Group alerts by alertname and severity
-  group_by: ['alertname', 'severity']
+  # Group alerts by these labels
+  group_by: ['alertname', 'severity', 'component']
 
   # Wait 30s before sending first notification for a group
   group_wait: 30s
 
-  # Wait 5m before sending updated notifications
+  # Wait 5m before sending updated notifications for a group
   group_interval: 5m
 
-  # Wait 4h before resending notifications
+  # Wait 4h before resending notifications for the same alert
   repeat_interval: 4h
 
-  # Child routes for different severities
+  # Child routes - evaluated in order, first match wins
   routes:
-    # Critical alerts - immediate notification
+    # =========================================================================
+    # CRITICAL Alerts - Immediate escalation to all channels
+    # =========================================================================
     - match:
         severity: critical
       receiver: 'critical-receiver'
       group_wait: 10s
-      repeat_interval: 1h
+      group_interval: 1m
+      repeat_interval: 15m
+      continue: false  # Stop processing after match
 
-    # Warning alerts
+    # =========================================================================
+    # HIGH Alerts - Slack + Email
+    # =========================================================================
     - match:
-        severity: warning
-      receiver: 'warning-receiver'
-      group_wait: 1m
-      repeat_interval: 4h
+        severity: high
+      receiver: 'high-receiver'
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 1h
+      continue: false
 
-# Inhibition rules - suppress notifications
+    # =========================================================================
+    # MEDIUM Alerts - Slack only (with time-based muting)
+    # =========================================================================
+    - match:
+        severity: medium
+      receiver: 'medium-receiver'
+      group_wait: 1m
+      group_interval: 10m
+      repeat_interval: 4h
+      # Mute during quiet hours (10 PM - 7 AM UTC)
+      mute_time_intervals:
+        - name: 'quiet-hours'
+      continue: false
+
+    # =========================================================================
+    # LOW Alerts - Email only (batched)
+    # =========================================================================
+    - match:
+        severity: low
+      receiver: 'low-receiver'
+      group_wait: 5m
+      group_interval: 30m
+      repeat_interval: 12h
+      # Mute during quiet hours (8 PM - 8 AM UTC)
+      mute_time_intervals:
+        - name: 'quiet-hours-extended'
+      continue: false
+
+    # =========================================================================
+    # Heartbeat/Health Check Alerts - Minimal notification
+    # =========================================================================
+    - match:
+        alertname: 'Heartbeat'
+      receiver: 'null-receiver'
+      continue: false
+
+    # =========================================================================
+    # Kill Switch Alerts - Maximum priority
+    # =========================================================================
+    - match:
+        alertname: 'KillSwitchTriggered'
+      receiver: 'critical-receiver'
+      group_wait: 0s
+      repeat_interval: 5m
+      continue: false
+
+    # =========================================================================
+    # Drawdown/Loss Alerts - High priority
+    # =========================================================================
+    - match_re:
+        alertname: '(MaxDrawdownBreached|DailyLossLimitBreached)'
+      receiver: 'critical-receiver'
+      group_wait: 0s
+      repeat_interval: 10m
+      continue: false
+
+# =============================================================================
+# Mute Time Intervals
+# =============================================================================
+time_intervals:
+  - name: 'quiet-hours'
+    time_intervals:
+      - times:
+          - start_time: '22:00'
+            end_time: '07:00'
+        weekdays: ['monday:friday']
+
+  - name: 'quiet-hours-extended'
+    time_intervals:
+      - times:
+          - start_time: '20:00'
+            end_time: '08:00'
+        weekdays: ['monday:friday']
+      # Full weekend quiet
+      - weekdays: ['saturday', 'sunday']
+
+  - name: 'weekends'
+    time_intervals:
+      - weekdays: ['saturday', 'sunday']
+
+# =============================================================================
+# Inhibition Rules - Suppress lower-priority alerts when higher-priority fires
+# =============================================================================
 inhibit_rules:
-  # Suppress warning alerts when critical alerts fire
+  # Suppress HIGH alerts when CRITICAL alerts fire for same component
   - source_match:
       severity: 'critical'
     target_match:
-      severity: 'warning'
-    equal: ['alertname']
+      severity: 'high'
+    equal: ['alertname', 'component']
 
-# Receivers
+  # Suppress MEDIUM alerts when HIGH or CRITICAL alerts fire
+  - source_match_re:
+      severity: '(critical|high)'
+    target_match:
+      severity: 'medium'
+    equal: ['alertname', 'component']
+
+  # Suppress LOW alerts when any higher severity fires
+  - source_match_re:
+      severity: '(critical|high|medium)'
+    target_match:
+      severity: 'low'
+    equal: ['alertname', 'component']
+
+  # Suppress model alerts when kill switch is active
+  - source_match:
+      alertname: 'KillSwitchTriggered'
+    target_match_re:
+      alertname: 'Model.*'
+    equal: []
+
+# =============================================================================
+# Receivers - Define notification endpoints
+# =============================================================================
 receivers:
-  # Default receiver - just logs
+  # Default receiver - logs only (fallback)
   - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://trading_app:8000/api/v1/alerts/webhook'
+        send_resolved: true
 
-  # Critical receiver - configure for your needs
+  # Null receiver - discards alerts (for heartbeats, etc.)
+  - name: 'null-receiver'
+
+  # =========================================================================
+  # CRITICAL Receiver - PagerDuty + Slack + Email
+  # =========================================================================
   - name: 'critical-receiver'
-    # Slack configuration
-    # slack_configs:
-    #   - channel: '#trading-alerts'
-    #     send_resolved: true
-    #     title: '{{ .Status | toUpper }} - {{ .CommonAnnotations.summary }}'
-    #     text: '{{ .CommonAnnotations.description }}'
+    # PagerDuty for incident management
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY}'
+        send_resolved: true
+        severity: critical
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          firing: '{{ template "pagerduty.default.instances" .Alerts.Firing }}'
+          resolved: '{{ template "pagerduty.default.instances" .Alerts.Resolved }}'
+          environment: '${APP_ENV}'
+          component: '{{ .CommonLabels.component }}'
 
-    # Email configuration
-    # email_configs:
-    #   - to: 'oncall@example.com'
-    #     send_resolved: true
+    # Slack notification to #trading-critical
+    slack_configs:
+      - channel: '#trading-critical'
+        send_resolved: true
+        username: 'AlphaTrade Alert Bot'
+        icon_emoji: ':rotating_light:'
+        title: '{{ if eq .Status "firing" }}:fire: CRITICAL ALERT{{ else }}:white_check_mark: RESOLVED{{ end }}'
+        text: |
+          *Alert:* {{ .CommonAnnotations.summary }}
+          *Description:* {{ .CommonAnnotations.description }}
+          *Severity:* {{ .CommonLabels.severity | toUpper }}
+          *Component:* {{ .CommonLabels.component }}
+          *Environment:* ${APP_ENV}
+          {{ if .CommonAnnotations.runbook_url }}*Runbook:* <{{ .CommonAnnotations.runbook_url }}|View Runbook>{{ end }}
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+        actions:
+          - type: button
+            text: 'View Dashboard'
+            url: 'http://localhost:3000/d/trading-overview'
+          - type: button
+            text: 'Acknowledge'
+            url: '{{ .ExternalURL }}/#/alerts'
 
-    # PagerDuty configuration
-    # pagerduty_configs:
-    #   - service_key: 'your-pagerduty-key'
-    #     send_resolved: true
+    # Email notification
+    email_configs:
+      - to: '${SMTP_TO}'
+        send_resolved: true
+        html: |
+          <html>
+          <body style="font-family: Arial, sans-serif;">
+            <div style="background: {{ if eq .Status "firing" }}#dc3545{{ else }}#28a745{{ end }}; color: white; padding: 20px;">
+              <h1>{{ if eq .Status "firing" }}CRITICAL ALERT{{ else }}RESOLVED{{ end }}</h1>
+            </div>
+            <div style="padding: 20px;">
+              <h2>{{ .CommonAnnotations.summary }}</h2>
+              <p>{{ .CommonAnnotations.description }}</p>
+              <table style="border-collapse: collapse; width: 100%;">
+                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Severity</strong></td><td style="padding: 8px; border: 1px solid #ddd;">{{ .CommonLabels.severity | toUpper }}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Component</strong></td><td style="padding: 8px; border: 1px solid #ddd;">{{ .CommonLabels.component }}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Environment</strong></td><td style="padding: 8px; border: 1px solid #ddd;">${APP_ENV}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>Time</strong></td><td style="padding: 8px; border: 1px solid #ddd;">{{ .StartsAt }}</td></tr>
+              </table>
+              {{ if .CommonAnnotations.runbook_url }}
+              <p><a href="{{ .CommonAnnotations.runbook_url }}" style="background: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">View Runbook</a></p>
+              {{ end }}
+            </div>
+            <div style="background: #f8f9fa; padding: 10px; text-align: center; font-size: 12px; color: #666;">
+              AlphaTrade Trading System - Alert Management
+            </div>
+          </body>
+          </html>
 
-  # Warning receiver
-  - name: 'warning-receiver'
-    # Slack configuration for warnings
-    # slack_configs:
-    #   - channel: '#trading-warnings'
-    #     send_resolved: true
+  # =========================================================================
+  # HIGH Receiver - Slack + Email
+  # =========================================================================
+  - name: 'high-receiver'
+    slack_configs:
+      - channel: '#trading-alerts'
+        send_resolved: true
+        username: 'AlphaTrade Alert Bot'
+        icon_emoji: ':warning:'
+        title: '{{ if eq .Status "firing" }}:warning: HIGH PRIORITY ALERT{{ else }}:white_check_mark: RESOLVED{{ end }}'
+        text: |
+          *Alert:* {{ .CommonAnnotations.summary }}
+          *Description:* {{ .CommonAnnotations.description }}
+          *Severity:* {{ .CommonLabels.severity | toUpper }}
+          *Component:* {{ .CommonLabels.component }}
+        color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+
+    email_configs:
+      - to: '${SMTP_TO}'
+        send_resolved: true
+        headers:
+          Subject: '[HIGH] AlphaTrade: {{ .CommonAnnotations.summary }}'
+
+  # =========================================================================
+  # MEDIUM Receiver - Slack only
+  # =========================================================================
+  - name: 'medium-receiver'
+    slack_configs:
+      - channel: '#trading-alerts'
+        send_resolved: true
+        username: 'AlphaTrade Alert Bot'
+        icon_emoji: ':bell:'
+        title: '{{ if eq .Status "firing" }}:large_yellow_circle: Alert{{ else }}:white_check_mark: Resolved{{ end }}'
+        text: |
+          *Alert:* {{ .CommonAnnotations.summary }}
+          *Component:* {{ .CommonLabels.component }}
+        color: '{{ if eq .Status "firing" }}#ffc107{{ else }}good{{ end }}'
+
+  # =========================================================================
+  # LOW Receiver - Email only (batched)
+  # =========================================================================
+  - name: 'low-receiver'
+    email_configs:
+      - to: '${SMTP_TO}'
+        send_resolved: false
+        headers:
+          Subject: '[INFO] AlphaTrade Daily Alert Summary'
+        text: |
+          AlphaTrade Trading System - Alert Summary
+
+          The following informational alerts were generated:
+
+          {{ range .Alerts }}
+          - {{ .Annotations.summary }}
+            Component: {{ .Labels.component }}
+            Time: {{ .StartsAt }}
+          {{ end }}
+
+          --
+          AlphaTrade Alert System

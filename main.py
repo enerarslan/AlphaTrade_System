@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -121,21 +121,223 @@ class TradingSystemApp:
     async def _initialize_components(self, mode: str) -> None:
         """Initialize system components.
 
+        CRITICAL: This method now fully initializes all components required
+        for production trading. Each component is initialized in order of
+        dependency and validated before proceeding.
+
         Args:
-            mode: Trading mode.
+            mode: Trading mode (live, paper, backtest).
+
+        Raises:
+            RuntimeError: If any critical component fails to initialize.
         """
         logger.info("Initializing system components")
+        initialization_errors: list[str] = []
 
-        # Placeholder for actual component initialization
-        # In a real implementation, this would:
-        # 1. Connect to database
-        # 2. Connect to Redis
-        # 3. Connect to broker (if live/paper)
-        # 4. Load models
-        # 5. Initialize data feeds
-        # 6. Start monitoring
+        # 1. Verify secure configuration
+        try:
+            logger.info("Step 1/7: Verifying secure configuration")
+            from quant_trading_system.config.secure_config import SecureConfigManager
+            self.secure_config = SecureConfigManager.get_instance()
+            config_status = self.secure_config.get_configuration_status()
+            logger.info(f"Config status: {config_status}")
 
-        logger.info("System components initialized")
+            # Verify Alpaca credentials if trading mode
+            if mode in ("live", "paper"):
+                if not self.secure_config.verify_alpaca_credentials():
+                    initialization_errors.append(
+                        "Alpaca credentials not configured or invalid"
+                    )
+        except Exception as e:
+            logger.error(f"Failed to verify secure config: {e}")
+            initialization_errors.append(f"Secure config error: {e}")
+
+        # 2. Configure alerting channels
+        self.alerting_channels = []
+        try:
+            logger.info("Step 2/8: Configuring alerting channels")
+            alerting_status = self.alert_manager.setup_notifiers_from_config()
+            self.alerting_channels = [ch for ch, ok in alerting_status.items() if ok]
+            if self.alerting_channels:
+                logger.info(f"Alerting channels configured: {self.alerting_channels}")
+            else:
+                logger.warning(
+                    "No external alerting channels configured. "
+                    "Set SLACK_WEBHOOK_URL, SMTP_*, or PAGERDUTY_SERVICE_KEY in environment."
+                )
+        except Exception as e:
+            logger.warning(f"Alerting setup failed (non-critical): {e}")
+
+        # 3. Initialize database connection
+        try:
+            logger.info("Step 3/8: Initializing database connection")
+            from quant_trading_system.database.connection import DatabaseManager
+            self.database = DatabaseManager()
+            await self.database.initialize()
+
+            # Verify connection with health check
+            if await self.database.async_health_check():
+                logger.info("Database connection verified")
+            else:
+                initialization_errors.append("Database health check failed")
+        except Exception as e:
+            logger.warning(f"Database initialization failed (non-critical): {e}")
+            self.database = None
+
+        # 4. Initialize Redis/Feature Store
+        try:
+            logger.info("Step 4/8: Initializing feature store (Redis)")
+            from quant_trading_system.data.feature_store import FeatureStore, FeatureStoreConfig
+            redis_url = self.settings.redis.url if hasattr(self.settings, 'redis') else None
+            if redis_url:
+                config = FeatureStoreConfig(redis_url=redis_url)
+                self.feature_store = FeatureStore(config)
+                logger.info("Feature store initialized with Redis")
+            else:
+                # Fallback to memory-only feature store
+                self.feature_store = FeatureStore(FeatureStoreConfig())
+                logger.info("Feature store initialized with memory cache only")
+        except Exception as e:
+            logger.warning(f"Feature store initialization failed: {e}")
+            self.feature_store = None
+
+        # 5. Initialize broker client (if trading mode)
+        if mode in ("live", "paper"):
+            try:
+                logger.info("Step 5/8: Initializing broker client (Alpaca)")
+                from quant_trading_system.execution.alpaca_client import AlpacaClient
+
+                api_key = self.secure_config.get_credential("ALPACA_API_KEY", required=False)
+                api_secret = self.secure_config.get_credential("ALPACA_API_SECRET", required=False)
+
+                if api_key and api_secret:
+                    self.broker_client = AlpacaClient(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        paper=(mode == "paper"),
+                    )
+                    # Verify connection
+                    account = await self.broker_client.get_account()
+                    if account:
+                        logger.info(
+                            f"Broker connected: {account.status}, "
+                            f"Equity: ${float(account.equity):,.2f}"
+                        )
+                    else:
+                        initialization_errors.append("Failed to get broker account info")
+                else:
+                    initialization_errors.append("Alpaca API credentials not found")
+                    self.broker_client = None
+            except Exception as e:
+                logger.error(f"Broker initialization failed: {e}")
+                initialization_errors.append(f"Broker error: {e}")
+                self.broker_client = None
+        else:
+            self.broker_client = None
+            logger.info("Step 5/8: Skipping broker (backtest mode)")
+
+        # 6. Initialize risk management
+        try:
+            logger.info("Step 6/8: Initializing risk management")
+            from quant_trading_system.risk.limits import (
+                RiskLimitsConfig,
+                PreTradeRiskChecker,
+                KillSwitch,
+            )
+
+            risk_config = RiskLimitsConfig()
+            self.risk_checker = PreTradeRiskChecker(risk_config)
+            self.kill_switch = KillSwitch(risk_config)
+            logger.info("Risk management initialized")
+        except Exception as e:
+            logger.error(f"Risk management initialization failed: {e}")
+            initialization_errors.append(f"Risk management error: {e}")
+
+        # 7. Load trained models
+        try:
+            logger.info("Step 7/8: Loading trained models")
+            from quant_trading_system.models.model_manager import ModelManager
+
+            self.model_manager = ModelManager(registry_path="models/registry")
+            models_path = Path("models")
+
+            loaded_models = []
+            if models_path.exists():
+                for model_file in models_path.glob("*.joblib"):
+                    try:
+                        import joblib
+                        model = joblib.load(model_file)
+                        loaded_models.append(model_file.stem)
+                    except Exception as e:
+                        logger.warning(f"Failed to load model {model_file}: {e}")
+
+                for model_file in models_path.glob("*.pt"):
+                    try:
+                        import torch
+                        # Just verify file is loadable
+                        torch.load(model_file, weights_only=True)
+                        loaded_models.append(model_file.stem)
+                    except Exception as e:
+                        logger.warning(f"Failed to load model {model_file}: {e}")
+
+            if loaded_models:
+                logger.info(f"Loaded models: {loaded_models}")
+            else:
+                logger.warning("No trained models found in models/ directory")
+        except Exception as e:
+            logger.warning(f"Model loading failed (non-critical): {e}")
+            self.model_manager = None
+
+        # 8. Initialize data feeds (if trading mode)
+        if mode in ("live", "paper") and self.broker_client:
+            try:
+                logger.info("Step 8/8: Initializing data feeds")
+                from quant_trading_system.data.live_feed import LiveFeed, LiveFeedConfig
+
+                feed_config = LiveFeedConfig(
+                    symbols=self.settings.trading.symbols if hasattr(self.settings, 'trading') else ["SPY"],
+                )
+                self.data_feed = LiveFeed(
+                    config=feed_config,
+                    event_bus=self.event_bus,
+                )
+                logger.info("Data feed initialized")
+            except Exception as e:
+                logger.warning(f"Data feed initialization failed: {e}")
+                self.data_feed = None
+        else:
+            self.data_feed = None
+            logger.info("Step 8/8: Skipping data feeds (backtest mode or no broker)")
+
+        # Report initialization summary
+        logger.info("=" * 60)
+        logger.info("COMPONENT INITIALIZATION SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"  Mode: {mode}")
+        alerting_str = ', '.join(self.alerting_channels) if self.alerting_channels else 'NONE'
+        logger.info(f"  Alerting: {alerting_str}")
+        logger.info(f"  Database: {'OK' if self.database else 'DISABLED'}")
+        logger.info(f"  Feature Store: {'OK' if self.feature_store else 'DISABLED'}")
+        logger.info(f"  Broker: {'OK' if self.broker_client else 'DISABLED'}")
+        logger.info(f"  Risk Management: {'OK' if hasattr(self, 'risk_checker') else 'DISABLED'}")
+        logger.info(f"  Models: {'OK' if self.model_manager else 'DISABLED'}")
+        logger.info(f"  Data Feed: {'OK' if self.data_feed else 'DISABLED'}")
+        logger.info("=" * 60)
+
+        # Check for critical initialization errors
+        if initialization_errors and mode == "live":
+            error_msg = "Critical initialization errors: " + "; ".join(initialization_errors)
+            logger.error(error_msg)
+            await alert_critical(
+                AlertType.SYSTEM_DOWN,
+                "Initialization Failed",
+                error_msg,
+            )
+            raise RuntimeError(error_msg)
+        elif initialization_errors:
+            logger.warning(f"Non-critical initialization issues: {initialization_errors}")
+
+        logger.info("System components initialized successfully")
 
     async def _run_main_loop(self, mode: str) -> None:
         """Run the main trading loop.
@@ -146,12 +348,12 @@ class TradingSystemApp:
         logger.info("Starting main trading loop")
 
         heartbeat_interval = 60  # seconds
-        last_heartbeat = datetime.utcnow()
+        last_heartbeat = datetime.now(timezone.utc)
 
         while self._running:
             try:
                 # Send heartbeat
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 if (now - last_heartbeat).total_seconds() >= heartbeat_interval:
                     self.event_bus.publish(
                         create_system_event(

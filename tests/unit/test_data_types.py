@@ -78,9 +78,20 @@ class TestOHLCVBar:
     def test_to_dict(self, sample_ohlcv_data):
         """Test conversion to dictionary."""
         bar = OHLCVBar(**sample_ohlcv_data)
-        d = bar.to_dict()
+        # Test with float conversion (preserve_decimal_precision=False)
+        d = bar.to_dict(preserve_decimal_precision=False)
         assert d["symbol"] == "AAPL"
         assert d["open"] == 185.50
+        assert d["volume"] == 1500000
+        assert "timestamp" in d
+
+    def test_to_dict_preserves_precision(self, sample_ohlcv_data):
+        """Test conversion to dictionary preserves decimal precision."""
+        bar = OHLCVBar(**sample_ohlcv_data)
+        # Default behavior preserves precision as strings
+        d = bar.to_dict()
+        assert d["symbol"] == "AAPL"
+        assert d["open"] == "185.50"
         assert d["volume"] == 1500000
         assert "timestamp" in d
 

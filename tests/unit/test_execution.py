@@ -11,7 +11,7 @@ Tests for:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -222,9 +222,9 @@ class TestAlpacaOrder:
             limit_price=None,
             stop_price=None,
             status="partially_filled",
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-            submitted_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            submitted_at=datetime.now(timezone.utc),
             filled_at=None,
             expired_at=None,
             cancelled_at=None,
@@ -619,7 +619,7 @@ class TestTradeRecord:
             side=OrderSide.BUY,
             quantity=Decimal("100"),
             price=Decimal("150"),
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
         assert record.symbol == "AAPL"
         assert record.settlement_status == SettlementStatus.PENDING

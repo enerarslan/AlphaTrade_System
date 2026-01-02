@@ -64,10 +64,21 @@ def sample_position_data():
 
 @pytest.fixture
 def event_bus():
-    """Create a fresh EventBus instance for testing."""
+    """Create a fresh EventBus instance for testing.
+
+    Resets the singleton instance before each test to ensure
+    clean state and prevent test pollution.
+    """
     from quant_trading_system.core.events import EventBus
 
-    return EventBus()
+    # Reset the singleton to ensure fresh instance
+    EventBus.reset_instance()
+    bus = EventBus()
+
+    yield bus
+
+    # Clean up after test
+    EventBus.reset_instance()
 
 
 @pytest.fixture
@@ -255,3 +266,29 @@ def sample_risk_metrics():
         beta=1.1,
         volatility_annual=0.15,
     )
+
+
+@pytest.fixture(autouse=True)
+def disable_dashboard_auth(monkeypatch):
+    """Disable dashboard authentication for all tests.
+
+    This fixture automatically runs for all tests and sets the
+    REQUIRE_AUTH environment variable to 'false' so dashboard
+    endpoints don't require authentication during testing.
+    """
+    import os
+
+    # Set environment variables BEFORE clearing the settings cache
+    monkeypatch.setenv("REQUIRE_AUTH", "false")
+    # Also set a test JWT secret to prevent warnings
+    if not os.environ.get("JWT_SECRET_KEY"):
+        monkeypatch.setenv("JWT_SECRET_KEY", "test_secret_key_for_testing_only")
+
+    # Clear the settings cache so it picks up the new environment variables
+    from quant_trading_system.config.settings import get_settings
+    get_settings.cache_clear()
+
+    yield
+
+    # Clear cache again after test to not affect subsequent tests
+    get_settings.cache_clear()

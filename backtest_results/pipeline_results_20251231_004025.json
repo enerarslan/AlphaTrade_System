@@ -1,0 +1,88 @@
+{
+  "timestamp": "2025-12-31T00:39:26.031005",
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "AMZN",
+    "NVDA",
+    "TSLA",
+    "META",
+    "JPM"
+  ],
+  "total_samples": 516948,
+  "features": 115,
+  "model_metrics": {
+    "xgboost": {
+      "accuracy": 0.530766998742625,
+      "auc": 0.5434610528044312
+    },
+    "lightgbm": {
+      "accuracy": 0.534655189089854,
+      "auc": 0.5483877579324004
+    },
+    "ensemble": {
+      "accuracy": 0.5342102717864396,
+      "auc": 0.5473615574986292
+    }
+  },
+  "backtest": {
+    "initial_capital": 100000.0,
+    "final_capital": 159602.87882993274,
+    "total_return_pct": 59.602878829932735,
+    "total_trades": 4814,
+    "win_rate_pct": 73.70170336518488,
+    "backtest_start": "2024-07-24",
+    "backtest_end": "2025-08-01",
+    "symbol_results": {
+      "AAPL": {
+        "initial": 12500.0,
+        "final": 17728.908381053865,
+        "return_pct": 41.83126704843092,
+        "trades": 598
+      },
+      "MSFT": {
+        "initial": 12500.0,
+        "final": 15495.68914793915,
+        "return_pct": 23.965513183513202,
+        "trades": 986
+      },
+      "GOOGL": {
+        "initial": 12500.0,
+        "final": 15029.295102181459,
+        "return_pct": 20.234360817451673,
+        "trades": 582
+      },
+      "AMZN": {
+        "initial": 12500.0,
+        "final": 14843.910112751442,
+        "return_pct": 18.751280902011537,
+        "trades": 514
+      },
+      "NVDA": {
+        "initial": 12500.0,
+        "final": 26262.841720319586,
+        "return_pct": 110.10273376255668,
+        "trades": 214
+      },
+      "TSLA": {
+        "initial": 12500.0,
+        "final": 34904.28314941479,
+        "return_pct": 179.23426519531833,
+        "trades": 312
+      },
+      "META": {
+        "initial": 12500.0,
+        "final": 15279.003219534712,
+        "return_pct": 22.232025756277697,
+        "trades": 676
+      },
+      "JPM": {
+        "initial": 12500.0,
+        "final": 20058.94799673774,
+        "return_pct": 60.47158397390193,
+        "trades": 932
+      }
+    }
+  }
+}

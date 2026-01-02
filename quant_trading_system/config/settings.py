@@ -8,6 +8,7 @@ support, and YAML configuration file loading.
 from __future__ import annotations
 
 import os
+import warnings
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
@@ -153,6 +154,156 @@ class LoggingSettings(BaseModel):
     retention: str = Field(default="30 days", description="Log retention period")
 
 
+class AlertSettings(BaseModel):
+    """Alert notification configuration settings.
+
+    Supports multiple notification channels:
+    - Slack: Webhook-based notifications with Block Kit formatting
+    - Email: SMTP-based notifications with HTML and plain text
+    - PagerDuty: Events API v2 integration for incident management
+    - SMS: Twilio-based SMS notifications for escalation
+
+    All credentials should be provided via environment variables.
+    """
+
+    # Slack Configuration
+    slack_webhook_url: str = Field(
+        default="",
+        description="Slack incoming webhook URL"
+    )
+    slack_channel: str = Field(
+        default="#trading-alerts",
+        description="Default Slack channel for alerts"
+    )
+    slack_critical_channel: str = Field(
+        default="#trading-critical",
+        description="Slack channel for critical alerts"
+    )
+    slack_username: str = Field(
+        default="AlphaTrade Alert Bot",
+        description="Bot username for Slack messages"
+    )
+
+    # Email (SMTP) Configuration
+    smtp_host: str = Field(default="", description="SMTP server hostname")
+    smtp_port: int = Field(default=587, description="SMTP server port")
+    smtp_user: str = Field(default="", description="SMTP authentication username")
+    smtp_password: str = Field(default="", description="SMTP authentication password")
+    smtp_from_address: str = Field(default="", description="Sender email address")
+    smtp_to_addresses: list[str] = Field(
+        default_factory=list,
+        description="List of recipient email addresses"
+    )
+    smtp_use_tls: bool = Field(default=True, description="Use TLS for SMTP connection")
+
+    # PagerDuty Configuration
+    pagerduty_service_key: str = Field(
+        default="",
+        description="PagerDuty Events API v2 integration key"
+    )
+    pagerduty_api_url: str = Field(
+        default="https://events.pagerduty.com/v2/enqueue",
+        description="PagerDuty Events API endpoint"
+    )
+
+    # Twilio SMS Configuration
+    twilio_account_sid: str = Field(default="", description="Twilio account SID")
+    twilio_auth_token: str = Field(default="", description="Twilio auth token")
+    twilio_from_number: str = Field(default="", description="Twilio phone number")
+    twilio_to_numbers: list[str] = Field(
+        default_factory=list,
+        description="List of recipient phone numbers"
+    )
+
+    # General Alert Settings
+    alert_system_name: str = Field(
+        default="AlphaTrade",
+        description="System name for alert identification"
+    )
+    runbook_base_url: str = Field(
+        default="",
+        description="Base URL for runbook links"
+    )
+
+    @property
+    def is_slack_configured(self) -> bool:
+        """Check if Slack notifications are configured."""
+        return bool(self.slack_webhook_url)
+
+    @property
+    def is_email_configured(self) -> bool:
+        """Check if email notifications are configured."""
+        return bool(self.smtp_host and self.smtp_from_address and self.smtp_to_addresses)
+
+    @property
+    def is_pagerduty_configured(self) -> bool:
+        """Check if PagerDuty notifications are configured."""
+        return bool(self.pagerduty_service_key)
+
+    @property
+    def is_sms_configured(self) -> bool:
+        """Check if SMS notifications are configured."""
+        return bool(
+            self.twilio_account_sid and
+            self.twilio_auth_token and
+            self.twilio_from_number and
+            self.twilio_to_numbers
+        )
+
+    def get_configuration_status(self) -> dict[str, bool]:
+        """Get status of all notification channels."""
+        return {
+            "slack": self.is_slack_configured,
+            "email": self.is_email_configured,
+            "pagerduty": self.is_pagerduty_configured,
+            "sms": self.is_sms_configured,
+        }
+
+    @classmethod
+    def from_env(cls) -> "AlertSettings":
+        """Create AlertSettings from environment variables.
+
+        Environment Variables:
+            SLACK_WEBHOOK_URL, SLACK_CHANNEL, SLACK_CRITICAL_CHANNEL, SLACK_USERNAME
+            SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM_ADDRESS, SMTP_TO_ADDRESSES
+            PAGERDUTY_SERVICE_KEY, PAGERDUTY_API_URL
+            TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, TWILIO_TO_NUMBERS
+            ALERT_SYSTEM_NAME, RUNBOOK_BASE_URL
+        """
+        def get_list(key: str) -> list[str]:
+            value = os.environ.get(key, "")
+            if not value:
+                return []
+            return [item.strip() for item in value.split(",") if item.strip()]
+
+        return cls(
+            # Slack
+            slack_webhook_url=os.environ.get("SLACK_WEBHOOK_URL", ""),
+            slack_channel=os.environ.get("SLACK_CHANNEL", "#trading-alerts"),
+            slack_critical_channel=os.environ.get("SLACK_CRITICAL_CHANNEL", "#trading-critical"),
+            slack_username=os.environ.get("SLACK_USERNAME", "AlphaTrade Alert Bot"),
+            # Email
+            smtp_host=os.environ.get("SMTP_HOST", ""),
+            smtp_port=int(os.environ.get("SMTP_PORT", "587")),
+            smtp_user=os.environ.get("SMTP_USER", ""),
+            smtp_password=os.environ.get("SMTP_PASSWORD", ""),
+            smtp_from_address=os.environ.get("SMTP_FROM_ADDRESS", ""),
+            smtp_to_addresses=get_list("SMTP_TO_ADDRESSES"),
+            smtp_use_tls=os.environ.get("SMTP_USE_TLS", "true").lower() == "true",
+            # PagerDuty
+            pagerduty_service_key=os.environ.get("PAGERDUTY_SERVICE_KEY", ""),
+            pagerduty_api_url=os.environ.get("PAGERDUTY_API_URL", "https://events.pagerduty.com/v2/enqueue"),
+            # Twilio
+            twilio_account_sid=os.environ.get("TWILIO_ACCOUNT_SID", ""),
+            twilio_auth_token=os.environ.get("TWILIO_AUTH_TOKEN", ""),
+            twilio_from_number=os.environ.get("TWILIO_FROM_NUMBER", ""),
+            twilio_to_numbers=get_list("TWILIO_TO_NUMBERS"),
+            # General
+            alert_system_name=os.environ.get("ALERT_SYSTEM_NAME", "AlphaTrade"),
+            runbook_base_url=os.environ.get("RUNBOOK_BASE_URL", ""),
+        )
+
+
 class SecuritySettings(BaseModel):
     """Security configuration settings for API authentication.
 
@@ -203,11 +354,10 @@ class SecuritySettings(BaseModel):
                     "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
                 )
             else:
-                import warnings
                 warnings.warn(
                     "JWT_SECRET_KEY is empty. Authentication will fail. "
                     "Set JWT_SECRET_KEY environment variable.",
-                    SecurityWarning,
+                    UserWarning,
                     stacklevel=2,
                 )
         # Validate minimum key length for security
@@ -260,6 +410,7 @@ class Settings(BaseSettings):
     model: ModelSettings = Field(default_factory=ModelSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
+    alerts: AlertSettings = Field(default_factory=AlertSettings)
 
     # Symbols configuration (loaded from YAML)
     symbols: list[str] = Field(default_factory=list)
@@ -319,6 +470,7 @@ def get_settings() -> Settings:
     2. Symbols from YAML
     3. Alpaca credentials from environment variables (secure) or YAML (dev)
     4. Security settings from environment variables
+    5. Alert settings from environment variables
     """
     settings = Settings()
 
@@ -334,5 +486,8 @@ def get_settings() -> Settings:
 
     # Load security settings from environment variables
     settings.security = SecuritySettings.from_env()
+
+    # Load alert settings from environment variables
+    settings.alerts = AlertSettings.from_env()
 
     return settings

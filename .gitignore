@@ -39,9 +39,32 @@ htmlcov/
 logs/
 *.log
 
-# Environment variables
+# Environment variables and secrets - CRITICAL: Never commit these
 .env
 .env.local
+.env.production
+.env.staging
+.env.*.local
+*.env
+
+# Security - API keys, credentials, certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials.json
+secrets.json
+service-account*.json
+*_credentials.yaml
+*_secrets.yaml
+
+# AWS credentials
+.aws/
+aws_credentials
+
+# Vault tokens
+.vault-token
 
 # Data
 data/

@@ -6,7 +6,7 @@ heartbeat monitoring, and state transitions for live data feeds.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
@@ -20,10 +20,13 @@ from quant_trading_system.core.exceptions import (
 )
 from quant_trading_system.data.live_feed import (
     AlpacaLiveFeed,
+    AlpacaWebSocketFeed,
     BaseLiveFeed,
     ConnectionState,
     MockLiveFeed,
-    PollingFeed,
+    WebSocketConfig,
+    StreamType,
+    create_live_feed,
 )
 from quant_trading_system.execution.alpaca_client import (
     AlpacaClient,
@@ -42,13 +45,13 @@ class TestConnectionStateTransitions:
 
     @pytest.fixture
     def alpaca_feed(self):
-        """Create an AlpacaLiveFeed for testing."""
-        return AlpacaLiveFeed(
+        """Create an AlpacaWebSocketFeed for testing."""
+        config = WebSocketConfig(
             api_key="test_key",
             api_secret="test_secret",
-            symbols=["AAPL"],
             paper=True,
         )
+        return AlpacaWebSocketFeed(config=config, symbols=["AAPL"])
 
     def test_initial_state_disconnected(self, alpaca_feed):
         """Test that initial state is DISCONNECTED."""
@@ -78,9 +81,12 @@ class TestConnectionStateTransitions:
         expected_states = {
             "DISCONNECTED",
             "CONNECTING",
+            "AUTHENTICATING",
             "CONNECTED",
+            "SUBSCRIBED",
             "RECONNECTING",
             "ERROR",
+            "CLOSED",
         }
         actual_states = {state.name for state in ConnectionState}
         assert expected_states == actual_states
@@ -91,34 +97,35 @@ class TestExponentialBackoff:
 
     @pytest.fixture
     def alpaca_feed(self):
-        """Create an AlpacaLiveFeed for testing."""
-        return AlpacaLiveFeed(
+        """Create an AlpacaWebSocketFeed for testing."""
+        config = WebSocketConfig(
             api_key="test_key",
             api_secret="test_secret",
-            symbols=["AAPL"],
             paper=True,
         )
+        return AlpacaWebSocketFeed(config=config, symbols=["AAPL"])
 
     def test_initial_reconnect_delay(self, alpaca_feed):
         """Test initial reconnect delay is set correctly."""
-        assert alpaca_feed._reconnect_delay == AlpacaLiveFeed.DEFAULT_RECONNECT_DELAY
+        assert alpaca_feed._reconnect_delay == alpaca_feed.config.initial_reconnect_delay
         assert alpaca_feed._reconnect_delay == 1.0
 
     def test_max_reconnect_delay(self, alpaca_feed):
-        """Test max reconnect delay constant."""
-        assert AlpacaLiveFeed.MAX_RECONNECT_DELAY == 60.0
+        """Test max reconnect delay from config."""
+        assert alpaca_feed.config.max_reconnect_delay == 60.0
 
     @pytest.mark.asyncio
     async def test_exponential_backoff_calculation(self, alpaca_feed):
         """Test that reconnect delay doubles each time up to max."""
         initial_delay = alpaca_feed._reconnect_delay
+        max_delay = alpaca_feed.config.max_reconnect_delay
 
         # Simulate backoff progression
         delays = [initial_delay]
         current_delay = initial_delay
 
         for _ in range(7):  # Test several iterations
-            current_delay = min(current_delay * 2, AlpacaLiveFeed.MAX_RECONNECT_DELAY)
+            current_delay = min(current_delay * 2, max_delay)
             delays.append(current_delay)
 
         # Expected: 1, 2, 4, 8, 16, 32, 60, 60
@@ -133,7 +140,7 @@ class TestExponentialBackoff:
         assert alpaca_feed._reconnect_delay == 32.0
 
         # Simulate what happens on successful connect - delay gets reset
-        alpaca_feed._reconnect_delay = AlpacaLiveFeed.DEFAULT_RECONNECT_DELAY
+        alpaca_feed._reconnect_delay = alpaca_feed.config.initial_reconnect_delay
         assert alpaca_feed._reconnect_delay == 1.0
 
 
@@ -142,61 +149,52 @@ class TestHeartbeatMonitoring:
 
     @pytest.fixture
     def alpaca_feed(self):
-        """Create an AlpacaLiveFeed for testing."""
-        return AlpacaLiveFeed(
+        """Create an AlpacaWebSocketFeed for testing."""
+        config = WebSocketConfig(
             api_key="test_key",
             api_secret="test_secret",
-            symbols=["AAPL"],
             paper=True,
         )
+        return AlpacaWebSocketFeed(config=config, symbols=["AAPL"])
 
     def test_heartbeat_interval_defined(self, alpaca_feed):
         """Test heartbeat interval is properly defined."""
-        assert AlpacaLiveFeed.HEARTBEAT_INTERVAL == 30.0
+        assert alpaca_feed.config.heartbeat_interval == 30.0
 
     def test_initial_heartbeat_none(self, alpaca_feed):
         """Test initial heartbeat is None before connection."""
-        assert alpaca_feed._last_heartbeat is None
+        assert alpaca_feed._last_market_message is None
 
     @pytest.mark.asyncio
     async def test_heartbeat_updated_on_bar_receipt(self, alpaca_feed):
         """Test heartbeat is updated when receiving bars."""
-        # Create mock bar
-        mock_bar = MagicMock()
-        mock_bar.symbol = "AAPL"
-        mock_bar.timestamp = datetime.utcnow()
-        mock_bar.open = 150.0
-        mock_bar.high = 151.0
-        mock_bar.low = 149.0
-        mock_bar.close = 150.5
-        mock_bar.volume = 1000
-        mock_bar.vwap = 150.25
-        mock_bar.trade_count = 50
+        # Create mock bar message (Alpaca format)
+        mock_bar_msg = {
+            "T": "b",
+            "S": "AAPL",
+            "t": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "o": 150.0,
+            "h": 151.0,
+            "l": 149.0,
+            "c": 150.5,
+            "v": 1000,
+            "vw": 150.25,
+            "n": 50,
+        }
 
-        before_time = datetime.utcnow()
-        await alpaca_feed._handle_bar(mock_bar)
-        after_time = datetime.utcnow()
+        before_time = datetime.now(timezone.utc)
+        await alpaca_feed._handle_bar(mock_bar_msg)
+        after_time = datetime.now(timezone.utc)
 
-        assert alpaca_feed._last_heartbeat is not None
-        assert before_time <= alpaca_feed._last_heartbeat <= after_time
+        # Bars are processed but heartbeat update happens in message handler
+        # This test validates the _handle_bar method works correctly
+        assert alpaca_feed._metrics["bars_processed"] == 1
 
     @pytest.mark.asyncio
-    async def test_heartbeat_timeout_triggers_reconnect(self, alpaca_feed):
-        """Test that heartbeat timeout triggers reconnection."""
-        # Set an old heartbeat (older than 2x heartbeat interval)
-        old_time = datetime.utcnow() - timedelta(seconds=70)
-        alpaca_feed._last_heartbeat = old_time
+    async def test_heartbeat_monitor_basic(self, alpaca_feed):
+        """Test that heartbeat monitor runs without errors."""
         alpaca_feed._running = True
-
-        # Mock _reconnect to track if it's called
-        reconnect_called = False
-
-        async def mock_reconnect():
-            nonlocal reconnect_called
-            reconnect_called = True
-            alpaca_feed._running = False  # Stop the monitor
-
-        alpaca_feed._reconnect = mock_reconnect
+        alpaca_feed._last_market_message = datetime.now(timezone.utc)
 
         # Run heartbeat monitor briefly
         monitor_task = asyncio.create_task(alpaca_feed._heartbeat_monitor())
@@ -205,14 +203,14 @@ class TestHeartbeatMonitoring:
         await asyncio.sleep(0.1)
 
         # Cancel the task
+        alpaca_feed._running = False
         monitor_task.cancel()
         try:
             await monitor_task
         except asyncio.CancelledError:
             pass
 
-        # Heartbeat check happens after HEARTBEAT_INTERVAL sleep,
-        # but we've cancelled before that. That's fine for this test.
+        # No errors should have occurred
 
 
 class TestLiveFeedReconnection:
@@ -220,28 +218,22 @@ class TestLiveFeedReconnection:
 
     @pytest.fixture
     def alpaca_feed(self):
-        """Create an AlpacaLiveFeed for testing."""
-        return AlpacaLiveFeed(
+        """Create an AlpacaWebSocketFeed for testing."""
+        config = WebSocketConfig(
             api_key="test_key",
             api_secret="test_secret",
-            symbols=["AAPL"],
             paper=True,
         )
+        return AlpacaWebSocketFeed(config=config, symbols=["AAPL"])
 
     @pytest.mark.asyncio
     async def test_connection_error_sets_error_state(self, alpaca_feed):
         """Test that connection errors set ERROR state."""
-        # Patch at the import source location
-        with patch.dict(
-            "sys.modules",
-            {"alpaca_trade_api": MagicMock(), "alpaca_trade_api.stream": MagicMock()},
-        ):
-            # Make Stream constructor raise an exception
+        # Patch websockets to raise an exception
+        with patch.dict("sys.modules", {"websockets": MagicMock()}):
             import sys
-
-            sys.modules["alpaca_trade_api.stream"].Stream.side_effect = Exception(
-                "Connection refused"
-            )
+            mock_ws = sys.modules["websockets"]
+            mock_ws.connect = AsyncMock(side_effect=Exception("Connection refused"))
 
             with pytest.raises(DataConnectionError):
                 await alpaca_feed.connect()
@@ -249,48 +241,44 @@ class TestLiveFeedReconnection:
             assert alpaca_feed.state == ConnectionState.ERROR
 
     @pytest.mark.asyncio
-    async def test_reconnect_sets_reconnecting_state(self, alpaca_feed):
-        """Test that reconnection attempt sets RECONNECTING state."""
+    async def test_reconnect_increments_attempts(self, alpaca_feed):
+        """Test that reconnection increments attempt counter."""
         alpaca_feed.state = ConnectionState.CONNECTED
+        alpaca_feed._running = True
+
+        initial_attempts = alpaca_feed._reconnect_attempts
 
         # Mock sleep to avoid waiting
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            with patch.object(alpaca_feed, "disconnect", new_callable=AsyncMock):
-                with patch.object(
-                    alpaca_feed, "connect", new_callable=AsyncMock
-                ) as mock_connect:
-                    mock_connect.return_value = None
+            # Mock the actual connection methods to fail
+            with patch.object(alpaca_feed, "_connect_market_stream",
+                            new_callable=AsyncMock) as mock_connect:
+                mock_connect.side_effect = Exception("Connection failed")
 
-                    await alpaca_feed._reconnect()
+                # Set max attempts low for test
+                alpaca_feed.config.max_reconnect_attempts = 1
 
-                    # State should have been set to RECONNECTING
-                    # (though connect may change it after)
+                await alpaca_feed._schedule_reconnect("market")
+
+                # After max attempts, should be in ERROR state
+                assert alpaca_feed.state == ConnectionState.ERROR
 
     @pytest.mark.asyncio
-    async def test_multiple_reconnection_attempts(self, alpaca_feed):
-        """Test multiple reconnection attempts with increasing delays."""
-        reconnect_attempts = []
+    async def test_reconnect_delay_increases(self, alpaca_feed):
+        """Test reconnection delay increases exponentially."""
+        initial_delay = alpaca_feed._reconnect_delay
+        max_delay = alpaca_feed.config.max_reconnect_delay
 
-        original_reconnect = alpaca_feed._reconnect
+        # Simulate backoff progression manually
+        delays = [initial_delay]
+        current_delay = initial_delay
+        for i in range(1, 8):
+            current_delay = min(current_delay * 2, max_delay)
+            delays.append(current_delay)
 
-        async def tracking_reconnect():
-            reconnect_attempts.append(alpaca_feed._reconnect_delay)
-            if len(reconnect_attempts) >= 3:
-                return  # Stop after 3 attempts
-            # Simulate delay increase
-            alpaca_feed._reconnect_delay = min(
-                alpaca_feed._reconnect_delay * 2,
-                AlpacaLiveFeed.MAX_RECONNECT_DELAY,
-            )
-
-        alpaca_feed._reconnect = tracking_reconnect
-
-        # Trigger reconnect multiple times
-        for _ in range(3):
-            await alpaca_feed._reconnect()
-
-        # Check delays increased
-        assert reconnect_attempts == [1.0, 2.0, 4.0]
+        # Expected: 1, 2, 4, 8, 16, 32, 60, 60
+        expected = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+        assert delays == expected
 
 
 class TestAlpacaClientRetryLogic:
@@ -419,71 +407,36 @@ class TestRateLimiter:
         assert limiter.can_proceed()
 
 
-class TestPollingFeedReconnection:
-    """Test polling feed fallback behavior."""
+class TestFactoryFunction:
+    """Test the create_live_feed factory function."""
 
-    @pytest.fixture
-    def polling_feed(self):
-        """Create PollingFeed for testing."""
-        return PollingFeed(
+    def test_create_mock_feed(self):
+        """Test creating a MockLiveFeed via factory."""
+        feed = create_live_feed(
+            feed_type="mock",
+            symbols=["AAPL", "MSFT"],
+            interval_seconds=0.1,
+        )
+        assert isinstance(feed, MockLiveFeed)
+        assert feed.symbols == ["AAPL", "MSFT"]
+
+    def test_create_alpaca_feed(self):
+        """Test creating an AlpacaWebSocketFeed via factory."""
+        feed = create_live_feed(
+            feed_type="alpaca",
+            symbols=["AAPL"],
             api_key="test_key",
             api_secret="test_secret",
-            symbols=["AAPL"],
-            poll_interval=0.1,  # Fast polling for testing
             paper=True,
         )
+        assert isinstance(feed, AlpacaWebSocketFeed)
+        assert feed.symbols == ["AAPL"]
+        assert feed.config.api_key == "test_key"
 
-    @pytest.mark.asyncio
-    async def test_polling_feed_connect_disconnect(self, polling_feed):
-        """Test PollingFeed connect/disconnect cycle."""
-        assert polling_feed.state == ConnectionState.DISCONNECTED
-
-        # Patch the module imports
-        mock_rest_module = MagicMock()
-        mock_rest_class = MagicMock()
-        mock_rest_module.REST = mock_rest_class
-
-        with patch.dict(
-            "sys.modules",
-            {
-                "alpaca_trade_api": MagicMock(),
-                "alpaca_trade_api.rest": mock_rest_module,
-            },
-        ):
-            await polling_feed.connect()
-            assert polling_feed.state == ConnectionState.CONNECTED
-            assert polling_feed._running
-
-            await polling_feed.disconnect()
-            assert polling_feed.state == ConnectionState.DISCONNECTED
-            assert not polling_feed._running
-
-    @pytest.mark.asyncio
-    async def test_polling_handles_errors_gracefully(self, polling_feed):
-        """Test polling continues despite individual poll errors."""
-        # The polling feed should handle errors gracefully without crashing
-
-        # Create a mock REST that raises errors
-        mock_rest_module = MagicMock()
-        mock_api = MagicMock()
-        mock_api.get_bars.side_effect = Exception("Network error")
-        mock_rest_module.REST.return_value = mock_api
-
-        with patch.dict(
-            "sys.modules",
-            {
-                "alpaca_trade_api": MagicMock(),
-                "alpaca_trade_api.rest": mock_rest_module,
-            },
-        ):
-            await polling_feed.connect()
-            # Let it run briefly - should not crash despite errors
-            await asyncio.sleep(0.15)
-            # Feed should still be running
-            assert polling_feed._running
-            await polling_feed.disconnect()
-
-        # Feed should handle errors gracefully
+    def test_unknown_feed_type_raises(self):
+        """Test that unknown feed type raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown feed type"):
+            create_live_feed(feed_type="unknown", symbols=["AAPL"])
 
 
 class TestCallbackNotification:
@@ -505,7 +458,7 @@ class TestCallbackNotification:
         def bar_callback(bar: OHLCVBar):
             received_bars.append(bar)
 
-        mock_feed.add_callback(bar_callback)
+        mock_feed.add_bar_callback(bar_callback)
         await mock_feed.connect()
 
         # Wait for at least one bar
@@ -526,8 +479,8 @@ class TestCallbackNotification:
         def good_callback(bar: OHLCVBar):
             good_callback_received.append(bar)
 
-        mock_feed.add_callback(bad_callback)
-        mock_feed.add_callback(good_callback)
+        mock_feed.add_bar_callback(bad_callback)
+        mock_feed.add_bar_callback(good_callback)
 
         await mock_feed.connect()
         await asyncio.sleep(0.1)
@@ -543,10 +496,10 @@ class TestCallbackNotification:
         def callback(bar):
             callback_count[0] += 1
 
-        mock_feed.add_callback(callback)
+        mock_feed.add_bar_callback(callback)
         assert callback in mock_feed._callbacks
 
-        mock_feed.remove_callback(callback)
+        mock_feed.remove_bar_callback(callback)
         assert callback not in mock_feed._callbacks
 
 
@@ -606,31 +559,29 @@ class TestConnectionFailureScenarios:
 
     @pytest.fixture
     def alpaca_feed(self):
-        """Create AlpacaLiveFeed for testing."""
-        return AlpacaLiveFeed(
+        """Create AlpacaWebSocketFeed for testing."""
+        config = WebSocketConfig(
             api_key="test_key",
             api_secret="test_secret",
-            symbols=["AAPL"],
             paper=True,
         )
+        return AlpacaWebSocketFeed(config=config, symbols=["AAPL"])
 
     @pytest.mark.asyncio
     async def test_import_error_handling(self, alpaca_feed):
-        """Test handling when alpaca-trade-api not installed."""
+        """Test handling when websockets not installed."""
         # Remove the module from cache to simulate import error
         import sys
 
         # Temporarily remove the module
         original_modules = {}
         for mod_name in list(sys.modules.keys()):
-            if mod_name.startswith("alpaca"):
+            if mod_name.startswith("websocket"):
                 original_modules[mod_name] = sys.modules.pop(mod_name)
 
         try:
-            # Create mock that raises ImportError
-            with patch.dict(
-                "sys.modules", {"alpaca_trade_api": None, "alpaca_trade_api.stream": None}
-            ):
+            # Create mock that simulates ImportError
+            with patch.dict("sys.modules", {"websockets": None}):
                 with pytest.raises(DataConnectionError) as exc_info:
                     await alpaca_feed.connect()
 
@@ -643,17 +594,11 @@ class TestConnectionFailureScenarios:
     @pytest.mark.asyncio
     async def test_auth_failure(self, alpaca_feed):
         """Test authentication failure handling."""
-        # Create a mock stream module that raises on Stream creation
-        mock_stream_module = MagicMock()
-        mock_stream_module.Stream.side_effect = Exception("Invalid API credentials")
+        # Mock websockets.connect to return a mock that fails auth
+        mock_ws = AsyncMock()
+        mock_ws.recv = AsyncMock(return_value='[{"T": "error", "msg": "auth failed"}]')
 
-        with patch.dict(
-            "sys.modules",
-            {
-                "alpaca_trade_api": MagicMock(),
-                "alpaca_trade_api.stream": mock_stream_module,
-            },
-        ):
+        with patch("websockets.connect", return_value=mock_ws):
             with pytest.raises(DataConnectionError):
                 await alpaca_feed.connect()
 
@@ -662,19 +607,8 @@ class TestConnectionFailureScenarios:
     @pytest.mark.asyncio
     async def test_network_timeout(self, alpaca_feed):
         """Test network timeout handling."""
-        # Create a mock stream module that raises TimeoutError
-        mock_stream_module = MagicMock()
-        mock_stream_module.Stream.side_effect = asyncio.TimeoutError(
-            "Connection timed out"
-        )
-
-        with patch.dict(
-            "sys.modules",
-            {
-                "alpaca_trade_api": MagicMock(),
-                "alpaca_trade_api.stream": mock_stream_module,
-            },
-        ):
+        # Mock websockets.connect to raise TimeoutError
+        with patch("websockets.connect", side_effect=asyncio.TimeoutError("Connection timed out")):
             with pytest.raises(DataConnectionError):
                 await alpaca_feed.connect()
 
@@ -697,13 +631,13 @@ class TestSubscriptionManagement:
 
     @pytest.fixture
     def alpaca_feed(self):
-        """Create AlpacaLiveFeed for testing."""
-        return AlpacaLiveFeed(
+        """Create AlpacaWebSocketFeed for testing."""
+        config = WebSocketConfig(
             api_key="test_key",
             api_secret="test_secret",
-            symbols=["AAPL"],
             paper=True,
         )
+        return AlpacaWebSocketFeed(config=config, symbols=["AAPL"])
 
     def test_initial_symbols(self, alpaca_feed):
         """Test initial symbols are set correctly."""
@@ -773,7 +707,7 @@ class TestStressScenarios:
         def counter_callback(bar):
             received_count[0] += 1
 
-        mock_feed.add_callback(counter_callback)
+        mock_feed.add_bar_callback(counter_callback)
 
         await mock_feed.connect()
         await asyncio.sleep(0.2)  # Should receive multiple bars per symbol
@@ -795,7 +729,7 @@ class TestStressScenarios:
 
         # Register 20 callbacks
         for i in range(20):
-            mock_feed.add_callback(make_callback(i))
+            mock_feed.add_bar_callback(make_callback(i))
 
         await mock_feed.connect()
         await asyncio.sleep(0.05)

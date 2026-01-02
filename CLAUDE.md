@@ -225,111 +225,9 @@ AlphaTrade_System/
 
 ### 4.1 Data Types (`core/data_types.py`)
 
-**Implemented dataclasses:**
-
-```python
-@dataclass
-class OHLCVBar:
-    symbol: str
-    timestamp: datetime
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: int
-    vwap: Decimal | None = None
-    trade_count: int | None = None
-
-@dataclass
-class Order:
-    id: str
-    symbol: str
-    side: OrderSide  # BUY, SELL
-    quantity: Decimal
-    order_type: OrderType  # MARKET, LIMIT, STOP, STOP_LIMIT
-    status: OrderStatus  # PENDING, SUBMITTED, FILLED, CANCELLED, REJECTED
-    time_in_force: TimeInForce  # DAY, GTC, IOC, FOK
-    limit_price: Decimal | None = None
-    stop_price: Decimal | None = None
-    filled_quantity: Decimal = Decimal("0")
-    filled_avg_price: Decimal | None = None
-
-@dataclass
-class Position:
-    symbol: str
-    quantity: Decimal
-    avg_entry_price: Decimal
-    current_price: Decimal
-    cost_basis: Decimal
-    market_value: Decimal
-    unrealized_pnl: Decimal
-    realized_pnl: Decimal = Decimal("0")
-    side: PositionSide = PositionSide.LONG
-
-@dataclass
-class Portfolio:
-    equity: Decimal
-    cash: Decimal
-    buying_power: Decimal
-    positions: dict[str, Position]
-    daily_pnl: Decimal
-    total_pnl: Decimal
-
-@dataclass
-class TradeSignal:
-    symbol: str
-    direction: Direction  # LONG, SHORT, FLAT
-    strength: float  # -1.0 to 1.0
-    confidence: float  # 0.0 to 1.0
-    horizon: int  # Bars ahead
-    model_source: str
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    metadata: dict = field(default_factory=dict)
-```
-
 ### 4.2 Event System (`core/events.py`)
 
-```python
-class EventBus:
-    """Singleton publish-subscribe event bus."""
-
-    def subscribe(self, event_type: Type[Event], handler: Callable) -> None
-    def unsubscribe(self, event_type: Type[Event], handler: Callable) -> None
-    def publish(self, event: Event) -> None
-    async def publish_async(self, event: Event) -> None
-
-# Event types
-class MarketDataEvent(Event):    # New bar data
-class SignalEvent(Event):        # Trading signals
-class OrderEvent(Event):         # Order lifecycle
-class FillEvent(Event):          # Trade executions
-class RiskEvent(Event):          # Risk alerts
-class SystemEvent(Event):        # System status
-```
-
 ### 4.3 Exception Hierarchy (`core/exceptions.py`)
-
-```python
-class TradingSystemError(Exception):        # Base exception
-    ├── DataError                           # Data loading/processing
-    │   ├── DataLoadError
-    │   ├── DataValidationError
-    │   └── DataNotFoundError
-    ├── ExecutionError                      # Order execution
-    │   ├── OrderRejectedError
-    │   ├── InsufficientFundsError
-    │   └── BrokerConnectionError
-    ├── RiskError                           # Risk violations
-    │   ├── PositionLimitError
-    │   ├── DrawdownLimitError
-    │   └── KillSwitchActiveError
-    ├── ModelError                          # ML models
-    │   ├── ModelNotFittedError
-    │   └── PredictionError
-    └── ConfigurationError                  # Config issues
-```
-
----
 
 ## 5. Data Architecture
 
@@ -560,80 +458,9 @@ class TradingModel(ABC):
 
 ### 6.2 AlphaFactor Interface (`alpha/factor_base.py`)
 
-```python
-class AlphaFactor(ABC):
-    """Base class for alpha factors."""
-
-    @property
-    @abstractmethod
-    def name(self) -> str: ...
-
-    @property
-    @abstractmethod
-    def category(self) -> AlphaCategory: ...  # MOMENTUM, MEAN_REVERSION, etc.
-
-    @abstractmethod
-    def compute(
-        self,
-        bars: pd.DataFrame,
-        universe: list[str],
-    ) -> pd.Series: ...  # Returns alpha scores by symbol
-
-    def normalize(self, alphas: pd.Series) -> pd.Series: ...
-    def winsorize(self, alphas: pd.Series, limits: tuple) -> pd.Series: ...
-```
-
 ### 6.3 Strategy Interface (`trading/strategy.py`)
 
-```python
-class Strategy(ABC):
-    """Trading strategy interface."""
-
-    @abstractmethod
-    def generate_signals(
-        self,
-        market_data: dict[str, pd.DataFrame],
-        portfolio: Portfolio,
-    ) -> list[TradeSignal]: ...
-
-    @abstractmethod
-    def get_position_sizes(
-        self,
-        signals: list[TradeSignal],
-        portfolio: Portfolio,
-        risk_limits: RiskLimits,
-    ) -> dict[str, Decimal]: ...
-
-    def on_bar(self, bar: OHLCVBar) -> None: ...
-    def on_fill(self, fill: FillEvent) -> None: ...
-```
-
 ### 6.4 Risk Checker Interface (`risk/limits.py`)
-
-```python
-class PreTradeRiskChecker:
-    """Pre-trade risk validation."""
-
-    def check_order(
-        self,
-        order: Order,
-        portfolio: Portfolio,
-        config: RiskLimitsConfig,
-    ) -> tuple[bool, str]: ...
-
-    def check_position_limit(self, symbol: str, new_qty: Decimal) -> bool: ...
-    def check_concentration(self, symbol: str, value: Decimal) -> bool: ...
-    def check_sector_exposure(self, sector: str, value: Decimal) -> bool: ...
-
-class IntraTradeMonitor:
-    """Real-time risk monitoring."""
-
-    def update(self, portfolio: Portfolio, market_data: dict) -> list[RiskAlert]: ...
-    def check_drawdown(self, portfolio: Portfolio) -> bool: ...
-    def check_volatility(self, returns: np.ndarray) -> bool: ...
-```
-
----
 
 ## 7. Trading Engine Specifics
 

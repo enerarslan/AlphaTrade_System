@@ -733,13 +733,68 @@ class TestKillSwitch:
         assert state.reason == KillSwitchReason.MANUAL_ACTIVATION
         assert kill_switch.is_active()
 
-    def test_reset(self, kill_switch):
-        """Test kill switch reset."""
+    def test_reset_with_cooldown(self, kill_switch):
+        """Test kill switch reset respects cooldown period."""
         kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
         assert kill_switch.is_active()
 
-        kill_switch.reset("authorized_user")
+        # Reset should fail during cooldown period
+        success, message = kill_switch.reset("authorized_user")
+        assert not success
+        assert "Cooldown period not elapsed" in message
+        assert kill_switch.is_active()
+
+    def test_reset_with_force(self, kill_switch, monkeypatch):
+        """Test kill switch reset with force override bypasses cooldown."""
+        # Set up override code for force reset (2-factor authorization)
+        monkeypatch.setenv("KILL_SWITCH_OVERRIDE_CODE", "TEST_OVERRIDE_123")
+
+        kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
+        assert kill_switch.is_active()
+
+        # Force reset without override code should fail
+        success, message = kill_switch.reset("authorized_user", force=True)
+        assert not success
+        assert "Invalid override code" in message
+
+        # Force reset with correct override code should work
+        success, message = kill_switch.reset(
+            "authorized_user",
+            force=True,
+            override_code="TEST_OVERRIDE_123"
+        )
+        assert success
         assert not kill_switch.is_active()
+
+    def test_reset_with_zero_cooldown(self):
+        """Test kill switch reset when cooldown is set to zero."""
+        kill_switch = KillSwitch(cooldown_minutes=0)
+        kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
+        assert kill_switch.is_active()
+
+        # Reset should work immediately with zero cooldown
+        success, message = kill_switch.reset("authorized_user")
+        assert success
+        assert not kill_switch.is_active()
+
+    def test_can_reset_returns_remaining_time(self, kill_switch):
+        """Test can_reset returns remaining cooldown time."""
+        kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
+
+        can_reset, reason = kill_switch.can_reset()
+        assert not can_reset
+        assert "Cooldown period not elapsed" in reason
+        assert "Remaining:" in reason
+
+    def test_get_cooldown_remaining(self, kill_switch):
+        """Test get_cooldown_remaining returns time delta."""
+        kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
+
+        remaining = kill_switch.get_cooldown_remaining()
+        assert remaining is not None
+        # Should be close to 30 minutes (minus a few seconds)
+        assert remaining.total_seconds() > 29 * 60
+        assert remaining.total_seconds() <= 30 * 60
 
     def test_can_trade_when_active(self, kill_switch):
         """Test trading is blocked when kill switch is active."""

@@ -767,7 +767,13 @@ class KillSwitch:
     """Emergency kill switch for halting all trading.
 
     THREAD-SAFE: Uses RLock to ensure atomic state transitions.
+
+    SAFETY FEATURE: Implements a 30-minute cooldown period before the kill switch
+    can be reset. This prevents premature re-enabling of trading after a risk event.
     """
+
+    # Cooldown period before kill switch can be reset (30 minutes)
+    COOLDOWN_MINUTES: int = 30
 
     def __init__(
         self,
@@ -775,6 +781,7 @@ class KillSwitch:
         event_bus: EventBus | None = None,
         cancel_orders_callback: Callable[[], int] | None = None,
         close_positions_callback: Callable[[], int] | None = None,
+        cooldown_minutes: int | None = None,
     ) -> None:
         """Initialize kill switch.
 
@@ -783,6 +790,7 @@ class KillSwitch:
             event_bus: Event bus for publishing events.
             cancel_orders_callback: Callback to cancel all orders.
             close_positions_callback: Callback to close all positions.
+            cooldown_minutes: Override default cooldown period (default: 30 minutes).
         """
         self.config = config or RiskLimitsConfig()
         self.event_bus = event_bus
@@ -791,6 +799,8 @@ class KillSwitch:
         self.state = KillSwitchState()
         # CRITICAL: Use RLock for thread-safe atomic operations
         self._lock = threading.RLock()
+        # Cooldown period configuration
+        self._cooldown_minutes = cooldown_minutes if cooldown_minutes is not None else self.COOLDOWN_MINUTES
 
     def check_conditions(
         self,
@@ -910,20 +920,149 @@ class KillSwitch:
             activated_by=activated_by,
         )
 
-    def reset(self, authorized_by: str) -> None:
-        """Reset the kill switch.
+    def get_cooldown_remaining(self) -> timedelta | None:
+        """Get remaining cooldown time before kill switch can be reset.
 
-        THREAD-SAFE: Uses lock for atomic reset.
+        THREAD-SAFE: Uses lock for consistent read.
 
-        Args:
-            authorized_by: Who authorized the reset.
+        Returns:
+            Remaining cooldown time, or None if not active or cooldown has passed.
+        """
+        with self._lock:
+            if not self.state.is_active or self.state.activated_at is None:
+                return None
+
+            elapsed = datetime.now(timezone.utc) - self.state.activated_at
+            cooldown_duration = timedelta(minutes=self._cooldown_minutes)
+
+            if elapsed >= cooldown_duration:
+                return None
+
+            return cooldown_duration - elapsed
+
+    def can_reset(self) -> tuple[bool, str | None]:
+        """Check if the kill switch can be reset (cooldown has passed).
+
+        THREAD-SAFE: Uses lock for consistent read.
+
+        Returns:
+            Tuple of (can_reset, reason_if_not).
         """
         with self._lock:
             if not self.state.is_active:
-                return
+                return False, "Kill switch is not active"
 
-            logger.warning(f"Kill switch reset authorized by: {authorized_by}")
+            if self.state.activated_at is None:
+                # This shouldn't happen, but handle it safely
+                return True, None
+
+            elapsed = datetime.now(timezone.utc) - self.state.activated_at
+            cooldown_duration = timedelta(minutes=self._cooldown_minutes)
+
+            if elapsed < cooldown_duration:
+                remaining = cooldown_duration - elapsed
+                minutes_remaining = int(remaining.total_seconds() / 60)
+                seconds_remaining = int(remaining.total_seconds() % 60)
+                return False, (
+                    f"Cooldown period not elapsed. "
+                    f"Remaining: {minutes_remaining}m {seconds_remaining}s"
+                )
+
+            return True, None
+
+    def reset(
+        self,
+        authorized_by: str,
+        force: bool = False,
+        override_code: str | None = None,
+    ) -> tuple[bool, str]:
+        """Reset the kill switch with cooldown enforcement.
+
+        THREAD-SAFE: Uses lock for atomic reset.
+
+        SAFETY: The kill switch cannot be reset until the cooldown period (30 minutes)
+        has elapsed since activation. This prevents premature re-enabling of trading
+        after a risk event.
+
+        CRITICAL FIX: Force reset now requires an override_code that must match
+        the KILL_SWITCH_OVERRIDE_CODE environment variable. This implements
+        2-factor authorization for emergency overrides.
+
+        Args:
+            authorized_by: Who authorized the reset.
+            force: If True, bypass cooldown check (DANGEROUS - use only in emergencies).
+                   Requires explicit acknowledgment and will be logged at CRITICAL level.
+            override_code: Required for force=True. Must match KILL_SWITCH_OVERRIDE_CODE
+                          environment variable.
+
+        Returns:
+            Tuple of (success, message).
+        """
+        import os
+
+        with self._lock:
+            if not self.state.is_active:
+                return False, "Kill switch is not active"
+
+            # Check cooldown unless force override is specified
+            if not force:
+                can_reset, reason = self.can_reset()
+                if not can_reset:
+                    logger.warning(
+                        f"Kill switch reset DENIED for {authorized_by}: {reason}"
+                    )
+                    return False, reason or "Cannot reset"
+
+            # Force override - requires 2-factor authorization
+            if force:
+                # CRITICAL: Verify override code for force reset
+                expected_code = os.environ.get("KILL_SWITCH_OVERRIDE_CODE")
+                if not expected_code:
+                    logger.error(
+                        f"Force reset DENIED for {authorized_by}: "
+                        "KILL_SWITCH_OVERRIDE_CODE environment variable not set"
+                    )
+                    return False, "Force reset not configured - contact system administrator"
+
+                if override_code != expected_code:
+                    logger.critical(
+                        f"SECURITY ALERT: Force reset with INVALID override code "
+                        f"attempted by {authorized_by}"
+                    )
+                    return False, "Invalid override code - force reset denied"
+
+                logger.critical(
+                    f"KILL SWITCH FORCE RESET by {authorized_by} - "
+                    f"Cooldown bypassed with valid override code! "
+                    f"Original activation: {self.state.reason.value if self.state.reason else 'unknown'} "
+                    f"at {self.state.activated_at.isoformat() if self.state.activated_at else 'unknown'}"
+                )
+
+            # Calculate how long the kill switch was active
+            active_duration = None
+            if self.state.activated_at:
+                active_duration = datetime.now(timezone.utc) - self.state.activated_at
+
+            logger.warning(
+                f"Kill switch reset authorized by: {authorized_by} "
+                f"(was active for {active_duration if active_duration else 'unknown duration'})"
+            )
             self.state.reset()
+
+            # Publish reset event
+            if self.event_bus:
+                event = create_risk_event(
+                    event_type=EventType.KILL_SWITCH_RESET,
+                    risk_data={
+                        "authorized_by": authorized_by,
+                        "force_override": force,
+                        "active_duration_seconds": active_duration.total_seconds() if active_duration else None,
+                    },
+                    source="KillSwitch",
+                )
+                self.event_bus.publish(event)
+
+            return True, "Kill switch reset successfully"
 
     def is_active(self) -> bool:
         """Check if kill switch is active.

@@ -8,7 +8,7 @@ ML alphas, and alpha combination strategies.
 import numpy as np
 import polars as pl
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 @pytest.fixture
@@ -75,7 +75,7 @@ class TestAlphaBase:
             alpha_id=uuid4(),
             alpha_name="test_alpha",
             symbol="AAPL",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             value=0.5,
             confidence=0.8,
             horizon=10,
@@ -95,7 +95,7 @@ class TestAlphaBase:
             alpha_id=uuid4(),
             alpha_name="test",
             symbol="AAPL",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             value=0.5,
             confidence=0.8,
             horizon=10,
@@ -107,7 +107,7 @@ class TestAlphaBase:
             alpha_id=uuid4(),
             alpha_name="test",
             symbol="AAPL",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             value=-0.5,
             confidence=0.8,
             horizon=10,
@@ -119,7 +119,7 @@ class TestAlphaBase:
             alpha_id=uuid4(),
             alpha_name="test",
             symbol="AAPL",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             value=0.05,
             confidence=0.8,
             horizon=10,

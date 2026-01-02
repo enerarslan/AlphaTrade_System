@@ -3,7 +3,7 @@ Integration tests for monitoring module.
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -156,7 +156,7 @@ class TestMonitoringIntegration:
             "symbol": "AAPL",
             "direction": "LONG",
             "strength": 0.75,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
         # 3. Order submitted

@@ -6,7 +6,7 @@ Tests data loading, preprocessing, feature store, and live feed.
 
 import asyncio
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -87,7 +87,7 @@ class TestDataLoader:
 
             # Create a lazy frame with non-standard column names
             df = pl.DataFrame({
-                "date": [datetime.utcnow()],
+                "date": [datetime.now(timezone.utc)],
                 "Open": [100.0],
                 "High": [101.0],
                 "Low": [99.0],
@@ -128,7 +128,7 @@ class TestParquetDataStore:
 
             # Create test data
             df = pl.DataFrame({
-                "timestamp": [datetime.utcnow() - timedelta(hours=i) for i in range(10)],
+                "timestamp": [datetime.now(timezone.utc) - timedelta(hours=i) for i in range(10)],
                 "open": [100.0 + i for i in range(10)],
                 "high": [101.0 + i for i in range(10)],
                 "low": [99.0 + i for i in range(10)],
@@ -153,7 +153,7 @@ class TestParquetDataStore:
 
             # Create test data
             df = pl.DataFrame({
-                "timestamp": [datetime.utcnow()],
+                "timestamp": [datetime.now(timezone.utc)],
                 "open": [100.0],
                 "high": [101.0],
                 "low": [99.0],
@@ -193,7 +193,7 @@ class TestDataPreprocessor:
         preprocessor = DataPreprocessor()
 
         df = pl.DataFrame({
-            "timestamp": [datetime.utcnow() + timedelta(hours=i) for i in range(5)],
+            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(5)],
             "open": [100.0, 101.0, -50.0, 103.0, 104.0],
             "high": [101.0, 102.0, 51.0, 104.0, 105.0],
             "low": [99.0, 100.0, 49.0, 102.0, 103.0],
@@ -213,7 +213,7 @@ class TestDataPreprocessor:
         preprocessor = DataPreprocessor()
 
         df = pl.DataFrame({
-            "timestamp": [datetime.utcnow() + timedelta(hours=i) for i in range(5)],
+            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(5)],
             "open": [100.0, 101.0, 102.0, 103.0, 104.0],
             "high": [101.0, 102.0, 100.0, 104.0, 105.0],  # 3rd row: high < open
             "low": [99.0, 100.0, 99.0, 102.0, 103.0],
@@ -232,7 +232,7 @@ class TestDataPreprocessor:
 
         preprocessor = DataPreprocessor()
 
-        ts = datetime.utcnow()
+        ts = datetime.now(timezone.utc)
         df = pl.DataFrame({
             "timestamp": [ts, ts, ts + timedelta(hours=1)],
             "open": [100.0, 101.0, 102.0],
@@ -267,7 +267,7 @@ class TestNormalizationMethod:
         preprocessor = DataPreprocessor()
 
         df = pl.DataFrame({
-            "timestamp": [datetime.utcnow() + timedelta(hours=i) for i in range(10)],
+            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(10)],
             "close": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
         })
 
@@ -282,7 +282,7 @@ class TestNormalizationMethod:
         preprocessor = DataPreprocessor()
 
         df = pl.DataFrame({
-            "timestamp": [datetime.utcnow() + timedelta(hours=i) for i in range(10)],
+            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(10)],
             "close": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
         })
 
@@ -375,7 +375,7 @@ class TestFeatureStore:
         store = FeatureStore()
 
         df = pl.DataFrame({
-            "timestamp": [datetime.utcnow() + timedelta(minutes=15 * i) for i in range(100)],
+            "timestamp": [datetime.now(timezone.utc) + timedelta(minutes=15 * i) for i in range(100)],
             "open": [100.0 + i * 0.1 for i in range(100)],
             "high": [101.0 + i * 0.1 for i in range(100)],
             "low": [99.0 + i * 0.1 for i in range(100)],
@@ -574,7 +574,7 @@ class TestMockLiveFeed:
                 symbols=["AAPL"],
                 interval_seconds=0.1,
             )
-            feed.add_callback(callback)
+            feed.add_bar_callback(callback)
 
             await feed.connect()
             await asyncio.sleep(0.3)  # Wait for some bars

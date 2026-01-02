@@ -11,7 +11,7 @@ Tests for:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -119,7 +119,7 @@ class TestMomentumStrategy:
 
             bars[symbol] = OHLCVBar(
                 symbol=symbol,
-                timestamp=datetime.utcnow() - timedelta(minutes=count - i),
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=count - i),
                 open=close - Decimal("0.5"),
                 high=close + Decimal("1"),
                 low=close - Decimal("1"),
@@ -178,7 +178,7 @@ class TestMomentumStrategy:
         for i in range(20):
             bar = OHLCVBar(
                 symbol="AAPL",
-                timestamp=datetime.utcnow() - timedelta(minutes=20 - i),
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=20 - i),
                 open=Decimal(str(base_price + i)),
                 high=Decimal(str(base_price + i + 1)),
                 low=Decimal(str(base_price + i - 1)),
@@ -255,7 +255,7 @@ class TestMLStrategy:
         for i in range(10):
             bar = OHLCVBar(
                 symbol="AAPL",
-                timestamp=datetime.utcnow() - timedelta(minutes=10 - i),
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=10 - i),
                 open=Decimal("100"),
                 high=Decimal("101"),
                 low=Decimal("99"),
@@ -452,7 +452,7 @@ class TestEnrichedSignal:
             model_source="test",
         )
         metadata = SignalMetadata(
-            expires_at=datetime.utcnow() - timedelta(minutes=1),
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
         )
         enriched = EnrichedSignal(signal=signal, metadata=metadata)
 
@@ -469,7 +469,7 @@ class TestEnrichedSignal:
             model_source="test",
         )
         metadata = SignalMetadata(
-            expires_at=datetime.utcnow() + timedelta(minutes=5),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         )
         enriched = EnrichedSignal(signal=signal, metadata=metadata)
 
@@ -859,7 +859,7 @@ class TestTradingSession:
         """Test session activity check."""
         session = TradingSession(
             session_id="test",
-            date=datetime.utcnow().date(),
+            date=datetime.now(timezone.utc).date(),
             state=EngineState.MARKET_HOURS,
         )
         assert session.is_active is True
@@ -950,7 +950,7 @@ class TestTradingEngine:
         engine = self.create_mock_engine()
         engine._session = TradingSession(
             session_id="test",
-            date=datetime.utcnow().date(),
+            date=datetime.now(timezone.utc).date(),
             state=EngineState.MARKET_HOURS,
         )
 
@@ -1008,7 +1008,7 @@ class TestTradingEngine:
         engine = self.create_mock_engine()
         engine._session = TradingSession(
             session_id="test",
-            date=datetime.utcnow().date(),
+            date=datetime.now(timezone.utc).date(),
             state=EngineState.MARKET_HOURS,
             start_equity=Decimal("100000"),
             current_equity=Decimal("99000"),  # 1% loss
@@ -1031,7 +1031,7 @@ class TestTradingEngine:
 
         engine._session = TradingSession(
             session_id="test",
-            date=datetime.utcnow().date(),
+            date=datetime.now(timezone.utc).date(),
             state=EngineState.MARKET_HOURS,
             start_equity=Decimal("100000"),
             current_equity=Decimal("100000"),
@@ -1114,7 +1114,7 @@ class TestTradingEngine:
         # Set up session and metrics
         engine._session = TradingSession(
             session_id="test",
-            date=datetime.utcnow().date(),
+            date=datetime.now(timezone.utc).date(),
             state=EngineState.MARKET_HOURS,
             start_equity=Decimal("100000"),
             current_equity=Decimal("100000"),

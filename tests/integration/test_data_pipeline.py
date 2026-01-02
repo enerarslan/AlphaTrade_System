@@ -200,7 +200,7 @@ class TestDataTypeConversions:
         )
 
         # Convert to dict
-        data = original.to_dict()
+        data = original.to_dict(preserve_decimal_precision=False)
 
         # Verify dict contents
         assert data["symbol"] == "AAPL"

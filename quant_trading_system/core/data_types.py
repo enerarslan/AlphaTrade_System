@@ -14,7 +14,22 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import numpy as np
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _serialize_decimal(value: Decimal) -> str:
+    """Serialize Decimal to string for JSON."""
+    return str(value)
+
+
+def _serialize_uuid(value: UUID) -> str:
+    """Serialize UUID to string for JSON."""
+    return str(value)
+
+
+def _serialize_datetime(value: datetime) -> str:
+    """Serialize datetime to ISO format string for JSON."""
+    return value.isoformat()
 
 
 class Direction(str, Enum):
@@ -133,8 +148,7 @@ class OHLCVBar(BaseModel):
                 "trade_count": self.trade_count,
             }
 
-    class Config:
-        frozen = True  # Immutable
+    model_config = ConfigDict(frozen=True)
 
 
 class TradeSignal(BaseModel):
@@ -165,8 +179,38 @@ class TradeSignal(BaseModel):
             and self.direction != Direction.FLAT
         )
 
-    class Config:
-        frozen = True
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary with JSON-serializable types."""
+        return {
+            "signal_id": str(self.signal_id),
+            "timestamp": self.timestamp.isoformat(),
+            "symbol": self.symbol,
+            "direction": self.direction.value,
+            "strength": self.strength,
+            "confidence": self.confidence,
+            "horizon": self.horizon,
+            "model_source": self.model_source,
+            "features_snapshot": self.features_snapshot,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TradeSignal":
+        """Create TradeSignal from dictionary."""
+        return cls(
+            signal_id=UUID(data["signal_id"]) if isinstance(data.get("signal_id"), str) else data.get("signal_id", uuid4()),
+            timestamp=datetime.fromisoformat(data["timestamp"]) if isinstance(data.get("timestamp"), str) else data.get("timestamp", datetime.now(timezone.utc)),
+            symbol=data["symbol"],
+            direction=Direction(data["direction"]),
+            strength=data["strength"],
+            confidence=data["confidence"],
+            horizon=data["horizon"],
+            model_source=data["model_source"],
+            features_snapshot=data.get("features_snapshot", {}),
+            metadata=data.get("metadata", {}),
+        )
+
+    model_config = ConfigDict(frozen=True)
 
 
 class Order(BaseModel):
@@ -221,6 +265,49 @@ class Order(BaseModel):
     def remaining_qty(self) -> Decimal:
         """Get remaining quantity to fill."""
         return self.quantity - self.filled_qty
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary with JSON-serializable types."""
+        return {
+            "order_id": str(self.order_id),
+            "client_order_id": self.client_order_id,
+            "broker_order_id": self.broker_order_id,
+            "symbol": self.symbol,
+            "side": self.side.value,
+            "order_type": self.order_type.value,
+            "quantity": str(self.quantity),
+            "limit_price": str(self.limit_price) if self.limit_price else None,
+            "stop_price": str(self.stop_price) if self.stop_price else None,
+            "time_in_force": self.time_in_force.value,
+            "status": self.status.value,
+            "filled_qty": str(self.filled_qty),
+            "filled_avg_price": str(self.filled_avg_price) if self.filled_avg_price else None,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "signal_id": str(self.signal_id) if self.signal_id else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Order":
+        """Create Order from dictionary."""
+        return cls(
+            order_id=UUID(data["order_id"]) if isinstance(data.get("order_id"), str) else data.get("order_id"),
+            client_order_id=data.get("client_order_id", ""),
+            broker_order_id=data.get("broker_order_id"),
+            symbol=data["symbol"],
+            side=OrderSide(data["side"]),
+            order_type=OrderType(data.get("order_type", "MARKET")),
+            quantity=Decimal(data["quantity"]),
+            limit_price=Decimal(data["limit_price"]) if data.get("limit_price") else None,
+            stop_price=Decimal(data["stop_price"]) if data.get("stop_price") else None,
+            time_in_force=TimeInForce(data.get("time_in_force", "DAY")),
+            status=OrderStatus(data.get("status", "PENDING")),
+            filled_qty=Decimal(data.get("filled_qty", "0")),
+            filled_avg_price=Decimal(data["filled_avg_price"]) if data.get("filled_avg_price") else None,
+            created_at=datetime.fromisoformat(data["created_at"]) if isinstance(data.get("created_at"), str) else data.get("created_at", datetime.now(timezone.utc)),
+            updated_at=datetime.fromisoformat(data["updated_at"]) if isinstance(data.get("updated_at"), str) else data.get("updated_at", datetime.now(timezone.utc)),
+            signal_id=UUID(data["signal_id"]) if isinstance(data.get("signal_id"), str) else data.get("signal_id"),
+        )
 
 
 class Position(BaseModel):
@@ -285,6 +372,35 @@ class Position(BaseModel):
             last_updated=datetime.now(timezone.utc),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary with JSON-serializable types."""
+        return {
+            "symbol": self.symbol,
+            "quantity": str(self.quantity),
+            "avg_entry_price": str(self.avg_entry_price),
+            "current_price": str(self.current_price),
+            "cost_basis": str(self.cost_basis),
+            "market_value": str(self.market_value),
+            "unrealized_pnl": str(self.unrealized_pnl),
+            "realized_pnl": str(self.realized_pnl),
+            "last_updated": self.last_updated.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Position":
+        """Create Position from dictionary."""
+        return cls(
+            symbol=data["symbol"],
+            quantity=Decimal(data["quantity"]),
+            avg_entry_price=Decimal(data["avg_entry_price"]),
+            current_price=Decimal(data["current_price"]),
+            cost_basis=Decimal(data["cost_basis"]),
+            market_value=Decimal(data["market_value"]),
+            unrealized_pnl=Decimal(data.get("unrealized_pnl", "0")),
+            realized_pnl=Decimal(data.get("realized_pnl", "0")),
+            last_updated=datetime.fromisoformat(data["last_updated"]) if isinstance(data.get("last_updated"), str) else data.get("last_updated", datetime.now(timezone.utc)),
+        )
+
 
 class Portfolio(BaseModel):
     """Portfolio state model."""
@@ -342,6 +458,37 @@ class Portfolio(BaseModel):
     def get_position(self, symbol: str) -> Position | None:
         """Get position for a symbol."""
         return self.positions.get(symbol.upper())
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary with JSON-serializable types."""
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "equity": str(self.equity),
+            "cash": str(self.cash),
+            "buying_power": str(self.buying_power),
+            "positions": {k: v.to_dict() for k, v in self.positions.items()},
+            "pending_orders": [o.to_dict() for o in self.pending_orders],
+            "daily_pnl": str(self.daily_pnl),
+            "total_pnl": str(self.total_pnl),
+            "margin_used": str(self.margin_used),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Portfolio":
+        """Create Portfolio from dictionary."""
+        positions = {k: Position.from_dict(v) for k, v in data.get("positions", {}).items()}
+        pending_orders = [Order.from_dict(o) for o in data.get("pending_orders", [])]
+        return cls(
+            timestamp=datetime.fromisoformat(data["timestamp"]) if isinstance(data.get("timestamp"), str) else data.get("timestamp", datetime.now(timezone.utc)),
+            equity=Decimal(data["equity"]),
+            cash=Decimal(data["cash"]),
+            buying_power=Decimal(data["buying_power"]),
+            positions=positions,
+            pending_orders=pending_orders,
+            daily_pnl=Decimal(data.get("daily_pnl", "0")),
+            total_pnl=Decimal(data.get("total_pnl", "0")),
+            margin_used=Decimal(data.get("margin_used", "0")),
+        )
 
 
 class RiskMetrics(BaseModel):

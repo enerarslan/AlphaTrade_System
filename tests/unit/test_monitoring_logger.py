@@ -5,7 +5,7 @@ Unit tests for monitoring/logger.py
 import json
 import logging
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -113,7 +113,7 @@ class TestTradeLogEntry:
     def test_create_trade_entry(self):
         """Test creating a trade log entry."""
         entry = TradeLogEntry(
-            entry_time=datetime.utcnow(),
+            entry_time=datetime.now(timezone.utc),
             symbol="AAPL",
             side="BUY",
             quantity=100.0,

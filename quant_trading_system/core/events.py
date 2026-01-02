@@ -54,6 +54,7 @@ class EventType(str, Enum):
     DRAWDOWN_WARNING = "risk.drawdown_warning"
     EXPOSURE_WARNING = "risk.exposure_warning"
     KILL_SWITCH_TRIGGERED = "risk.kill_switch"
+    KILL_SWITCH_RESET = "risk.kill_switch_reset"
 
     # System Events
     SYSTEM_START = "system.start"

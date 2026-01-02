@@ -82,7 +82,9 @@ class TradingEngineConfig:
     max_daily_trades: int = 100
     max_daily_loss_pct: float = 0.02  # 2% max daily loss
     kill_switch_drawdown: float = 0.05  # 5% drawdown triggers kill switch
-    enable_risk_checks: bool = True
+    # CRITICAL FIX: enable_risk_checks removed - risk checks are now MANDATORY
+    # Risk checks can NEVER be disabled in production. This prevents accidental
+    # or intentional bypass of safety controls.
     enable_reconciliation: bool = True
     heartbeat_interval: int = 60  # seconds
     state_save_interval: int = 300  # seconds
@@ -590,10 +592,11 @@ class TradingEngine:
             # 1. Get latest market data
             await self._update_market_data()
 
-            # 2. Check risk limits
-            if self.config.enable_risk_checks:
-                if not self._check_risk_limits():
-                    return
+            # 2. Check risk limits - MANDATORY (cannot be disabled)
+            # CRITICAL FIX: Risk checks always run. Safety controls are non-negotiable.
+            if not self._check_risk_limits():
+                logger.warning("Risk limits check failed - skipping this iteration")
+                return
 
             # 3. Generate signals
             portfolio = self.position_tracker.get_portfolio()

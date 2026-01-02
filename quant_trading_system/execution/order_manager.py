@@ -423,14 +423,18 @@ class OrderManager:
     def create_order(
         self,
         request: OrderRequest,
-        portfolio: Portfolio | None = None,
+        portfolio: Portfolio,
         current_price: Decimal | None = None,
     ) -> ManagedOrder:
         """Create a new managed order.
 
+        CRITICAL FIX: portfolio is now REQUIRED to ensure risk checks are always
+        performed. This prevents orders from being created without proper
+        buying power, position limit, and concentration checks.
+
         Args:
             request: Order request.
-            portfolio: Current portfolio for validation.
+            portfolio: Current portfolio for validation (REQUIRED).
             current_price: Current price for validation.
 
         Returns:
@@ -438,8 +442,16 @@ class OrderManager:
 
         Raises:
             OrderSubmissionError: If validation fails.
+            ValueError: If portfolio is not provided.
         """
-        # Validate order
+        # CRITICAL: Ensure portfolio is provided for risk checks
+        if portfolio is None:
+            raise ValueError(
+                "Portfolio is required for order creation. "
+                "Risk checks cannot be bypassed."
+            )
+
+        # Validate order with mandatory risk checks
         validation = self.validator.validate(request, portfolio, current_price)
         if not validation.is_valid:
             raise OrderSubmissionError(

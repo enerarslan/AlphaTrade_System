@@ -341,13 +341,13 @@ class AlpacaClient:
 
         Args:
             api_key: Alpaca API key (or from ALPACA_API_KEY env var).
-            api_secret: Alpaca API secret (or from ALPACA_SECRET_KEY env var).
+            api_secret: Alpaca API secret (or from ALPACA_API_SECRET env var).
             environment: Paper or live trading environment.
             max_retries: Maximum number of retries for failed requests.
             retry_delay: Base delay between retries (exponential backoff).
         """
         self.api_key = api_key or os.environ.get("ALPACA_API_KEY", "")
-        self.api_secret = api_secret or os.environ.get("ALPACA_SECRET_KEY", "")
+        self.api_secret = api_secret or os.environ.get("ALPACA_API_SECRET", "")
         self.environment = environment
         self.max_retries = max_retries
         self.retry_delay = retry_delay
@@ -367,6 +367,9 @@ class AlpacaClient:
         # WebSocket callbacks
         self._trade_callbacks: list[Callable[[dict[str, Any]], None]] = []
         self._account_callbacks: list[Callable[[dict[str, Any]], None]] = []
+
+        # WebSocket streaming state
+        self._stream_running = False
 
         logger.info(f"AlpacaClient initialized for {environment.value} trading")
 
@@ -560,6 +563,71 @@ class AlpacaClient:
 
     # Order Methods
 
+    def _is_transient_error(self, error: Exception) -> bool:
+        """Check if an error is transient and can be retried.
+
+        Transient errors include:
+        - Network timeouts
+        - Connection errors
+        - Rate limit errors (429)
+        - Server errors (5xx)
+
+        Non-transient errors (should NOT be retried):
+        - Authentication errors (401, 403)
+        - Invalid order errors (422)
+        - Insufficient funds
+        - Order already exists
+
+        Args:
+            error: The exception to check.
+
+        Returns:
+            True if the error is transient and can be retried.
+        """
+        error_str = str(error).lower()
+
+        # Non-transient errors - do not retry
+        non_transient_patterns = [
+            "insufficient",
+            "authentication",
+            "forbidden",
+            "invalid order",
+            "already exists",
+            "not found",
+            "422",
+            "401",
+            "403",
+        ]
+
+        for pattern in non_transient_patterns:
+            if pattern in error_str:
+                return False
+
+        # Transient error patterns - safe to retry
+        transient_patterns = [
+            "timeout",
+            "connection",
+            "network",
+            "rate limit",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "temporary",
+            "unavailable",
+        ]
+
+        for pattern in transient_patterns:
+            if pattern in error_str:
+                return True
+
+        # For generic BrokerConnectionError, assume transient unless specifically non-transient
+        if isinstance(error, BrokerConnectionError):
+            return True
+
+        return False
+
     async def submit_order(
         self,
         symbol: str,
@@ -575,7 +643,12 @@ class AlpacaClient:
         take_profit: dict[str, Any] | None = None,
         stop_loss: dict[str, Any] | None = None,
     ) -> AlpacaOrder:
-        """Submit an order.
+        """Submit an order with retry logic for transient failures.
+
+        Implements exponential backoff retry for transient errors:
+        - Max 3 retries with backoff: 1s, 2s, 4s
+        - Only retries on transient failures (network issues, rate limits, server errors)
+        - Does NOT retry on non-transient errors (insufficient funds, invalid orders)
 
         Args:
             symbol: Stock symbol.
@@ -595,8 +668,13 @@ class AlpacaClient:
             Submitted order.
 
         Raises:
-            OrderSubmissionError: If order submission fails.
+            OrderSubmissionError: If order submission fails after all retries.
+            InsufficientFundsError: If insufficient buying power (not retried).
         """
+        # Order submission retry configuration
+        ORDER_MAX_RETRIES = 3
+        ORDER_BASE_DELAY = 1.0  # Base delay in seconds (1s, 2s, 4s)
+
         type_map = {
             OrderType.MARKET: "market",
             OrderType.LIMIT: "limit",
@@ -636,21 +714,66 @@ class AlpacaClient:
         if stop_loss:
             order_data["stop_loss"] = stop_loss
 
-        try:
-            data = await self._request("POST", "/v2/orders", json_data=order_data)
-            order = AlpacaOrder.from_alpaca(data)
-            logger.info(f"Order submitted: {order.order_id} {symbol} {side.value} {qty}")
-            return order
-        except BrokerConnectionError as e:
-            if "insufficient" in str(e).lower():
-                raise InsufficientFundsError(
-                    f"Insufficient funds for order: {e}",
+        last_error: Exception | None = None
+
+        for attempt in range(ORDER_MAX_RETRIES):
+            try:
+                data = await self._request("POST", "/v2/orders", json_data=order_data)
+                order = AlpacaOrder.from_alpaca(data)
+                if attempt > 0:
+                    logger.info(f"Order submitted after {attempt + 1} attempts: {order.order_id} {symbol} {side.value} {qty}")
+                else:
+                    logger.info(f"Order submitted: {order.order_id} {symbol} {side.value} {qty}")
+                return order
+
+            except InsufficientFundsError:
+                # Non-transient error - do not retry
+                logger.error(f"Insufficient funds for order: {symbol} {side.value} {qty}")
+                raise
+
+            except (BrokerConnectionError, OrderSubmissionError) as e:
+                last_error = e
+
+                # Check if error is transient and can be retried
+                if not self._is_transient_error(e):
+                    logger.error(f"Non-transient error submitting order, not retrying: {e}")
+                    if "insufficient" in str(e).lower():
+                        raise InsufficientFundsError(
+                            f"Insufficient funds for order: {e}",
+                            symbol=symbol,
+                        )
+                    raise OrderSubmissionError(
+                        f"Failed to submit order: {e}",
+                        symbol=symbol,
+                    )
+
+                # Transient error - retry with exponential backoff
+                if attempt < ORDER_MAX_RETRIES - 1:
+                    delay = ORDER_BASE_DELAY * (2 ** attempt)  # 1s, 2s, 4s
+                    logger.warning(
+                        f"Transient error submitting order (attempt {attempt + 1}/{ORDER_MAX_RETRIES}), "
+                        f"retrying in {delay}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        f"Order submission failed after {ORDER_MAX_RETRIES} attempts: {e}"
+                    )
+
+            except Exception as e:
+                last_error = e
+                logger.error(f"Unexpected error submitting order: {e}")
+                # For unexpected errors, do not retry
+                raise OrderSubmissionError(
+                    f"Failed to submit order: {e}",
                     symbol=symbol,
                 )
-            raise OrderSubmissionError(
-                f"Failed to submit order: {e}",
-                symbol=symbol,
-            )
+
+        # All retries exhausted
+        raise OrderSubmissionError(
+            f"Failed to submit order after {ORDER_MAX_RETRIES} attempts: {last_error}",
+            symbol=symbol,
+        )
 
     async def get_order(self, order_id: str, by_client_id: bool = False) -> AlpacaOrder:
         """Get order by ID.
@@ -1028,6 +1151,127 @@ class AlpacaClient:
                 callback(data)
             except Exception as e:
                 logger.error(f"Account callback error: {e}")
+
+    # WebSocket Streaming Methods
+
+    async def start_trade_stream(self) -> None:
+        """Start WebSocket stream for real-time trade/order updates.
+
+        Connects to Alpaca's trading stream to receive real-time updates on:
+        - Order status changes (new, fill, partial_fill, canceled, rejected, expired)
+        - Account updates
+
+        The stream will automatically reconnect on disconnection.
+        """
+        try:
+            import websockets
+            import json as json_module
+        except ImportError:
+            logger.error("websockets package required for trade streaming")
+            return
+
+        stream_url = (
+            "wss://paper-api.alpaca.markets/stream"
+            if self.environment == TradingEnvironment.PAPER
+            else "wss://api.alpaca.markets/stream"
+        )
+
+        logger.info(f"Connecting to trade stream: {stream_url}")
+
+        self._stream_running = True
+        reconnect_delay = 1.0
+        max_reconnect_delay = 60.0
+
+        while self._stream_running:
+            try:
+                async with websockets.connect(
+                    stream_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as ws:
+                    # Wait for welcome
+                    welcome = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                    logger.debug(f"Trade stream welcome: {welcome}")
+
+                    # Authenticate
+                    auth_msg = json_module.dumps({
+                        "action": "auth",
+                        "key": self.api_key,
+                        "secret": self.api_secret,
+                    })
+                    await ws.send(auth_msg)
+
+                    auth_response = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                    auth_data = json_module.loads(auth_response)
+                    logger.debug(f"Trade stream auth: {auth_data}")
+
+                    # Subscribe to trade updates
+                    listen_msg = json_module.dumps({
+                        "action": "listen",
+                        "data": {"streams": ["trade_updates"]},
+                    })
+                    await ws.send(listen_msg)
+
+                    logger.info("Trade stream connected and authenticated")
+                    reconnect_delay = 1.0  # Reset on successful connection
+
+                    # Handle messages
+                    async for message in ws:
+                        try:
+                            data = json_module.loads(message)
+                            await self._handle_stream_message(data)
+                        except json_module.JSONDecodeError:
+                            logger.error(f"Invalid JSON in trade stream: {message}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._stream_running:
+                    logger.warning(f"Trade stream error: {e}, reconnecting in {reconnect_delay}s")
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
+        logger.info("Trade stream stopped")
+
+    async def _handle_stream_message(self, data: dict[str, Any]) -> None:
+        """Handle incoming trade stream message."""
+        stream = data.get("stream")
+
+        if stream == "trade_updates":
+            trade_data = data.get("data", {})
+            event = trade_data.get("event")
+
+            logger.info(
+                f"Trade update: {event} - "
+                f"{trade_data.get('order', {}).get('symbol')} "
+                f"qty={trade_data.get('order', {}).get('qty')}"
+            )
+
+            # Dispatch to callbacks
+            self._dispatch_trade_update(trade_data)
+
+        elif stream == "authorization":
+            status = data.get("data", {}).get("status")
+            if status != "authorized":
+                logger.error(f"Trade stream authorization failed: {status}")
+
+        elif stream == "listening":
+            streams = data.get("data", {}).get("streams", [])
+            logger.info(f"Trade stream subscribed to: {streams}")
+
+    def stop_trade_stream(self) -> None:
+        """Stop the trade stream."""
+        self._stream_running = False
+
+    async def start_with_stream(self) -> None:
+        """Connect to Alpaca API and start trade stream.
+
+        Convenience method that connects and starts the WebSocket stream
+        for real-time trade updates.
+        """
+        await self.connect()
+        # Start stream in background task
+        asyncio.create_task(self.start_trade_stream())
 
 
 # Convenience functions for order creation

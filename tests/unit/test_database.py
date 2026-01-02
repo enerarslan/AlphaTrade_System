@@ -5,7 +5,7 @@ Tests database connection management, ORM models, and repositories.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -111,7 +111,7 @@ class TestOHLCVBarModel:
 
         bar = OHLCVBar(
             symbol="AAPL",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             open=Decimal("150.00"),
             high=Decimal("152.00"),
             low=Decimal("149.00"),
@@ -129,7 +129,7 @@ class TestOHLCVBarModel:
         """Test OHLCVBar to_dict method."""
         from quant_trading_system.database.models import OHLCVBar
 
-        timestamp = datetime.utcnow()
+        timestamp = datetime.now(timezone.utc)
         bar = OHLCVBar(
             symbol="AAPL",
             timestamp=timestamp,
@@ -140,11 +140,34 @@ class TestOHLCVBarModel:
             volume=1000000,
         )
 
-        result = bar.to_dict()
+        # Test with float conversion (preserve_decimal_precision=False)
+        result = bar.to_dict(preserve_decimal_precision=False)
 
         assert result["symbol"] == "AAPL"
         assert result["timestamp"] == timestamp.isoformat()
         assert result["open"] == 150.00
+
+    def test_ohlcv_bar_to_dict_preserves_precision(self):
+        """Test OHLCVBar to_dict method preserves decimal precision by default."""
+        from quant_trading_system.database.models import OHLCVBar
+
+        timestamp = datetime.now(timezone.utc)
+        bar = OHLCVBar(
+            symbol="AAPL",
+            timestamp=timestamp,
+            open=Decimal("150.00"),
+            high=Decimal("152.00"),
+            low=Decimal("149.00"),
+            close=Decimal("151.00"),
+            volume=1000000,
+        )
+
+        # Default preserves precision as strings
+        result = bar.to_dict()
+
+        assert result["symbol"] == "AAPL"
+        assert result["timestamp"] == timestamp.isoformat()
+        assert result["open"] == "150.00"
 
 
 class TestOrderModel:
@@ -184,11 +207,33 @@ class TestOrderModel:
             status="FILLED",
         )
 
-        result = order.to_dict()
+        # Test with float conversion (preserve_decimal_precision=False)
+        result = order.to_dict(preserve_decimal_precision=False)
 
         assert result["symbol"] == "AAPL"
         assert result["side"] == "BUY"
         assert result["quantity"] == 100.0
+
+    def test_order_to_dict_preserves_precision(self):
+        """Test Order to_dict method preserves decimal precision by default."""
+        from quant_trading_system.database.models import Order
+
+        order = Order(
+            order_id=str(uuid4()),
+            client_order_id="test-001",
+            symbol="AAPL",
+            side="BUY",
+            order_type="MARKET",
+            quantity=Decimal("100"),
+            status="FILLED",
+        )
+
+        # Default preserves precision as strings
+        result = order.to_dict()
+
+        assert result["symbol"] == "AAPL"
+        assert result["side"] == "BUY"
+        assert result["quantity"] == "100"
 
 
 class TestTradeModel:
@@ -206,7 +251,7 @@ class TestTradeModel:
             quantity=Decimal("100"),
             price=Decimal("150.00"),
             commission=Decimal("1.00"),
-            executed_at=datetime.utcnow(),
+            executed_at=datetime.now(timezone.utc),
         )
 
         assert trade.symbol == "AAPL"
@@ -242,7 +287,7 @@ class TestSignalModel:
 
         signal = Signal(
             signal_id=str(uuid4()),
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             symbol="AAPL",
             direction="LONG",
             strength=0.8,
@@ -264,7 +309,7 @@ class TestDailyPerformanceModel:
         from quant_trading_system.database.models import DailyPerformance
 
         perf = DailyPerformance(
-            date=datetime.utcnow().date(),
+            date=datetime.now(timezone.utc).date(),
             starting_equity=Decimal("100000.00"),
             ending_equity=Decimal("101000.00"),
             pnl=Decimal("1000.00"),
