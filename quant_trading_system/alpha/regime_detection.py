@@ -880,26 +880,285 @@ class RegimeAdaptiveController:
         ]
 
 
+# =============================================================================
+# JPMorgan-level Enhancement: State Caching for Regime Detection
+# =============================================================================
+
+
+class CachedRegimeDetector(RegimeDetector):
+    """
+    Cached wrapper for regime detectors with state persistence.
+
+    JPMorgan-level enhancement: Provides caching to avoid redundant
+    regime computations and supports persistent state storage.
+
+    Features:
+    - In-memory cache with TTL expiration
+    - Persistent state storage (JSON/pickle)
+    - Cache invalidation on data change
+    - Performance metrics tracking
+    """
+
+    def __init__(
+        self,
+        detector: RegimeDetector,
+        cache_ttl_seconds: float = 60.0,
+        max_cache_size: int = 1000,
+        enable_persistence: bool = False,
+        persistence_path: str | None = None,
+    ):
+        """Initialize cached detector.
+
+        Args:
+            detector: Underlying regime detector to wrap.
+            cache_ttl_seconds: Time-to-live for cache entries in seconds.
+            max_cache_size: Maximum number of cached entries.
+            enable_persistence: Enable persistent state storage.
+            persistence_path: Path for persistent storage file.
+        """
+        self._detector = detector
+        self._cache_ttl = cache_ttl_seconds
+        self._max_cache_size = max_cache_size
+        self._enable_persistence = enable_persistence
+        self._persistence_path = persistence_path
+
+        # In-memory cache: hash -> (timestamp, RegimeState)
+        self._cache: dict[str, tuple[float, RegimeState]] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+        # Last computed state for quick access
+        self._last_state: RegimeState | None = None
+        self._last_data_hash: str | None = None
+
+        # Load persisted state if available
+        if enable_persistence and persistence_path:
+            self._load_persisted_state()
+
+    def _compute_data_hash(self, data: pd.DataFrame) -> str:
+        """Compute hash of data for cache key.
+
+        Uses last few rows and basic statistics for efficient hashing.
+        """
+        import hashlib
+
+        if len(data) == 0:
+            return "empty"
+
+        # Use last row values + shape for hash
+        last_rows = data.tail(5)
+
+        # Get price column
+        if "close" in data.columns:
+            close_vals = last_rows["close"].values
+        elif "Close" in data.columns:
+            close_vals = last_rows["Close"].values
+        else:
+            close_vals = last_rows.iloc[:, 0].values
+
+        # Create hash from values
+        hash_input = f"{len(data)}_{close_vals.tobytes().hex()}"
+        return hashlib.md5(hash_input.encode()).hexdigest()[:16]
+
+    def detect(self, data: pd.DataFrame) -> RegimeState:
+        """Detect regime with caching.
+
+        Args:
+            data: DataFrame with price/volume data.
+
+        Returns:
+            Cached or freshly computed RegimeState.
+        """
+        import time
+
+        current_time = time.time()
+        data_hash = self._compute_data_hash(data)
+
+        # Check cache
+        if data_hash in self._cache:
+            cached_time, cached_state = self._cache[data_hash]
+            if current_time - cached_time < self._cache_ttl:
+                self._cache_hits += 1
+                logger.debug(f"Regime cache hit: {cached_state.regime.value}")
+                return cached_state
+
+        # Cache miss - compute regime
+        self._cache_misses += 1
+        state = self._detector.detect(data)
+
+        # Update cache
+        self._cache[data_hash] = (current_time, state)
+        self._last_state = state
+        self._last_data_hash = data_hash
+
+        # Enforce cache size limit
+        if len(self._cache) > self._max_cache_size:
+            self._evict_oldest_entries()
+
+        # Persist state if enabled
+        if self._enable_persistence:
+            self._persist_state()
+
+        return state
+
+    def _evict_oldest_entries(self) -> None:
+        """Evict oldest cache entries to maintain size limit."""
+        if len(self._cache) <= self._max_cache_size:
+            return
+
+        # Sort by timestamp and keep newest
+        sorted_entries = sorted(
+            self._cache.items(),
+            key=lambda x: x[1][0],
+            reverse=True,
+        )
+        self._cache = dict(sorted_entries[:self._max_cache_size])
+
+    def _persist_state(self) -> None:
+        """Persist current state to disk."""
+        if not self._persistence_path or not self._last_state:
+            return
+
+        try:
+            import json
+            from pathlib import Path
+
+            path = Path(self._persistence_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            state_data = {
+                "last_state": self._last_state.to_dict(),
+                "last_data_hash": self._last_data_hash,
+                "cache_hits": self._cache_hits,
+                "cache_misses": self._cache_misses,
+                "cache_size": len(self._cache),
+            }
+
+            with open(path, "w") as f:
+                json.dump(state_data, f, indent=2)
+
+        except Exception as e:
+            logger.warning(f"Failed to persist regime state: {e}")
+
+    def _load_persisted_state(self) -> None:
+        """Load persisted state from disk."""
+        if not self._persistence_path:
+            return
+
+        try:
+            import json
+            from pathlib import Path
+
+            path = Path(self._persistence_path)
+            if not path.exists():
+                return
+
+            with open(path, "r") as f:
+                state_data = json.load(f)
+
+            # Restore last state (partial - for quick warmup)
+            if "last_state" in state_data:
+                last = state_data["last_state"]
+                self._last_state = RegimeState(
+                    regime=MarketRegime(last["regime"]),
+                    probability=last["probability"],
+                    characteristics=[
+                        RegimeCharacteristic(c)
+                        for c in last.get("characteristics", [])
+                    ],
+                    timestamp=datetime.fromisoformat(last["timestamp"]),
+                    duration_bars=last.get("duration_bars", 0),
+                    metadata=last.get("metadata", {}),
+                )
+                self._last_data_hash = state_data.get("last_data_hash")
+                logger.info(f"Restored persisted regime state: {self._last_state.regime.value}")
+
+        except Exception as e:
+            logger.warning(f"Failed to load persisted regime state: {e}")
+
+    def get_regime_history(self) -> list[RegimeState]:
+        """Get regime history from underlying detector."""
+        return self._detector.get_regime_history()
+
+    def get_last_state(self) -> RegimeState | None:
+        """Get the last computed regime state without recomputation.
+
+        Returns:
+            Last computed RegimeState, or None if not available.
+        """
+        return self._last_state
+
+    def get_cache_stats(self) -> dict[str, Any]:
+        """Get cache performance statistics.
+
+        Returns:
+            Dictionary with cache statistics.
+        """
+        total = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total if total > 0 else 0.0
+
+        return {
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate": hit_rate,
+            "cache_size": len(self._cache),
+            "max_cache_size": self._max_cache_size,
+            "cache_ttl_seconds": self._cache_ttl,
+        }
+
+    def clear_cache(self) -> None:
+        """Clear the regime cache."""
+        self._cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        logger.info("Regime cache cleared")
+
+    def invalidate(self) -> None:
+        """Invalidate the cache (same as clear)."""
+        self.clear_cache()
+
+
 def create_regime_detector(
     method: str = "composite",
+    enable_caching: bool = False,
+    cache_ttl_seconds: float = 60.0,
+    enable_persistence: bool = False,
+    persistence_path: str | None = None,
     **kwargs: Any,
 ) -> RegimeDetector:
     """Factory function to create regime detector.
 
+    JPMorgan-level enhancement: Added caching and persistence options.
+
     Args:
         method: Detection method ("volatility", "trend", "hmm", "composite").
+        enable_caching: Wrap detector with caching layer.
+        cache_ttl_seconds: Cache TTL when caching is enabled.
+        enable_persistence: Enable persistent state storage.
+        persistence_path: Path for persistent storage.
         **kwargs: Additional parameters for detector.
 
     Returns:
-        Configured regime detector.
+        Configured regime detector (optionally with caching).
     """
     if method == "volatility":
-        return VolatilityRegimeDetector(**kwargs)
+        detector = VolatilityRegimeDetector(**kwargs)
     elif method == "trend":
-        return TrendRegimeDetector(**kwargs)
+        detector = TrendRegimeDetector(**kwargs)
     elif method == "hmm":
-        return HMMRegimeDetector(**kwargs)
+        detector = HMMRegimeDetector(**kwargs)
     elif method == "composite":
-        return CompositeRegimeDetector(**kwargs)
+        detector = CompositeRegimeDetector(**kwargs)
     else:
         raise ValueError(f"Unknown detection method: {method}")
+
+    # Wrap with caching if requested
+    if enable_caching:
+        detector = CachedRegimeDetector(
+            detector,
+            cache_ttl_seconds=cache_ttl_seconds,
+            enable_persistence=enable_persistence,
+            persistence_path=persistence_path,
+        )
+
+    return detector

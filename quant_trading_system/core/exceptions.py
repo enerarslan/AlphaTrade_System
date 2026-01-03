@@ -420,6 +420,40 @@ class ModelValidationError(ModelError):
 
 
 # =============================================================================
+# Strategy Errors
+# =============================================================================
+
+
+class StrategyError(TradingSystemError):
+    """Base exception for strategy-related errors.
+
+    Raised when a trading strategy encounters errors during
+    signal generation, portfolio construction, or decision making.
+
+    Examples:
+        - Signal generation failed
+        - Portfolio optimization failed
+        - Strategy configuration invalid
+    """
+
+    def __init__(
+        self,
+        message: str,
+        strategy_name: str | None = None,
+        symbol: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        details = kwargs.pop("details", {})
+        if strategy_name:
+            details["strategy_name"] = strategy_name
+        if symbol:
+            details["symbol"] = symbol
+        super().__init__(message, details=details, **kwargs)
+        self.strategy_name = strategy_name
+        self.symbol = symbol
+
+
+# =============================================================================
 # Execution Errors
 # =============================================================================
 

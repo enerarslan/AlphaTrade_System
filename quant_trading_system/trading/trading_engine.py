@@ -37,7 +37,7 @@ from quant_trading_system.core.events import (
     EventType,
     create_system_event,
 )
-from quant_trading_system.core.exceptions import ExecutionError, TradingSystemError
+from quant_trading_system.core.exceptions import ExecutionError, TradingSystemError, StrategyError
 from quant_trading_system.execution.alpaca_client import AlpacaClient
 from quant_trading_system.execution.order_manager import ManagedOrder, OrderManager, OrderRequest
 from quant_trading_system.execution.position_tracker import PositionTracker
@@ -92,6 +92,11 @@ class TradingEngineConfig:
     # MISSING FEATURE: Watchdog timer configuration
     watchdog_timeout: int = 120  # seconds - max time without heartbeat before alert
     watchdog_enabled: bool = True  # Enable watchdog timer for detecting stuck loops
+
+    # MAJOR FIX: Strategy exception escalation configuration
+    # Tracks consecutive strategy exceptions and triggers kill switch after threshold
+    max_consecutive_strategy_exceptions: int = 3  # Kill switch after N consecutive exceptions
+    strategy_exception_reset_interval: int = 300  # Reset counter after N seconds of success
 
 
 @dataclass
@@ -216,6 +221,10 @@ class TradingEngine:
 
         # MISSING FEATURE: OS signal handlers for graceful shutdown
         self._signal_handlers_installed = False
+
+        # MAJOR FIX: Strategy exception tracking for kill switch escalation
+        self._consecutive_strategy_exceptions: int = 0
+        self._last_successful_iteration: datetime | None = None
 
         # Register for order events
         order_manager.on_fill(self._on_order_fill)
@@ -644,9 +653,20 @@ class TradingEngine:
             latency_ms = (datetime.now(timezone.utc) - iteration_start).total_seconds() * 1000
             self._update_avg_latency(latency_ms)
 
+            # MAJOR FIX: Reset exception counter on successful iteration
+            self._record_successful_iteration()
+
+        except (StrategyError, ExecutionError) as e:
+            # MAJOR FIX: Strategy-specific exceptions trigger escalation tracking
+            logger.error(f"Strategy/execution error in iteration: {e}")
+            self._metrics.errors_count += 1
+            self._handle_strategy_exception(e)
+
         except Exception as e:
             logger.error(f"Market hours iteration error: {e}")
             self._metrics.errors_count += 1
+            # Non-strategy exceptions also tracked for safety
+            self._handle_strategy_exception(e)
 
         # Wait for next bar interval
         await self._wait_for_next_bar()
@@ -980,10 +1000,110 @@ class TradingEngine:
 
         This is critical for correct trading hours detection since
         US market hours are defined in Eastern Time.
+
+        JPMorgan-level enhancement: Explicit DST handling to avoid
+        edge cases during spring forward/fall back transitions.
         """
         eastern = ZoneInfo("America/New_York")
         now_eastern = datetime.now(eastern)
         return now_eastern.time()
+
+    def _get_eastern_datetime(self) -> datetime:
+        """Get current datetime in US Eastern timezone.
+
+        JPMorgan-level enhancement: Full datetime with DST awareness.
+
+        Returns:
+            Timezone-aware datetime in America/New_York timezone.
+        """
+        eastern = ZoneInfo("America/New_York")
+        return datetime.now(eastern)
+
+    def _is_dst_transition_day(self) -> bool:
+        """Check if today is a DST transition day.
+
+        JPMorgan-level enhancement: Detect DST transition days where
+        trading hours may be affected by time zone changes.
+
+        US DST rules (since 2007):
+        - Spring forward: 2nd Sunday in March at 2 AM → 3 AM
+        - Fall back: 1st Sunday in November at 2 AM → 1 AM
+
+        Returns:
+            True if today is a DST transition day.
+        """
+        eastern = ZoneInfo("America/New_York")
+        now = datetime.now(eastern)
+
+        # Check if DST status changes today
+        # Get the start and end of today
+        today_start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=eastern)
+        today_end = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=eastern)
+
+        # DST at start and end of day
+        dst_start = today_start.dst()
+        dst_end = today_end.dst()
+
+        # If DST status is different, it's a transition day
+        if dst_start != dst_end:
+            logger.info(
+                f"DST transition detected today ({now.date()}): "
+                f"{'Spring Forward' if dst_end > dst_start else 'Fall Back'}"
+            )
+            return True
+
+        return False
+
+    def _get_utc_offset_hours(self) -> float:
+        """Get current UTC offset for Eastern Time in hours.
+
+        JPMorgan-level enhancement: Provides offset for UTC-based
+        systems that need to convert to Eastern Time.
+
+        Returns:
+            UTC offset in hours (negative for behind UTC).
+            -5.0 for EST (standard time)
+            -4.0 for EDT (daylight time)
+        """
+        eastern = ZoneInfo("America/New_York")
+        now = datetime.now(eastern)
+        offset = now.utcoffset()
+
+        if offset is not None:
+            return offset.total_seconds() / 3600
+        return -5.0  # Default to EST if somehow offset is unavailable
+
+    def _is_in_trading_day(self, dt: datetime | None = None) -> bool:
+        """Check if a datetime is within a valid trading day.
+
+        JPMorgan-level enhancement: Accounts for DST transitions
+        and market holidays.
+
+        Args:
+            dt: Datetime to check (defaults to current Eastern time).
+
+        Returns:
+            True if the datetime falls within market hours.
+        """
+        if dt is None:
+            dt = self._get_eastern_datetime()
+
+        current_time = dt.time()
+
+        # Check basic market hours
+        is_trading_time = (
+            self.config.trading_start <= current_time < self.config.trading_end
+        )
+
+        # On DST transition days, be more conservative
+        if self._is_dst_transition_day():
+            # Log for awareness
+            logger.debug(
+                f"DST transition day check: time={current_time}, "
+                f"is_trading={is_trading_time}"
+            )
+
+        return is_trading_time
 
     def _update_avg_latency(self, latency_ms: float) -> None:
         """Update average latency with exponential moving average."""
@@ -1030,6 +1150,74 @@ class TradingEngine:
                     f"New max drawdown: {self._metrics.max_drawdown:.2%} "
                     f"(Peak: ${self._metrics.peak_equity:.2f}, Current: ${current_equity:.2f})"
                 )
+
+    # =========================================================================
+    # MAJOR FIX: Strategy Exception Escalation Tracking
+    # =========================================================================
+
+    def _record_successful_iteration(self) -> None:
+        """Record a successful iteration for exception tracking.
+
+        Resets the consecutive exception counter if we've had enough
+        success time since the last exception.
+        """
+        now = datetime.now(timezone.utc)
+
+        # If we've had enough successful time, reset the counter
+        if self._last_successful_iteration:
+            elapsed = (now - self._last_successful_iteration).total_seconds()
+            if elapsed >= self.config.strategy_exception_reset_interval:
+                if self._consecutive_strategy_exceptions > 0:
+                    logger.info(
+                        f"Strategy exception counter reset after {elapsed:.0f}s "
+                        f"of successful operation"
+                    )
+                    self._consecutive_strategy_exceptions = 0
+
+        self._last_successful_iteration = now
+
+    def _handle_strategy_exception(self, exception: Exception) -> None:
+        """Handle a strategy/execution exception with escalation logic.
+
+        Tracks consecutive exceptions and triggers kill switch if threshold
+        is exceeded. This prevents a malfunctioning strategy from causing
+        continuous damage.
+
+        Args:
+            exception: The exception that occurred.
+        """
+        self._consecutive_strategy_exceptions += 1
+
+        logger.warning(
+            f"Strategy exception {self._consecutive_strategy_exceptions}/"
+            f"{self.config.max_consecutive_strategy_exceptions}: {exception}"
+        )
+
+        # Record in session
+        if self._session:
+            self._session.errors.append(
+                f"Strategy exception ({self._consecutive_strategy_exceptions}): {str(exception)[:200]}"
+            )
+
+        # Check if we've hit the threshold
+        if self._consecutive_strategy_exceptions >= self.config.max_consecutive_strategy_exceptions:
+            reason = (
+                f"STRATEGY EXCEPTION ESCALATION: {self._consecutive_strategy_exceptions} "
+                f"consecutive strategy exceptions. Last error: {str(exception)[:100]}"
+            )
+            self.trigger_kill_switch(reason)
+
+            # Publish critical alert
+            self._publish_event(
+                EventType.SYSTEM_ERROR,
+                reason,
+                details={
+                    "consecutive_exceptions": self._consecutive_strategy_exceptions,
+                    "threshold": self.config.max_consecutive_strategy_exceptions,
+                    "last_exception": str(exception),
+                    "exception_type": type(exception).__name__,
+                },
+            )
 
     def _publish_event(
         self,

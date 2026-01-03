@@ -739,6 +739,160 @@ class ElasticNetModel(TradingModel):
         predictions = self.predict(X)
         return super()._compute_metrics(y, predictions)
 
+    def predict_proba(
+        self,
+        X: np.ndarray,
+        calibration_method: str = "platt",
+    ) -> np.ndarray:
+        """Generate pseudo-probability estimates for regression outputs.
+
+        JPMorgan-level enhancement: Provides probability-like outputs from
+        regression predictions using calibration techniques.
+
+        For trading applications, this is useful when:
+        - Combining with classifiers in ensemble models
+        - Converting signals to confidence scores
+        - Risk-adjusted position sizing based on model confidence
+
+        Args:
+            X: Feature matrix (n_samples, n_features)
+            calibration_method: Method for converting regression to probabilities.
+                - "platt": Platt scaling using sigmoid (default)
+                - "minmax": Min-max scaling to [0, 1]
+                - "quantile": Quantile-based normalization
+
+        Returns:
+            Array of shape (n_samples, 2) with probabilities for [down, up]
+            where column 0 is P(return < 0) and column 1 is P(return > 0)
+
+        Example:
+            >>> model = ElasticNetModel()
+            >>> model.fit(X_train, y_train)
+            >>> proba = model.predict_proba(X_test)
+            >>> confidence = proba[:, 1]  # Probability of positive return
+        """
+        if not self._is_fitted:
+            raise ValueError("Model not fitted yet")
+
+        X = self._validate_input(X)
+        predictions = self.predict(X)
+
+        if calibration_method == "platt":
+            # Platt scaling: apply sigmoid to convert regression output to probability
+            # Scale predictions to reasonable range for sigmoid
+            if not hasattr(self, "_calibration_scale"):
+                # Use training prediction statistics for scaling
+                train_std = max(np.std(predictions), 1e-6)
+                self._calibration_scale = train_std
+
+            # Sigmoid transformation: P(positive) = 1 / (1 + exp(-prediction/scale))
+            scaled_preds = predictions / self._calibration_scale
+            prob_positive = 1.0 / (1.0 + np.exp(-scaled_preds))
+
+        elif calibration_method == "minmax":
+            # Min-max scaling to [0, 1]
+            pred_min = np.min(predictions)
+            pred_max = np.max(predictions)
+            pred_range = max(pred_max - pred_min, 1e-6)
+            prob_positive = (predictions - pred_min) / pred_range
+
+        elif calibration_method == "quantile":
+            # Quantile-based: rank / n gives uniform distribution
+            from scipy import stats
+            prob_positive = stats.rankdata(predictions) / len(predictions)
+
+        else:
+            raise ValueError(
+                f"Unknown calibration method: {calibration_method}. "
+                "Choose from: 'platt', 'minmax', 'quantile'"
+            )
+
+        # Ensure probabilities are in [0, 1]
+        prob_positive = np.clip(prob_positive, 0.0, 1.0)
+        prob_negative = 1.0 - prob_positive
+
+        return np.column_stack([prob_negative, prob_positive])
+
+    def calibrate(
+        self,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray,
+        method: str = "isotonic",
+    ) -> "ElasticNetModel":
+        """Calibrate the model using holdout calibration data.
+
+        JPMorgan-level enhancement: Proper probability calibration using
+        scikit-learn's calibration framework for more accurate confidence scores.
+
+        Args:
+            X_cal: Calibration features
+            y_cal: Calibration targets (binary: 0/1 or continuous)
+            method: Calibration method ("isotonic" or "sigmoid")
+
+        Returns:
+            self for method chaining
+        """
+        if not self._is_fitted:
+            raise ValueError("Model must be fitted before calibration")
+
+        from sklearn.isotonic import IsotonicRegression
+        from sklearn.linear_model import LogisticRegression
+
+        # Get predictions on calibration set
+        cal_predictions = self.predict(X_cal)
+
+        # Binarize targets if continuous
+        if not np.all(np.isin(y_cal, [0, 1])):
+            y_cal_binary = (y_cal > 0).astype(int)
+        else:
+            y_cal_binary = y_cal
+
+        if method == "isotonic":
+            # Isotonic regression for non-parametric calibration
+            self._calibrator = IsotonicRegression(out_of_bounds="clip")
+            self._calibrator.fit(cal_predictions, y_cal_binary)
+
+        elif method == "sigmoid":
+            # Platt scaling with logistic regression
+            self._calibrator = LogisticRegression()
+            self._calibrator.fit(cal_predictions.reshape(-1, 1), y_cal_binary)
+
+        else:
+            raise ValueError(f"Unknown calibration method: {method}")
+
+        self._calibration_method = method
+        self._is_calibrated = True
+
+        return self
+
+    def predict_proba_calibrated(self, X: np.ndarray) -> np.ndarray:
+        """Generate calibrated probability estimates.
+
+        Requires calling calibrate() first.
+
+        Args:
+            X: Feature matrix
+
+        Returns:
+            Array of shape (n_samples, 2) with calibrated probabilities
+        """
+        if not getattr(self, "_is_calibrated", False):
+            raise ValueError("Model not calibrated. Call calibrate() first.")
+
+        predictions = self.predict(X)
+
+        if self._calibration_method == "isotonic":
+            prob_positive = self._calibrator.predict(predictions)
+        else:  # sigmoid
+            prob_positive = self._calibrator.predict_proba(
+                predictions.reshape(-1, 1)
+            )[:, 1]
+
+        prob_positive = np.clip(prob_positive, 0.0, 1.0)
+        prob_negative = 1.0 - prob_positive
+
+        return np.column_stack([prob_negative, prob_positive])
+
 
 def create_sample_weights(
     n_samples: int,

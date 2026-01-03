@@ -90,6 +90,13 @@ class SizingConstraints(BaseModel):
     max_daily_turnover_pct: float = Field(default=0.20, ge=0, le=1.0, description="Max daily turnover")
     min_position_value: Decimal = Field(default=Decimal("100"), ge=0, description="Min $ value for position")
 
+    # MAJOR FIX: Buying power validation
+    # Ensure position size doesn't exceed available buying power
+    buying_power_buffer_pct: float = Field(
+        default=0.05, ge=0, le=0.5,
+        description="Buffer to keep below buying power (5% = reserve 5% of buying power)"
+    )
+
     # Soft limits (gradual penalty)
     soft_limit_threshold: float = Field(default=0.8, ge=0, le=1.0, description="Start applying soft penalty at this % of hard limit")
     soft_limit_penalty_rate: float = Field(default=0.5, ge=0, le=1.0, description="Reduction rate per % over soft threshold")
@@ -100,8 +107,16 @@ class SizingConstraints(BaseModel):
         equity: Decimal,
         entry_price: Decimal,
         current_positions: int,
+        buying_power: Decimal | None = None,
     ) -> tuple[Decimal, list[str]]:
         """Apply hard position limits.
+
+        Args:
+            size: Proposed position size in shares.
+            equity: Current portfolio equity.
+            entry_price: Expected entry price per share.
+            current_positions: Number of current positions.
+            buying_power: Available buying power (optional but recommended).
 
         Returns:
             Tuple of (adjusted size, list of constraints applied).
@@ -119,6 +134,26 @@ class SizingConstraints(BaseModel):
         if size * entry_price > max_value_by_pct:
             size = max_value_by_pct / entry_price
             constraints_applied.append(f"max_position_pct:{self.max_position_pct}")
+
+        # MAJOR FIX: Buying power validation
+        # This is CRITICAL for live trading - prevents order rejections from broker
+        if buying_power is not None and buying_power > 0:
+            # Apply buffer to keep some buying power in reserve
+            usable_buying_power = buying_power * Decimal(str(1.0 - self.buying_power_buffer_pct))
+            position_value = size * entry_price
+
+            if position_value > usable_buying_power:
+                # Reduce size to fit within buying power
+                old_size = size
+                size = usable_buying_power / entry_price
+                constraints_applied.append(
+                    f"buying_power:{buying_power:.2f}|buffer:{self.buying_power_buffer_pct:.1%}"
+                )
+                logger.warning(
+                    f"Position size reduced from {old_size:.2f} to {size:.2f} shares "
+                    f"due to buying power constraint (available: ${usable_buying_power:.2f}, "
+                    f"total buying power: ${buying_power:.2f})"
+                )
 
         # Max number of positions
         if current_positions >= self.max_portfolio_positions:
@@ -176,12 +211,17 @@ class BasePositionSizer(ABC):
         portfolio: Portfolio,
         entry_price: Decimal,
     ) -> tuple[Decimal, list[str]]:
-        """Apply sizing constraints to raw size."""
+        """Apply sizing constraints to raw size.
+
+        MAJOR FIX: Now validates against buying power to prevent
+        order rejections from broker due to insufficient funds.
+        """
         return self.constraints.apply_hard_limits(
             size=raw_size,
             equity=portfolio.equity,
             entry_price=entry_price,
             current_positions=portfolio.position_count,
+            buying_power=portfolio.buying_power,  # MAJOR FIX: Pass buying power
         )
 
 

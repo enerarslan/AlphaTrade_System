@@ -974,3 +974,312 @@ def get_metrics_collector() -> MetricsCollector:
         MetricsCollector instance.
     """
     return MetricsCollector()
+
+
+# =============================================================================
+# MAJOR FIX: Heartbeat Metrics for External Monitoring
+# =============================================================================
+
+HEARTBEAT_TIMESTAMP = Gauge(
+    "system_heartbeat_timestamp",
+    "Unix timestamp of last heartbeat",
+    registry=REGISTRY,
+)
+
+HEARTBEAT_COUNT = Counter(
+    "system_heartbeat_count",
+    "Total heartbeat count",
+    registry=REGISTRY,
+)
+
+HEARTBEAT_HEALTH_STATUS = Gauge(
+    "system_health_status",
+    "System health status (1=healthy, 0=degraded, -1=critical)",
+    registry=REGISTRY,
+)
+
+HEARTBEAT_COMPONENT_STATUS = Gauge(
+    "component_health_status",
+    "Component health status",
+    ["component"],  # database, redis, broker, model_server
+    registry=REGISTRY,
+)
+
+
+class HealthStatus:
+    """Health status constants."""
+    HEALTHY = 1
+    DEGRADED = 0
+    CRITICAL = -1
+
+
+class HeartbeatService:
+    """
+    MAJOR FIX: Heartbeat service for external monitoring integration.
+
+    Provides:
+    - Periodic heartbeat emission to Prometheus metrics
+    - Health check aggregation across components
+    - External monitoring webhooks (PagerDuty, custom endpoints)
+    - Dead man's switch support for alerting on missed heartbeats
+    """
+
+    _instance: "HeartbeatService | None" = None
+
+    def __new__(cls) -> "HeartbeatService":
+        """Singleton pattern."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(
+        self,
+        interval_seconds: float = 30.0,
+        pagerduty_routing_key: str | None = None,
+        custom_webhook_url: str | None = None,
+    ) -> None:
+        """
+        Initialize heartbeat service.
+
+        Args:
+            interval_seconds: Heartbeat interval
+            pagerduty_routing_key: Optional PagerDuty Events API v2 routing key
+            custom_webhook_url: Optional custom webhook URL for heartbeats
+        """
+        if getattr(self, '_initialized', False):
+            return
+
+        self.interval_seconds = interval_seconds
+        self.pagerduty_routing_key = pagerduty_routing_key
+        self.custom_webhook_url = custom_webhook_url
+
+        self._running = False
+        self._task: Any = None  # asyncio.Task
+        self._health_status = HealthStatus.HEALTHY
+        self._component_status: dict[str, int] = {}
+        self._last_heartbeat: float = 0
+        self._consecutive_failures: int = 0
+        self._max_failures_before_critical = 3
+
+        import logging
+        self._logger = logging.getLogger(__name__)
+        self._initialized = True
+
+    async def start(self) -> None:
+        """Start the heartbeat service."""
+        if self._running:
+            return
+
+        self._running = True
+        import asyncio
+        self._task = asyncio.create_task(self._heartbeat_loop())
+        self._logger.info(f"Heartbeat service started (interval={self.interval_seconds}s)")
+
+    async def stop(self) -> None:
+        """Stop the heartbeat service."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except Exception:
+                pass
+        self._logger.info("Heartbeat service stopped")
+
+    async def _heartbeat_loop(self) -> None:
+        """Main heartbeat loop."""
+        import asyncio
+
+        while self._running:
+            try:
+                await self._emit_heartbeat()
+                self._consecutive_failures = 0
+            except Exception as e:
+                self._consecutive_failures += 1
+                self._logger.error(f"Heartbeat failed: {e}")
+
+                if self._consecutive_failures >= self._max_failures_before_critical:
+                    self._health_status = HealthStatus.CRITICAL
+                    HEARTBEAT_HEALTH_STATUS.set(HealthStatus.CRITICAL)
+
+            await asyncio.sleep(self.interval_seconds)
+
+    async def _emit_heartbeat(self) -> None:
+        """Emit a single heartbeat."""
+        current_time = time.time()
+        self._last_heartbeat = current_time
+
+        # Update Prometheus metrics
+        HEARTBEAT_TIMESTAMP.set(current_time)
+        HEARTBEAT_COUNT.inc()
+        HEARTBEAT_HEALTH_STATUS.set(self._health_status)
+
+        # Update component status metrics
+        for component, status in self._component_status.items():
+            HEARTBEAT_COMPONENT_STATUS.labels(component=component).set(status)
+
+        # Send to external monitoring if configured
+        if self.pagerduty_routing_key:
+            await self._send_pagerduty_heartbeat()
+
+        if self.custom_webhook_url:
+            await self._send_webhook_heartbeat()
+
+        self._logger.debug(f"Heartbeat emitted: status={self._health_status}")
+
+    async def _send_pagerduty_heartbeat(self) -> None:
+        """Send heartbeat to PagerDuty Events API v2."""
+        import aiohttp
+        import json
+
+        url = "https://events.pagerduty.com/v2/enqueue"
+        payload = {
+            "routing_key": self.pagerduty_routing_key,
+            "event_action": "trigger",
+            "dedup_key": "alphatrade-heartbeat",
+            "payload": {
+                "summary": "AlphaTrade System Heartbeat",
+                "severity": "info",
+                "source": "alphatrade-trading-system",
+                "component": "heartbeat",
+                "custom_details": {
+                    "health_status": self._health_status,
+                    "component_status": self._component_status,
+                    "timestamp": self._last_heartbeat,
+                },
+            },
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status != 202:
+                        self._logger.warning(
+                            f"PagerDuty heartbeat failed: {response.status}"
+                        )
+        except Exception as e:
+            self._logger.warning(f"PagerDuty heartbeat error: {e}")
+
+    async def _send_webhook_heartbeat(self) -> None:
+        """Send heartbeat to custom webhook endpoint."""
+        import aiohttp
+        import json
+
+        payload = {
+            "event": "heartbeat",
+            "system": "alphatrade",
+            "timestamp": self._last_heartbeat,
+            "health_status": self._health_status,
+            "components": self._component_status,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.custom_webhook_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status >= 400:
+                        self._logger.warning(
+                            f"Webhook heartbeat failed: {response.status}"
+                        )
+        except Exception as e:
+            self._logger.warning(f"Webhook heartbeat error: {e}")
+
+    def update_component_health(self, component: str, status: int) -> None:
+        """
+        Update health status for a component.
+
+        Args:
+            component: Component name (database, redis, broker, etc.)
+            status: Health status (HealthStatus.HEALTHY/DEGRADED/CRITICAL)
+        """
+        self._component_status[component] = status
+        HEARTBEAT_COMPONENT_STATUS.labels(component=component).set(status)
+
+        # Aggregate overall health
+        self._update_overall_health()
+
+    def _update_overall_health(self) -> None:
+        """Update overall system health based on component status."""
+        if not self._component_status:
+            return
+
+        # If any component is critical, system is critical
+        if any(s == HealthStatus.CRITICAL for s in self._component_status.values()):
+            self._health_status = HealthStatus.CRITICAL
+        # If any component is degraded, system is degraded
+        elif any(s == HealthStatus.DEGRADED for s in self._component_status.values()):
+            self._health_status = HealthStatus.DEGRADED
+        else:
+            self._health_status = HealthStatus.HEALTHY
+
+        HEARTBEAT_HEALTH_STATUS.set(self._health_status)
+
+    def set_overall_health(self, status: int) -> None:
+        """
+        Directly set overall system health status.
+
+        Args:
+            status: Health status
+        """
+        self._health_status = status
+        HEARTBEAT_HEALTH_STATUS.set(status)
+
+    def get_health_status(self) -> dict[str, Any]:
+        """
+        Get current health status.
+
+        Returns:
+            Dictionary with health information
+        """
+        return {
+            "overall_status": self._health_status,
+            "component_status": self._component_status.copy(),
+            "last_heartbeat": self._last_heartbeat,
+            "consecutive_failures": self._consecutive_failures,
+            "is_running": self._running,
+        }
+
+    def is_healthy(self) -> bool:
+        """Check if system is healthy."""
+        return self._health_status == HealthStatus.HEALTHY
+
+    @property
+    def last_heartbeat_age(self) -> float:
+        """Get seconds since last heartbeat."""
+        if self._last_heartbeat == 0:
+            return float("inf")
+        return time.time() - self._last_heartbeat
+
+
+def get_heartbeat_service(
+    interval_seconds: float = 30.0,
+    pagerduty_routing_key: str | None = None,
+    custom_webhook_url: str | None = None,
+) -> HeartbeatService:
+    """
+    Get or create the singleton heartbeat service.
+
+    Args:
+        interval_seconds: Heartbeat interval
+        pagerduty_routing_key: Optional PagerDuty routing key
+        custom_webhook_url: Optional custom webhook URL
+
+    Returns:
+        HeartbeatService singleton instance
+    """
+    service = HeartbeatService(
+        interval_seconds=interval_seconds,
+        pagerduty_routing_key=pagerduty_routing_key,
+        custom_webhook_url=custom_webhook_url,
+    )
+    return service

@@ -1338,3 +1338,401 @@ def validate_range(
         return wrapper  # type: ignore
 
     return decorator
+
+
+# =============================================================================
+# JPMorgan-level Enhancement: Circuit Breaker Pattern
+# =============================================================================
+
+
+class CircuitBreakerState:
+    """Circuit breaker states."""
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, requests blocked
+    HALF_OPEN = "half_open"  # Testing recovery
+
+
+class CircuitBreakerError(Exception):
+    """Raised when circuit breaker is open."""
+
+    def __init__(self, message: str, service_name: str, time_until_retry: float):
+        super().__init__(message)
+        self.service_name = service_name
+        self.time_until_retry = time_until_retry
+
+
+class CircuitBreaker:
+    """Circuit breaker for protecting external service calls.
+
+    JPMorgan-level enhancement: Implements the circuit breaker pattern
+    to prevent cascading failures and provide graceful degradation
+    when external services are unavailable.
+
+    States:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Service is failing, requests are blocked
+    - HALF_OPEN: Testing if service has recovered
+
+    Example:
+        >>> breaker = CircuitBreaker("alpaca_api", failure_threshold=5)
+        >>> try:
+        ...     async with breaker:
+        ...         await alpaca_client.get_account()
+        ... except CircuitBreakerError as e:
+        ...     logger.warning(f"Service unavailable: {e}")
+        ...     use_cached_data()
+    """
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        success_threshold: int = 2,
+        timeout_seconds: float = 60.0,
+        half_open_max_calls: int = 1,
+    ):
+        """Initialize circuit breaker.
+
+        Args:
+            name: Name of the service being protected.
+            failure_threshold: Number of failures before opening circuit.
+            success_threshold: Number of successes in half-open to close circuit.
+            timeout_seconds: Time to wait before trying half-open.
+            half_open_max_calls: Max concurrent calls in half-open state.
+        """
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.success_threshold = success_threshold
+        self.timeout_seconds = timeout_seconds
+        self.half_open_max_calls = half_open_max_calls
+
+        self._state = CircuitBreakerState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time: float | None = None
+        self._half_open_calls = 0
+        self._lock = threading.RLock()
+
+        # Metrics
+        self._total_failures = 0
+        self._total_successes = 0
+        self._times_opened = 0
+
+    @property
+    def state(self) -> str:
+        """Get current circuit breaker state."""
+        with self._lock:
+            self._check_state_transition()
+            return self._state
+
+    def _check_state_transition(self) -> None:
+        """Check and perform state transitions based on timeout."""
+        if self._state == CircuitBreakerState.OPEN:
+            if self._last_failure_time is not None:
+                elapsed = time.time() - self._last_failure_time
+                if elapsed >= self.timeout_seconds:
+                    self._state = CircuitBreakerState.HALF_OPEN
+                    self._half_open_calls = 0
+                    logger.info(f"Circuit breaker '{self.name}' entering half-open state")
+
+    def _record_success(self) -> None:
+        """Record a successful call."""
+        with self._lock:
+            self._total_successes += 1
+
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self.success_threshold:
+                    self._state = CircuitBreakerState.CLOSED
+                    self._failure_count = 0
+                    self._success_count = 0
+                    logger.info(f"Circuit breaker '{self.name}' closed after recovery")
+            elif self._state == CircuitBreakerState.CLOSED:
+                # Reset failure count on success
+                self._failure_count = 0
+
+    def _record_failure(self, error: Exception) -> None:
+        """Record a failed call."""
+        with self._lock:
+            self._total_failures += 1
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                # Failure during half-open, go back to open
+                self._state = CircuitBreakerState.OPEN
+                self._success_count = 0
+                logger.warning(
+                    f"Circuit breaker '{self.name}' reopened after half-open failure: {error}"
+                )
+            elif self._state == CircuitBreakerState.CLOSED:
+                if self._failure_count >= self.failure_threshold:
+                    self._state = CircuitBreakerState.OPEN
+                    self._times_opened += 1
+                    logger.error(
+                        f"Circuit breaker '{self.name}' opened after {self._failure_count} failures"
+                    )
+
+    def _can_execute(self) -> bool:
+        """Check if a call can be executed."""
+        with self._lock:
+            self._check_state_transition()
+
+            if self._state == CircuitBreakerState.CLOSED:
+                return True
+            elif self._state == CircuitBreakerState.OPEN:
+                return False
+            elif self._state == CircuitBreakerState.HALF_OPEN:
+                if self._half_open_calls < self.half_open_max_calls:
+                    self._half_open_calls += 1
+                    return True
+                return False
+
+            return False
+
+    def _get_time_until_retry(self) -> float:
+        """Get time remaining until circuit breaker will try half-open."""
+        if self._last_failure_time is None:
+            return 0.0
+        elapsed = time.time() - self._last_failure_time
+        return max(0.0, self.timeout_seconds - elapsed)
+
+    def call(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """Execute a function through the circuit breaker.
+
+        Args:
+            func: Function to execute.
+            *args: Positional arguments for the function.
+            **kwargs: Keyword arguments for the function.
+
+        Returns:
+            Function result if successful.
+
+        Raises:
+            CircuitBreakerError: If circuit is open.
+            Exception: Re-raises any exception from the function.
+        """
+        if not self._can_execute():
+            time_until_retry = self._get_time_until_retry()
+            raise CircuitBreakerError(
+                f"Circuit breaker '{self.name}' is open. "
+                f"Retry in {time_until_retry:.1f}s",
+                self.name,
+                time_until_retry,
+            )
+
+        try:
+            result = func(*args, **kwargs)
+            self._record_success()
+            return result
+        except Exception as e:
+            self._record_failure(e)
+            raise
+
+    async def call_async(
+        self,
+        func: Callable[..., Awaitable[T]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> T:
+        """Execute an async function through the circuit breaker.
+
+        Args:
+            func: Async function to execute.
+            *args: Positional arguments for the function.
+            **kwargs: Keyword arguments for the function.
+
+        Returns:
+            Function result if successful.
+
+        Raises:
+            CircuitBreakerError: If circuit is open.
+            Exception: Re-raises any exception from the function.
+        """
+        if not self._can_execute():
+            time_until_retry = self._get_time_until_retry()
+            raise CircuitBreakerError(
+                f"Circuit breaker '{self.name}' is open. "
+                f"Retry in {time_until_retry:.1f}s",
+                self.name,
+                time_until_retry,
+            )
+
+        try:
+            result = await func(*args, **kwargs)
+            self._record_success()
+            return result
+        except Exception as e:
+            self._record_failure(e)
+            raise
+
+    def __enter__(self) -> "CircuitBreaker":
+        """Context manager entry for sync calls."""
+        if not self._can_execute():
+            time_until_retry = self._get_time_until_retry()
+            raise CircuitBreakerError(
+                f"Circuit breaker '{self.name}' is open. "
+                f"Retry in {time_until_retry:.1f}s",
+                self.name,
+                time_until_retry,
+            )
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Context manager exit for sync calls."""
+        if exc_type is None:
+            self._record_success()
+        elif exc_type is not CircuitBreakerError:
+            self._record_failure(exc_val)  # type: ignore
+
+    async def __aenter__(self) -> "CircuitBreaker":
+        """Async context manager entry."""
+        if not self._can_execute():
+            time_until_retry = self._get_time_until_retry()
+            raise CircuitBreakerError(
+                f"Circuit breaker '{self.name}' is open. "
+                f"Retry in {time_until_retry:.1f}s",
+                self.name,
+                time_until_retry,
+            )
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Async context manager exit."""
+        if exc_type is None:
+            self._record_success()
+        elif exc_type is not CircuitBreakerError:
+            self._record_failure(exc_val)  # type: ignore
+
+    def reset(self) -> None:
+        """Manually reset the circuit breaker to closed state."""
+        with self._lock:
+            self._state = CircuitBreakerState.CLOSED
+            self._failure_count = 0
+            self._success_count = 0
+            self._last_failure_time = None
+            self._half_open_calls = 0
+            logger.info(f"Circuit breaker '{self.name}' manually reset")
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Get circuit breaker metrics.
+
+        Returns:
+            Dictionary with circuit breaker statistics.
+        """
+        with self._lock:
+            return {
+                "name": self.name,
+                "state": self._state,
+                "failure_count": self._failure_count,
+                "success_count": self._success_count,
+                "total_failures": self._total_failures,
+                "total_successes": self._total_successes,
+                "times_opened": self._times_opened,
+                "time_until_retry": self._get_time_until_retry(),
+            }
+
+
+class CircuitBreakerRegistry:
+    """Registry for managing multiple circuit breakers.
+
+    JPMorgan-level enhancement: Centralized management of circuit
+    breakers for all external services.
+    """
+
+    _instance: "CircuitBreakerRegistry | None" = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __new__(cls) -> "CircuitBreakerRegistry":
+        """Singleton pattern."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._breakers = {}
+                    instance._default_config = {
+                        "failure_threshold": 5,
+                        "success_threshold": 2,
+                        "timeout_seconds": 60.0,
+                    }
+                    cls._instance = instance
+        return cls._instance
+
+    @classmethod
+    def get_instance(cls) -> "CircuitBreakerRegistry":
+        """Get the singleton instance."""
+        return cls()
+
+    def get_or_create(
+        self,
+        name: str,
+        failure_threshold: int | None = None,
+        success_threshold: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> CircuitBreaker:
+        """Get or create a circuit breaker by name.
+
+        Args:
+            name: Name of the service.
+            failure_threshold: Override default failure threshold.
+            success_threshold: Override default success threshold.
+            timeout_seconds: Override default timeout.
+
+        Returns:
+            CircuitBreaker instance.
+        """
+        if name not in self._breakers:
+            self._breakers[name] = CircuitBreaker(
+                name=name,
+                failure_threshold=failure_threshold or self._default_config["failure_threshold"],
+                success_threshold=success_threshold or self._default_config["success_threshold"],
+                timeout_seconds=timeout_seconds or self._default_config["timeout_seconds"],
+            )
+        return self._breakers[name]
+
+    def get(self, name: str) -> CircuitBreaker | None:
+        """Get a circuit breaker by name.
+
+        Args:
+            name: Name of the service.
+
+        Returns:
+            CircuitBreaker if exists, None otherwise.
+        """
+        return self._breakers.get(name)
+
+    def get_all_metrics(self) -> dict[str, dict[str, Any]]:
+        """Get metrics for all circuit breakers.
+
+        Returns:
+            Dictionary mapping service names to metrics.
+        """
+        return {name: cb.get_metrics() for name, cb in self._breakers.items()}
+
+    def reset_all(self) -> None:
+        """Reset all circuit breakers."""
+        for cb in self._breakers.values():
+            cb.reset()
+
+
+def get_circuit_breaker(name: str, **kwargs: Any) -> CircuitBreaker:
+    """Get or create a circuit breaker from the global registry.
+
+    Args:
+        name: Name of the service.
+        **kwargs: Additional circuit breaker configuration.
+
+    Returns:
+        CircuitBreaker instance.
+    """
+    return CircuitBreakerRegistry.get_instance().get_or_create(name, **kwargs)

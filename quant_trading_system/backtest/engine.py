@@ -80,6 +80,10 @@ class BacktestConfig:
     allow_fractional: bool = True
     max_leverage: float = 1.0
 
+    # CRITICAL FIX: Strict mode blocks look-ahead bias configurations
+    # When True (default), 'same_close' execution is blocked as it introduces look-ahead bias
+    strict_mode: bool = True
+
     # Risk parameters
     max_position_pct: float = 0.10
     max_drawdown_halt: float = 0.20
@@ -754,14 +758,30 @@ class BacktestEngine:
     def _get_fill_price(self, bar: OHLCVBar) -> Decimal | None:
         """Get fill price based on execution config.
 
+        CRITICAL FIX: In strict_mode (default), 'same_close' is blocked as it
+        introduces look-ahead bias - the signal uses close data but execution
+        happens at the same close, which is not realistically possible.
+
         WARNING: 'same_close' execution has look-ahead bias and should only
         be used for theoretical analysis. Use 'next_open' for realistic results.
+
+        Raises:
+            ValueError: If same_close is used with strict_mode=True.
         """
         if self.config.fill_at == "next_open":
             return bar.open
         elif self.config.fill_at == "next_close":
             return bar.close
         elif self.config.fill_at == "same_close":
+            # CRITICAL FIX: Block same_close in strict_mode (default)
+            if self.config.strict_mode:
+                raise ValueError(
+                    "LOOK-AHEAD BIAS ERROR: 'same_close' execution is blocked in strict_mode. "
+                    "This mode uses close price for signals but executes at the same close, "
+                    "which introduces look-ahead bias and produces unrealistic results. "
+                    "Use 'next_open' for realistic backtesting. "
+                    "Set strict_mode=False only for theoretical/research analysis."
+                )
             # WARNING: This introduces look-ahead bias since signal uses close data
             # but execution happens at the same close. Only use for theoretical analysis.
             logger.warning(
@@ -1097,3 +1117,411 @@ class VectorizedBacktest:
             "total_trades": results["trades"].sum(),
             "total_days": len(strategy_returns),
         }
+
+
+@dataclass
+class WalkForwardWindow:
+    """Configuration for a single walk-forward validation window."""
+    train_start: datetime
+    train_end: datetime
+    test_start: datetime
+    test_end: datetime
+    window_id: int
+    gap_bars: int = 0
+
+
+@dataclass
+class WalkForwardResult:
+    """Results from a single walk-forward window."""
+    window_id: int
+    train_start: datetime
+    train_end: datetime
+    test_start: datetime
+    test_end: datetime
+    train_metrics: dict[str, float]
+    test_metrics: dict[str, float]
+    equity_curve: list[tuple[datetime, float]]
+    trades: list[Trade]
+    is_oos_ratio: float = 0.0  # In-sample vs Out-of-sample performance ratio
+
+
+@dataclass
+class WalkForwardReport:
+    """Aggregate report from walk-forward validation."""
+    windows: list[WalkForwardResult]
+    aggregate_metrics: dict[str, float]
+    is_valid: bool
+    validation_messages: list[str]
+    total_trades: int = 0
+    combined_equity_curve: list[tuple[datetime, float]] = field(default_factory=list)
+
+
+class WalkForwardValidator:
+    """
+    MAJOR FIX: Walk-forward validation for backtest robustness.
+
+    Walk-forward analysis divides data into multiple train/test windows,
+    training the model on each training period and testing on the subsequent
+    out-of-sample period. This is the gold standard for validating trading
+    strategies and detecting overfitting.
+
+    Critical for institutional-grade backtesting where in-sample optimization
+    can lead to significantly overestimated performance.
+    """
+
+    def __init__(
+        self,
+        n_windows: int = 5,
+        train_pct: float = 0.7,
+        gap_bars: int = 5,
+        min_train_samples: int = 500,
+        min_test_samples: int = 100,
+    ):
+        """
+        Initialize walk-forward validator.
+
+        Args:
+            n_windows: Number of walk-forward windows
+            train_pct: Percentage of each window for training (rest for testing)
+            gap_bars: Gap between train and test to prevent leakage
+            min_train_samples: Minimum training samples per window
+            min_test_samples: Minimum testing samples per window
+        """
+        self.n_windows = n_windows
+        self.train_pct = train_pct
+        self.gap_bars = gap_bars
+        self.min_train_samples = min_train_samples
+        self.min_test_samples = min_test_samples
+
+        self._logger = logging.getLogger(__name__)
+
+    def create_windows(
+        self,
+        data: pd.DataFrame,
+        date_column: str | None = None,
+    ) -> list[WalkForwardWindow]:
+        """
+        Create walk-forward windows from data.
+
+        Args:
+            data: DataFrame with time index or date column
+            date_column: Optional column name for dates (if not index)
+
+        Returns:
+            List of WalkForwardWindow configurations
+        """
+        if date_column is not None:
+            dates = pd.to_datetime(data[date_column])
+        else:
+            dates = pd.to_datetime(data.index)
+
+        n_samples = len(dates)
+        window_size = n_samples // self.n_windows
+        train_size = int(window_size * self.train_pct)
+        test_size = window_size - train_size - self.gap_bars
+
+        if train_size < self.min_train_samples:
+            self._logger.warning(
+                f"Train size {train_size} is below minimum {self.min_train_samples}. "
+                f"Consider reducing n_windows or increasing data."
+            )
+
+        if test_size < self.min_test_samples:
+            self._logger.warning(
+                f"Test size {test_size} is below minimum {self.min_test_samples}. "
+                f"Consider reducing n_windows or gap_bars."
+            )
+
+        windows = []
+        for i in range(self.n_windows):
+            start_idx = i * window_size
+            train_end_idx = start_idx + train_size
+            test_start_idx = train_end_idx + self.gap_bars
+            test_end_idx = min((i + 1) * window_size, n_samples)
+
+            if test_end_idx > n_samples or test_start_idx >= test_end_idx:
+                break
+
+            window = WalkForwardWindow(
+                train_start=dates.iloc[start_idx].to_pydatetime() if hasattr(dates.iloc[start_idx], 'to_pydatetime') else dates.iloc[start_idx],
+                train_end=dates.iloc[train_end_idx - 1].to_pydatetime() if hasattr(dates.iloc[train_end_idx - 1], 'to_pydatetime') else dates.iloc[train_end_idx - 1],
+                test_start=dates.iloc[test_start_idx].to_pydatetime() if hasattr(dates.iloc[test_start_idx], 'to_pydatetime') else dates.iloc[test_start_idx],
+                test_end=dates.iloc[test_end_idx - 1].to_pydatetime() if hasattr(dates.iloc[test_end_idx - 1], 'to_pydatetime') else dates.iloc[test_end_idx - 1],
+                window_id=i,
+                gap_bars=self.gap_bars,
+            )
+            windows.append(window)
+
+        self._logger.info(f"Created {len(windows)} walk-forward windows")
+        return windows
+
+    def run_validation(
+        self,
+        data: dict[str, pd.DataFrame],
+        strategy_factory: Callable[[pd.DataFrame], Strategy],
+        config: BacktestConfig | None = None,
+        train_callback: Callable[[pd.DataFrame, WalkForwardWindow], None] | None = None,
+    ) -> WalkForwardReport:
+        """
+        Run walk-forward validation.
+
+        Args:
+            data: Dictionary mapping symbols to DataFrames
+            strategy_factory: Factory function to create strategy from training data
+            config: Backtest configuration
+            train_callback: Optional callback called after training each window
+
+        Returns:
+            WalkForwardReport with all results
+        """
+        config = config or BacktestConfig()
+
+        # Get common dates across all symbols
+        first_symbol = list(data.keys())[0]
+        df = data[first_symbol]
+        windows = self.create_windows(df)
+
+        if len(windows) == 0:
+            return WalkForwardReport(
+                windows=[],
+                aggregate_metrics={},
+                is_valid=False,
+                validation_messages=["No valid windows could be created from data"],
+            )
+
+        results = []
+        all_trades = []
+        combined_equity = []
+
+        for window in windows:
+            self._logger.info(
+                f"Running window {window.window_id + 1}/{len(windows)}: "
+                f"Train {window.train_start.date()} to {window.train_end.date()}, "
+                f"Test {window.test_start.date()} to {window.test_end.date()}"
+            )
+
+            # Filter data for window
+            train_data = {}
+            test_data = {}
+            for symbol, symbol_df in data.items():
+                # Handle both index and regular datetime index
+                idx = symbol_df.index
+                if hasattr(idx, 'tz') and idx.tz is not None:
+                    # Timezone-aware, make window dates aware
+                    from datetime import timezone as tz
+                    train_mask = (idx >= pd.Timestamp(window.train_start, tz=idx.tz)) & \
+                                 (idx <= pd.Timestamp(window.train_end, tz=idx.tz))
+                    test_mask = (idx >= pd.Timestamp(window.test_start, tz=idx.tz)) & \
+                                (idx <= pd.Timestamp(window.test_end, tz=idx.tz))
+                else:
+                    train_mask = (idx >= pd.Timestamp(window.train_start)) & \
+                                 (idx <= pd.Timestamp(window.train_end))
+                    test_mask = (idx >= pd.Timestamp(window.test_start)) & \
+                                (idx <= pd.Timestamp(window.test_end))
+
+                train_data[symbol] = symbol_df[train_mask].copy()
+                test_data[symbol] = symbol_df[test_mask].copy()
+
+            # Skip if insufficient data
+            if any(len(df) < self.min_train_samples for df in train_data.values()):
+                self._logger.warning(f"Skipping window {window.window_id}: insufficient training data")
+                continue
+
+            if any(len(df) < self.min_test_samples for df in test_data.values()):
+                self._logger.warning(f"Skipping window {window.window_id}: insufficient test data")
+                continue
+
+            # Create strategy from training data
+            try:
+                # Merge training data for strategy factory
+                merged_train = pd.concat([df for df in train_data.values()], axis=0)
+                strategy = strategy_factory(merged_train)
+
+                if train_callback:
+                    train_callback(merged_train, window)
+            except Exception as e:
+                self._logger.error(f"Strategy creation failed for window {window.window_id}: {e}")
+                continue
+
+            # Run backtest on training data (in-sample metrics)
+            train_handler = PandasDataHandler(train_data)
+            train_engine = BacktestEngine(train_handler, strategy, config)
+            train_state = train_engine.run()
+            train_metrics = self._calculate_metrics(train_state)
+
+            # Run backtest on test data (out-of-sample metrics)
+            test_handler = PandasDataHandler(test_data)
+            test_engine = BacktestEngine(test_handler, strategy, config)
+            test_state = test_engine.run()
+            test_metrics = self._calculate_metrics(test_state)
+
+            # Calculate IS/OOS ratio
+            train_sharpe = train_metrics.get("sharpe_ratio", 0)
+            test_sharpe = test_metrics.get("sharpe_ratio", 0)
+            is_oos_ratio = train_sharpe / test_sharpe if test_sharpe > 0 else float("inf")
+
+            result = WalkForwardResult(
+                window_id=window.window_id,
+                train_start=window.train_start,
+                train_end=window.train_end,
+                test_start=window.test_start,
+                test_end=window.test_end,
+                train_metrics=train_metrics,
+                test_metrics=test_metrics,
+                equity_curve=test_state.equity_curve,
+                trades=test_state.trades,
+                is_oos_ratio=is_oos_ratio,
+            )
+            results.append(result)
+            all_trades.extend(test_state.trades)
+            combined_equity.extend(test_state.equity_curve)
+
+        # Aggregate results
+        aggregate_metrics = self._aggregate_metrics(results)
+        is_valid, messages = self._validate_results(results, aggregate_metrics)
+
+        return WalkForwardReport(
+            windows=results,
+            aggregate_metrics=aggregate_metrics,
+            is_valid=is_valid,
+            validation_messages=messages,
+            total_trades=len(all_trades),
+            combined_equity_curve=sorted(combined_equity, key=lambda x: x[0]),
+        )
+
+    def _calculate_metrics(self, state: BacktestState) -> dict[str, float]:
+        """Calculate metrics from backtest state."""
+        if not state.equity_curve:
+            return {
+                "total_return": 0.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "win_rate": 0.0,
+                "trade_count": 0,
+            }
+
+        equity_values = [e for _, e in state.equity_curve]
+        returns = [
+            (equity_values[i] - equity_values[i - 1]) / equity_values[i - 1]
+            for i in range(1, len(equity_values))
+            if equity_values[i - 1] > 0
+        ]
+
+        if not returns:
+            return {
+                "total_return": 0.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "win_rate": 0.0,
+                "trade_count": 0,
+            }
+
+        total_return = (equity_values[-1] / equity_values[0] - 1) if equity_values[0] > 0 else 0
+        volatility = float(np.std(returns) * np.sqrt(252 * 26)) if returns else 0  # 15-min bars
+        sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252 * 26)) if returns and np.std(returns) > 0 else 0
+
+        # Max drawdown
+        peak = equity_values[0]
+        max_dd = 0.0
+        for val in equity_values:
+            peak = max(peak, val)
+            dd = (peak - val) / peak if peak > 0 else 0
+            max_dd = max(max_dd, dd)
+
+        # Win rate from trades
+        winning_trades = sum(1 for t in state.trades if float(t.pnl) > 0)
+        total_trades = len(state.trades)
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+
+        return {
+            "total_return": total_return,
+            "sharpe_ratio": sharpe,
+            "volatility": volatility,
+            "max_drawdown": max_dd,
+            "win_rate": win_rate,
+            "trade_count": total_trades,
+        }
+
+    def _aggregate_metrics(self, results: list[WalkForwardResult]) -> dict[str, float]:
+        """Aggregate metrics across all walk-forward windows."""
+        if not results:
+            return {}
+
+        # Average OOS metrics across windows
+        oos_metrics = {
+            "avg_oos_return": np.mean([r.test_metrics.get("total_return", 0) for r in results]),
+            "avg_oos_sharpe": np.mean([r.test_metrics.get("sharpe_ratio", 0) for r in results]),
+            "avg_oos_max_dd": np.mean([r.test_metrics.get("max_drawdown", 0) for r in results]),
+            "avg_oos_win_rate": np.mean([r.test_metrics.get("win_rate", 0) for r in results]),
+            "std_oos_sharpe": np.std([r.test_metrics.get("sharpe_ratio", 0) for r in results]),
+            "avg_is_oos_ratio": np.mean([r.is_oos_ratio for r in results if r.is_oos_ratio < float("inf")]),
+            "max_is_oos_ratio": max(r.is_oos_ratio for r in results if r.is_oos_ratio < float("inf")) if any(r.is_oos_ratio < float("inf") for r in results) else float("inf"),
+            "windows_positive": sum(1 for r in results if r.test_metrics.get("total_return", 0) > 0),
+            "windows_total": len(results),
+        }
+
+        # IS (in-sample) metrics for comparison
+        oos_metrics.update({
+            "avg_is_return": np.mean([r.train_metrics.get("total_return", 0) for r in results]),
+            "avg_is_sharpe": np.mean([r.train_metrics.get("sharpe_ratio", 0) for r in results]),
+        })
+
+        return oos_metrics
+
+    def _validate_results(
+        self,
+        results: list[WalkForwardResult],
+        aggregate: dict[str, float],
+    ) -> tuple[bool, list[str]]:
+        """Validate walk-forward results for overfitting and robustness."""
+        messages = []
+        is_valid = True
+
+        if not results:
+            return False, ["No walk-forward windows completed"]
+
+        # Check 1: Average IS/OOS ratio (overfitting indicator)
+        avg_ratio = aggregate.get("avg_is_oos_ratio", 0)
+        if avg_ratio > 2.0:
+            messages.append(
+                f"OVERFITTING WARNING: Average IS/OOS ratio {avg_ratio:.2f} > 2.0. "
+                f"Strategy performs much better on training data than test data."
+            )
+            is_valid = False
+
+        # Check 2: OOS Sharpe consistency
+        std_sharpe = aggregate.get("std_oos_sharpe", 0)
+        avg_sharpe = aggregate.get("avg_oos_sharpe", 0)
+        if avg_sharpe > 0 and std_sharpe / avg_sharpe > 1.0:
+            messages.append(
+                f"INSTABILITY WARNING: High OOS Sharpe variance. "
+                f"Avg={avg_sharpe:.2f}, Std={std_sharpe:.2f}. "
+                f"Strategy performance is inconsistent across windows."
+            )
+
+        # Check 3: Percentage of positive windows
+        windows_positive = aggregate.get("windows_positive", 0)
+        windows_total = aggregate.get("windows_total", 1)
+        pct_positive = windows_positive / windows_total
+        if pct_positive < 0.6:
+            messages.append(
+                f"ROBUSTNESS WARNING: Only {pct_positive:.1%} of windows are profitable. "
+                f"Strategy may not be robust across market conditions."
+            )
+
+        # Check 4: Average OOS Sharpe is positive
+        if avg_sharpe <= 0:
+            messages.append(
+                f"PERFORMANCE WARNING: Average OOS Sharpe ratio is {avg_sharpe:.2f}. "
+                f"Strategy does not show positive risk-adjusted returns."
+            )
+            is_valid = False
+
+        if is_valid:
+            messages.append(
+                f"WALK-FORWARD VALIDATION PASSED: {windows_total} windows, "
+                f"{pct_positive:.1%} profitable, avg OOS Sharpe={avg_sharpe:.2f}, "
+                f"avg IS/OOS ratio={avg_ratio:.2f}"
+            )
+
+        return is_valid, messages

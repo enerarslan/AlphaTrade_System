@@ -302,10 +302,32 @@ class FileAuditStorage(AuditStorage):
         end_time: datetime | None = None,
         event_types: list[AuditEventType] | None = None,
         limit: int = 1000,
+        verify_on_read: bool = False,
     ) -> list[AuditEvent]:
-        """Retrieve audit events with optional filters."""
+        """
+        Retrieve audit events with optional filters.
+
+        MAJOR FIX: Added verify_on_read parameter for hash chain verification
+        during retrieval to detect tampering.
+
+        Args:
+            start_time: Filter events after this time
+            end_time: Filter events before this time
+            event_types: Filter by event types
+            limit: Maximum events to return
+            verify_on_read: If True, verify each event's hash and chain
+
+        Returns:
+            List of audit events
+
+        Raises:
+            AuditIntegrityError: If verify_on_read=True and integrity check fails
+        """
         events = []
         log_files = sorted(self.storage_dir.glob("audit_*.jsonl"))
+
+        previous_hash: str | None = None
+        integrity_errors: list[str] = []
 
         for log_file in log_files:
             try:
@@ -316,6 +338,24 @@ class FileAuditStorage(AuditStorage):
 
                         event_data = json.loads(line)
                         event = AuditEvent.from_dict(event_data)
+
+                        # MAJOR FIX: Verify integrity on read if requested
+                        if verify_on_read:
+                            # Verify event hash
+                            if not event.verify_integrity():
+                                integrity_errors.append(
+                                    f"HASH MISMATCH: Event {event.event_id} at {event.timestamp} "
+                                    f"has invalid hash (possible tampering)"
+                                )
+
+                            # Verify chain link
+                            if previous_hash is not None and event.previous_hash != previous_hash:
+                                integrity_errors.append(
+                                    f"CHAIN BREAK: Event {event.event_id} expected previous_hash "
+                                    f"{previous_hash[:16]}... but got {(event.previous_hash or 'None')[:16]}..."
+                                )
+
+                            previous_hash = event.event_hash
 
                         # Apply filters
                         if start_time and event.timestamp < start_time:
@@ -330,7 +370,93 @@ class FileAuditStorage(AuditStorage):
             except Exception as e:
                 logger.warning(f"Error reading audit log {log_file}: {e}")
 
+        # MAJOR FIX: Raise error if integrity verification failed
+        if verify_on_read and integrity_errors:
+            from quant_trading_system.core.exceptions import TradingSystemError
+
+            error_summary = "; ".join(integrity_errors[:5])  # First 5 errors
+            if len(integrity_errors) > 5:
+                error_summary += f" ... and {len(integrity_errors) - 5} more errors"
+
+            logger.critical(f"AUDIT LOG INTEGRITY VIOLATION: {error_summary}")
+            raise TradingSystemError(
+                f"Audit log integrity verification failed: {len(integrity_errors)} errors detected. "
+                f"{error_summary}"
+            )
+
         return events[:limit]
+
+    def retrieve_verified(
+        self,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        event_types: list[AuditEventType] | None = None,
+        limit: int = 1000,
+    ) -> tuple[list[AuditEvent], bool, list[str]]:
+        """
+        MAJOR FIX: Retrieve audit events with integrity verification.
+
+        This method always verifies the hash chain but returns errors
+        instead of raising exceptions, allowing callers to decide how to handle.
+
+        Args:
+            start_time: Filter events after this time
+            end_time: Filter events before this time
+            event_types: Filter by event types
+            limit: Maximum events to return
+
+        Returns:
+            Tuple of (events, is_valid, error_messages)
+        """
+        events = []
+        log_files = sorted(self.storage_dir.glob("audit_*.jsonl"))
+
+        previous_hash: str | None = None
+        integrity_errors: list[str] = []
+
+        for log_file in log_files:
+            try:
+                with open(log_file, "r") as f:
+                    for line in f:
+                        if len(events) >= limit:
+                            break
+
+                        event_data = json.loads(line)
+                        event = AuditEvent.from_dict(event_data)
+
+                        # Verify event hash
+                        if not event.verify_integrity():
+                            integrity_errors.append(
+                                f"HASH MISMATCH: Event {event.event_id} at {event.timestamp}"
+                            )
+
+                        # Verify chain link
+                        if previous_hash is not None and event.previous_hash != previous_hash:
+                            integrity_errors.append(
+                                f"CHAIN BREAK at event {event.event_id}"
+                            )
+
+                        previous_hash = event.event_hash
+
+                        # Apply filters
+                        if start_time and event.timestamp < start_time:
+                            continue
+                        if end_time and event.timestamp > end_time:
+                            continue
+                        if event_types and event.event_type not in event_types:
+                            continue
+
+                        events.append(event)
+
+            except Exception as e:
+                integrity_errors.append(f"Read error in {log_file}: {e}")
+                logger.warning(f"Error reading audit log {log_file}: {e}")
+
+        is_valid = len(integrity_errors) == 0
+        if not is_valid:
+            logger.warning(f"Audit log integrity issues: {len(integrity_errors)} errors found")
+
+        return events[:limit], is_valid, integrity_errors
 
     def get_last_hash(self) -> str | None:
         """Get hash of the last stored event."""

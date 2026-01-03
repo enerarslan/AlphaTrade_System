@@ -16,7 +16,9 @@ import hashlib
 import json
 import logging
 import pickle
+import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -25,6 +27,133 @@ from typing import Any
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# MAJOR FIX: Model versioning enforcement
+# System version for model compatibility checking
+# Format: MAJOR.MINOR.PATCH following semantic versioning
+SYSTEM_MODEL_VERSION = "1.0.0"
+
+
+@dataclass
+class SemanticVersion:
+    """Semantic version representation for comparison."""
+    major: int
+    minor: int
+    patch: int
+
+    @classmethod
+    def parse(cls, version_str: str) -> "SemanticVersion":
+        """
+        Parse version string into SemanticVersion.
+
+        Args:
+            version_str: Version string like "1.2.3" or "1.2"
+
+        Returns:
+            SemanticVersion instance
+
+        Raises:
+            ValueError: If version string is invalid
+        """
+        if not version_str:
+            raise ValueError("Version string cannot be empty")
+
+        # Match MAJOR.MINOR.PATCH or MAJOR.MINOR
+        match = re.match(r'^(\d+)\.(\d+)(?:\.(\d+))?$', version_str.strip())
+        if not match:
+            raise ValueError(f"Invalid version format: {version_str}. Expected MAJOR.MINOR.PATCH")
+
+        major = int(match.group(1))
+        minor = int(match.group(2))
+        patch = int(match.group(3)) if match.group(3) else 0
+
+        return cls(major=major, minor=minor, patch=patch)
+
+    def __str__(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SemanticVersion):
+            return False
+        return (self.major, self.minor, self.patch) == (other.major, other.minor, other.patch)
+
+    def __lt__(self, other: "SemanticVersion") -> bool:
+        return (self.major, self.minor, self.patch) < (other.major, other.minor, other.patch)
+
+    def __le__(self, other: "SemanticVersion") -> bool:
+        return self == other or self < other
+
+    def __gt__(self, other: "SemanticVersion") -> bool:
+        return (self.major, self.minor, self.patch) > (other.major, other.minor, other.patch)
+
+    def __ge__(self, other: "SemanticVersion") -> bool:
+        return self == other or self > other
+
+
+class VersionCompatibility(str, Enum):
+    """Model version compatibility levels."""
+    COMPATIBLE = "compatible"          # Fully compatible
+    MINOR_MISMATCH = "minor_mismatch"  # Minor version differs (warning)
+    MAJOR_MISMATCH = "major_mismatch"  # Major version differs (error)
+    FUTURE_VERSION = "future_version"  # Model from newer system (error)
+
+
+def check_version_compatibility(
+    model_version: str,
+    system_version: str = SYSTEM_MODEL_VERSION,
+    strict: bool = False,
+) -> tuple[VersionCompatibility, str]:
+    """
+    Check if model version is compatible with system version.
+
+    Compatibility rules:
+    - Same MAJOR.MINOR.PATCH: COMPATIBLE
+    - Same MAJOR, different MINOR/PATCH (model older): MINOR_MISMATCH (warning)
+    - Different MAJOR: MAJOR_MISMATCH (error in strict mode)
+    - Model version newer than system: FUTURE_VERSION (error)
+
+    Args:
+        model_version: Model's version string
+        system_version: Current system version
+        strict: If True, treat any mismatch as error
+
+    Returns:
+        Tuple of (VersionCompatibility, message)
+    """
+    try:
+        model_ver = SemanticVersion.parse(model_version)
+        system_ver = SemanticVersion.parse(system_version)
+    except ValueError as e:
+        return VersionCompatibility.MAJOR_MISMATCH, f"Version parse error: {e}"
+
+    # Exact match
+    if model_ver == system_ver:
+        return VersionCompatibility.COMPATIBLE, f"Model version {model_version} matches system version"
+
+    # Model from future system version
+    if model_ver > system_ver:
+        return VersionCompatibility.FUTURE_VERSION, (
+            f"Model version {model_version} is newer than system version {system_version}. "
+            f"Model may use features not available in this system."
+        )
+
+    # Major version mismatch
+    if model_ver.major != system_ver.major:
+        return VersionCompatibility.MAJOR_MISMATCH, (
+            f"Major version mismatch: model={model_version}, system={system_version}. "
+            f"Model may be incompatible with current system architecture."
+        )
+
+    # Minor/patch mismatch (model is older)
+    if strict:
+        return VersionCompatibility.MINOR_MISMATCH, (
+            f"Version mismatch (strict mode): model={model_version}, system={system_version}. "
+        )
+
+    return VersionCompatibility.MINOR_MISMATCH, (
+        f"Minor version mismatch: model={model_version}, system={system_version}. "
+        f"Model should be compatible but consider retraining."
+    )
 
 
 class ModelType(str, Enum):
@@ -258,9 +387,11 @@ class TradingModel(ABC):
             pickle.dump(self._model, f)
 
         # Save metadata
+        # MAJOR FIX: Include system version for compatibility checking
         metadata = {
             "name": self._name,
             "version": self._version,
+            "system_version": SYSTEM_MODEL_VERSION,  # Track system version at save time
             "model_type": self._model_type.value,
             "is_fitted": self._is_fitted,
             "feature_names": self._feature_names,
@@ -275,21 +406,31 @@ class TradingModel(ABC):
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2, default=str)
 
-    def load(self, path: str | Path) -> "TradingModel":
+    def load(
+        self,
+        path: str | Path,
+        strict_version: bool = False,
+        allow_minor_mismatch: bool = True,
+    ) -> "TradingModel":
         """
-        Deserialize model from disk.
+        Deserialize model from disk with version compatibility checking.
 
-        Loads the model and verifies checksum integrity.
+        Loads the model, verifies checksum integrity, and checks version compatibility.
+
+        MAJOR FIX: Added model versioning enforcement to prevent loading
+        incompatible models that could produce incorrect predictions.
 
         Args:
             path: Path to saved model (without extension)
+            strict_version: If True, require exact version match
+            allow_minor_mismatch: If True, allow minor version differences with warning
 
         Returns:
             self for method chaining
 
         Raises:
             FileNotFoundError: If model files don't exist
-            ValueError: If checksum verification fails
+            ValueError: If checksum verification fails or version incompatible
         """
         path = Path(path)
         model_path = path.with_suffix(".pkl")
@@ -303,6 +444,25 @@ class TradingModel(ABC):
         # Load and verify metadata
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
+
+        # MAJOR FIX: Version compatibility check
+        saved_system_version = metadata.get("system_version", "0.0.0")
+        compatibility, message = check_version_compatibility(
+            model_version=saved_system_version,
+            system_version=SYSTEM_MODEL_VERSION,
+            strict=strict_version,
+        )
+
+        if compatibility == VersionCompatibility.COMPATIBLE:
+            logger.debug(f"Model version check passed: {message}")
+        elif compatibility == VersionCompatibility.MINOR_MISMATCH:
+            if allow_minor_mismatch:
+                logger.warning(f"Model version warning: {message}")
+            else:
+                raise ValueError(f"Model version incompatible: {message}")
+        elif compatibility in (VersionCompatibility.MAJOR_MISMATCH, VersionCompatibility.FUTURE_VERSION):
+            logger.error(f"Model version error: {message}")
+            raise ValueError(f"Model version incompatible: {message}")
 
         # Verify checksum
         current_checksum = self._compute_checksum(model_path)
@@ -331,6 +491,14 @@ class TradingModel(ABC):
         )
         self._training_metrics = metadata["training_metrics"]
         self._params = metadata.get("params", {})
+
+        # Store loaded system version for reference
+        self._loaded_system_version = saved_system_version
+
+        logger.info(
+            f"Loaded model {self._name} v{self._version} "
+            f"(trained on system v{saved_system_version}, current system v{SYSTEM_MODEL_VERSION})"
+        )
 
         return self
 

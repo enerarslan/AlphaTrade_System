@@ -1381,8 +1381,11 @@ class AlertManager:
     - Alert creation and routing
     - Deduplication and rate limiting
     - Multi-channel notification
-    - Escalation handling
+    - Escalation handling with timeout
     - Acknowledgment tracking
+
+    JPMorgan-level enhancement: Added escalation timeout functionality
+    to automatically escalate unacknowledged alerts.
     """
 
     def __init__(
@@ -1390,6 +1393,7 @@ class AlertManager:
         rate_limit_window_seconds: int = 300,
         rate_limit_max_alerts: int = 5,
         dedup_window_seconds: int = 600,
+        escalation_check_interval_seconds: int = 60,
     ) -> None:
         """Initialize the alert manager.
 
@@ -1397,10 +1401,12 @@ class AlertManager:
             rate_limit_window_seconds: Rate limit window in seconds.
             rate_limit_max_alerts: Maximum alerts per fingerprint in window.
             dedup_window_seconds: Deduplication window in seconds.
+            escalation_check_interval_seconds: How often to check for escalations.
         """
         self.rate_limit_window = timedelta(seconds=rate_limit_window_seconds)
         self.rate_limit_max = rate_limit_max_alerts
         self.dedup_window = timedelta(seconds=dedup_window_seconds)
+        self.escalation_check_interval = escalation_check_interval_seconds
 
         self._notifiers: dict[AlertChannel, AlertNotifier] = {}
         self._routing_rules: dict[AlertSeverity, AlertRule] = {}
@@ -1409,6 +1415,11 @@ class AlertManager:
         self._alert_history: list[Alert] = []
         self._max_history = 10000
         self._suppressed_fingerprints: set[str] = set()
+
+        # JPMorgan-level enhancement: Escalation tracking
+        self._escalated_alerts: set[str] = set()  # Alert fingerprints that have been escalated
+        self._escalation_task: asyncio.Task | None = None
+        self._escalation_running = False
 
         # Default routing rules
         self._setup_default_routing()
@@ -1713,6 +1724,177 @@ class AlertManager:
         self._alert_history.append(alert)
         if len(self._alert_history) > self._max_history:
             self._alert_history = self._alert_history[-self._max_history :]
+
+    # =========================================================================
+    # JPMorgan-level Enhancement: Alert Escalation Timeout
+    # =========================================================================
+
+    async def start_escalation_monitor(self) -> None:
+        """Start the background escalation monitoring task.
+
+        JPMorgan-level enhancement: Automatically escalates unacknowledged
+        alerts after the configured timeout period.
+        """
+        if self._escalation_running:
+            logger.warning("Escalation monitor already running")
+            return
+
+        self._escalation_running = True
+        self._escalation_task = asyncio.create_task(self._escalation_loop())
+        logger.info(
+            f"Started escalation monitor (check interval: {self.escalation_check_interval}s)"
+        )
+
+    async def stop_escalation_monitor(self) -> None:
+        """Stop the background escalation monitoring task."""
+        self._escalation_running = False
+
+        if self._escalation_task:
+            self._escalation_task.cancel()
+            try:
+                await self._escalation_task
+            except asyncio.CancelledError:
+                pass
+            self._escalation_task = None
+
+        logger.info("Stopped escalation monitor")
+
+    async def _escalation_loop(self) -> None:
+        """Background loop that checks for alerts needing escalation."""
+        while self._escalation_running:
+            try:
+                await self._check_escalations()
+            except Exception as e:
+                logger.error(f"Error in escalation check: {e}")
+
+            await asyncio.sleep(self.escalation_check_interval)
+
+    async def _check_escalations(self) -> None:
+        """Check all active alerts for escalation needs.
+
+        Escalates alerts that:
+        1. Are still in FIRING status (not acknowledged)
+        2. Have exceeded their escalation timeout
+        3. Have not already been escalated
+        """
+        now = datetime.now(timezone.utc)
+
+        for fingerprint, alert in list(self._active_alerts.items()):
+            # Skip already escalated or acknowledged alerts
+            if fingerprint in self._escalated_alerts:
+                continue
+            if alert.status != AlertStatus.FIRING:
+                continue
+
+            # Get routing rule for this severity
+            rule = self._routing_rules.get(alert.severity)
+            if not rule or rule.escalation_minutes is None:
+                continue
+
+            # Check if escalation timeout exceeded
+            escalation_threshold = timedelta(minutes=rule.escalation_minutes)
+            time_since_alert = now - alert.timestamp
+
+            if time_since_alert >= escalation_threshold:
+                await self._escalate_alert(alert, rule)
+
+    async def _escalate_alert(self, alert: Alert, rule: AlertRule) -> None:
+        """Escalate an alert to additional channels.
+
+        Args:
+            alert: The alert to escalate.
+            rule: The routing rule with escalation channels.
+        """
+        if not rule.escalation_channels:
+            return
+
+        logger.warning(
+            f"Escalating unacknowledged alert: {alert.title} "
+            f"(after {rule.escalation_minutes} minutes)"
+        )
+
+        # Mark as escalated
+        self._escalated_alerts.add(alert.fingerprint)
+
+        # Update alert metadata
+        alert.context["escalated"] = True
+        alert.context["escalated_at"] = datetime.now(timezone.utc).isoformat()
+        alert.context["escalation_reason"] = f"Unacknowledged after {rule.escalation_minutes} minutes"
+
+        # Create escalation message
+        escalation_title = f"[ESCALATED] {alert.title}"
+        escalation_message = (
+            f"ALERT ESCALATION: This alert has been unacknowledged for "
+            f"{rule.escalation_minutes} minutes.\n\n"
+            f"Original message: {alert.message}"
+        )
+
+        # Send to escalation channels
+        for channel in rule.escalation_channels:
+            notifier = self._notifiers.get(channel)
+            if notifier:
+                try:
+                    # Create escalated version of the alert
+                    escalated_alert = Alert(
+                        alert_type=alert.alert_type,
+                        severity=AlertSeverity.CRITICAL,  # Escalated alerts are critical
+                        title=escalation_title,
+                        message=escalation_message,
+                        context=alert.context,
+                        suggested_action=alert.suggested_action,
+                        runbook_link=alert.runbook_link,
+                    )
+                    success = await notifier.send(escalated_alert)
+                    if success:
+                        logger.info(f"Escalation sent to {channel.value}")
+                    else:
+                        logger.warning(f"Failed to send escalation to {channel.value}")
+                except Exception as e:
+                    logger.error(f"Error sending escalation to {channel.value}: {e}")
+
+    def get_pending_escalations(self) -> list[tuple[Alert, int]]:
+        """Get alerts pending escalation with time remaining.
+
+        Returns:
+            List of (alert, seconds_until_escalation) tuples.
+        """
+        now = datetime.now(timezone.utc)
+        pending = []
+
+        for fingerprint, alert in self._active_alerts.items():
+            # Skip already escalated or acknowledged
+            if fingerprint in self._escalated_alerts:
+                continue
+            if alert.status != AlertStatus.FIRING:
+                continue
+
+            rule = self._routing_rules.get(alert.severity)
+            if not rule or rule.escalation_minutes is None:
+                continue
+
+            escalation_threshold = timedelta(minutes=rule.escalation_minutes)
+            time_since_alert = now - alert.timestamp
+            time_remaining = escalation_threshold - time_since_alert
+
+            if time_remaining.total_seconds() > 0:
+                pending.append((alert, int(time_remaining.total_seconds())))
+
+        return sorted(pending, key=lambda x: x[1])
+
+    def reset_escalation(self, fingerprint: str) -> bool:
+        """Reset escalation status for an alert.
+
+        Args:
+            fingerprint: Alert fingerprint to reset.
+
+        Returns:
+            True if reset was successful.
+        """
+        if fingerprint in self._escalated_alerts:
+            self._escalated_alerts.discard(fingerprint)
+            logger.info(f"Escalation reset for alert: {fingerprint}")
+            return True
+        return False
 
     def acknowledge_alert(self, alert_id: str, acknowledged_by: str) -> bool:
         """Acknowledge an alert.

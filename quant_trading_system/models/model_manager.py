@@ -380,6 +380,270 @@ class ModelRegistry:
         self._save_registry()
 
 
+class FutureLeakValidator:
+    """
+    MAJOR FIX: Validate training data for future data leakage.
+
+    Institutional-grade validation to prevent look-ahead bias in features.
+    This is CRITICAL for trading systems where even small leakage can cause
+    models to appear highly profitable in backtests but fail in live trading.
+    """
+
+    def __init__(
+        self,
+        strict_mode: bool = True,
+        check_timestamps: bool = True,
+        check_target_leak: bool = True,
+        check_feature_correlation: bool = True,
+        max_target_correlation: float = 0.95,
+    ):
+        """
+        Initialize validator.
+
+        Args:
+            strict_mode: If True, raise errors on validation failures
+            check_timestamps: Validate timestamp ordering
+            check_target_leak: Check if target appears in features
+            check_feature_correlation: Check for suspiciously high correlation
+            max_target_correlation: Max allowed feature-target correlation
+        """
+        self.strict_mode = strict_mode
+        self.check_timestamps = check_timestamps
+        self.check_target_leak = check_target_leak
+        self.check_feature_correlation = check_feature_correlation
+        self.max_target_correlation = max_target_correlation
+
+        import logging
+        self.logger = logging.getLogger(__name__)
+
+    def validate(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_names: list[str] | None = None,
+        timestamps: np.ndarray | None = None,
+    ) -> tuple[bool, list[str]]:
+        """
+        Validate training data for future leakage.
+
+        Args:
+            X: Feature matrix of shape (n_samples, n_features)
+            y: Target array of shape (n_samples,)
+            feature_names: Optional list of feature names for better error messages
+            timestamps: Optional array of timestamps for ordering validation
+
+        Returns:
+            Tuple of (is_valid, list of warning/error messages)
+        """
+        issues = []
+        is_valid = True
+
+        # Check 1: Timestamp ordering (if timestamps provided)
+        if self.check_timestamps and timestamps is not None:
+            ts_issues = self._validate_timestamp_ordering(timestamps)
+            if ts_issues:
+                issues.extend(ts_issues)
+                is_valid = False
+
+        # Check 2: Target leak detection
+        if self.check_target_leak:
+            target_issues = self._check_target_in_features(X, y, feature_names)
+            if target_issues:
+                issues.extend(target_issues)
+                is_valid = False
+
+        # Check 3: Suspiciously high feature-target correlation
+        if self.check_feature_correlation:
+            corr_issues = self._check_feature_target_correlation(X, y, feature_names)
+            if corr_issues:
+                issues.extend(corr_issues)
+                # High correlation is a warning, not necessarily an error
+                if self.strict_mode:
+                    is_valid = False
+
+        # Check 4: NaN/Inf values that might indicate forward-filling issues
+        nan_issues = self._check_data_quality(X, y, feature_names)
+        if nan_issues:
+            issues.extend(nan_issues)
+            if self.strict_mode:
+                is_valid = False
+
+        # Log results
+        if is_valid:
+            self.logger.info("FUTURE LEAK VALIDATION: PASSED")
+        else:
+            for issue in issues:
+                self.logger.error(f"FUTURE LEAK VALIDATION: {issue}")
+
+        return is_valid, issues
+
+    def _validate_timestamp_ordering(self, timestamps: np.ndarray) -> list[str]:
+        """Check timestamps are strictly increasing."""
+        issues = []
+
+        if len(timestamps) < 2:
+            return issues
+
+        # Convert to comparable format if datetime
+        if hasattr(timestamps[0], 'timestamp'):
+            ts_numeric = np.array([t.timestamp() for t in timestamps])
+        else:
+            ts_numeric = np.asarray(timestamps)
+
+        # Check for non-increasing timestamps
+        diffs = np.diff(ts_numeric)
+        non_increasing = np.where(diffs <= 0)[0]
+
+        if len(non_increasing) > 0:
+            issues.append(
+                f"TIMESTAMP ORDERING VIOLATION: Found {len(non_increasing)} non-increasing "
+                f"timestamps. First violation at index {non_increasing[0]}. "
+                f"This may indicate data shuffle or duplicate timestamps."
+            )
+
+        return issues
+
+    def _check_target_in_features(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_names: list[str] | None,
+    ) -> list[str]:
+        """Check if target appears directly in features."""
+        issues = []
+
+        # Check each column for exact match with target
+        for i in range(X.shape[1]):
+            if np.allclose(X[:, i], y, rtol=1e-5, atol=1e-8):
+                feat_name = feature_names[i] if feature_names else f"column_{i}"
+                issues.append(
+                    f"TARGET LEAK DETECTED: Feature '{feat_name}' is identical to target. "
+                    f"This indicates direct target leakage."
+                )
+
+            # Also check for shifted target (predicting with future values)
+            if len(y) > 1:
+                # Check if feature is the target shifted forward (future leak!)
+                for shift in [1, 2, 3, 5, 10]:
+                    if len(y) > shift:
+                        y_shifted = y[shift:]
+                        x_col = X[:-shift, i]
+                        if len(y_shifted) == len(x_col) and np.allclose(x_col, y_shifted, rtol=1e-5, atol=1e-8):
+                            feat_name = feature_names[i] if feature_names else f"column_{i}"
+                            issues.append(
+                                f"FORWARD LEAK DETECTED: Feature '{feat_name}' matches "
+                                f"target shifted by {shift} periods (future data!)."
+                            )
+
+        return issues
+
+    def _check_feature_target_correlation(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_names: list[str] | None,
+    ) -> list[str]:
+        """Check for suspiciously high feature-target correlation."""
+        issues = []
+
+        # Compute correlation for each feature
+        for i in range(X.shape[1]):
+            x_col = X[:, i]
+
+            # Skip if constant
+            if np.std(x_col) < 1e-10 or np.std(y) < 1e-10:
+                continue
+
+            try:
+                correlation = np.corrcoef(x_col, y)[0, 1]
+
+                if np.abs(correlation) > self.max_target_correlation:
+                    feat_name = feature_names[i] if feature_names else f"column_{i}"
+                    issues.append(
+                        f"SUSPICIOUS CORRELATION: Feature '{feat_name}' has "
+                        f"correlation {correlation:.4f} with target (threshold: "
+                        f"{self.max_target_correlation}). This may indicate leakage."
+                    )
+            except (ValueError, FloatingPointError):
+                continue
+
+        return issues
+
+    def _check_data_quality(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        feature_names: list[str] | None,
+    ) -> list[str]:
+        """Check for data quality issues that may indicate leakage."""
+        issues = []
+
+        # Check for NaN values
+        nan_counts = np.sum(np.isnan(X), axis=0)
+        high_nan_cols = np.where(nan_counts > len(X) * 0.5)[0]
+
+        for col_idx in high_nan_cols:
+            feat_name = feature_names[col_idx] if feature_names else f"column_{col_idx}"
+            issues.append(
+                f"DATA QUALITY: Feature '{feat_name}' has {nan_counts[col_idx]}/{len(X)} "
+                f"NaN values (>50%). Check feature computation."
+            )
+
+        # Check for Inf values
+        inf_counts = np.sum(np.isinf(X), axis=0)
+        has_inf = np.where(inf_counts > 0)[0]
+
+        for col_idx in has_inf:
+            feat_name = feature_names[col_idx] if feature_names else f"column_{col_idx}"
+            issues.append(
+                f"DATA QUALITY: Feature '{feat_name}' has {inf_counts[col_idx]} Inf values. "
+                f"This may cause model instability."
+            )
+
+        return issues
+
+    def validate_time_series_split(
+        self,
+        train_timestamps: np.ndarray,
+        test_timestamps: np.ndarray,
+        gap_bars: int = 0,
+    ) -> tuple[bool, list[str]]:
+        """
+        Validate that train/test split respects time ordering.
+
+        Args:
+            train_timestamps: Timestamps of training data
+            test_timestamps: Timestamps of test data
+            gap_bars: Expected gap between train and test
+
+        Returns:
+            Tuple of (is_valid, list of messages)
+        """
+        issues = []
+        is_valid = True
+
+        if len(train_timestamps) == 0 or len(test_timestamps) == 0:
+            issues.append("Empty train or test timestamps")
+            return False, issues
+
+        # Get max train timestamp and min test timestamp
+        if hasattr(train_timestamps[0], 'timestamp'):
+            train_max = max(t.timestamp() for t in train_timestamps)
+            test_min = min(t.timestamp() for t in test_timestamps)
+        else:
+            train_max = np.max(train_timestamps)
+            test_min = np.min(test_timestamps)
+
+        if train_max >= test_min:
+            issues.append(
+                f"TIME ORDERING VIOLATION: Train data extends to {train_max}, "
+                f"but test data starts at {test_min}. Train must precede test!"
+            )
+            is_valid = False
+
+        return is_valid, issues
+
+
 class OverfittingDetector:
     """
     JPMORGAN FIX: Detect overfitting by comparing in-sample and out-of-sample metrics.
@@ -732,6 +996,10 @@ class ModelManager:
         y: np.ndarray,
         validation_split: float = 0.2,
         gap: int = 5,
+        feature_names: list[str] | None = None,
+        timestamps: np.ndarray | None = None,
+        validate_leakage: bool = True,
+        strict_leakage_check: bool = True,
         **kwargs: Any,
     ) -> TradingModel:
         """
@@ -741,6 +1009,8 @@ class ModelManager:
         The gap creates a buffer zone between training and validation data
         to prevent information leakage from features computed near the boundary.
 
+        MAJOR FIX: Added future leak validation before training.
+
         Args:
             model: Model to train
             X: Feature matrix
@@ -748,12 +1018,40 @@ class ModelManager:
             validation_split: Fraction for validation
             gap: Number of samples to skip between train and validation
                  to prevent look-ahead bias (default: 5 bars)
+            feature_names: Optional feature names for better error messages
+            timestamps: Optional timestamps for ordering validation
+            validate_leakage: Whether to run future leak validation
+            strict_leakage_check: If True, raise error on validation failure
             **kwargs: Additional training parameters
 
         Returns:
             Trained model
+
+        Raises:
+            ValueError: If validation fails and strict_leakage_check=True
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         n_samples = len(X)
+
+        # MAJOR FIX: Run future leak validation before training
+        if validate_leakage:
+            validator = FutureLeakValidator(strict_mode=strict_leakage_check)
+            is_valid, issues = validator.validate(
+                X, y, feature_names=feature_names, timestamps=timestamps
+            )
+
+            if not is_valid:
+                if strict_leakage_check:
+                    from quant_trading_system.core.exceptions import DataValidationError
+                    raise DataValidationError(
+                        f"Training data failed future leak validation: {issues}"
+                    )
+                else:
+                    logger.warning(
+                        f"Training data has potential leakage issues (proceeding anyway): {issues}"
+                    )
 
         # Calculate split point with gap
         # Gap ensures no feature leakage from validation period
@@ -774,8 +1072,6 @@ class ModelManager:
         X_val = X[split_idx + gap:]
         y_val = y[split_idx + gap:]
 
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(
             f"Training split: train={len(X_train)}, gap={gap}, val={len(X_val)}, "
             f"total={n_samples}"

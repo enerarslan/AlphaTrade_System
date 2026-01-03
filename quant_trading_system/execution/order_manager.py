@@ -356,6 +356,9 @@ class OrderManager:
     - Fill tracking and reconciliation
     """
 
+    # MAJOR FIX: Default order timeout in minutes
+    DEFAULT_ORDER_TIMEOUT_MINUTES: int = 30
+
     def __init__(
         self,
         client: AlpacaClient,
@@ -364,6 +367,7 @@ class OrderManager:
         router: SmartOrderRouter | None = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
+        order_timeout_minutes: int | None = None,
     ) -> None:
         """Initialize order manager.
 
@@ -374,6 +378,8 @@ class OrderManager:
             router: Smart order router.
             max_retries: Maximum retry attempts.
             retry_delay: Base delay between retries.
+            order_timeout_minutes: MAJOR FIX - Auto-cancel orders older than this.
+                                   Default is 30 minutes. Set to 0 to disable.
         """
         self.client = client
         self.event_bus = event_bus
@@ -381,6 +387,11 @@ class OrderManager:
         self.router = router or SmartOrderRouter()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        # MAJOR FIX: Order timeout for auto-cancel of stale orders
+        self.order_timeout_minutes = (
+            order_timeout_minutes if order_timeout_minutes is not None
+            else self.DEFAULT_ORDER_TIMEOUT_MINUTES
+        )
 
         # Order tracking
         self._orders: dict[UUID, ManagedOrder] = {}
@@ -920,10 +931,46 @@ class OrderManager:
                         except Exception as e:
                             logger.warning(f"Failed to fetch order state: {e}")
 
+                # MAJOR FIX: Check for order timeout and auto-cancel stale orders
+                if self.order_timeout_minutes > 0:
+                    await self._check_order_timeouts()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Order monitoring error: {e}")
+
+    async def _check_order_timeouts(self) -> None:
+        """Check for stale orders and auto-cancel them.
+
+        MAJOR FIX: Orders that have been pending for longer than order_timeout_minutes
+        are automatically cancelled to prevent stuck orders from accumulating.
+        """
+        now = datetime.now(timezone.utc)
+        timeout_delta = timedelta(minutes=self.order_timeout_minutes)
+
+        for managed in list(self._orders.values()):
+            if not managed.is_active:
+                continue
+
+            # Check if order has timed out
+            if managed.submission_time is not None:
+                elapsed = now - managed.submission_time
+                if elapsed > timeout_delta:
+                    logger.warning(
+                        f"Order {managed.order.order_id} timed out after "
+                        f"{elapsed.total_seconds() / 60:.1f} minutes - auto-cancelling"
+                    )
+                    try:
+                        await self.cancel_order(
+                            managed.order.order_id,
+                            reason=f"Auto-cancelled: timeout after {self.order_timeout_minutes} minutes"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to auto-cancel timed out order "
+                            f"{managed.order.order_id}: {e}"
+                        )
 
     async def reconcile_with_broker(self) -> dict[str, Any]:
         """Reconcile internal state with broker.

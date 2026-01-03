@@ -302,6 +302,317 @@ class MarketImpactModel(BaseSlippageModel):
         return conditions.price * Decimal(str(impact_pct))
 
 
+class AlmgrenChrissModel(BaseSlippageModel):
+    """
+    MAJOR FIX: Almgren-Chriss institutional-grade market impact model.
+
+    Implements the Almgren-Chriss (2000) optimal execution framework
+    which is the industry standard for modeling market impact in
+    institutional trading.
+
+    The model has two components:
+    1. Temporary Impact (g): Price impact that decays quickly, proportional
+       to the trading rate (shares per unit time)
+    2. Permanent Impact (h): Cumulative price impact that persists,
+       proportional to total trade size
+
+    Key formulas:
+    - Temporary impact: g(v) = η × σ × |v|^α where v = trading rate
+    - Permanent impact: h(v) = γ × σ × sgn(v) × |v|^β
+
+    Typically α ≈ 0.5-0.6 and β ≈ 0.5 (square-root impact)
+
+    Reference:
+    Almgren, R., & Chriss, N. (2000). Optimal execution of portfolio
+    transactions. Journal of Risk, 3(2), 5-39.
+    """
+
+    def __init__(
+        self,
+        # Temporary impact parameters
+        eta: float = 0.1,              # Temporary impact coefficient
+        alpha: float = 0.6,            # Temporary impact exponent (typically 0.5-1)
+
+        # Permanent impact parameters
+        gamma: float = 0.05,           # Permanent impact coefficient
+        beta: float = 0.5,             # Permanent impact exponent (typically 0.5)
+
+        # Risk parameters
+        sigma_daily: float = 0.02,     # Daily volatility (overridden by conditions if available)
+
+        # Trading parameters
+        execution_horizon_bars: int = 1,  # Bars to execute over
+        risk_aversion: float = 1.0,    # Lambda (risk aversion parameter)
+
+        # Limits
+        max_impact_pct: float = 0.05,  # Maximum total impact
+        max_temporary_pct: float = 0.03,  # Maximum temporary impact
+        max_permanent_pct: float = 0.02,  # Maximum permanent impact
+    ) -> None:
+        """
+        Initialize Almgren-Chriss model.
+
+        Args:
+            eta: Temporary impact coefficient (higher = more temporary slippage)
+            alpha: Temporary impact exponent (0.5 = square root)
+            gamma: Permanent impact coefficient (higher = more price movement)
+            beta: Permanent impact exponent (0.5 = square root)
+            sigma_daily: Default daily volatility
+            execution_horizon_bars: Number of bars over which to execute
+            risk_aversion: Risk aversion parameter (higher = faster execution)
+            max_impact_pct: Cap on total market impact
+            max_temporary_pct: Cap on temporary impact
+            max_permanent_pct: Cap on permanent impact
+        """
+        self.eta = eta
+        self.alpha = alpha
+        self.gamma = gamma
+        self.beta = beta
+        self.sigma_daily = sigma_daily
+        self.execution_horizon_bars = execution_horizon_bars
+        self.risk_aversion = risk_aversion
+        self.max_impact_pct = max_impact_pct
+        self.max_temporary_pct = max_temporary_pct
+        self.max_permanent_pct = max_permanent_pct
+
+        self._logger = logging.getLogger(__name__)
+
+    def calculate_slippage(
+        self,
+        order: Order,
+        conditions: MarketConditions,
+    ) -> Decimal:
+        """
+        Calculate total slippage using Almgren-Chriss model.
+
+        Total slippage = temporary impact + half of permanent impact
+        (half because we're executing at the midpoint of the impact)
+
+        Args:
+            order: Order to calculate slippage for
+            conditions: Current market conditions
+
+        Returns:
+            Slippage per share in price terms
+        """
+        if conditions.avg_daily_volume <= 0:
+            return Decimal("0")
+
+        # Calculate components
+        temporary = self._calculate_temporary_impact(order, conditions)
+        permanent = self._calculate_permanent_impact(order, conditions)
+
+        # Total cost is temporary impact plus half of permanent impact
+        # (we execute at average of pre-trade and post-trade prices)
+        total_impact = temporary + (permanent / Decimal("2"))
+
+        # Log for debugging
+        self._logger.debug(
+            f"Almgren-Chriss impact for {order.symbol}: "
+            f"temp={float(temporary):.6f}, perm={float(permanent):.6f}, "
+            f"total={float(total_impact):.6f}"
+        )
+
+        return total_impact
+
+    def _calculate_temporary_impact(
+        self,
+        order: Order,
+        conditions: MarketConditions,
+    ) -> Decimal:
+        """
+        Calculate temporary (instantaneous) market impact.
+
+        Temporary impact = η × σ × (Q/V)^α × P
+
+        This represents the cost of demanding liquidity - market makers
+        widen spreads for aggressive orders.
+        """
+        # Use provided volatility or default
+        sigma = conditions.volatility if conditions.volatility > 0 else self.sigma_daily
+
+        # Participation rate (order size as fraction of daily volume)
+        participation = float(order.quantity) / conditions.avg_daily_volume
+
+        # Trading rate factor - executing faster increases temporary impact
+        # Adjust for execution horizon (faster execution = higher rate)
+        rate_factor = 1.0 / max(1, self.execution_horizon_bars)
+
+        # Temporary impact formula: η × σ × |participation × rate_factor|^α
+        temp_impact_pct = self.eta * sigma * (participation * rate_factor) ** self.alpha
+
+        # Apply cap
+        temp_impact_pct = min(temp_impact_pct, self.max_temporary_pct)
+
+        return conditions.price * Decimal(str(temp_impact_pct))
+
+    def _calculate_permanent_impact(
+        self,
+        order: Order,
+        conditions: MarketConditions,
+    ) -> Decimal:
+        """
+        Calculate permanent market impact.
+
+        Permanent impact = γ × σ × (Q/V)^β × P
+
+        This represents the information content of the trade - prices
+        move because other market participants infer information.
+        """
+        sigma = conditions.volatility if conditions.volatility > 0 else self.sigma_daily
+
+        # Participation rate
+        participation = float(order.quantity) / conditions.avg_daily_volume
+
+        # Permanent impact formula: γ × σ × |participation|^β
+        perm_impact_pct = self.gamma * sigma * (participation ** self.beta)
+
+        # Apply cap
+        perm_impact_pct = min(perm_impact_pct, self.max_permanent_pct)
+
+        return conditions.price * Decimal(str(perm_impact_pct))
+
+    def calculate_permanent_impact(
+        self,
+        order: Order,
+        conditions: MarketConditions,
+    ) -> Decimal:
+        """Public method for permanent impact (for compatibility)."""
+        return self._calculate_permanent_impact(order, conditions)
+
+    def calculate_optimal_trajectory(
+        self,
+        total_shares: int,
+        conditions: MarketConditions,
+        n_intervals: int = 10,
+    ) -> list[tuple[int, float]]:
+        """
+        Calculate optimal execution trajectory using Almgren-Chriss framework.
+
+        Returns the optimal number of shares to trade at each interval
+        to minimize expected cost + risk.
+
+        Args:
+            total_shares: Total shares to execute
+            conditions: Market conditions
+            n_intervals: Number of trading intervals
+
+        Returns:
+            List of (shares_to_trade, expected_cost) per interval
+        """
+        sigma = conditions.volatility if conditions.volatility > 0 else self.sigma_daily
+        price = float(conditions.price)
+
+        # Almgren-Chriss optimal trajectory parameters
+        # τ = sqrt(λ × σ² / η) where λ is risk aversion
+        if self.eta > 0:
+            tau = np.sqrt(self.risk_aversion * sigma ** 2 / self.eta)
+        else:
+            tau = 1.0
+
+        # Calculate optimal trajectory using exponential decay
+        remaining = total_shares
+        trajectory = []
+
+        for i in range(n_intervals):
+            # Optimal trading rate decreases exponentially
+            time_remaining = n_intervals - i
+            if tau > 0 and time_remaining > 0:
+                # Trade more aggressively at start, less at end
+                trade_fraction = np.exp(-tau * i / n_intervals) / sum(
+                    np.exp(-tau * j / n_intervals) for j in range(time_remaining)
+                )
+            else:
+                trade_fraction = 1.0 / time_remaining if time_remaining > 0 else 0
+
+            shares_this_interval = int(remaining * trade_fraction)
+            shares_this_interval = min(shares_this_interval, remaining)
+
+            # Calculate expected cost for this slice
+            participation = shares_this_interval / conditions.avg_daily_volume if conditions.avg_daily_volume > 0 else 0
+            expected_cost = self.eta * sigma * (participation ** self.alpha) * price * shares_this_interval
+
+            trajectory.append((shares_this_interval, expected_cost))
+            remaining -= shares_this_interval
+
+        return trajectory
+
+    def estimate_total_cost(
+        self,
+        order: Order,
+        conditions: MarketConditions,
+    ) -> dict[str, float]:
+        """
+        Estimate total execution cost breakdown.
+
+        Returns:
+            Dictionary with temporary, permanent, spread, and total costs
+        """
+        temp = float(self._calculate_temporary_impact(order, conditions))
+        perm = float(self._calculate_permanent_impact(order, conditions))
+        spread = float(conditions.spread) / 2  # Half spread cost
+
+        quantity = float(order.quantity)
+        price = float(conditions.price)
+
+        # Cost per share and total
+        temp_per_share = temp
+        perm_per_share = perm / 2  # Average of pre/post trade price
+        spread_per_share = spread
+
+        return {
+            "temporary_per_share": temp_per_share,
+            "permanent_per_share": perm_per_share,
+            "spread_per_share": spread_per_share,
+            "total_per_share": temp_per_share + perm_per_share + spread_per_share,
+            "temporary_total": temp_per_share * quantity,
+            "permanent_total": perm_per_share * quantity,
+            "spread_total": spread_per_share * quantity,
+            "total_cost": (temp_per_share + perm_per_share + spread_per_share) * quantity,
+            "total_cost_bps": ((temp_per_share + perm_per_share + spread_per_share) / price) * 10000,
+        }
+
+
+def create_almgren_chriss_simulator(
+    commission_bps: float = 5.0,
+    eta: float = 0.1,
+    gamma: float = 0.05,
+    base_spread_bps: float = 5.0,
+) -> MarketSimulator:
+    """
+    Create a simulator using the Almgren-Chriss market impact model.
+
+    This is the recommended simulator for institutional-grade backtesting
+    as it provides the most realistic execution cost estimation.
+
+    Args:
+        commission_bps: Commission in basis points
+        eta: Temporary impact coefficient
+        gamma: Permanent impact coefficient
+        base_spread_bps: Base bid-ask spread
+
+    Returns:
+        MarketSimulator with Almgren-Chriss model
+    """
+    return MarketSimulator(
+        slippage_model=AlmgrenChrissModel(
+            eta=eta,
+            gamma=gamma,
+            max_impact_pct=0.05,
+        ),
+        bid_ask_simulator=BidAskSimulator(
+            base_spread_bps=base_spread_bps,
+            volatility_spread_factor=2.0,
+        ),
+        fill_simulator=FillSimulator(
+            fill_probability=0.95,
+            partial_fill_probability=0.10,
+        ),
+        latency_simulator=LatencySimulator(),
+        commission_bps=commission_bps,
+    )
+
+
 class BidAskSimulator:
     """Simulates bid-ask spread and execution at bid/ask."""
 

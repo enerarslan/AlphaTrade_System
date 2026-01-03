@@ -119,29 +119,33 @@ class AccountInfo:
 
     @classmethod
     def from_alpaca(cls, data: dict[str, Any]) -> "AccountInfo":
-        """Create from Alpaca API response."""
+        """Create from Alpaca API response.
+
+        CRITICAL FIX: All monetary values converted through str() to avoid
+        float precision issues. Decimal(0.1) != Decimal("0.1").
+        """
         return cls(
             account_id=data["id"],
             status=data["status"],
             currency=data["currency"],
-            cash=Decimal(data["cash"]),
-            portfolio_value=Decimal(data["portfolio_value"]),
-            buying_power=Decimal(data["buying_power"]),
-            daytrading_buying_power=Decimal(data.get("daytrading_buying_power", "0")),
-            regt_buying_power=Decimal(data.get("regt_buying_power", "0")),
-            equity=Decimal(data["equity"]),
-            last_equity=Decimal(data["last_equity"]),
-            long_market_value=Decimal(data["long_market_value"]),
-            short_market_value=Decimal(data["short_market_value"]),
-            initial_margin=Decimal(data["initial_margin"]),
-            maintenance_margin=Decimal(data["maintenance_margin"]),
+            cash=Decimal(str(data["cash"])),
+            portfolio_value=Decimal(str(data["portfolio_value"])),
+            buying_power=Decimal(str(data["buying_power"])),
+            daytrading_buying_power=Decimal(str(data.get("daytrading_buying_power", "0"))),
+            regt_buying_power=Decimal(str(data.get("regt_buying_power", "0"))),
+            equity=Decimal(str(data["equity"])),
+            last_equity=Decimal(str(data["last_equity"])),
+            long_market_value=Decimal(str(data["long_market_value"])),
+            short_market_value=Decimal(str(data["short_market_value"])),
+            initial_margin=Decimal(str(data["initial_margin"])),
+            maintenance_margin=Decimal(str(data["maintenance_margin"])),
             multiplier=int(data.get("multiplier", 1)),
             pattern_day_trader=data.get("pattern_day_trader", False),
             trading_blocked=data.get("trading_blocked", False),
             transfers_blocked=data.get("transfers_blocked", False),
             account_blocked=data.get("account_blocked", False),
             created_at=datetime.fromisoformat(data["created_at"].replace("Z", "+00:00")),
-            sma=Decimal(data["sma"]) if data.get("sma") else None,
+            sma=Decimal(str(data["sma"])) if data.get("sma") else None,
             daytrade_count=data.get("daytrade_count", 0),
         )
 
@@ -166,21 +170,25 @@ class AlpacaPosition:
 
     @classmethod
     def from_alpaca(cls, data: dict[str, Any]) -> "AlpacaPosition":
-        """Create from Alpaca API response."""
+        """Create from Alpaca API response.
+
+        CRITICAL FIX: All monetary values converted through str() to avoid
+        float precision issues. Decimal(0.1) != Decimal("0.1").
+        """
         return cls(
             symbol=data["symbol"],
-            quantity=Decimal(data["qty"]),
-            avg_entry_price=Decimal(data["avg_entry_price"]),
-            current_price=Decimal(data["current_price"]),
-            market_value=Decimal(data["market_value"]),
-            unrealized_pnl=Decimal(data["unrealized_pl"]),
-            unrealized_pnl_pct=Decimal(data["unrealized_plpc"]),
-            cost_basis=Decimal(data["cost_basis"]),
+            quantity=Decimal(str(data["qty"])),
+            avg_entry_price=Decimal(str(data["avg_entry_price"])),
+            current_price=Decimal(str(data["current_price"])),
+            market_value=Decimal(str(data["market_value"])),
+            unrealized_pnl=Decimal(str(data["unrealized_pl"])),
+            unrealized_pnl_pct=Decimal(str(data["unrealized_plpc"])),
+            cost_basis=Decimal(str(data["cost_basis"])),
             asset_class=data["asset_class"],
             asset_id=data["asset_id"],
             side=data["side"],
             exchange=data["exchange"],
-            change_today=Decimal(data["change_today"]) if data.get("change_today") else None,
+            change_today=Decimal(str(data["change_today"])) if data.get("change_today") else None,
         )
 
     def to_position(self) -> Position:
@@ -237,6 +245,8 @@ class AlpacaOrder:
         if data.get("legs"):
             legs = [cls.from_alpaca(leg) for leg in data["legs"]]
 
+        # CRITICAL FIX: Convert through str() to avoid float precision issues
+        # Decimal(0.1) != Decimal("0.1") due to floating point representation
         return cls(
             order_id=data["id"],
             client_order_id=data["client_order_id"],
@@ -244,11 +254,11 @@ class AlpacaOrder:
             side=data["side"],
             order_type=data["type"],
             time_in_force=data["time_in_force"],
-            quantity=Decimal(data["qty"]),
-            filled_qty=Decimal(data["filled_qty"]),
-            filled_avg_price=Decimal(data["filled_avg_price"]) if data.get("filled_avg_price") else None,
-            limit_price=Decimal(data["limit_price"]) if data.get("limit_price") else None,
-            stop_price=Decimal(data["stop_price"]) if data.get("stop_price") else None,
+            quantity=Decimal(str(data["qty"])),
+            filled_qty=Decimal(str(data["filled_qty"])),
+            filled_avg_price=Decimal(str(data["filled_avg_price"])) if data.get("filled_avg_price") else None,
+            limit_price=Decimal(str(data["limit_price"])) if data.get("limit_price") else None,
+            stop_price=Decimal(str(data["stop_price"])) if data.get("stop_price") else None,
             status=data["status"],
             created_at=parse_time(data["created_at"]) or datetime.now(timezone.utc),
             updated_at=parse_time(data["updated_at"]) or datetime.now(timezone.utc),

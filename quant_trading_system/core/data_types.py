@@ -455,6 +455,15 @@ class Portfolio(BaseModel):
         """Get gross exposure (long + short)."""
         return self.long_exposure + self.short_exposure
 
+    @property
+    def total_value(self) -> Decimal:
+        """Get total portfolio value (cash + positions market value).
+
+        Returns Decimal for JPMorgan-level precision in monetary calculations.
+        This is the authoritative portfolio valuation metric.
+        """
+        return self.cash + self.total_market_value
+
     def get_position(self, symbol: str) -> Position | None:
         """Get position for a symbol."""
         return self.positions.get(symbol.upper())

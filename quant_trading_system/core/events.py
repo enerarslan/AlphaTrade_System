@@ -141,6 +141,10 @@ class Event:
 # Type alias for event handlers
 EventHandler = Callable[[Event], Awaitable[None] | None]
 
+# Type alias for error callbacks
+# Parameters: (event, handler_name, exception)
+ErrorCallback = Callable[[Event, str, Exception], Awaitable[None] | None]
+
 
 @dataclass
 class DeadLetterEntry:
@@ -209,6 +213,8 @@ class EventBus:
         self._event_history: list[Event] = []
         self._max_history_size = 1000
         self._global_handlers: list[tuple[str, EventHandler, int]] = []
+        # JPMorgan-level enhancement: Custom error callbacks for external monitoring
+        self._error_callbacks: list[tuple[str, ErrorCallback]] = []
         self._initialized = True
 
     @classmethod
@@ -298,6 +304,55 @@ class EventBus:
                 if h == handler:
                     handlers.pop(i)
                     logger.debug(f"Handler '{name}' unsubscribed from {event_type.value}")
+                    return True
+        return False
+
+    def register_error_callback(
+        self,
+        callback: ErrorCallback,
+        callback_name: str | None = None,
+    ) -> None:
+        """Register a callback to be invoked when a handler fails.
+
+        THREAD-SAFE: Uses lock to protect callback registration.
+
+        This enables integration with external monitoring systems, custom
+        alerting, and application-specific error recovery logic.
+
+        JPMorgan-level enhancement: Ensures handler errors are not silently
+        swallowed but can be escalated to monitoring systems.
+
+        Args:
+            callback: Function called when a handler fails.
+                      Signature: (event, handler_name, exception) -> None
+            callback_name: Optional name for the callback (for logging).
+
+        Example:
+            >>> async def alert_on_error(event, handler_name, error):
+            ...     await send_alert(f"Handler {handler_name} failed: {error}")
+            >>> bus.register_error_callback(alert_on_error, "alerter")
+        """
+        name = callback_name or getattr(callback, "__name__", "anonymous")
+        with self._lock:
+            self._error_callbacks.append((name, callback))
+        logger.debug(f"Error callback '{name}' registered")
+
+    def unregister_error_callback(self, callback: ErrorCallback) -> bool:
+        """Unregister an error callback.
+
+        THREAD-SAFE: Uses lock to protect callback removal.
+
+        Args:
+            callback: The callback to remove.
+
+        Returns:
+            True if callback was found and removed, False otherwise.
+        """
+        with self._lock:
+            for i, (name, cb) in enumerate(self._error_callbacks):
+                if cb == callback:
+                    self._error_callbacks.pop(i)
+                    logger.debug(f"Error callback '{name}' unregistered")
                     return True
         return False
 
@@ -397,9 +452,12 @@ class EventBus:
             self._handle_error(event, handler_name, e)
 
     def _handle_error(self, event: Event, handler_name: str, error: Exception) -> None:
-        """Handle a handler error by logging and adding to dead letter queue.
+        """Handle a handler error by logging, adding to dead letter queue, and invoking callbacks.
 
         THREAD-SAFE: Uses lock to protect metrics and dead letter queue.
+
+        JPMorgan-level enhancement: Invokes registered error callbacks to enable
+        external monitoring integration and custom error handling.
         """
         with self._lock:
             self._metrics["events_failed"] += 1
@@ -412,10 +470,54 @@ class EventBus:
             )
             self._dead_letter_queue.append(entry)
 
+            # Get snapshot of error callbacks under lock
+            error_callbacks = list(self._error_callbacks)
+
         logger.error(
             f"Handler '{handler_name}' failed for event {event.event_type.value}: {error}",
             exc_info=True,
         )
+
+        # Invoke registered error callbacks (outside lock to prevent deadlocks)
+        for callback_name, callback in error_callbacks:
+            try:
+                result = callback(event, handler_name, error)
+                # Handle async callbacks
+                if asyncio.iscoroutine(result):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self._run_error_callback(callback_name, callback, event, handler_name, error))
+                    except RuntimeError:
+                        # No event loop running, run synchronously with new loop
+                        asyncio.run(result)
+            except Exception as callback_error:
+                # Error callback failures should not propagate - log and continue
+                logger.warning(
+                    f"Error callback '{callback_name}' failed: {callback_error}",
+                    exc_info=True,
+                )
+
+    async def _run_error_callback(
+        self,
+        callback_name: str,
+        callback: ErrorCallback,
+        event: Event,
+        handler_name: str,
+        error: Exception,
+    ) -> None:
+        """Run an async error callback safely.
+
+        Errors in error callbacks are logged but do not propagate.
+        """
+        try:
+            result = callback(event, handler_name, error)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as callback_error:
+            logger.warning(
+                f"Async error callback '{callback_name}' failed: {callback_error}",
+                exc_info=True,
+            )
 
     def _add_to_history(self, event: Event) -> None:
         """Add event to history, maintaining max size."""

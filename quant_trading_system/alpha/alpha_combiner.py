@@ -227,18 +227,29 @@ class ICWeighter(AlphaWeighter):
 
 
 class SharpeWeighter(AlphaWeighter):
-    """Weight alphas by their Sharpe ratio."""
+    """Weight alphas by their Sharpe ratio.
 
-    def __init__(self, lookback: int = 60, annualization: float = 252.0):
+    MAJOR FIX: Uses lagged alpha values with forward returns to prevent
+    look-ahead bias. Alpha at time t is used to predict returns from t to t+1.
+    """
+
+    def __init__(
+        self,
+        lookback: int = 60,
+        annualization: float = 252.0,
+        return_lag: int = 1,
+    ):
         """
         Initialize Sharpe weighter.
 
         Args:
             lookback: Lookback period for Sharpe calculation
             annualization: Annualization factor
+            return_lag: Number of periods to lag returns (default 1 = forward returns)
         """
         self.lookback = lookback
         self.annualization = annualization
+        self.return_lag = return_lag
 
     def compute_weights(
         self,
@@ -246,20 +257,39 @@ class SharpeWeighter(AlphaWeighter):
         returns: np.ndarray | None = None,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Weight by Sharpe ratio of alpha times returns."""
+        """Weight by Sharpe ratio of alpha times returns.
+
+        MAJOR FIX: Now properly aligns alpha values with forward returns
+        to prevent look-ahead bias.
+        """
         if returns is None:
             return EqualWeighter().compute_weights(alpha_values)
 
         sharpes = {}
         for name, values in alpha_values.items():
+            # MAJOR FIX: Align alpha values with FORWARD returns
+            # Alpha at time t should predict returns from t to t+lag
+            # So we use alpha[:-lag] vs returns[lag:]
+            lag = self.return_lag
+            if lag > 0 and len(values) > lag and len(returns) > lag:
+                lagged_alpha = values[:-lag]
+                forward_returns = returns[lag:]
+            else:
+                lagged_alpha = values
+                forward_returns = returns
+
             # Compute alpha returns (signal * forward returns)
-            valid_mask = ~(np.isnan(values) | np.isnan(returns))
+            min_len = min(len(lagged_alpha), len(forward_returns))
+            lagged_alpha = lagged_alpha[-min_len:]
+            forward_returns = forward_returns[-min_len:]
+
+            valid_mask = ~(np.isnan(lagged_alpha) | np.isnan(forward_returns))
             if np.sum(valid_mask) < self.lookback:
                 sharpes[name] = 0.0
                 continue
 
-            alpha_returns = values[valid_mask] * returns[valid_mask]
-            alpha_returns = alpha_returns[-self.lookback :]
+            alpha_returns = lagged_alpha[valid_mask] * forward_returns[valid_mask]
+            alpha_returns = alpha_returns[-self.lookback:]
 
             if len(alpha_returns) >= 10:
                 mean_ret = np.mean(alpha_returns)
@@ -432,16 +462,22 @@ class OptimizedWeighter(AlphaWeighter):
 
 
 class RankWeighter(AlphaWeighter):
-    """Weight alphas by their IC rank."""
+    """Weight alphas by their IC rank.
 
-    def __init__(self, lookback: int = 20):
+    MAJOR FIX: Uses lagged alpha values with forward returns to prevent
+    look-ahead bias.
+    """
+
+    def __init__(self, lookback: int = 20, return_lag: int = 1):
         """
         Initialize rank weighter.
 
         Args:
             lookback: Lookback period for IC calculation
+            return_lag: Number of periods to lag returns (default 1 = forward returns)
         """
         self.lookback = lookback
+        self.return_lag = return_lag
 
     def compute_weights(
         self,
@@ -449,20 +485,33 @@ class RankWeighter(AlphaWeighter):
         returns: np.ndarray | None = None,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Weight by IC rank (higher IC = more weight)."""
+        """Weight by IC rank (higher IC = more weight).
+
+        MAJOR FIX: Now properly aligns alpha values with forward returns
+        to prevent look-ahead bias.
+        """
         if returns is None:
             return EqualWeighter().compute_weights(alpha_values)
 
         # Compute ICs
         ics = {}
         for name, values in alpha_values.items():
-            valid_mask = ~(np.isnan(values) | np.isnan(returns))
+            # MAJOR FIX: Align alpha values with FORWARD returns
+            lag = self.return_lag
+            if lag > 0 and len(values) > lag and len(returns) > lag:
+                lagged_alpha = values[:-lag]
+                forward_returns = returns[lag:]
+            else:
+                lagged_alpha = values
+                forward_returns = returns
+
+            valid_mask = ~(np.isnan(lagged_alpha) | np.isnan(forward_returns))
             if np.sum(valid_mask) < self.lookback:
                 ics[name] = 0.0
                 continue
 
-            valid_alpha = values[valid_mask][-self.lookback :]
-            valid_returns = returns[valid_mask][-self.lookback :]
+            valid_alpha = lagged_alpha[valid_mask][-self.lookback:]
+            valid_returns = forward_returns[valid_mask][-self.lookback:]
 
             if len(valid_alpha) >= 10:
                 ic, _ = stats.spearmanr(valid_alpha, valid_returns)
@@ -489,18 +538,24 @@ class RankWeighter(AlphaWeighter):
 
 
 class DecayWeighter(AlphaWeighter):
-    """Weight alphas with exponential decay based on recency of high IC."""
+    """Weight alphas with exponential decay based on recency of high IC.
 
-    def __init__(self, lookback: int = 60, halflife: int = 20):
+    MAJOR FIX: Uses lagged alpha values with forward returns to prevent
+    look-ahead bias.
+    """
+
+    def __init__(self, lookback: int = 60, halflife: int = 20, return_lag: int = 1):
         """
         Initialize decay weighter.
 
         Args:
             lookback: Lookback period
             halflife: Decay half-life in periods
+            return_lag: Number of periods to lag returns (default 1 = forward returns)
         """
         self.lookback = lookback
         self.halflife = halflife
+        self.return_lag = return_lag
 
     def compute_weights(
         self,
@@ -508,7 +563,11 @@ class DecayWeighter(AlphaWeighter):
         returns: np.ndarray | None = None,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Weight with exponential decay."""
+        """Weight with exponential decay.
+
+        MAJOR FIX: Now properly aligns alpha values with forward returns
+        to prevent look-ahead bias.
+        """
         if returns is None:
             return EqualWeighter().compute_weights(alpha_values)
 
@@ -516,7 +575,16 @@ class DecayWeighter(AlphaWeighter):
         weighted_ics = {}
 
         for name, values in alpha_values.items():
-            valid_mask = ~(np.isnan(values) | np.isnan(returns))
+            # MAJOR FIX: Align alpha values with FORWARD returns
+            lag = self.return_lag
+            if lag > 0 and len(values) > lag and len(returns) > lag:
+                lagged_alpha = values[:-lag]
+                forward_returns = returns[lag:]
+            else:
+                lagged_alpha = values
+                forward_returns = returns
+
+            valid_mask = ~(np.isnan(lagged_alpha) | np.isnan(forward_returns))
             n_valid = np.sum(valid_mask)
 
             if n_valid < 10:
@@ -525,8 +593,8 @@ class DecayWeighter(AlphaWeighter):
 
             # Compute rolling ICs with decay weights
             window = min(self.lookback, n_valid)
-            valid_alpha = values[valid_mask][-window:]
-            valid_returns = returns[valid_mask][-window:]
+            valid_alpha = lagged_alpha[valid_mask][-window:]
+            valid_returns = forward_returns[valid_mask][-window:]
 
             # Compute IC for each sub-window
             sub_window = 10

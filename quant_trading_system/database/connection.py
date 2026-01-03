@@ -31,6 +31,77 @@ from quant_trading_system.core.exceptions import DataConnectionError
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# CONNECTION POOL MONITORING
+# =============================================================================
+
+
+class PoolMetrics:
+    """Metrics for connection pool monitoring.
+
+    Tracks pool usage, wait times, and health for observability.
+    """
+
+    def __init__(self) -> None:
+        self._checkouts: int = 0
+        self._checkins: int = 0
+        self._overflow_count: int = 0
+        self._invalid_count: int = 0
+        self._total_wait_time_ms: float = 0.0
+        self._max_wait_time_ms: float = 0.0
+        self._errors: int = 0
+
+    def record_checkout(self, wait_time_ms: float = 0.0) -> None:
+        """Record a connection checkout from pool."""
+        self._checkouts += 1
+        self._total_wait_time_ms += wait_time_ms
+        self._max_wait_time_ms = max(self._max_wait_time_ms, wait_time_ms)
+
+    def record_checkin(self) -> None:
+        """Record a connection return to pool."""
+        self._checkins += 1
+
+    def record_overflow(self) -> None:
+        """Record creation of overflow connection."""
+        self._overflow_count += 1
+
+    def record_invalid(self) -> None:
+        """Record detection of invalid connection."""
+        self._invalid_count += 1
+
+    def record_error(self) -> None:
+        """Record a connection error."""
+        self._errors += 1
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get pool statistics.
+
+        Returns:
+            Dictionary with pool metrics.
+        """
+        avg_wait = self._total_wait_time_ms / self._checkouts if self._checkouts > 0 else 0.0
+        return {
+            "checkouts": self._checkouts,
+            "checkins": self._checkins,
+            "active_connections": self._checkouts - self._checkins,
+            "overflow_count": self._overflow_count,
+            "invalid_count": self._invalid_count,
+            "avg_wait_time_ms": avg_wait,
+            "max_wait_time_ms": self._max_wait_time_ms,
+            "errors": self._errors,
+        }
+
+    def reset(self) -> None:
+        """Reset all metrics."""
+        self._checkouts = 0
+        self._checkins = 0
+        self._overflow_count = 0
+        self._invalid_count = 0
+        self._total_wait_time_ms = 0.0
+        self._max_wait_time_ms = 0.0
+        self._errors = 0
+
+
 class DatabaseManager:
     """Manages PostgreSQL database connections and sessions.
 

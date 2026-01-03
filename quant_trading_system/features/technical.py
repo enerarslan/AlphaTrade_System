@@ -17,12 +17,210 @@ this module with technical_extended.py.
 
 from __future__ import annotations
 
+import hashlib
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from functools import lru_cache, wraps
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 import polars as pl
+
+
+# =============================================================================
+# MEMOIZATION CACHE FOR INDICATOR CALCULATIONS
+# =============================================================================
+
+
+class IndicatorCache:
+    """
+    Thread-safe LRU cache for indicator calculations.
+
+    Provides memoization to avoid recomputing indicators on the same data.
+    Uses content-based hashing for cache keys.
+    """
+
+    _instance: IndicatorCache | None = None
+    _lock = threading.Lock()
+
+    def __new__(cls) -> IndicatorCache:
+        """Singleton pattern for global cache."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(
+        self,
+        max_size: int = 1000,
+        ttl_seconds: float = 300.0,  # 5 minutes default TTL
+    ) -> None:
+        if self._initialized:
+            return
+
+        self._cache: dict[str, tuple[Any, float]] = {}
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._access_order: list[str] = []
+        self._cache_lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self._initialized = True
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset singleton (for testing)."""
+        with cls._lock:
+            cls._instance = None
+
+    def _make_key(
+        self,
+        indicator_name: str,
+        df_hash: str,
+        params: dict[str, Any]
+    ) -> str:
+        """Create cache key from indicator name, data hash, and parameters."""
+        # Sort params for consistent key generation
+        params_str = str(sorted(params.items()))
+        key_str = f"{indicator_name}:{df_hash}:{params_str}"
+        return hashlib.md5(key_str.encode()).hexdigest()
+
+    def _hash_dataframe(self, df: pl.DataFrame) -> str:
+        """Create hash of DataFrame contents for cache key."""
+        # Use shape and sample of data for fast hashing
+        shape_str = str(df.shape)
+        cols_str = str(df.columns)
+
+        # Sample first, middle, last rows for content hash
+        n = len(df)
+        if n > 0:
+            indices = [0, n // 2, n - 1] if n > 2 else list(range(n))
+            sample_data = []
+            for idx in indices:
+                row = df.row(idx)
+                sample_data.append(str(row))
+            data_str = "|".join(sample_data)
+        else:
+            data_str = "empty"
+
+        hash_input = f"{shape_str}:{cols_str}:{data_str}"
+        return hashlib.md5(hash_input.encode()).hexdigest()
+
+    def get(
+        self,
+        indicator_name: str,
+        df: pl.DataFrame,
+        params: dict[str, Any]
+    ) -> dict[str, np.ndarray] | None:
+        """Get cached result if available and not expired."""
+        df_hash = self._hash_dataframe(df)
+        key = self._make_key(indicator_name, df_hash, params)
+
+        with self._cache_lock:
+            if key in self._cache:
+                result, timestamp = self._cache[key]
+                if time.time() - timestamp < self._ttl_seconds:
+                    self._hits += 1
+                    # Update access order for LRU
+                    if key in self._access_order:
+                        self._access_order.remove(key)
+                    self._access_order.append(key)
+                    return result
+                else:
+                    # Expired, remove from cache
+                    del self._cache[key]
+                    if key in self._access_order:
+                        self._access_order.remove(key)
+
+            self._misses += 1
+            return None
+
+    def set(
+        self,
+        indicator_name: str,
+        df: pl.DataFrame,
+        params: dict[str, Any],
+        result: dict[str, np.ndarray]
+    ) -> None:
+        """Store result in cache."""
+        df_hash = self._hash_dataframe(df)
+        key = self._make_key(indicator_name, df_hash, params)
+
+        with self._cache_lock:
+            # Evict oldest entries if at capacity
+            while len(self._cache) >= self._max_size and self._access_order:
+                oldest_key = self._access_order.pop(0)
+                if oldest_key in self._cache:
+                    del self._cache[oldest_key]
+
+            self._cache[key] = (result, time.time())
+            self._access_order.append(key)
+
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        with self._cache_lock:
+            self._cache.clear()
+            self._access_order.clear()
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get cache statistics."""
+        with self._cache_lock:
+            total = self._hits + self._misses
+            hit_rate = self._hits / total if total > 0 else 0.0
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": hit_rate,
+                "ttl_seconds": self._ttl_seconds,
+            }
+
+
+def cached_indicator(method: Callable) -> Callable:
+    """
+    Decorator to cache indicator compute() results.
+
+    Usage:
+        class MyIndicator(TechnicalIndicator):
+            @cached_indicator
+            def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
+                # expensive computation
+                ...
+    """
+    @wraps(method)
+    def wrapper(self: TechnicalIndicator, df: pl.DataFrame) -> dict[str, np.ndarray]:
+        cache = IndicatorCache()
+
+        # Get indicator parameters for cache key
+        params = {}
+        for attr in dir(self):
+            if not attr.startswith('_') and attr != 'name':
+                val = getattr(self, attr)
+                if isinstance(val, (int, float, str, bool, list, tuple)):
+                    params[attr] = val
+
+        # Check cache
+        cached_result = cache.get(self.name, df, params)
+        if cached_result is not None:
+            return cached_result
+
+        # Compute and cache
+        result = method(self, df)
+        cache.set(self.name, df, params, result)
+        return result
+
+    return wrapper
+
+
+# Global function to get cache instance
+def get_indicator_cache() -> IndicatorCache:
+    """Get the global indicator cache instance."""
+    return IndicatorCache()
 
 
 @dataclass
@@ -307,9 +505,15 @@ class KAMA(TechnicalIndicator):
         # ER = 1 means perfect trend (all movement in one direction)
         # ER = 0 means pure noise (price went nowhere despite movement)
         change = np.abs(close[self.period :] - close[: -self.period])
-        volatility = np.zeros(n - self.period)
-        for i in range(n - self.period):
-            volatility[i] = np.sum(np.abs(np.diff(close[i : i + self.period + 1])))
+
+        # VECTORIZED: Calculate volatility using rolling sum of absolute differences
+        # Instead of loop, use cumsum of absolute differences
+        abs_diff = np.abs(np.diff(close))
+        # Pad with 0 at start to align indices
+        abs_diff_padded = np.concatenate([[0], abs_diff])
+        cumsum_abs_diff = np.cumsum(abs_diff_padded)
+        # Rolling sum = cumsum[i+period] - cumsum[i]
+        volatility = cumsum_abs_diff[self.period:] - cumsum_abs_diff[:-self.period]
 
         # Avoid division by zero
         volatility = np.where(volatility == 0, 1e-10, volatility)
@@ -416,20 +620,26 @@ class ADX(TechnicalIndicator):
         close = df["close"].to_numpy().astype(np.float64)
 
         n = len(close)
+
+        # VECTORIZED: Calculate TR, +DM, -DM without loops
+        # True Range calculation
         tr = np.zeros(n)
-        plus_dm = np.zeros(n)
-        minus_dm = np.zeros(n)
+        tr[0] = high[0] - low[0]
+        hl = high[1:] - low[1:]
+        hc = np.abs(high[1:] - close[:-1])
+        lc = np.abs(low[1:] - close[:-1])
+        tr[1:] = np.maximum(np.maximum(hl, hc), lc)
 
-        for i in range(1, n):
-            h_diff = high[i] - high[i - 1]
-            l_diff = low[i - 1] - low[i]
+        # Directional Movement calculation
+        h_diff = np.zeros(n)
+        l_diff = np.zeros(n)
+        h_diff[1:] = high[1:] - high[:-1]
+        l_diff[1:] = low[:-1] - low[1:]
 
-            plus_dm[i] = h_diff if h_diff > l_diff and h_diff > 0 else 0
-            minus_dm[i] = l_diff if l_diff > h_diff and l_diff > 0 else 0
-
-            tr[i] = max(
-                high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1])
-            )
+        # +DM: h_diff if h_diff > l_diff and h_diff > 0, else 0
+        plus_dm = np.where((h_diff > l_diff) & (h_diff > 0), h_diff, 0)
+        # -DM: l_diff if l_diff > h_diff and l_diff > 0, else 0
+        minus_dm = np.where((l_diff > h_diff) & (l_diff > 0), l_diff, 0)
 
         # Smooth with Wilder's method
         atr = self._wilder_smooth(tr, self.period)
@@ -472,20 +682,26 @@ class Aroon(TechnicalIndicator):
         aroon_up = np.full(n, np.nan)
         aroon_down = np.full(n, np.nan)
 
+        # VECTORIZED using numpy stride tricks for rolling window operations
         # LOOK-AHEAD BIAS FIX: Window should be exactly 'period' elements
-        # Previously used [i - period : i + 1] which gave period+1 elements
-        # Fixed to use [i - period + 1 : i + 1] for exactly 'period' elements
-        for i in range(self.period - 1, n):
-            # Correct window: last 'period' bars ending at current bar i
-            window_high = high[i - self.period + 1 : i + 1]  # Exactly period elements
-            window_low = low[i - self.period + 1 : i + 1]    # Exactly period elements
+        if n >= self.period:
+            from numpy.lib.stride_tricks import sliding_window_view
+
+            # Create rolling windows for high and low
+            high_windows = sliding_window_view(high, self.period)
+            low_windows = sliding_window_view(low, self.period)
+
+            # Find argmax/argmin for each window (vectorized)
+            argmax_high = np.argmax(high_windows, axis=1)
+            argmin_low = np.argmin(low_windows, axis=1)
 
             # Days since highest high / lowest low within the window
-            days_since_high = (self.period - 1) - np.argmax(window_high)
-            days_since_low = (self.period - 1) - np.argmin(window_low)
+            days_since_high = (self.period - 1) - argmax_high
+            days_since_low = (self.period - 1) - argmin_low
 
-            aroon_up[i] = ((self.period - days_since_high) / self.period) * 100
-            aroon_down[i] = ((self.period - days_since_low) / self.period) * 100
+            # Calculate Aroon values
+            aroon_up[self.period - 1:] = ((self.period - days_since_high) / self.period) * 100
+            aroon_down[self.period - 1:] = ((self.period - days_since_low) / self.period) * 100
 
         aroon_osc = aroon_up - aroon_down
 
@@ -713,9 +929,15 @@ class Ichimoku(TechnicalIndicator):
         n = len(close)
 
         def midpoint(h: np.ndarray, l: np.ndarray, period: int) -> np.ndarray:
+            """VECTORIZED midpoint calculation using sliding_window_view."""
             result = np.full(len(h), np.nan)
-            for i in range(period - 1, len(h)):
-                result[i] = (np.max(h[i - period + 1 : i + 1]) + np.min(l[i - period + 1 : i + 1])) / 2
+            if len(h) >= period:
+                from numpy.lib.stride_tricks import sliding_window_view
+                h_windows = sliding_window_view(h, period)
+                l_windows = sliding_window_view(l, period)
+                max_h = np.max(h_windows, axis=1)
+                min_l = np.min(l_windows, axis=1)
+                result[period - 1:] = (max_h + min_l) / 2
             return result
 
         tenkan_sen = midpoint(high, low, self.tenkan)
@@ -874,13 +1096,24 @@ class StochasticOscillator(TechnicalIndicator):
         n = len(close)
         stoch_k = np.full(n, np.nan)
 
-        for i in range(self.k_period - 1, n):
-            highest = np.max(high[i - self.k_period + 1 : i + 1])
-            lowest = np.min(low[i - self.k_period + 1 : i + 1])
-            if highest != lowest:
-                stoch_k[i] = 100 * (close[i] - lowest) / (highest - lowest)
-            else:
-                stoch_k[i] = 50
+        # VECTORIZED using sliding_window_view
+        if n >= self.k_period:
+            from numpy.lib.stride_tricks import sliding_window_view
+            high_windows = sliding_window_view(high, self.k_period)
+            low_windows = sliding_window_view(low, self.k_period)
+
+            highest = np.max(high_windows, axis=1)
+            lowest = np.min(low_windows, axis=1)
+            close_aligned = close[self.k_period - 1:]
+
+            range_hl = highest - lowest
+            # Avoid division by zero
+            range_hl = np.where(range_hl == 0, 1, range_hl)
+            stoch_k[self.k_period - 1:] = np.where(
+                highest != lowest,
+                100 * (close_aligned - lowest) / range_hl,
+                50
+            )
 
         stoch_d = SMA._rolling_mean(stoch_k, self.d_period)
 
@@ -943,13 +1176,23 @@ class WilliamsR(TechnicalIndicator):
         n = len(close)
         williams_r = np.full(n, np.nan)
 
-        for i in range(self.period - 1, n):
-            highest = np.max(high[i - self.period + 1 : i + 1])
-            lowest = np.min(low[i - self.period + 1 : i + 1])
-            if highest != lowest:
-                williams_r[i] = -100 * (highest - close[i]) / (highest - lowest)
-            else:
-                williams_r[i] = -50
+        # VECTORIZED using sliding_window_view
+        if n >= self.period:
+            from numpy.lib.stride_tricks import sliding_window_view
+            high_windows = sliding_window_view(high, self.period)
+            low_windows = sliding_window_view(low, self.period)
+
+            highest = np.max(high_windows, axis=1)
+            lowest = np.min(low_windows, axis=1)
+            close_aligned = close[self.period - 1:]
+
+            range_hl = highest - lowest
+            range_hl_safe = np.where(range_hl == 0, 1, range_hl)
+            williams_r[self.period - 1:] = np.where(
+                highest != lowest,
+                -100 * (highest - close_aligned) / range_hl_safe,
+                -50
+            )
 
         return {f"williams_r_{self.period}": williams_r}
 
@@ -974,8 +1217,16 @@ class CCI(TechnicalIndicator):
         n = len(tp)
         mean_dev = np.full(n, np.nan)
 
-        for i in range(self.period - 1, n):
-            mean_dev[i] = np.mean(np.abs(tp[i - self.period + 1 : i + 1] - sma_tp[i]))
+        # VECTORIZED mean deviation calculation
+        if n >= self.period:
+            from numpy.lib.stride_tricks import sliding_window_view
+            tp_windows = sliding_window_view(tp, self.period)
+            # For each window, compute mean absolute deviation from sma_tp at that position
+            # sma_tp[self.period - 1:] contains the SMA values aligned with windows
+            sma_aligned = sma_tp[self.period - 1:]
+            # Expand sma_aligned to match window shape for broadcasting
+            deviations = np.abs(tp_windows - sma_aligned[:, np.newaxis])
+            mean_dev[self.period - 1:] = np.mean(deviations, axis=1)
 
         cci = (tp - sma_tp) / (self.constant * np.where(mean_dev == 0, 1, mean_dev))
 
@@ -1290,9 +1541,13 @@ class DonchianChannel(TechnicalIndicator):
         upper = np.full(n, np.nan)
         lower = np.full(n, np.nan)
 
-        for i in range(self.period - 1, n):
-            upper[i] = np.max(high[i - self.period + 1 : i + 1])
-            lower[i] = np.min(low[i - self.period + 1 : i + 1])
+        # VECTORIZED using sliding_window_view
+        if n >= self.period:
+            from numpy.lib.stride_tricks import sliding_window_view
+            high_windows = sliding_window_view(high, self.period)
+            low_windows = sliding_window_view(low, self.period)
+            upper[self.period - 1:] = np.max(high_windows, axis=1)
+            lower[self.period - 1:] = np.min(low_windows, axis=1)
 
         middle = (upper + lower) / 2
 
@@ -1435,16 +1690,17 @@ class OBV(TechnicalIndicator):
         close = df["close"].to_numpy().astype(np.float64)
         volume = df["volume"].to_numpy().astype(np.float64)
 
-        obv = np.zeros(len(close))
-        obv[0] = volume[0]
+        # VECTORIZED OBV calculation
+        # Compute sign of price changes: +1 for up, -1 for down, 0 for flat
+        price_diff = np.diff(close, prepend=close[0])
+        direction = np.sign(price_diff)
+        direction[0] = 0  # First bar has no prior comparison
 
-        for i in range(1, len(close)):
-            if close[i] > close[i - 1]:
-                obv[i] = obv[i - 1] + volume[i]
-            elif close[i] < close[i - 1]:
-                obv[i] = obv[i - 1] - volume[i]
-            else:
-                obv[i] = obv[i - 1]
+        # Volume with direction
+        directed_volume = direction * volume
+
+        # OBV is cumulative sum of directed volume
+        obv = np.cumsum(directed_volume)
 
         return {"obv": obv}
 
@@ -1517,24 +1773,39 @@ class MFI(TechnicalIndicator):
         tp = (high + low + close) / 3
         raw_mf = tp * volume
 
-        pos_mf = np.zeros(len(tp))
-        neg_mf = np.zeros(len(tp))
-
-        for i in range(1, len(tp)):
-            if tp[i] > tp[i - 1]:
-                pos_mf[i] = raw_mf[i]
-            elif tp[i] < tp[i - 1]:
-                neg_mf[i] = raw_mf[i]
+        # VECTORIZED: Compute positive and negative money flow
+        tp_diff = np.diff(tp, prepend=tp[0])
+        pos_mf = np.where(tp_diff > 0, raw_mf, 0)
+        neg_mf = np.where(tp_diff < 0, raw_mf, 0)
+        pos_mf[0] = 0  # First bar has no comparison
+        neg_mf[0] = 0
 
         n = len(close)
         mfi = np.full(n, np.nan)
-        for i in range(self.period, n):
-            pos_sum = np.sum(pos_mf[i - self.period + 1 : i + 1])
-            neg_sum = np.sum(neg_mf[i - self.period + 1 : i + 1])
-            if neg_sum != 0:
-                mfi[i] = 100 - (100 / (1 + pos_sum / neg_sum))
-            else:
-                mfi[i] = 100
+
+        # VECTORIZED: Rolling sum using cumsum
+        if n >= self.period:
+            cumsum_pos = np.cumsum(pos_mf)
+            cumsum_neg = np.cumsum(neg_mf)
+
+            # Rolling sum = cumsum[i] - cumsum[i-period]
+            pos_sum = np.zeros(n)
+            neg_sum = np.zeros(n)
+
+            pos_sum[self.period:] = cumsum_pos[self.period:] - cumsum_pos[:-self.period]
+            neg_sum[self.period:] = cumsum_neg[self.period:] - cumsum_neg[:-self.period]
+
+            # Handle first valid window
+            pos_sum[self.period - 1] = cumsum_pos[self.period - 1]
+            neg_sum[self.period - 1] = cumsum_neg[self.period - 1]
+
+            # Calculate MFI
+            neg_sum_safe = np.where(neg_sum == 0, 1e-10, neg_sum)
+            mfi[self.period - 1:] = np.where(
+                neg_sum[self.period - 1:] != 0,
+                100 - (100 / (1 + pos_sum[self.period - 1:] / neg_sum_safe[self.period - 1:])),
+                100
+            )
 
         return {f"mfi_{self.period}": mfi}
 
@@ -1709,14 +1980,19 @@ class RollingHighLow(TechnicalIndicator):
         low = df["low"].to_numpy().astype(np.float64)
         results = {}
 
+        # VECTORIZED using sliding_window_view
+        from numpy.lib.stride_tricks import sliding_window_view
+        n = len(high)
+
         for period in self.periods:
-            n = len(high)
             roll_high = np.full(n, np.nan)
             roll_low = np.full(n, np.nan)
 
-            for i in range(period - 1, n):
-                roll_high[i] = np.max(high[i - period + 1 : i + 1])
-                roll_low[i] = np.min(low[i - period + 1 : i + 1])
+            if n >= period:
+                high_windows = sliding_window_view(high, period)
+                low_windows = sliding_window_view(low, period)
+                roll_high[period - 1:] = np.max(high_windows, axis=1)
+                roll_low[period - 1:] = np.min(low_windows, axis=1)
 
             results[f"rolling_high_{period}"] = roll_high
             results[f"rolling_low_{period}"] = roll_low

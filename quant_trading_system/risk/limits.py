@@ -53,6 +53,9 @@ class KillSwitchReason(str, Enum):
     BROKER_CONNECTION_LOSS = "broker_connection_loss"
     MANUAL_ACTIVATION = "manual_activation"
     LIMIT_BREACH = "limit_breach"
+    # MAJOR FIX: Consecutive losses circuit breaker
+    CONSECUTIVE_LOSSES = "consecutive_losses"
+    STRATEGY_EXCEPTION = "strategy_exception"
 
 
 @dataclass
@@ -149,6 +152,18 @@ class RiskLimitsConfig(BaseModel):
     min_order_value: Decimal = Field(default=Decimal("100"), ge=0, description="Min order value")
     max_order_value: Decimal = Field(default=Decimal("50000"), ge=0, description="Max single order value")
 
+    # MAJOR FIX: Consecutive loss circuit breaker
+    max_consecutive_losses: int = Field(
+        default=5,
+        ge=1,
+        description="Max consecutive losing trades before halting. Default 5."
+    )
+    consecutive_loss_cooldown_minutes: int = Field(
+        default=60,
+        ge=0,
+        description="Cooldown period after consecutive loss halt. Default 60 minutes."
+    )
+
     # Blacklist
     symbol_blacklist: list[str] = Field(default_factory=list, description="Symbols not allowed to trade")
 
@@ -157,6 +172,183 @@ class RiskLimitsConfig(BaseModel):
     trading_start_minute: int = Field(default=30, ge=0, le=59, description="Trading start minute")
     trading_end_hour: int = Field(default=16, ge=0, le=23, description="Trading end hour")
     trading_end_minute: int = Field(default=0, ge=0, le=59, description="Trading end minute")
+
+
+class ConsecutiveLossCircuitBreaker:
+    """MAJOR FIX: Circuit breaker for consecutive losing trades.
+
+    Tracks trade outcomes and halts trading when a configurable number
+    of consecutive losses occurs. This prevents runaway losses from
+    compounding during adverse market conditions or strategy failures.
+
+    THREAD-SAFE: Uses RLock for all state modifications.
+    """
+
+    def __init__(
+        self,
+        config: RiskLimitsConfig | None = None,
+        kill_switch: "KillSwitch | None" = None,
+        event_bus: EventBus | None = None,
+    ) -> None:
+        """Initialize circuit breaker.
+
+        Args:
+            config: Risk limits configuration.
+            kill_switch: Kill switch to activate on breach.
+            event_bus: Event bus for publishing alerts.
+        """
+        self.config = config or RiskLimitsConfig()
+        self.kill_switch = kill_switch
+        self.event_bus = event_bus
+        self._lock = threading.RLock()
+
+        # Track consecutive losses
+        self._consecutive_losses: int = 0
+        self._is_halted: bool = False
+        self._halted_at: datetime | None = None
+        self._trade_history: list[tuple[datetime, bool]] = []  # (time, is_win)
+
+    def record_trade(self, pnl: Decimal) -> tuple[bool, str | None]:
+        """Record a completed trade outcome.
+
+        THREAD-SAFE: Uses lock for atomic updates.
+
+        Args:
+            pnl: Profit/loss of the trade.
+
+        Returns:
+            Tuple of (should_halt, reason).
+        """
+        with self._lock:
+            is_win = pnl >= 0
+            now = datetime.now(timezone.utc)
+            self._trade_history.append((now, is_win))
+
+            # Keep only last 100 trades for memory efficiency
+            if len(self._trade_history) > 100:
+                self._trade_history = self._trade_history[-100:]
+
+            if is_win:
+                # Reset consecutive loss counter on winning trade
+                self._consecutive_losses = 0
+                return False, None
+
+            # Increment consecutive losses
+            self._consecutive_losses += 1
+            logger.warning(
+                f"Consecutive loss #{self._consecutive_losses} recorded. "
+                f"Threshold: {self.config.max_consecutive_losses}"
+            )
+
+            if self._consecutive_losses >= self.config.max_consecutive_losses:
+                return self._trigger_halt()
+
+            return False, None
+
+    def _trigger_halt(self) -> tuple[bool, str]:
+        """Trigger trading halt due to consecutive losses.
+
+        Returns:
+            Tuple of (True, reason).
+        """
+        self._is_halted = True
+        self._halted_at = datetime.now(timezone.utc)
+
+        reason = (
+            f"Consecutive loss circuit breaker triggered: "
+            f"{self._consecutive_losses} consecutive losses "
+            f"(threshold: {self.config.max_consecutive_losses})"
+        )
+        logger.critical(reason)
+
+        # Activate kill switch if available
+        if self.kill_switch:
+            self.kill_switch.activate(
+                reason=KillSwitchReason.CONSECUTIVE_LOSSES,
+                trigger_value=float(self._consecutive_losses),
+                activated_by="consecutive_loss_circuit_breaker",
+            )
+
+        # Publish event
+        if self.event_bus:
+            event = create_risk_event(
+                event_type=EventType.LIMIT_BREACH,
+                risk_data={
+                    "type": "consecutive_loss_circuit_breaker",
+                    "consecutive_losses": self._consecutive_losses,
+                    "threshold": self.config.max_consecutive_losses,
+                },
+                source="ConsecutiveLossCircuitBreaker",
+            )
+            self.event_bus.publish(event)
+
+        return True, reason
+
+    def can_trade(self) -> tuple[bool, str | None]:
+        """Check if trading is allowed.
+
+        THREAD-SAFE: Uses lock for consistent read.
+
+        Returns:
+            Tuple of (can_trade, reason_if_not).
+        """
+        with self._lock:
+            if not self._is_halted:
+                return True, None
+
+            if self._halted_at is None:
+                return True, None
+
+            # Check if cooldown has elapsed
+            elapsed = datetime.now(timezone.utc) - self._halted_at
+            cooldown = timedelta(minutes=self.config.consecutive_loss_cooldown_minutes)
+
+            if elapsed >= cooldown:
+                # Cooldown elapsed - auto-reset
+                self._is_halted = False
+                self._consecutive_losses = 0
+                logger.info("Consecutive loss circuit breaker cooldown elapsed - trading resumed")
+                return True, None
+
+            remaining = cooldown - elapsed
+            minutes = int(remaining.total_seconds() / 60)
+            seconds = int(remaining.total_seconds() % 60)
+            return False, f"Consecutive loss halt - cooldown remaining: {minutes}m {seconds}s"
+
+    def reset(self, authorized_by: str) -> None:
+        """Manually reset the circuit breaker.
+
+        Args:
+            authorized_by: Who authorized the reset.
+        """
+        with self._lock:
+            logger.warning(f"Consecutive loss circuit breaker reset by: {authorized_by}")
+            self._is_halted = False
+            self._consecutive_losses = 0
+            self._halted_at = None
+
+    @property
+    def consecutive_losses(self) -> int:
+        """Get current consecutive loss count."""
+        with self._lock:
+            return self._consecutive_losses
+
+    @property
+    def is_halted(self) -> bool:
+        """Check if circuit breaker is halted."""
+        with self._lock:
+            return self._is_halted
+
+    def get_status(self) -> dict[str, Any]:
+        """Get circuit breaker status."""
+        with self._lock:
+            return {
+                "consecutive_losses": self._consecutive_losses,
+                "threshold": self.config.max_consecutive_losses,
+                "is_halted": self._is_halted,
+                "halted_at": self._halted_at.isoformat() if self._halted_at else None,
+                "cooldown_minutes": self.config.consecutive_loss_cooldown_minutes,
+            }
 
 
 class PreTradeRiskChecker:
@@ -782,6 +974,7 @@ class KillSwitch:
         cancel_orders_callback: Callable[[], int] | None = None,
         close_positions_callback: Callable[[], int] | None = None,
         cooldown_minutes: int | None = None,
+        violation_checker: Callable[[KillSwitchReason], tuple[bool, str]] | None = None,
     ) -> None:
         """Initialize kill switch.
 
@@ -791,6 +984,9 @@ class KillSwitch:
             cancel_orders_callback: Callback to cancel all orders.
             close_positions_callback: Callback to close all positions.
             cooldown_minutes: Override default cooldown period (default: 30 minutes).
+            violation_checker: CRITICAL FIX - Callback to verify violation condition has cleared.
+                              Takes KillSwitchReason, returns (is_cleared, message).
+                              Reset is blocked if violation is still active.
         """
         self.config = config or RiskLimitsConfig()
         self.event_bus = event_bus
@@ -801,6 +997,8 @@ class KillSwitch:
         self._lock = threading.RLock()
         # Cooldown period configuration
         self._cooldown_minutes = cooldown_minutes if cooldown_minutes is not None else self.COOLDOWN_MINUTES
+        # CRITICAL FIX: Violation checker to verify condition has cleared before reset
+        self._violation_checker = violation_checker
 
     def check_conditions(
         self,
@@ -970,19 +1168,65 @@ class KillSwitch:
 
             return True, None
 
+    def set_violation_checker(
+        self,
+        checker: Callable[[KillSwitchReason], tuple[bool, str]] | None,
+    ) -> None:
+        """Set the violation checker callback.
+
+        CRITICAL: This allows runtime configuration of violation verification.
+
+        Args:
+            checker: Callback that takes KillSwitchReason, returns (is_cleared, message).
+        """
+        with self._lock:
+            self._violation_checker = checker
+
+    def check_violation_cleared(self) -> tuple[bool, str]:
+        """Check if the original violation condition has cleared.
+
+        CRITICAL FIX: This prevents premature reset when the violation is still active.
+
+        Returns:
+            Tuple of (is_cleared, message).
+        """
+        with self._lock:
+            if not self.state.is_active or self.state.reason is None:
+                return True, "No active violation"
+
+            if self._violation_checker is None:
+                # If no checker is configured, allow reset with warning
+                logger.warning(
+                    "No violation checker configured - allowing reset without verification. "
+                    "This is a safety gap. Configure a violation_checker for JPMorgan-level safety."
+                )
+                return True, "No violation checker configured"
+
+            try:
+                is_cleared, message = self._violation_checker(self.state.reason)
+                if not is_cleared:
+                    logger.warning(
+                        f"Violation condition still active: {message}"
+                    )
+                return is_cleared, message
+            except Exception as e:
+                logger.error(f"Violation checker failed: {e}")
+                # Fail-safe: don't allow reset if checker fails
+                return False, f"Violation checker error: {e}"
+
     def reset(
         self,
         authorized_by: str,
         force: bool = False,
         override_code: str | None = None,
     ) -> tuple[bool, str]:
-        """Reset the kill switch with cooldown enforcement.
+        """Reset the kill switch with cooldown and violation verification.
 
         THREAD-SAFE: Uses lock for atomic reset.
 
-        SAFETY: The kill switch cannot be reset until the cooldown period (30 minutes)
-        has elapsed since activation. This prevents premature re-enabling of trading
-        after a risk event.
+        SAFETY: The kill switch cannot be reset until:
+        1. The cooldown period (30 minutes) has elapsed since activation
+        2. CRITICAL FIX: The original violation condition has cleared
 
         CRITICAL FIX: Force reset now requires an override_code that must match
         the KILL_SWITCH_OVERRIDE_CODE environment variable. This implements
@@ -990,7 +1234,7 @@ class KillSwitch:
 
         Args:
             authorized_by: Who authorized the reset.
-            force: If True, bypass cooldown check (DANGEROUS - use only in emergencies).
+            force: If True, bypass cooldown AND violation check (DANGEROUS).
                    Requires explicit acknowledgment and will be logged at CRITICAL level.
             override_code: Required for force=True. Must match KILL_SWITCH_OVERRIDE_CODE
                           environment variable.
@@ -1012,6 +1256,15 @@ class KillSwitch:
                         f"Kill switch reset DENIED for {authorized_by}: {reason}"
                     )
                     return False, reason or "Cannot reset"
+
+                # CRITICAL FIX: Verify violation condition has cleared
+                is_cleared, violation_msg = self.check_violation_cleared()
+                if not is_cleared:
+                    logger.warning(
+                        f"Kill switch reset DENIED for {authorized_by}: "
+                        f"Violation condition still active - {violation_msg}"
+                    )
+                    return False, f"Violation still active: {violation_msg}"
 
             # Force override - requires 2-factor authorization
             if force:
