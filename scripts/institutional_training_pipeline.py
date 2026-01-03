@@ -94,6 +94,15 @@ from quant_trading_system.alpha.momentum_alphas import (
     RsiMomentum,
 )
 
+# Import P2-B: Purged Cross-Validation
+from quant_trading_system.models.purged_cv import (
+    PurgedKFold,
+    create_purged_cv,
+)
+
+# Import P2-C: IC-Based Ensemble
+from quant_trading_system.models.ensemble import ICBasedEnsemble
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -289,6 +298,22 @@ class InstitutionalTrainingPipeline:
             PriceMomentum(lookback=60),
             RsiMomentum(period=14),
         ]
+
+        # ===== PURGED CROSS-VALIDATION (P2-B Enhancement) =====
+        self.purged_cv = create_purged_cv(
+            n_splits=5,
+            purge_gap=5,
+            embargo_pct=0.01,
+        )
+        logger.info("Purged Cross-Validation ENABLED (P2-B)")
+
+        # ===== IC-BASED ENSEMBLE (P2-C Enhancement) =====
+        self.ic_ensemble = ICBasedEnsemble(
+            name="institutional_ic_ensemble",
+            ic_lookback=60,
+            min_ic_threshold=0.02,
+        )
+        logger.info("IC-Based Ensemble ENABLED (P2-C)")
 
         # ===== MODEL VALIDATION GATES =====
         if enable_validation_gates:

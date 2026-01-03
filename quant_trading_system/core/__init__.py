@@ -47,6 +47,13 @@ from .exceptions import (
 )
 from .events import EventBus, Event, EventType
 from .registry import ComponentRegistry, registry
+from .system_integrator import (
+    IntegratorState,
+    SystemIntegrator,
+    SystemIntegratorConfig,
+    create_system_integrator,
+    get_system_integrator,
+)
 
 __all__ = [
     # Data types
@@ -94,4 +101,10 @@ __all__ = [
     # Registry
     "ComponentRegistry",
     "registry",
+    # System Integrator
+    "IntegratorState",
+    "SystemIntegrator",
+    "SystemIntegratorConfig",
+    "create_system_integrator",
+    "get_system_integrator",
 ]

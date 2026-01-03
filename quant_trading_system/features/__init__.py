@@ -88,12 +88,14 @@ from .optimized_pipeline import (
     CacheBackend,
     ComputeMode,
     FeatureSpec,
+    GPUVectorizedCalculators,
     HybridCache,
     MemoryCache as OptimizedMemoryCache,
     OptimizedFeaturePipeline,
     OptimizedPipelineConfig,
     VectorizedCalculators,
     create_optimized_pipeline,
+    CUDF_AVAILABLE,
 )
 from .technical import (
     ADX,
@@ -280,5 +282,7 @@ __all__ = [
     "OptimizedFeaturePipeline",
     "OptimizedPipelineConfig",
     "VectorizedCalculators",
+    "GPUVectorizedCalculators",
+    "CUDF_AVAILABLE",
     "create_optimized_pipeline",
 ]

@@ -1,0 +1,428 @@
+# Multi-Region Kubernetes Deployment Configuration
+# AlphaTrade System - Production Multi-Region Setup
+#
+# This configuration enables deployment across multiple regions for:
+# - Latency optimization (closer to exchanges)
+# - High availability and disaster recovery
+# - Regional data residency compliance
+#
+# Supported regions:
+# - us-east-1: Primary (NYSE/NASDAQ proximity)
+# - us-west-2: Secondary (West Coast users, DR)
+# - eu-west-1: European markets (optional)
+# - ap-northeast-1: Asian markets (optional)
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alphatrade
+  labels:
+    app: alphatrade
+    environment: production
+
+---
+# ConfigMap for region-specific settings
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alphatrade-region-config
+  namespace: alphatrade
+data:
+  REGION: "${REGION:-us-east-1}"
+  PRIMARY_REGION: "us-east-1"
+  ENABLE_CROSS_REGION_REPLICATION: "true"
+  REGIONAL_LATENCY_THRESHOLD_MS: "50"
+  # Exchange proximity settings
+  NYSE_REGION: "us-east-1"
+  NASDAQ_REGION: "us-east-1"
+  CME_REGION: "us-central-1"
+
+---
+# Secret for sensitive configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alphatrade-secrets
+  namespace: alphatrade
+type: Opaque
+stringData:
+  ALPACA_API_KEY: "${ALPACA_API_KEY}"
+  ALPACA_API_SECRET: "${ALPACA_API_SECRET}"
+  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+  REDIS_PASSWORD: "${REDIS_PASSWORD}"
+  GRAFANA_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
+
+---
+# Main Trading Application Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alphatrade-trading
+  namespace: alphatrade
+  labels:
+    app: alphatrade
+    component: trading
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: alphatrade
+      component: trading
+  template:
+    metadata:
+      labels:
+        app: alphatrade
+        component: trading
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: alphatrade
+                    component: trading
+                topologyKey: topology.kubernetes.io/zone
+      containers:
+        - name: trading-app
+          image: alphatrade/trading-app:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: alphatrade-region-config
+            - secretRef:
+                name: alphatrade-secrets
+          env:
+            - name: APP_ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FORMAT
+              value: "json"
+            - name: DATABASE__HOST
+              value: "alphatrade-postgres"
+            - name: DATABASE__PORT
+              value: "5432"
+            - name: DATABASE__NAME
+              value: "quant_trading"
+            - name: REDIS__HOST
+              value: "alphatrade-redis"
+            - name: REDIS__PORT
+              value: "6379"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+            - name: models
+              mountPath: /app/models_artifacts
+      volumes:
+        - name: logs
+          emptyDir: {}
+        - name: models
+          persistentVolumeClaim:
+            claimName: alphatrade-models-pvc
+
+---
+# Trading Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: alphatrade-trading
+  namespace: alphatrade
+  labels:
+    app: alphatrade
+    component: trading
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: http
+  selector:
+    app: alphatrade
+    component: trading
+
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: alphatrade-postgres
+  namespace: alphatrade
+spec:
+  serviceName: alphatrade-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alphatrade
+      component: postgres
+  template:
+    metadata:
+      labels:
+        app: alphatrade
+        component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: timescale/timescaledb:latest-pg15
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "quant_trading"
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: alphatrade-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+                - -d
+                - quant_trading
+            initialDelaySeconds: 30
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 100Gi
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: alphatrade-postgres
+  namespace: alphatrade
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: alphatrade
+    component: postgres
+
+---
+# Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alphatrade-redis
+  namespace: alphatrade
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alphatrade
+      component: redis
+  template:
+    metadata:
+      labels:
+        app: alphatrade
+        component: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --maxmemory
+            - 512mb
+            - --maxmemory-policy
+            - allkeys-lru
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: alphatrade-redis
+  namespace: alphatrade
+spec:
+  type: ClusterIP
+  ports:
+    - port: 6379
+      targetPort: 6379
+  selector:
+    app: alphatrade
+    component: redis
+
+---
+# Models PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alphatrade-models-pvc
+  namespace: alphatrade
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# Horizontal Pod Autoscaler for Trading App
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: alphatrade-trading-hpa
+  namespace: alphatrade
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: alphatrade-trading
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+---
+# Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alphatrade-trading-pdb
+  namespace: alphatrade
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: alphatrade
+      component: trading
+
+---
+# Network Policy - Only allow traffic within namespace and from ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alphatrade-network-policy
+  namespace: alphatrade
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: alphatrade
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: alphatrade
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

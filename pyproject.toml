@@ -99,6 +99,31 @@ docs = [
     "mkdocs-material>=9.5.0",
     "mkdocstrings[python]>=0.24.0",
 ]
+# GPU acceleration for feature computation (cuDF/RAPIDS)
+# Note: Requires NVIDIA GPU and CUDA 11.8+
+# Install via: pip install cudf-cu11 cupy-cuda11x
+gpu = [
+    "numba>=0.58.0",
+    # cudf and cupy are installed separately via conda or pip
+    # as they require specific CUDA versions
+]
+# Alternative data source providers
+altdata = [
+    "requests>=2.31.0",
+    "aiohttp>=3.9.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+]
+# Full installation with all optional features
+full = [
+    "numba>=0.58.0",
+    "requests>=2.31.0",
+    "aiohttp>=3.9.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "shap>=0.43.0",  # Model explainability
+    "lime>=0.2.0",   # Model explainability
+]
 
 [project.urls]
 Homepage = "https://github.com/alphatrade/quant-trading-system"

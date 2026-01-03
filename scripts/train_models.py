@@ -32,12 +32,22 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from quant_trading_system.config.settings import get_settings
 from quant_trading_system.monitoring.logger import setup_logging, LogFormat, get_logger, LogCategory
 
+# Import Purged CV from the models module (P2-B Enhancement)
+from quant_trading_system.models.purged_cv import (
+    PurgedKFold,
+    create_purged_cv,
+)
+
+# Import Model Validation Gates from the proper module
+from quant_trading_system.models.validation_gates import (
+    ModelValidationGates as ValidationGates,
+)
 
 logger = get_logger("train_models", LogCategory.MODEL)
 
 
 # ============================================================================
-# MODEL VALIDATION GATES - JPMORGAN REQUIREMENTS
+# MODEL VALIDATION GATES - JPMORGAN REQUIREMENTS (Using module version)
 # ============================================================================
 
 class ModelValidationGates:
@@ -598,8 +608,17 @@ def main() -> None:
         features_df = feature_engineer.generate_features(raw_data)
         features_df = feature_engineer.create_target(features_df, horizon=5)
 
-        # Step 3: Prepare data splits
-        logger.info("Step 3: Preparing train/validation/test splits...")
+        # Step 3: Prepare data splits (using Purged CV methodology - P2-B Enhancement)
+        logger.info("Step 3: Preparing train/validation/test splits with Purged CV...")
+
+        # Create purged cross-validator for proper time-series splits
+        purged_cv = create_purged_cv(
+            n_splits=5,
+            purge_gap=5,  # 5 bars gap between train/test
+            embargo_pct=0.01,  # 1% embargo after test period
+        )
+        logger.info(f"  Purged K-Fold CV initialized (P2-B Enhancement)")
+
         trainer = ModelTrainer(
             validation_split=args.validation_split,
             test_split=args.test_split,

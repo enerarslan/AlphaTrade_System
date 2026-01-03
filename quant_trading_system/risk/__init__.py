@@ -76,6 +76,15 @@ from quant_trading_system.risk.correlation_monitor import (
     HedgingSuggestion,
     create_correlation_monitor,
 )
+from quant_trading_system.risk.drawdown_monitor import (
+    DrawdownAlert,
+    DrawdownMonitorConfig,
+    DrawdownSeverity,
+    DrawdownState,
+    DrawdownType,
+    IntradayDrawdownMonitor,
+    create_drawdown_monitor,
+)
 
 __all__ = [
     # Position Sizing
@@ -143,4 +152,12 @@ __all__ = [
     "HedgeAnalyzer",
     "CorrelationMonitor",
     "create_correlation_monitor",
+    # Intraday Drawdown Monitoring (P2-E Enhancement)
+    "DrawdownSeverity",
+    "DrawdownType",
+    "DrawdownState",
+    "DrawdownAlert",
+    "DrawdownMonitorConfig",
+    "IntradayDrawdownMonitor",
+    "create_drawdown_monitor",
 ]

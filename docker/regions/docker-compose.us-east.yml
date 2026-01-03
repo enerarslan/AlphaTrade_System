@@ -1,0 +1,55 @@
+# US-East Region (Primary) Docker Compose Override
+# Optimized for NYSE/NASDAQ proximity with lowest latency
+#
+# Usage: docker-compose -f docker/docker-compose.yml -f docker/regions/docker-compose.us-east.yml up -d
+
+version: '3.8'
+
+services:
+  trading_app:
+    environment:
+      - REGION=us-east-1
+      - REGION_NAME=US East (N. Virginia)
+      - REGION_TYPE=primary
+      - EXCHANGE_PROXIMITY=high
+      - TARGET_LATENCY_MS=5
+      - ENABLE_COLOCATION=true
+      - DATA_CENTER=equinix-ny5
+      # Regional API endpoints
+      - ALPACA__BASE_URL=https://paper-api.alpaca.markets
+      - MARKET_DATA_ENDPOINT=wss://stream.data.alpaca.markets/v2/iex
+      # Regional optimization
+      - ENABLE_MARKET_MICROSTRUCTURE=true
+      - ORDER_ROUTING=smart
+      - EXECUTION_VENUE_PREFERENCE=direct
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    labels:
+      - "region=us-east-1"
+      - "priority=primary"
+      - "exchange_proximity=high"
+
+  postgres:
+    environment:
+      - REGION=us-east-1
+      - ENABLE_REPLICATION=true
+      - REPLICATION_ROLE=primary
+    labels:
+      - "region=us-east-1"
+      - "replication_role=primary"
+
+  redis:
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    labels:
+      - "region=us-east-1"

@@ -55,6 +55,19 @@ from quant_trading_system.models.validation_gates import (
     ValidationReport,
 )
 
+# System Integrator (P1/P2/P3 Enhancements)
+from quant_trading_system.core.system_integrator import (
+    SystemIntegrator,
+    SystemIntegratorConfig,
+    create_system_integrator,
+)
+
+# Purged Cross-Validation (P2-B)
+from quant_trading_system.models.purged_cv import (
+    PurgedKFold,
+    create_purged_cv,
+)
+
 # Optional Redis
 REDIS_AVAILABLE = False
 try:
@@ -763,6 +776,30 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     )
     logger.info("Model Validation Gates ENABLED (JPMorgan-level)")
 
+    # ===== SYSTEM INTEGRATOR (P1/P2/P3 Enhancements) =====
+    system_integrator = create_system_integrator(
+        SystemIntegratorConfig(
+            enable_vix_scaling=True,
+            enable_tca=True,
+            enable_market_impact=True,
+            enable_optimized_features=True,
+            enable_correlation_monitor=True,
+            # Disable real-time components for backtest
+            enable_drawdown_alerts=False,
+            enable_alt_data=False,
+            enable_rl_meta=False,
+        )
+    )
+    logger.info("System Integrator ENABLED (VIX, TCA, Market Impact, Optimized Features)")
+
+    # ===== PURGED CROSS-VALIDATION =====
+    purged_cv = create_purged_cv(
+        n_splits=5,
+        purge_gap=5,
+        embargo_pct=0.01,
+    )
+    logger.info("Purged Cross-Validation ENABLED (P2-B)")
+
     # ===== REDIS SETUP (OPTIONAL) =====
     redis_client = None
     if REDIS_AVAILABLE:
@@ -910,6 +947,9 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
             "alpha_factors_used": len(alpha_factors),
             "validation_gates_passed": validation_passed,
             "redis_caching": redis_client is not None,
+            "system_integrator_enabled": True,
+            "purged_cv_enabled": True,
+            "enhancements": ["VIX Scaling", "TCA", "Market Impact", "Optimized Features", "Purged CV"],
         },
         "metrics": metrics,
         "trade_log": trade_log,

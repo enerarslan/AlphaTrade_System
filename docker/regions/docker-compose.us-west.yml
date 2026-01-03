@@ -1,0 +1,54 @@
+# US-West Region (Secondary/DR) Docker Compose Override
+# Secondary region for disaster recovery and West Coast users
+#
+# Usage: docker-compose -f docker/docker-compose.yml -f docker/regions/docker-compose.us-west.yml up -d
+
+version: '3.8'
+
+services:
+  trading_app:
+    environment:
+      - REGION=us-west-2
+      - REGION_NAME=US West (Oregon)
+      - REGION_TYPE=secondary
+      - EXCHANGE_PROXIMITY=medium
+      - TARGET_LATENCY_MS=30
+      - ENABLE_COLOCATION=false
+      - DATA_CENTER=aws-us-west-2
+      # Regional API endpoints
+      - ALPACA__BASE_URL=https://paper-api.alpaca.markets
+      - MARKET_DATA_ENDPOINT=wss://stream.data.alpaca.markets/v2/iex
+      # DR settings
+      - ENABLE_FAILOVER_MODE=true
+      - PRIMARY_REGION=us-east-1
+      - FAILOVER_PRIORITY=1
+      # Regional optimization
+      - ENABLE_MARKET_MICROSTRUCTURE=false
+      - ORDER_ROUTING=standard
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    labels:
+      - "region=us-west-2"
+      - "priority=secondary"
+      - "exchange_proximity=medium"
+
+  postgres:
+    environment:
+      - REGION=us-west-2
+      - ENABLE_REPLICATION=true
+      - REPLICATION_ROLE=replica
+      - PRIMARY_HOST=trading_postgres_us_east
+    labels:
+      - "region=us-west-2"
+      - "replication_role=replica"
+
+  redis:
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --replica-read-only yes
+    labels:
+      - "region=us-west-2"

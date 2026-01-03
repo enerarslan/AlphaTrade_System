@@ -65,6 +65,13 @@ from quant_trading_system.models.validation_gates import (
 from quant_trading_system.core.events import EventBus, EventType, create_system_event
 from quant_trading_system.monitoring.metrics import get_metrics_collector
 
+# System Integrator (P1/P2/P3 Enhancements)
+from quant_trading_system.core.system_integrator import (
+    SystemIntegrator,
+    SystemIntegratorConfig,
+    create_system_integrator,
+)
+
 # Optional imports
 REDIS_AVAILABLE = False
 DB_AVAILABLE = False
@@ -106,6 +113,7 @@ class InstitutionalTradingSystem:
         enable_tracing: bool = True,
         enable_redis: bool = True,
         enable_db: bool = True,
+        enable_enhancements: bool = True,
     ):
         """Initialize the trading system.
 
@@ -115,6 +123,7 @@ class InstitutionalTradingSystem:
             enable_tracing: Enable OpenTelemetry tracing.
             enable_redis: Enable Redis caching.
             enable_db: Enable database storage.
+            enable_enhancements: Enable P1/P2/P3 enhancement components.
         """
         self.settings = settings
         self.mode = mode
@@ -158,6 +167,29 @@ class InstitutionalTradingSystem:
             min_profit_factor=1.1,
         )
         logger.info("Model Validation Gates ENABLED")
+
+        # ===== SYSTEM INTEGRATOR (P1/P2/P3 Enhancements) =====
+        self.enable_enhancements = enable_enhancements
+        if enable_enhancements:
+            self.system_integrator = create_system_integrator(
+                SystemIntegratorConfig(
+                    enable_vix_scaling=True,
+                    enable_sector_rebalancing=True,
+                    enable_order_book_alpha=True,
+                    enable_tca=True,
+                    enable_alt_data=True,
+                    enable_purged_cv=True,
+                    enable_ic_ensemble=True,
+                    enable_rl_meta=True,
+                    enable_drawdown_alerts=True,
+                    enable_correlation_monitor=True,
+                    enable_market_impact=True,
+                    enable_optimized_features=True,
+                )
+            )
+            logger.info("System Integrator ENABLED (P1/P2/P3 Enhancements)")
+        else:
+            self.system_integrator = None
 
         # ===== REDIS =====
         self.redis_client = None
@@ -259,6 +291,41 @@ class InstitutionalTradingSystem:
             except Exception as e:
                 logger.warning(f"Model loading failed: {e}")
 
+            # 4. Initialize System Integrator (P1/P2/P3 Enhancements)
+            if self.enable_enhancements and self.system_integrator:
+                try:
+                    # Get initial equity from broker if available
+                    initial_equity = None
+                    if self.broker_client:
+                        try:
+                            account = await self.broker_client.get_account()
+                            if account:
+                                from decimal import Decimal
+                                initial_equity = Decimal(str(account.equity))
+                        except Exception:
+                            pass
+
+                    # Get trading symbols
+                    trading_symbols = (
+                        self.settings.symbols[:10]
+                        if hasattr(self.settings, "symbols")
+                        else ["SPY", "QQQ", "AAPL", "MSFT"]
+                    )
+
+                    # Initialize all enhancement components
+                    await self.system_integrator.initialize(
+                        symbols=trading_symbols,
+                        initial_equity=initial_equity,
+                    )
+
+                    # Log component status
+                    component_status = self.system_integrator.get_component_status()
+                    enabled_count = sum(1 for s in component_status.values() if s["initialized"])
+                    logger.info(f"System Integrator: {enabled_count}/{len(component_status)} enhancements initialized")
+
+                except Exception as e:
+                    logger.warning(f"System Integrator initialization failed: {e}")
+
             # Print summary
             logger.info("-" * 70)
             logger.info("INSTITUTIONAL-GRADE FEATURES:")
@@ -269,6 +336,8 @@ class InstitutionalTradingSystem:
             logger.info(f"  Redis Caching:            {'ENABLED' if self.redis_client else 'DISABLED'}")
             logger.info(f"  Database Storage:         {'ENABLED' if self.db_manager else 'DISABLED'}")
             logger.info(f"  Kill Switch:              ACTIVE")
+            if self.system_integrator:
+                logger.info(f"  System Integrator:        ENABLED (P1/P2/P3)")
             logger.info("-" * 70)
             logger.info(f"Trading Mode: {self.mode.upper()}")
             logger.info("=" * 70)
@@ -331,6 +400,14 @@ class InstitutionalTradingSystem:
         """Shutdown the trading system gracefully."""
         logger.info("Shutting down trading system...")
         self._running = False
+
+        # Stop System Integrator
+        if self.system_integrator:
+            try:
+                await self.system_integrator.stop()
+                logger.info("System Integrator stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping System Integrator: {e}")
 
         # Publish system stop event
         self.event_bus.publish(

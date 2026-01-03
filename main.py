@@ -63,6 +63,13 @@ from quant_trading_system.alpha.regime_detection import (
     MarketRegime,
 )
 
+# System Integrator (P1/P2/P3 Enhancement Components)
+from quant_trading_system.core.system_integrator import (
+    SystemIntegrator,
+    SystemIntegratorConfig,
+    create_system_integrator,
+)
+
 
 logger = get_logger("main", LogCategory.SYSTEM)
 
@@ -85,6 +92,7 @@ class TradingSystemApp:
         settings: Settings,
         enable_tracing: bool = True,
         enable_validation_gates: bool = True,
+        enable_enhancements: bool = True,
     ) -> None:
         """Initialize the trading system.
 
@@ -92,6 +100,7 @@ class TradingSystemApp:
             settings: Application settings.
             enable_tracing: Enable OpenTelemetry distributed tracing.
             enable_validation_gates: Enable JPMorgan-level model validation.
+            enable_enhancements: Enable P1/P2/P3 enhancement components.
         """
         self.settings = settings
         self.event_bus = EventBus()
@@ -131,6 +140,29 @@ class TradingSystemApp:
             use_hmm=False,  # HMM requires hmmlearn
         )
         self.current_regime: MarketRegime | None = None
+
+        # ===== SYSTEM INTEGRATOR (P1/P2/P3 Enhancements) =====
+        self.enable_enhancements = enable_enhancements
+        if enable_enhancements:
+            self.system_integrator = create_system_integrator(
+                SystemIntegratorConfig(
+                    enable_vix_scaling=True,
+                    enable_sector_rebalancing=True,
+                    enable_order_book_alpha=True,
+                    enable_tca=True,
+                    enable_alt_data=True,
+                    enable_purged_cv=True,
+                    enable_ic_ensemble=True,
+                    enable_rl_meta=True,
+                    enable_drawdown_alerts=True,
+                    enable_correlation_monitor=True,
+                    enable_market_impact=True,
+                    enable_optimized_features=True,
+                )
+            )
+            logger.info("System Integrator ENABLED (P1/P2/P3 Enhancements)")
+        else:
+            self.system_integrator = None
 
         # Set system info in metrics
         self.metrics.set_system_info(
@@ -422,6 +454,45 @@ class TradingSystemApp:
             logger.warning(f"Data lineage initialization failed (non-critical): {e}")
             self.lineage_tracker = None
 
+        # 10. Initialize System Integrator (P1/P2/P3 Enhancements)
+        if self.enable_enhancements and self.system_integrator:
+            try:
+                logger.info("Step 10/10: Initializing System Integrator (All Enhancements)")
+
+                # Determine initial equity from broker if available
+                initial_equity = None
+                if self.broker_client:
+                    try:
+                        account = await self.broker_client.get_account()
+                        if account:
+                            from decimal import Decimal
+                            initial_equity = Decimal(str(account.equity))
+                    except Exception:
+                        pass
+
+                # Get trading symbols
+                trading_symbols = (
+                    self.settings.trading.symbols
+                    if hasattr(self.settings, "trading") and hasattr(self.settings.trading, "symbols")
+                    else ["SPY", "QQQ", "AAPL", "MSFT"]
+                )
+
+                # Initialize all enhancement components
+                await self.system_integrator.initialize(
+                    symbols=trading_symbols,
+                    initial_equity=initial_equity,
+                )
+
+                # Log component status
+                component_status = self.system_integrator.get_component_status()
+                enabled_count = sum(1 for s in component_status.values() if s["initialized"])
+                logger.info(f"System Integrator: {enabled_count}/{len(component_status)} enhancements initialized")
+
+            except Exception as e:
+                logger.warning(f"System Integrator initialization failed (non-critical): {e}")
+        else:
+            logger.info("Step 10/10: Skipping System Integrator (disabled)")
+
         # Report initialization summary (JPMorgan-level)
         logger.info("=" * 70)
         logger.info("INSTITUTIONAL-GRADE COMPONENT INITIALIZATION SUMMARY")
@@ -445,6 +516,17 @@ class TradingSystemApp:
         logger.info(f"    Models:                   {'OK' if self.model_manager else 'DISABLED'}")
         logger.info(f"    Data Feed:                {'OK' if self.data_feed else 'DISABLED'}")
         logger.info(f"    Data Lineage:             {'OK' if hasattr(self, 'lineage_tracker') and self.lineage_tracker else 'DISABLED'}")
+        logger.info("-" * 70)
+        logger.info("  P1/P2/P3 ENHANCEMENTS (via System Integrator):")
+        if self.system_integrator and self.system_integrator.state.initialized:
+            component_status = self.system_integrator.get_component_status()
+            for name, status in component_status.items():
+                status_str = "OK" if status["initialized"] else "DISABLED"
+                if status.get("error"):
+                    status_str = "ERROR"
+                logger.info(f"    {name:35} {status_str}")
+        else:
+            logger.info("    System Integrator:          DISABLED")
         logger.info("=" * 70)
 
         # Check for critical initialization errors
@@ -516,6 +598,14 @@ class TradingSystemApp:
         """Stop the trading system."""
         logger.info("Stopping trading system")
         self._running = False
+
+        # Stop System Integrator
+        if self.system_integrator:
+            try:
+                await self.system_integrator.stop()
+                logger.info("System Integrator stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping System Integrator: {e}")
 
         # Cancel all tasks
         for task in self._tasks:
