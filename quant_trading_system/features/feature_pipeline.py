@@ -8,24 +8,38 @@ Provides:
 - Feature selection (variance, correlation, importance)
 - Target variable generation
 - Feature versioning and metadata
+- GPU-accelerated computation via OptimizedFeaturePipeline (when available)
+- Alternative data feature integration
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
 
 import numpy as np
+import pandas as pd
 import polars as pl
 
 from .cross_sectional import CrossSectionalFeatureCalculator
 from .microstructure import MicrostructureFeatureCalculator
 from .statistical import StatisticalFeatureCalculator
 from .technical import TechnicalIndicatorCalculator
+
+# Import optimized pipeline for GPU acceleration
+from .optimized_pipeline import (
+    OptimizedFeaturePipeline,
+    OptimizedPipelineConfig,
+    ComputeMode,
+    CUDF_AVAILABLE,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureGroup(str, Enum):
@@ -62,6 +76,12 @@ class FeatureConfig:
     correlation_threshold: float = 0.95  # Max correlation between features
     include_targets: bool = False
     target_horizons: list[int] = field(default_factory=lambda: [1, 5, 10, 20])
+    # GPU acceleration settings
+    use_gpu: bool = False  # Enable GPU-accelerated features via cuDF
+    use_optimized_pipeline: bool = True  # Use OptimizedFeaturePipeline for basic features
+    gpu_min_batch_size: int = 10000  # Minimum rows to benefit from GPU
+    parallel_workers: int = 4  # Number of parallel workers for feature computation
+    use_cache: bool = True  # Enable feature caching
 
 
 @dataclass
@@ -191,6 +211,7 @@ class FeaturePipeline:
     - Validation and cleaning
     - Normalization
     - Feature selection
+    - GPU-accelerated computation (when available)
 
     Usage:
         pipeline = FeaturePipeline(config)
@@ -200,7 +221,9 @@ class FeaturePipeline:
     def __init__(self, config: FeatureConfig | None = None):
         self.config = config or FeatureConfig()
         self._calculators: dict[FeatureGroup, Any] = {}
+        self._optimized_pipeline: OptimizedFeaturePipeline | None = None
         self._initialize_calculators()
+        self._initialize_optimized_pipeline()
 
     def _initialize_calculators(self) -> None:
         """Initialize feature calculators for each group."""
@@ -208,6 +231,79 @@ class FeaturePipeline:
         self._calculators[FeatureGroup.STATISTICAL] = StatisticalFeatureCalculator()
         self._calculators[FeatureGroup.MICROSTRUCTURE] = MicrostructureFeatureCalculator()
         self._calculators[FeatureGroup.CROSS_SECTIONAL] = CrossSectionalFeatureCalculator()
+
+    def _initialize_optimized_pipeline(self) -> None:
+        """Initialize the optimized pipeline for GPU acceleration."""
+        if not self.config.use_optimized_pipeline:
+            return
+
+        # Determine compute mode
+        use_gpu = self.config.use_gpu and CUDF_AVAILABLE
+        if use_gpu:
+            compute_mode = ComputeMode.GPU
+            logger.info("GPU acceleration enabled for feature computation")
+        else:
+            compute_mode = ComputeMode.PARALLEL
+            if self.config.use_gpu and not CUDF_AVAILABLE:
+                logger.warning("GPU requested but cuDF not available, using parallel CPU")
+
+        opt_config = OptimizedPipelineConfig(
+            compute_mode=compute_mode,
+            num_workers=self.config.parallel_workers,
+            use_numba=True,
+            use_gpu=use_gpu,
+            gpu_min_batch_size=self.config.gpu_min_batch_size,
+        )
+        self._optimized_pipeline = OptimizedFeaturePipeline(opt_config)
+        logger.info(f"Optimized pipeline initialized with mode: {compute_mode.value}")
+
+    def _compute_optimized_features(
+        self, df: pl.DataFrame, symbol: str
+    ) -> dict[str, np.ndarray]:
+        """Compute features using the optimized pipeline.
+
+        Uses GPU acceleration if available, otherwise parallel CPU.
+
+        Args:
+            df: Input polars DataFrame
+            symbol: Symbol identifier
+
+        Returns:
+            Dictionary of feature name to numpy array
+        """
+        if self._optimized_pipeline is None:
+            return {}
+
+        try:
+            # Convert polars to pandas for optimized pipeline
+            pdf = df.to_pandas()
+
+            # Ensure correct column names
+            col_mapping = {
+                c: c.lower() for c in pdf.columns
+            }
+            pdf = pdf.rename(columns=col_mapping)
+
+            # Compute features using optimized pipeline
+            result_df = self._optimized_pipeline.compute_features(
+                pdf,
+                symbol=symbol,
+                use_cache=self.config.use_cache,
+            )
+
+            # Extract computed features (exclude original columns)
+            original_cols = set(pdf.columns)
+            features = {}
+            for col in result_df.columns:
+                if col not in original_cols:
+                    features[col] = result_df[col].to_numpy()
+
+            logger.debug(f"Optimized pipeline computed {len(features)} features for {symbol}")
+            return features
+
+        except Exception as e:
+            logger.warning(f"Optimized pipeline failed, falling back to standard: {e}")
+            return {}
 
     def compute(
         self,
@@ -229,12 +325,26 @@ class FeaturePipeline:
         all_features: dict[str, np.ndarray] = {}
         all_metadata: dict[str, FeatureMetadata] = {}
 
+        # Use optimized pipeline for basic technical features if available
+        if self._optimized_pipeline is not None and len(df) >= 100:
+            optimized_features = self._compute_optimized_features(df, symbol)
+            for name, values in optimized_features.items():
+                if self._validate_feature(values):
+                    all_features[name] = values
+                    all_metadata[name] = self._compute_metadata(
+                        name, values, FeatureGroup.TECHNICAL
+                    )
+
         groups_to_compute = self._get_groups_to_compute()
 
         for group in groups_to_compute:
             group_features = self._compute_group(df, group, universe_data)
 
             for name, values in group_features.items():
+                # Skip if already computed by optimized pipeline
+                if name in all_features:
+                    continue
+
                 # Validate feature
                 if not self._validate_feature(values):
                     continue

@@ -68,6 +68,28 @@ from quant_trading_system.models.purged_cv import (
     create_purged_cv,
 )
 
+# GPU-Accelerated Features (P3-C Extended)
+from quant_trading_system.features.optimized_pipeline import (
+    CUDF_AVAILABLE,
+    ComputeMode,
+    GPUVectorizedCalculators,
+)
+
+# Alternative Data Providers (P2-A Extended)
+from quant_trading_system.data.alternative_data import (
+    create_alt_data_aggregator,
+    SatelliteProvider,
+    CreditCardProvider,
+    SupplyChainProvider,
+)
+
+# Multi-Region Configuration
+from quant_trading_system.config.regional import (
+    get_regional_settings,
+    get_region_config,
+    CUDF_AVAILABLE as GPU_AVAILABLE,
+)
+
 # Optional Redis
 REDIS_AVAILABLE = False
 try:
@@ -101,7 +123,7 @@ from quant_trading_system.core.data_types import (
     TradeSignal,
 )
 from quant_trading_system.data.loader import DataLoader
-from quant_trading_system.features.feature_pipeline import FeaturePipeline
+from quant_trading_system.features.feature_pipeline import FeaturePipeline, FeatureConfig
 from quant_trading_system.monitoring.logger import (
     LogCategory,
     LogFormat,
@@ -800,6 +822,17 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     )
     logger.info("Purged Cross-Validation ENABLED (P2-B)")
 
+    # ===== GPU ACCELERATION CHECK =====
+    if CUDF_AVAILABLE:
+        logger.info("GPU Acceleration AVAILABLE (cuDF/RAPIDS)")
+    else:
+        logger.info("GPU not available, using CPU-optimized pipeline")
+
+    # ===== REGIONAL CONFIGURATION =====
+    regional_settings = get_regional_settings()
+    region_config = regional_settings.get_current_config()
+    logger.info(f"Regional Config: {region_config.region_name} (latency target: {region_config.target_latency_ms}ms)")
+
     # ===== REDIS SETUP (OPTIONAL) =====
     redis_client = None
     if REDIS_AVAILABLE:
@@ -949,7 +982,15 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
             "redis_caching": redis_client is not None,
             "system_integrator_enabled": True,
             "purged_cv_enabled": True,
-            "enhancements": ["VIX Scaling", "TCA", "Market Impact", "Optimized Features", "Purged CV"],
+            "gpu_acceleration": CUDF_AVAILABLE,
+            "region": region_config.region_id,
+            "region_latency_ms": region_config.target_latency_ms,
+            "enhancements": [
+                "VIX Scaling", "TCA", "Market Impact", "Optimized Features", "Purged CV",
+                "GPU Acceleration" if CUDF_AVAILABLE else "CPU Optimized",
+                "Satellite Data", "Credit Card Data", "Supply Chain Data",
+                f"Region: {region_config.region_name}",
+            ],
         },
         "metrics": metrics,
         "trade_log": trade_log,

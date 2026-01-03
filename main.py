@@ -70,6 +70,20 @@ from quant_trading_system.core.system_integrator import (
     create_system_integrator,
 )
 
+# GPU-Accelerated Features (P3-C Extended)
+from quant_trading_system.features.optimized_pipeline import CUDF_AVAILABLE
+
+# Regional Configuration
+from quant_trading_system.config.regional import (
+    get_regional_settings,
+    get_region_config,
+)
+
+# Alternative Data Providers
+from quant_trading_system.data.alternative_data import (
+    create_alt_data_aggregator,
+)
+
 
 logger = get_logger("main", LogCategory.SYSTEM)
 
@@ -163,6 +177,21 @@ class TradingSystemApp:
             logger.info("System Integrator ENABLED (P1/P2/P3 Enhancements)")
         else:
             self.system_integrator = None
+
+        # ===== GPU ACCELERATION =====
+        if CUDF_AVAILABLE:
+            logger.info("GPU Acceleration: AVAILABLE (cuDF/RAPIDS)")
+        else:
+            logger.info("GPU Acceleration: CPU-only mode")
+
+        # ===== REGIONAL CONFIGURATION =====
+        regional_settings = get_regional_settings()
+        region_config = regional_settings.get_current_config()
+        self.region_config = region_config
+        logger.info(
+            f"Region: {region_config.region_name} "
+            f"(latency target: {region_config.target_latency_ms}ms)"
+        )
 
         # Set system info in metrics
         self.metrics.set_system_info(

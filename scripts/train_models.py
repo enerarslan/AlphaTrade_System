@@ -43,6 +43,29 @@ from quant_trading_system.models.validation_gates import (
     ModelValidationGates as ValidationGates,
 )
 
+# GPU-Accelerated Features (P3-C Extended)
+from quant_trading_system.features.optimized_pipeline import (
+    CUDF_AVAILABLE,
+    ComputeMode,
+    OptimizedFeaturePipeline,
+    OptimizedPipelineConfig,
+)
+
+# Feature Pipeline with GPU support
+from quant_trading_system.features.feature_pipeline import (
+    FeaturePipeline,
+    FeatureConfig,
+)
+
+# Regional Configuration
+from quant_trading_system.config.regional import (
+    get_regional_settings,
+    get_region_config,
+)
+
+# IC-Based Ensemble (P2-C)
+from quant_trading_system.models.ensemble import ICBasedEnsemble
+
 logger = get_logger("train_models", LogCategory.MODEL)
 
 
@@ -588,6 +611,16 @@ def main() -> None:
     logger.info("JPMORGAN-LEVEL MODEL TRAINING PIPELINE")
     logger.info("=" * 60)
 
+    # Log GPU and Regional Configuration
+    if CUDF_AVAILABLE:
+        logger.info("GPU Acceleration: ENABLED (cuDF/RAPIDS)")
+    else:
+        logger.info("GPU Acceleration: NOT AVAILABLE (using CPU)")
+
+    regional_settings = get_regional_settings()
+    region_config = regional_settings.get_current_config()
+    logger.info(f"Region: {region_config.region_name}")
+
     start_time = time.time()
 
     try:
@@ -722,6 +755,19 @@ def main() -> None:
             },
             "features": len(feature_cols),
             "models": results,
+            "infrastructure": {
+                "gpu_available": CUDF_AVAILABLE,
+                "region": region_config.region_id,
+                "region_name": region_config.region_name,
+                "purged_cv_enabled": True,
+                "ic_ensemble_available": True,
+            },
+            "enhancements": [
+                "Purged K-Fold CV (P2-B)",
+                "IC-Based Ensemble (P2-C)",
+                "GPU Acceleration" if CUDF_AVAILABLE else "CPU Optimized",
+                f"Region: {region_config.region_name}",
+            ],
         }
 
         report_path = args.output_dir / f"training_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"

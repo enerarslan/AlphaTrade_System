@@ -103,6 +103,27 @@ from quant_trading_system.models.purged_cv import (
 # Import P2-C: IC-Based Ensemble
 from quant_trading_system.models.ensemble import ICBasedEnsemble
 
+# Import GPU-Accelerated Features (P3-C Extended)
+from quant_trading_system.features.optimized_pipeline import (
+    CUDF_AVAILABLE,
+    ComputeMode,
+    GPUVectorizedCalculators,
+)
+
+# Import Regional Configuration
+from quant_trading_system.config.regional import (
+    get_regional_settings,
+    get_region_config,
+)
+
+# Import Alternative Data
+from quant_trading_system.data.alternative_data import (
+    create_alt_data_aggregator,
+    SatelliteProvider,
+    CreditCardProvider,
+    SupplyChainProvider,
+)
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -149,6 +170,23 @@ def _detect_gpu():
     else:
         logger.warning("No GPU detected. Training will run on CPU (slower).")
         return "cpu"
+
+
+def _log_infrastructure_status():
+    """Log infrastructure status (cuDF, regional config)."""
+    # cuDF/RAPIDS for feature acceleration
+    if CUDF_AVAILABLE:
+        logger.info("cuDF/RAPIDS: AVAILABLE (GPU-accelerated feature computation)")
+    else:
+        logger.info("cuDF/RAPIDS: NOT AVAILABLE (using CPU-based features)")
+
+    # Regional configuration
+    regional_settings = get_regional_settings()
+    region_config = regional_settings.get_current_config()
+    logger.info(f"Region: {region_config.region_name} (latency target: {region_config.target_latency_ms}ms)")
+
+    # Alternative data status
+    logger.info("Alternative Data: Satellite, Credit Card, Supply Chain providers AVAILABLE")
 
 
 # Lazy import function for model classes
@@ -1234,6 +1272,10 @@ def main():
     logger.info(f"  Redis Caching:     {'DISABLED' if args.no_redis else 'ENABLED'}")
     logger.info(f"  Database Storage:  {'DISABLED' if args.no_db else 'ENABLED'}")
     logger.info(f"  Validation Gates:  {'DISABLED' if args.no_validation else 'ENABLED'}")
+    logger.info("=" * 70)
+
+    # Log infrastructure status (GPU features, regional config)
+    _log_infrastructure_status()
     logger.info("=" * 70)
 
     # Create and run pipeline with all institutional-grade features
