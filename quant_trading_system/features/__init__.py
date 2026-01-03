@@ -84,6 +84,17 @@ from .statistical import (
     TailRatio,
     ZScore,
 )
+from .optimized_pipeline import (
+    CacheBackend,
+    ComputeMode,
+    FeatureSpec,
+    HybridCache,
+    MemoryCache as OptimizedMemoryCache,
+    OptimizedFeaturePipeline,
+    OptimizedPipelineConfig,
+    VectorizedCalculators,
+    create_optimized_pipeline,
+)
 from .technical import (
     ADX,
     Aroon,
@@ -260,4 +271,14 @@ __all__ = [
     "FeatureSelector",
     "FeatureValidator",
     "create_pipeline",
+    # Optimized Pipeline (P3-C Enhancement)
+    "CacheBackend",
+    "ComputeMode",
+    "FeatureSpec",
+    "HybridCache",
+    "OptimizedMemoryCache",
+    "OptimizedFeaturePipeline",
+    "OptimizedPipelineConfig",
+    "VectorizedCalculators",
+    "create_optimized_pipeline",
 ]

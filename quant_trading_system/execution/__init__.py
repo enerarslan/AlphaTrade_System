@@ -48,6 +48,31 @@ from quant_trading_system.execution.position_tracker import (
     SettlementStatus,
     TradeRecord,
 )
+from quant_trading_system.execution.tca import (
+    BenchmarkType,
+    CostBreakdown,
+    CostComponent,
+    ExecutionMetrics,
+    ExecutionQuality,
+    PostTradeAnalyzer,
+    PreTradeCostEstimator,
+    TCAConfig,
+    TCAManager,
+    TCAReport,
+    create_tca_manager,
+)
+from quant_trading_system.execution.market_impact import (
+    AdaptiveMarketImpactModel,
+    AlmgrenChrissModel,
+    ExecutionRecord,
+    ImpactEstimate,
+    ImpactModelType,
+    MarketCondition,
+    MarketConditionClassifier,
+    MarketImpactConfig,
+    TimeOfDayAdjuster,
+    create_market_impact_model,
+)
 
 __all__ = [
     # alpaca_client
@@ -89,4 +114,27 @@ __all__ = [
     "ReconciliationResult",
     "SettlementStatus",
     "TradeRecord",
+    # TCA (P1-D Enhancement)
+    "BenchmarkType",
+    "CostBreakdown",
+    "CostComponent",
+    "ExecutionMetrics",
+    "ExecutionQuality",
+    "PostTradeAnalyzer",
+    "PreTradeCostEstimator",
+    "TCAConfig",
+    "TCAManager",
+    "TCAReport",
+    "create_tca_manager",
+    # Market Impact (P3-B Enhancement)
+    "ImpactModelType",
+    "MarketCondition",
+    "ImpactEstimate",
+    "ExecutionRecord",
+    "MarketImpactConfig",
+    "MarketConditionClassifier",
+    "AlmgrenChrissModel",
+    "TimeOfDayAdjuster",
+    "AdaptiveMarketImpactModel",
+    "create_market_impact_model",
 ]

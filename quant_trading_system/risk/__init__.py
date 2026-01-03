@@ -53,6 +53,29 @@ from quant_trading_system.risk.risk_monitor import (
     VaRCalculator,
     VaRMethod,
 )
+from quant_trading_system.risk.sector_rebalancer import (
+    GICSSector,
+    RebalanceAction,
+    SectorClassifier,
+    SectorExposure,
+    SectorExposureMonitor,
+    SectorRebalanceConfig,
+    SectorRebalancer,
+    create_sector_rebalancer,
+)
+from quant_trading_system.risk.correlation_monitor import (
+    CorrelationAlert,
+    CorrelationCalculator,
+    CorrelationMethod,
+    CorrelationMonitor,
+    CorrelationMonitorConfig,
+    CorrelationRegime,
+    CorrelationRegimeDetector,
+    CorrelationSnapshot,
+    HedgeAnalyzer,
+    HedgingSuggestion,
+    create_correlation_monitor,
+)
 
 __all__ = [
     # Position Sizing
@@ -99,4 +122,25 @@ __all__ = [
     "RiskCheckResult",
     "RiskLimitsConfig",
     "RiskLimitsManager",
+    # Sector Rebalancing (P1-B Enhancement)
+    "GICSSector",
+    "RebalanceAction",
+    "SectorClassifier",
+    "SectorExposure",
+    "SectorExposureMonitor",
+    "SectorRebalanceConfig",
+    "SectorRebalancer",
+    "create_sector_rebalancer",
+    # Correlation Monitoring (P3-A Enhancement)
+    "CorrelationMethod",
+    "CorrelationRegime",
+    "CorrelationAlert",
+    "HedgingSuggestion",
+    "CorrelationSnapshot",
+    "CorrelationMonitorConfig",
+    "CorrelationCalculator",
+    "CorrelationRegimeDetector",
+    "HedgeAnalyzer",
+    "CorrelationMonitor",
+    "create_correlation_monitor",
 ]

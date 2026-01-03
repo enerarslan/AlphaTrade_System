@@ -28,6 +28,7 @@ from quant_trading_system.models.ensemble import (
     AdaptiveEnsemble,
     AggregationMethod,
     AveragingEnsemble,
+    ICBasedEnsemble,
     RegimeAwareEnsemble,
     StackingEnsemble,
     VotingEnsemble,
@@ -44,6 +45,29 @@ from quant_trading_system.models.reinforcement import (
     A2CAgent,
     PPOAgent,
     TradingEnvironment,
+)
+from quant_trading_system.models.purged_cv import (
+    CombinatorialPurgedKFold,
+    CVFoldResult,
+    CVSummary,
+    EventPurgedKFold,
+    PurgedKFold,
+    WalkForwardCV,
+    create_purged_cv,
+    validate_no_leakage,
+)
+from quant_trading_system.models.rl_meta_learning import (
+    EpisodeStats,
+    Experience,
+    HierarchicalOption,
+    HierarchicalRLController,
+    IntrinsicCuriosityModule,
+    MarketRegimeRL,
+    MetaLearningAgent,
+    RegimeAdaptiveRewardShaper,
+    RewardType,
+    RLMetaConfig,
+    create_meta_learning_agent,
 )
 
 __all__ = [
@@ -73,6 +97,7 @@ __all__ = [
     "StackingEnsemble",
     "AdaptiveEnsemble",
     "RegimeAwareEnsemble",
+    "ICBasedEnsemble",  # P2-C Enhancement
     "AggregationMethod",
     "create_model_ensemble",
     # Model Management
@@ -81,4 +106,25 @@ __all__ = [
     "HyperparameterOptimizer",
     "TimeSeriesSplitter",
     "SplitMethod",
+    # Purged Cross-Validation (P2-B Enhancement)
+    "PurgedKFold",
+    "CombinatorialPurgedKFold",
+    "WalkForwardCV",
+    "EventPurgedKFold",
+    "CVFoldResult",
+    "CVSummary",
+    "create_purged_cv",
+    "validate_no_leakage",
+    # RL Meta-Learning (P2-D Enhancement)
+    "RewardType",
+    "MarketRegimeRL",
+    "Experience",
+    "EpisodeStats",
+    "RLMetaConfig",
+    "RegimeAdaptiveRewardShaper",
+    "IntrinsicCuriosityModule",
+    "HierarchicalOption",
+    "HierarchicalRLController",
+    "MetaLearningAgent",
+    "create_meta_learning_agent",
 ]

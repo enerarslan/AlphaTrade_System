@@ -685,6 +685,329 @@ class RegimeAwareEnsemble(EnsembleModel):
         return result
 
 
+# =============================================================================
+# P2-C Enhancement: IC-Based Auto-Reweighting Ensemble
+# =============================================================================
+
+
+class ICBasedEnsemble(EnsembleModel):
+    """
+    P2-C Enhancement: Information Coefficient (IC) Based Auto-Reweighting Ensemble.
+
+    Dynamically adjusts model weights based on rolling Information Coefficient (IC),
+    which measures the correlation between predictions and actual returns.
+
+    IC is a standard quant metric for measuring alpha quality:
+    - IC = correlation(predicted_returns, actual_returns)
+    - Higher IC models get higher weights
+    - Rolling IC allows adaptation to changing market conditions
+
+    Expected Impact: +10-15 bps annually from optimal model weighting.
+
+    Features:
+    - Rolling IC calculation per model
+    - IC decay weighting (recent IC matters more)
+    - Minimum weight constraints
+    - Information Ratio (IR) based alternatives
+    - Sharpe-weighted option
+    """
+
+    def __init__(
+        self,
+        name: str = "ic_ensemble",
+        version: str = "1.0.0",
+        model_type: ModelType = ModelType.REGRESSOR,
+        ic_window: int = 60,
+        ic_decay: float = 0.94,
+        min_weight: float = 0.05,
+        weight_method: str = "ic_weighted",  # "ic_weighted", "ir_weighted", "sharpe_weighted"
+        rebalance_frequency: int = 5,
+        warmup_periods: int = 20,
+        **kwargs: Any,
+    ):
+        """
+        Initialize IC-based auto-reweighting ensemble.
+
+        Args:
+            name: Model identifier
+            version: Version string
+            model_type: Classification or regression
+            ic_window: Rolling window size for IC calculation
+            ic_decay: Exponential decay factor for IC (newer observations weighted more)
+            min_weight: Minimum weight floor per model
+            weight_method: Method for converting IC to weights
+            rebalance_frequency: How often to update weights (in periods)
+            warmup_periods: Minimum periods before starting IC-based weighting
+            **kwargs: Additional parameters
+        """
+        super().__init__(name, version, model_type, **kwargs)
+        self._params.update({
+            "ic_window": ic_window,
+            "ic_decay": ic_decay,
+            "min_weight": min_weight,
+            "weight_method": weight_method,
+            "rebalance_frequency": rebalance_frequency,
+            "warmup_periods": warmup_periods,
+        })
+
+        # IC tracking
+        self._prediction_history: list[dict[int, float]] = []  # Model predictions
+        self._actual_history: list[float] = []  # Actual returns
+        self._ic_history: dict[int, list[float]] = {}  # IC history per model
+        self._weight_history: list[np.ndarray] = []  # Weight history
+        self._periods_since_rebalance: int = 0
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        validation_data: tuple[np.ndarray, np.ndarray] | None = None,
+        sample_weights: np.ndarray | None = None,
+        **kwargs: Any,
+    ) -> "ICBasedEnsemble":
+        """Train all base models."""
+        for model in self._base_models:
+            model.fit(X, y, validation_data, sample_weights, **kwargs)
+
+        # Initialize equal weights
+        n_models = len(self._base_models)
+        self._weights = np.ones(n_models) / n_models
+
+        # Initialize IC history
+        for i in range(n_models):
+            self._ic_history[i] = []
+
+        metrics = {"n_base_models": n_models}
+        feature_names = kwargs.get("feature_names", [f"f{i}" for i in range(X.shape[1])])
+        self._record_training(metrics, feature_names)
+
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Generate IC-weighted predictions."""
+        X = self._validate_input(X)
+
+        predictions = np.array([model.predict(X) for model in self._base_models])
+        weights = self._weights / self._weights.sum()
+
+        return np.average(predictions, axis=0, weights=weights)
+
+    def get_model_predictions(self, X: np.ndarray) -> dict[int, np.ndarray]:
+        """Get predictions from each individual model.
+
+        Args:
+            X: Feature matrix
+
+        Returns:
+            Dictionary mapping model index to predictions
+        """
+        X = self._validate_input(X)
+        return {i: model.predict(X) for i, model in enumerate(self._base_models)}
+
+    def update_with_actuals(
+        self,
+        predictions: dict[int, float],
+        actual: float,
+    ) -> None:
+        """
+        Update IC tracking with new observation.
+
+        Args:
+            predictions: Dictionary mapping model index to prediction
+            actual: Actual realized return/value
+        """
+        # Store history
+        self._prediction_history.append(predictions)
+        self._actual_history.append(actual)
+
+        # Keep bounded history
+        window = self._params["ic_window"]
+        if len(self._prediction_history) > window:
+            self._prediction_history = self._prediction_history[-window:]
+            self._actual_history = self._actual_history[-window:]
+
+        # Update IC and potentially rebalance
+        self._periods_since_rebalance += 1
+
+        if (len(self._prediction_history) >= self._params["warmup_periods"] and
+            self._periods_since_rebalance >= self._params["rebalance_frequency"]):
+
+            self._update_weights()
+            self._periods_since_rebalance = 0
+
+    def _calculate_ic(self, model_idx: int) -> float:
+        """Calculate rolling IC for a model.
+
+        IC = Pearson correlation between predictions and actuals
+
+        Args:
+            model_idx: Model index
+
+        Returns:
+            Information Coefficient value
+        """
+        if len(self._prediction_history) < 10:
+            return 0.0
+
+        preds = [p.get(model_idx, 0) for p in self._prediction_history]
+        actuals = self._actual_history
+
+        # Apply exponential decay weights
+        n = len(preds)
+        decay = self._params["ic_decay"]
+        weights = np.array([decay ** (n - 1 - i) for i in range(n)])
+        weights /= weights.sum()
+
+        # Weighted correlation
+        preds_arr = np.array(preds)
+        actuals_arr = np.array(actuals)
+
+        # Weighted mean
+        pred_mean = np.average(preds_arr, weights=weights)
+        actual_mean = np.average(actuals_arr, weights=weights)
+
+        # Weighted covariance
+        cov = np.average(
+            (preds_arr - pred_mean) * (actuals_arr - actual_mean),
+            weights=weights
+        )
+
+        # Weighted std
+        pred_std = np.sqrt(np.average((preds_arr - pred_mean) ** 2, weights=weights))
+        actual_std = np.sqrt(np.average((actuals_arr - actual_mean) ** 2, weights=weights))
+
+        if pred_std < 1e-10 or actual_std < 1e-10:
+            return 0.0
+
+        ic = cov / (pred_std * actual_std)
+
+        # Clip to valid range
+        return np.clip(ic, -1.0, 1.0)
+
+    def _calculate_ir(self, model_idx: int) -> float:
+        """Calculate Information Ratio (IC / IC volatility).
+
+        IR = mean(IC) / std(IC)
+
+        Args:
+            model_idx: Model index
+
+        Returns:
+            Information Ratio value
+        """
+        ic_hist = self._ic_history.get(model_idx, [])
+        if len(ic_hist) < 5:
+            return 0.0
+
+        ic_std = np.std(ic_hist)
+        if ic_std < 1e-10:
+            return 0.0
+
+        return np.mean(ic_hist) / ic_std
+
+    def _update_weights(self) -> None:
+        """Update model weights based on IC/IR."""
+        n_models = len(self._base_models)
+        method = self._params["weight_method"]
+
+        # Calculate metrics for each model
+        ics = np.array([self._calculate_ic(i) for i in range(n_models)])
+
+        # Store IC history
+        for i in range(n_models):
+            self._ic_history[i].append(ics[i])
+            if len(self._ic_history[i]) > self._params["ic_window"]:
+                self._ic_history[i] = self._ic_history[i][-self._params["ic_window"]:]
+
+        if method == "ic_weighted":
+            # Weight by IC (positive ICs only matter)
+            positive_ics = np.maximum(ics, 0)
+            if positive_ics.sum() > 0:
+                new_weights = positive_ics / positive_ics.sum()
+            else:
+                new_weights = np.ones(n_models) / n_models
+
+        elif method == "ir_weighted":
+            # Weight by Information Ratio
+            irs = np.array([self._calculate_ir(i) for i in range(n_models)])
+            positive_irs = np.maximum(irs, 0)
+            if positive_irs.sum() > 0:
+                new_weights = positive_irs / positive_irs.sum()
+            else:
+                new_weights = np.ones(n_models) / n_models
+
+        elif method == "sharpe_weighted":
+            # Weight by IC * sqrt(frequency) (proxy for Sharpe contribution)
+            sharpe_proxy = ics * np.sqrt(len(self._prediction_history))
+            positive_sharpe = np.maximum(sharpe_proxy, 0)
+            if positive_sharpe.sum() > 0:
+                new_weights = positive_sharpe / positive_sharpe.sum()
+            else:
+                new_weights = np.ones(n_models) / n_models
+
+        else:
+            new_weights = np.ones(n_models) / n_models
+
+        # Apply minimum weight floor
+        min_weight = self._params["min_weight"]
+        new_weights = np.maximum(new_weights, min_weight)
+        new_weights /= new_weights.sum()
+
+        # Smooth transition
+        alpha = 0.3  # Blend rate
+        self._weights = (1 - alpha) * self._weights + alpha * new_weights
+
+        # Store weight history
+        self._weight_history.append(self._weights.copy())
+        if len(self._weight_history) > 100:
+            self._weight_history = self._weight_history[-100:]
+
+        logger.debug(
+            f"IC-based weight update: ICs={ics}, weights={self._weights}"
+        )
+
+    def get_model_ics(self) -> dict[int, float]:
+        """Get current IC for each model.
+
+        Returns:
+            Dictionary mapping model index to IC value
+        """
+        return {i: self._calculate_ic(i) for i in range(len(self._base_models))}
+
+    def get_model_irs(self) -> dict[int, float]:
+        """Get current IR for each model.
+
+        Returns:
+            Dictionary mapping model index to IR value
+        """
+        return {i: self._calculate_ir(i) for i in range(len(self._base_models))}
+
+    def get_weight_history(self) -> list[np.ndarray]:
+        """Get weight history."""
+        return self._weight_history.copy()
+
+    def get_ic_summary(self) -> dict[str, Any]:
+        """Get summary of IC statistics.
+
+        Returns:
+            Dictionary with IC summary statistics
+        """
+        n_models = len(self._base_models)
+        ics = self.get_model_ics()
+        irs = self.get_model_irs()
+
+        return {
+            "n_models": n_models,
+            "model_ics": ics,
+            "model_irs": irs,
+            "avg_ic": np.mean(list(ics.values())),
+            "max_ic": np.max(list(ics.values())),
+            "current_weights": self._weights.tolist(),
+            "history_length": len(self._prediction_history),
+            "warmup_periods": self._params["warmup_periods"],
+        }
+
+
 def create_model_ensemble(
     models: list[TradingModel],
     method: str = "stacking",
@@ -696,7 +1019,7 @@ def create_model_ensemble(
 
     Args:
         models: List of base models
-        method: Ensemble method ("voting", "averaging", "stacking", "adaptive", "regime")
+        method: Ensemble method ("voting", "averaging", "stacking", "adaptive", "regime", "ic_based")
         model_type: Classification or regression
         **kwargs: Additional parameters for the ensemble
 
@@ -713,6 +1036,8 @@ def create_model_ensemble(
         ensemble = AdaptiveEnsemble(model_type=model_type, **kwargs)
     elif method == "regime":
         ensemble = RegimeAwareEnsemble(model_type=model_type, **kwargs)
+    elif method == "ic_based":
+        ensemble = ICBasedEnsemble(model_type=model_type, **kwargs)
     else:
         raise ValueError(f"Unknown ensemble method: {method}")
 

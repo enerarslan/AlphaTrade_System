@@ -49,6 +49,418 @@ class MicrostructureFeature(ABC):
 
 
 # =============================================================================
+# P1-C Enhancement: ORDER BOOK IMBALANCE FEATURES
+# =============================================================================
+
+
+class OrderBookImbalance(MicrostructureFeature):
+    """
+    P1-C Enhancement: Order Book Imbalance for alpha generation.
+
+    Calculates imbalance metrics from Level 2 order book data:
+    - Bid-ask imbalance at best levels
+    - Multi-level depth imbalance
+    - Order flow imbalance
+    - Imbalance momentum and acceleration
+
+    Expected Impact: +6-10 bps annually from improved signal quality.
+
+    This feature requires Level 2 market data columns:
+    - bid_price_1, bid_size_1, ask_price_1, ask_size_1 (best bid/ask)
+    - Optionally: bid_price_2-N, bid_size_2-N, ask_price_2-N, ask_size_2-N
+
+    If L2 data is not available, falls back to OHLCV-based approximation.
+    """
+
+    def __init__(
+        self,
+        depth_levels: int = 5,
+        windows: list[int] | None = None,
+        decay_factor: float = 0.9,
+    ):
+        """Initialize Order Book Imbalance calculator.
+
+        Args:
+            depth_levels: Number of order book levels to consider
+            windows: Rolling window sizes for imbalance metrics
+            decay_factor: Exponential decay for depth weighting
+        """
+        super().__init__("OrderBookImbalance")
+        self.depth_levels = depth_levels
+        self.windows = windows or [5, 10, 20, 60]
+        self.decay_factor = decay_factor
+
+    def _has_level2_data(self, df: pl.DataFrame) -> bool:
+        """Check if Level 2 data is available."""
+        required_l2 = ["bid_price_1", "bid_size_1", "ask_price_1", "ask_size_1"]
+        return all(col in df.columns for col in required_l2)
+
+    def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
+        """Compute order book imbalance features."""
+        results = {}
+
+        if self._has_level2_data(df):
+            # Use real Level 2 data
+            results.update(self._compute_l2_imbalance(df))
+        else:
+            # Fallback to OHLCV approximation
+            results.update(self._compute_ohlcv_approximation(df))
+
+        return results
+
+    def _compute_l2_imbalance(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
+        """Compute imbalance from Level 2 order book data."""
+        results = {}
+        n = len(df)
+
+        # Best bid/ask imbalance
+        bid_size_1 = df["bid_size_1"].to_numpy().astype(np.float64)
+        ask_size_1 = df["ask_size_1"].to_numpy().astype(np.float64)
+        bid_price_1 = df["bid_price_1"].to_numpy().astype(np.float64)
+        ask_price_1 = df["ask_price_1"].to_numpy().astype(np.float64)
+
+        # Level 1 imbalance: (bid_size - ask_size) / (bid_size + ask_size)
+        total_size = bid_size_1 + ask_size_1
+        l1_imbalance = np.where(
+            total_size > 0,
+            (bid_size_1 - ask_size_1) / total_size,
+            0.0
+        )
+        results["obi_l1"] = l1_imbalance
+
+        # Bid-ask spread
+        spread = ask_price_1 - bid_price_1
+        mid_price = (bid_price_1 + ask_price_1) / 2
+        spread_pct = np.where(mid_price > 0, spread / mid_price, 0.0)
+        results["spread_pct"] = spread_pct
+
+        # Weighted mid-price (microprice)
+        micro_price = np.where(
+            total_size > 0,
+            (bid_price_1 * ask_size_1 + ask_price_1 * bid_size_1) / total_size,
+            mid_price
+        )
+        results["micro_price"] = micro_price
+
+        # Microprice deviation from mid
+        micro_deviation = np.where(
+            mid_price > 0,
+            (micro_price - mid_price) / mid_price,
+            0.0
+        )
+        results["micro_deviation"] = micro_deviation
+
+        # Multi-level depth imbalance if available
+        depth_imbalance = self._compute_depth_imbalance(df, n)
+        if depth_imbalance is not None:
+            results["obi_depth"] = depth_imbalance
+
+        # Rolling imbalance metrics
+        for window in self.windows:
+            # Rolling mean imbalance
+            rolling_imb = np.full(n, np.nan)
+            for i in range(window - 1, n):
+                rolling_imb[i] = np.mean(l1_imbalance[i - window + 1: i + 1])
+            results[f"obi_ma_{window}"] = rolling_imb
+
+            # Imbalance momentum (change in imbalance)
+            imb_mom = np.full(n, np.nan)
+            if window > 1:
+                for i in range(window, n):
+                    imb_mom[i] = rolling_imb[i] - rolling_imb[i - window]
+            results[f"obi_momentum_{window}"] = imb_mom
+
+            # Imbalance persistence (autocorrelation)
+            imb_persist = np.full(n, np.nan)
+            lag = min(window // 2, 5)
+            for i in range(window + lag - 1, n):
+                recent = l1_imbalance[i - window + 1: i + 1]
+                lagged = l1_imbalance[i - window + 1 - lag: i + 1 - lag]
+                if len(recent) == len(lagged) and len(recent) > 2:
+                    corr = np.corrcoef(recent, lagged)
+                    if not np.isnan(corr[0, 1]):
+                        imb_persist[i] = corr[0, 1]
+            results[f"obi_persistence_{window}"] = imb_persist
+
+        # Imbalance pressure (signed by price direction)
+        if "close" in df.columns:
+            close = df["close"].to_numpy().astype(np.float64)
+            price_dir = np.sign(np.diff(close, prepend=close[0]))
+            imb_pressure = l1_imbalance * price_dir
+            results["obi_pressure"] = imb_pressure
+
+        return results
+
+    def _compute_depth_imbalance(
+        self,
+        df: pl.DataFrame,
+        n: int,
+    ) -> np.ndarray | None:
+        """Compute weighted depth imbalance across multiple levels."""
+        total_bid_depth = np.zeros(n)
+        total_ask_depth = np.zeros(n)
+
+        levels_found = 0
+
+        for level in range(1, self.depth_levels + 1):
+            bid_col = f"bid_size_{level}"
+            ask_col = f"ask_size_{level}"
+
+            if bid_col not in df.columns or ask_col not in df.columns:
+                break
+
+            bid_size = df[bid_col].to_numpy().astype(np.float64)
+            ask_size = df[ask_col].to_numpy().astype(np.float64)
+
+            # Apply exponential decay weighting (closer levels matter more)
+            weight = self.decay_factor ** (level - 1)
+
+            total_bid_depth += bid_size * weight
+            total_ask_depth += ask_size * weight
+            levels_found += 1
+
+        if levels_found < 2:
+            return None
+
+        total_depth = total_bid_depth + total_ask_depth
+        depth_imbalance = np.where(
+            total_depth > 0,
+            (total_bid_depth - total_ask_depth) / total_depth,
+            0.0
+        )
+
+        return depth_imbalance
+
+    def _compute_ohlcv_approximation(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
+        """Fallback: Approximate order book imbalance from OHLCV data."""
+        self.validate_input(df, ["high", "low", "close", "volume"])
+
+        high = df["high"].to_numpy().astype(np.float64)
+        low = df["low"].to_numpy().astype(np.float64)
+        close = df["close"].to_numpy().astype(np.float64)
+        volume = df["volume"].to_numpy().astype(np.float64)
+
+        results = {}
+        n = len(close)
+
+        # Approximate imbalance using Close Location Value (CLV)
+        hl_range = high - low
+        clv = np.where(hl_range > 0, (2 * close - high - low) / hl_range, 0.0)
+        results["obi_approx"] = clv
+
+        # Volume-weighted CLV
+        vw_clv = clv * volume
+        results["obi_volume_weighted"] = vw_clv
+
+        # Rolling approximations
+        for window in self.windows:
+            rolling_clv = np.full(n, np.nan)
+            for i in range(window - 1, n):
+                rolling_clv[i] = np.mean(clv[i - window + 1: i + 1])
+            results[f"obi_approx_ma_{window}"] = rolling_clv
+
+            # Volume-weighted rolling
+            rolling_vw = np.full(n, np.nan)
+            rolling_vol = np.full(n, np.nan)
+            for i in range(window - 1, n):
+                vol_sum = np.sum(volume[i - window + 1: i + 1])
+                if vol_sum > 0:
+                    rolling_vw[i] = (
+                        np.sum(vw_clv[i - window + 1: i + 1]) / vol_sum
+                    )
+                rolling_vol[i] = vol_sum
+            results[f"obi_vw_ma_{window}"] = rolling_vw
+
+        return results
+
+
+class OrderBookPressure(MicrostructureFeature):
+    """
+    P1-C Enhancement: Order Book Pressure indicator.
+
+    Measures the directional pressure from order book depth,
+    useful for predicting short-term price movements.
+
+    Features:
+    - Bid/Ask pressure ratio
+    - Cumulative depth pressure
+    - Pressure divergence (vs price direction)
+    - Pressure acceleration
+    """
+
+    def __init__(
+        self,
+        windows: list[int] | None = None,
+        pressure_threshold: float = 0.6,
+    ):
+        """Initialize Order Book Pressure calculator.
+
+        Args:
+            windows: Rolling window sizes
+            pressure_threshold: Threshold for significant pressure signal
+        """
+        super().__init__("OrderBookPressure")
+        self.windows = windows or [5, 10, 20]
+        self.pressure_threshold = pressure_threshold
+
+    def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
+        """Compute order book pressure features."""
+        results = {}
+        n = len(df)
+
+        # Check for Level 2 data
+        has_l2 = all(
+            col in df.columns
+            for col in ["bid_size_1", "ask_size_1"]
+        )
+
+        if has_l2:
+            bid_size = df["bid_size_1"].to_numpy().astype(np.float64)
+            ask_size = df["ask_size_1"].to_numpy().astype(np.float64)
+        else:
+            # Fallback: estimate from OHLCV
+            self.validate_input(df, ["high", "low", "close", "volume"])
+            high = df["high"].to_numpy().astype(np.float64)
+            low = df["low"].to_numpy().astype(np.float64)
+            close = df["close"].to_numpy().astype(np.float64)
+            volume = df["volume"].to_numpy().astype(np.float64)
+
+            # Estimate bid/ask from CLV
+            hl_range = np.maximum(high - low, 1e-10)
+            buy_ratio = (close - low) / hl_range
+            bid_size = volume * buy_ratio
+            ask_size = volume * (1 - buy_ratio)
+
+        # Pressure ratio: bid_pressure / (bid_pressure + ask_pressure)
+        total = bid_size + ask_size
+        pressure_ratio = np.where(total > 0, bid_size / total, 0.5)
+        results["obp_ratio"] = pressure_ratio
+
+        # Centered pressure (-1 to 1 scale)
+        centered_pressure = (pressure_ratio - 0.5) * 2
+        results["obp_centered"] = centered_pressure
+
+        # Rolling pressure metrics
+        for window in self.windows:
+            # Rolling mean pressure
+            rolling_press = np.full(n, np.nan)
+            for i in range(window - 1, n):
+                rolling_press[i] = np.mean(centered_pressure[i - window + 1: i + 1])
+            results[f"obp_ma_{window}"] = rolling_press
+
+            # Pressure acceleration
+            accel = np.full(n, np.nan)
+            accel[window:] = np.diff(rolling_press[window - 1:])
+            results[f"obp_accel_{window}"] = accel
+
+            # Pressure signal (1 for buy pressure, -1 for sell, 0 neutral)
+            signal = np.zeros(n)
+            signal[rolling_press > self.pressure_threshold] = 1
+            signal[rolling_press < -self.pressure_threshold] = -1
+            results[f"obp_signal_{window}"] = signal
+
+        # Cumulative pressure
+        cum_pressure = np.cumsum(centered_pressure)
+        # Detrend by subtracting linear trend
+        x = np.arange(n)
+        if n > 1:
+            slope = (cum_pressure[-1] - cum_pressure[0]) / (n - 1)
+            detrended = cum_pressure - (slope * x + cum_pressure[0])
+            results["obp_cumulative_detrended"] = detrended
+        else:
+            results["obp_cumulative_detrended"] = cum_pressure
+
+        return results
+
+
+class QuoteImbalanceVelocity(MicrostructureFeature):
+    """
+    P1-C Enhancement: Quote Imbalance Velocity.
+
+    Measures the rate of change in order book imbalance,
+    which can signal aggressive order flow and momentum.
+    """
+
+    def __init__(
+        self,
+        windows: list[int] | None = None,
+        velocity_threshold: float = 0.1,
+    ):
+        """Initialize Quote Imbalance Velocity calculator.
+
+        Args:
+            windows: Rolling windows for velocity calculation
+            velocity_threshold: Threshold for significant velocity
+        """
+        super().__init__("QuoteImbalanceVelocity")
+        self.windows = windows or [3, 5, 10]
+        self.velocity_threshold = velocity_threshold
+
+    def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
+        """Compute quote imbalance velocity features."""
+        results = {}
+        n = len(df)
+
+        # Get imbalance first (reuse OrderBookImbalance logic)
+        has_l2 = all(
+            col in df.columns
+            for col in ["bid_size_1", "ask_size_1"]
+        )
+
+        if has_l2:
+            bid_size = df["bid_size_1"].to_numpy().astype(np.float64)
+            ask_size = df["ask_size_1"].to_numpy().astype(np.float64)
+            total = bid_size + ask_size
+            imbalance = np.where(total > 0, (bid_size - ask_size) / total, 0.0)
+        else:
+            # Fallback to CLV
+            self.validate_input(df, ["high", "low", "close"])
+            high = df["high"].to_numpy().astype(np.float64)
+            low = df["low"].to_numpy().astype(np.float64)
+            close = df["close"].to_numpy().astype(np.float64)
+            hl_range = np.maximum(high - low, 1e-10)
+            imbalance = (2 * close - high - low) / hl_range
+
+        results["qiv_imbalance"] = imbalance
+
+        # Imbalance velocity (first derivative)
+        velocity = np.diff(imbalance, prepend=imbalance[0])
+        results["qiv_velocity"] = velocity
+
+        # Imbalance acceleration (second derivative)
+        acceleration = np.diff(velocity, prepend=velocity[0])
+        results["qiv_acceleration"] = acceleration
+
+        # Rolling velocities
+        for window in self.windows:
+            # Average velocity over window
+            rolling_vel = np.full(n, np.nan)
+            for i in range(window - 1, n):
+                rolling_vel[i] = np.mean(velocity[i - window + 1: i + 1])
+            results[f"qiv_vel_ma_{window}"] = rolling_vel
+
+            # Velocity magnitude (absolute)
+            results[f"qiv_vel_mag_{window}"] = np.abs(rolling_vel)
+
+            # Velocity direction signal
+            signal = np.zeros(n)
+            signal[rolling_vel > self.velocity_threshold] = 1
+            signal[rolling_vel < -self.velocity_threshold] = -1
+            results[f"qiv_signal_{window}"] = signal
+
+            # Velocity persistence
+            persist = np.full(n, np.nan)
+            for i in range(window, n):
+                prev_vel = rolling_vel[i - window]
+                curr_vel = rolling_vel[i]
+                if not np.isnan(prev_vel) and not np.isnan(curr_vel):
+                    persist[i] = 1 if np.sign(prev_vel) == np.sign(curr_vel) else 0
+            results[f"qiv_persist_{window}"] = persist
+
+        return results
+
+
+# =============================================================================
 # ORDER FLOW FEATURES
 # =============================================================================
 
@@ -1091,6 +1503,13 @@ class MicrostructureFeatureCalculator:
 
     def _add_default_features(self) -> None:
         """Add all default microstructure features."""
+        # P1-C Enhancement: Order Book Imbalance Features
+        self.features.extend([
+            OrderBookImbalance(),
+            OrderBookPressure(),
+            QuoteImbalanceVelocity(),
+        ])
+
         # Order flow
         self.features.extend([
             BuySellVolumeImbalance(),

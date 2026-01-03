@@ -70,6 +70,17 @@ class EventType(str, Enum):
     POSITION_UPDATED = "portfolio.position_updated"
     PORTFOLIO_REBALANCED = "portfolio.rebalanced"
 
+    # VIX & Regime Events (P1-A Enhancement)
+    VIX_UPDATE = "market.vix_update"
+    REGIME_CHANGE = "market.regime_change"
+
+    # TCA Events (P1-D Enhancement)
+    TCA_ANALYSIS = "execution.tca_analysis"
+    TCA_ALERT = "execution.tca_alert"
+
+    # System Alert Events
+    SYSTEM_ALERT = "system.alert"
+
 
 class EventPriority(int, Enum):
     """Event priority levels for queue ordering."""
