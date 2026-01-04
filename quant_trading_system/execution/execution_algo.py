@@ -577,6 +577,9 @@ class VWAPAlgorithm(ExecutionAlgorithm):
         total_weight = sum(profile_normalized)
         if total_weight > 0:
             profile_normalized = [w / total_weight for w in profile_normalized]
+        else:
+            # FIX: Fall back to uniform distribution if total_weight is zero
+            profile_normalized = [1.0 / num_intervals for _ in range(num_intervals)]
 
         slices = []
         start_time = datetime.now(timezone.utc)
@@ -931,22 +934,25 @@ class AlgoExecutionEngine:
         self,
         order_manager: OrderManager,
         client: AlpacaClient,
+        portfolio_getter: Callable[[], Any] | None = None,
     ) -> None:
         """Initialize execution engine.
 
         Args:
             order_manager: Order manager for execution.
             client: Alpaca client for market data.
+            portfolio_getter: FIX - Callable that returns current portfolio for risk checks.
         """
         self.order_manager = order_manager
         self.client = client
+        self._portfolio_getter = portfolio_getter
 
-        # Algorithm instances
+        # Algorithm instances - FIX: Pass portfolio_getter to all algorithms
         self._algorithms: dict[AlgoType, ExecutionAlgorithm] = {
-            AlgoType.TWAP: TWAPAlgorithm(order_manager, client),
-            AlgoType.VWAP: VWAPAlgorithm(order_manager, client),
+            AlgoType.TWAP: TWAPAlgorithm(order_manager, client, portfolio_getter),
+            AlgoType.VWAP: VWAPAlgorithm(order_manager, client, portfolio_getter),
             AlgoType.IMPLEMENTATION_SHORTFALL: ImplementationShortfallAlgorithm(
-                order_manager, client
+                order_manager, client, portfolio_getter
             ),
         }
 

@@ -657,6 +657,11 @@ def run_backtest(args: argparse.Namespace) -> int:
         logger.error(f"Invalid date format: {e}")
         return 1
 
+    # FIX: Validate date ordering
+    if end_date <= start_date:
+        logger.error(f"End date ({args.end}) must be after start date ({args.start})")
+        return 1
+
     # Create session
     session = BacktestSession(
         start_date=start_date,

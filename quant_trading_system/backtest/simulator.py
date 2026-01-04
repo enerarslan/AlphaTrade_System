@@ -63,6 +63,11 @@ class MarketConditions:
     previous_close: Decimal | None = None  # Previous day's close price
     is_market_open: bool = True  # Whether this is market open bar
 
+    def __post_init__(self):
+        """Validate market conditions. FIX: Prevent division by zero."""
+        if self.avg_daily_volume <= 0:
+            raise ValueError("avg_daily_volume must be positive to prevent division by zero")
+
     @property
     def spread(self) -> Decimal:
         """Get bid-ask spread."""

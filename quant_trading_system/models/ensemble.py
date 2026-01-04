@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -808,14 +809,24 @@ class ICBasedEnsemble(EnsembleModel):
         self,
         predictions: dict[int, float],
         actual: float,
+        timestamp: datetime | None = None,
     ) -> None:
         """
-        Update IC tracking with new observation.
+        Update IC tracking with new observation. FIX: Added timestamp validation.
 
         Args:
             predictions: Dictionary mapping model index to prediction
             actual: Actual realized return/value
+            timestamp: Optional timestamp for ordering validation
         """
+        # FIX: Validate timestamp ordering to prevent look-ahead bias
+        if timestamp is not None:
+            if hasattr(self, '_last_timestamp') and self._last_timestamp is not None:
+                if timestamp <= self._last_timestamp:
+                    logger.warning(f"Out-of-order update rejected: {timestamp} <= {self._last_timestamp}")
+                    return
+            self._last_timestamp = timestamp
+
         # Store history
         self._prediction_history.append(predictions)
         self._actual_history.append(actual)

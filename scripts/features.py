@@ -719,7 +719,8 @@ class FeatureCalculator:
         """Generate cache key for data."""
         import hashlib
 
-        data_hash = hashlib.md5(
+        # FIX: Use SHA256 instead of deprecated MD5
+        data_hash = hashlib.sha256(
             f"{len(df)}_{df.iloc[0].to_dict() if len(df) > 0 else ''}_{symbol}".encode()
         ).hexdigest()[:16]
 

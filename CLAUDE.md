@@ -34,9 +34,19 @@
 
 ```
 AlphaTrade_System/
-├── main.py                         # Entry point (CLI)
+├── main.py                         # Unified CLI entry point
 ├── pyproject.toml                  # Dependencies
 ├── .env                            # Environment variables (NOT in git)
+│
+├── scripts/                        # Operational scripts (v1.3.0)
+│   ├── __init__.py                 # Package init
+│   ├── trade.py                    # Live/Paper trading (@trader CRITICAL)
+│   ├── backtest.py                 # Comprehensive backtesting
+│   ├── train.py                    # ML model training (@mlquant)
+│   ├── data.py                     # Data management (@data)
+│   ├── features.py                 # Feature engineering (@mlquant)
+│   ├── health.py                   # System diagnostics (@infra)
+│   └── deploy.py                   # Deployment/setup (@infra)
 │
 ├── quant_trading_system/           # Main package
 │   ├── config/                     # Configuration (settings.py, *.yaml)
@@ -52,7 +62,6 @@ AlphaTrade_System/
 │   ├── database/                   # Database layer (connection.py, models.py, repository.py)
 │   └── monitoring/                 # Observability (metrics.py, alerting.py, audit.py)
 │
-├── scripts/                        # Operational scripts
 ├── tests/                          # Test suite (700+ tests)
 ├── docker/                         # Docker infrastructure
 ├── data/raw/                       # Historical data (47 symbols)
@@ -561,28 +570,110 @@ Agent files in `.claude/agents/`
 
 ## 21. Quick Reference
 
-### Commands
-```bash
-# Standard (Windows/CPU)
-python main.py trade --mode paper               # Paper trading
-python main.py trade --mode live                # Live trading
-python scripts/run_backtest.py --start-date 2024-01-01 --end-date 2024-06-30
-python scripts/train_models.py --model xgboost --symbols AAPL MSFT
-python main.py dashboard --port 8000
+### Unified CLI Commands (v1.3.0)
 
-# GPU-Accelerated (WSL2)
+All operations are accessed through `main.py` with subcommands:
+
+```bash
+# ═══════════════════════════════════════════════════════════════════════════
+# TRADING (@trader CRITICAL)
+# ═══════════════════════════════════════════════════════════════════════════
+python main.py trade --mode paper              # Paper trading
+python main.py trade --mode live               # Live trading (REAL MONEY)
+python main.py trade --mode paper --symbols AAPL MSFT GOOGL
+python main.py trade --mode paper --dry-run    # Simulation only
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BACKTESTING
+# ═══════════════════════════════════════════════════════════════════════════
+python main.py backtest --start-date 2024-01-01 --end-date 2024-06-30
+python main.py backtest --symbols AAPL MSFT --initial-capital 100000
+python main.py backtest --execution-mode realistic --slippage-bps 5
+python main.py backtest --monte-carlo --n-simulations 1000
+python main.py backtest --report html --output reports/
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODEL TRAINING (@mlquant)
+# ═══════════════════════════════════════════════════════════════════════════
+python main.py train --model xgboost --symbols AAPL MSFT
+python main.py train --model lightgbm --optimize optuna --n-trials 100
+python main.py train --model lstm --use-gpu --epochs 100
+python main.py train --model ensemble
+python main.py train --model xgboost --meta-labeling --multiple-testing
+python main.py train --validate-only --model-path models/xgboost.pkl
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATA MANAGEMENT (@data)
+# ═══════════════════════════════════════════════════════════════════════════
+python main.py data list                       # List available symbols
+python main.py data download --symbols AAPL MSFT --start-date 2024-01-01
+python main.py data validate --path data/raw/
+python main.py data preprocess --input data/raw/ --output data/processed/
+python main.py data export --format parquet --output data/export/
+python main.py data intrinsic --bar-type volume --threshold 10000
+python main.py data altdata --providers news sentiment --symbols AAPL
+python main.py data vix --start-date 2024-01-01
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE ENGINEERING (@mlquant)
+# ═══════════════════════════════════════════════════════════════════════════
+python main.py features compute --symbols AAPL MSFT --groups all
+python main.py features compute --groups trend momentum volatility
+python main.py features analyze --path data/features/
+python main.py features importance --model models/xgboost.pkl
+python main.py features gpu --symbols AAPL MSFT --benchmark
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SYSTEM HEALTH (@infra)
+# ═══════════════════════════════════════════════════════════════════════════
+python main.py health check                    # Full health check
+python main.py health status                   # Quick status
+python main.py health risk                     # Risk system status
+python main.py health models                   # Model health
+python main.py health audit                    # Verify audit log
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DEPLOYMENT (@infra)
+# ═══════════════════════════════════════════════════════════════════════════
+python main.py deploy setup                    # Initial setup wizard
+python main.py deploy env check                # Validate environment
+python main.py deploy docker up                # Start Docker services
+python main.py deploy docker down              # Stop Docker services
+python main.py deploy docker status            # Service status
+python main.py deploy k8s apply                # Apply K8s manifests
+python main.py deploy db migrate               # Database migrations
+python main.py deploy gpu check                # Check GPU availability
+python main.py deploy gpu setup                # Setup WSL2 GPU env
+```
+
+### GPU-Accelerated Commands (WSL2)
+```bash
+# Access WSL2 environment
 wsl -d Ubuntu-22.04
 source /root/miniconda3/bin/activate alphatrade
 cd /root/AlphaTrade_System
-python scripts/run_backtest.py --use-gpu
-python scripts/train_models.py --use-gpu --model xgboost
-python scripts/institutional_training_pipeline.py --use-gpu
+
+# GPU-accelerated operations
+python main.py backtest --use-gpu --symbols AAPL MSFT
+python main.py train --model xgboost --use-gpu
+python main.py features compute --use-gpu --groups all
 ```
+
+### Scripts (v1.3.0)
+| Script | Agent | Purpose |
+|--------|-------|---------|
+| `scripts/trade.py` | @trader | Live/Paper trading with full safety checks |
+| `scripts/backtest.py` | - | Comprehensive backtesting with Monte Carlo |
+| `scripts/train.py` | @mlquant | ML training with Purged CV, meta-labeling |
+| `scripts/data.py` | @data | Data download, validation, intrinsic bars |
+| `scripts/features.py` | @mlquant | Feature computation with GPU support |
+| `scripts/health.py` | @infra | System health and diagnostics |
+| `scripts/deploy.py` | @infra | Deployment, Docker, K8s, GPU setup |
 
 ### Key Files
 | Purpose | Location |
 |---------|----------|
-| Entry point | `main.py` |
+| Unified CLI | `main.py` |
 | Settings | `quant_trading_system/config/settings.py` |
 | Regional Config | `quant_trading_system/config/regional.py` |
 | Data types | `quant_trading_system/core/data_types.py` |
@@ -645,4 +736,90 @@ Expected improvement: **+95-155 bps annually** from all implemented enhancements
 
 ---
 
-*AlphaTrade System v1.3.0*
+## 22. Claude Instructions for Future Sessions
+
+### CRITICAL SAFETY RULES (READ FIRST)
+1. **@trader has CRITICAL priority** - Any changes to execution, risk, or order-related code MUST be reviewed with extreme care
+2. **NEVER bypass KillSwitch.is_active()** - This is the primary safety mechanism
+3. **NEVER bypass PreTradeRiskChecker** - ALL orders must pass through risk validation
+4. **Use datetime.now(timezone.utc)** - NOT datetime.utcnow() (deprecated)
+5. **MIN_EMBARGO_PCT = 0.01** - Purged CV classes must enforce minimum 1% embargo
+
+### Code Quality Standards
+1. **No unused imports** - Remove any import that is not used
+2. **No duplicate functions** - Each function should exist in exactly one place
+3. **Type hints required** - All functions must have proper type annotations
+4. **Docstrings required** - All public functions must have docstrings with @agent tags where applicable
+
+### Agent System Usage
+When working on specific areas, invoke the appropriate agent:
+- `/orchestrator` - For complex multi-component tasks
+- `@architect` - For architectural decisions and core changes
+- `@mlquant` - For ML models, features, alpha factors
+- `@trader` - **CRITICAL** - For execution, risk, orders (always double-check safety)
+- `@data` - For data pipelines, database operations
+- `@infra` - For Docker, K8s, testing, monitoring
+
+### Common Tasks
+
+#### Adding a New Feature
+1. Check if existing code can be extended
+2. Follow existing patterns in the codebase
+3. Add appropriate tests
+4. Update CLAUDE.md if architecture changes
+
+#### Modifying Risk/Execution Code
+1. **ALWAYS** check for KillSwitch integration
+2. **ALWAYS** ensure PreTradeRiskChecker is used
+3. Add audit logging for any significant changes
+4. Test with paper trading first
+
+#### Running Health Checks
+```bash
+python main.py health check    # Full system check
+python main.py health risk     # Risk system status
+```
+
+#### Debugging Issues
+1. Check `python main.py health status` first
+2. Review logs in `logs/` directory
+3. Check circuit breaker status
+4. Verify kill switch is not active
+
+### Enhancement Priority System
+- **P0**: Critical safety issues - Fix immediately
+- **P1**: High priority - Core functionality
+- **P2**: Medium priority - Important improvements
+- **P3**: Low priority - Nice to have
+
+### Testing Requirements
+```bash
+pytest tests/                           # All tests
+pytest tests/unit/test_risk.py -v       # Specific test
+pytest tests/ -k "kill_switch" -v       # Pattern match
+```
+
+### Before Committing
+1. Run `python main.py health check`
+2. Run `pytest tests/ -x` (stop on first failure)
+3. Verify no unused imports or duplicate code
+4. Update CLAUDE.md if needed
+
+### Known Module Locations
+- Safety: `quant_trading_system/risk/limits.py` (KillSwitch, PreTradeRiskChecker)
+- Events: `quant_trading_system/core/events.py` (EventBus)
+- Models: `quant_trading_system/models/` (all ML models)
+- Features: `quant_trading_system/features/` (technical, statistical, microstructure)
+- Execution: `quant_trading_system/execution/` (orders, Alpaca client)
+
+### GPU Development (WSL2)
+```bash
+wsl -d Ubuntu-22.04
+source /root/miniconda3/bin/activate alphatrade
+cd /root/AlphaTrade_System
+# Now you can use --use-gpu flags
+```
+
+---
+
+*AlphaTrade System v1.3.0 - Last Updated: January 2026*

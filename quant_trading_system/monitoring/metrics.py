@@ -1061,6 +1061,8 @@ class HeartbeatService:
         self._last_heartbeat: float = 0
         self._consecutive_failures: int = 0
         self._max_failures_before_critical = 3
+        # FIX: Add PagerDuty-specific failure tracking
+        self._consecutive_pagerduty_failures: int = 0
 
         import logging
         self._logger = logging.getLogger(__name__)
@@ -1163,8 +1165,20 @@ class HeartbeatService:
                         self._logger.warning(
                             f"PagerDuty heartbeat failed: {response.status}"
                         )
+                        # FIX: Track consecutive failures
+                        self._consecutive_pagerduty_failures += 1
+                    else:
+                        # Reset on success
+                        self._consecutive_pagerduty_failures = 0
         except Exception as e:
+            # FIX: Track consecutive failures and escalate after threshold
+            self._consecutive_pagerduty_failures += 1
             self._logger.warning(f"PagerDuty heartbeat error: {e}")
+            if self._consecutive_pagerduty_failures >= 3:
+                self._logger.error(
+                    f"PagerDuty heartbeat failed {self._consecutive_pagerduty_failures} "
+                    "times consecutively - check PagerDuty connectivity"
+                )
 
     async def _send_webhook_heartbeat(self) -> None:
         """Send heartbeat to custom webhook endpoint."""

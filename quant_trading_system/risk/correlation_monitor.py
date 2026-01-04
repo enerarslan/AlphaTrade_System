@@ -38,6 +38,9 @@ from quant_trading_system.core.events import (
 
 logger = logging.getLogger(__name__)
 
+# FIX: Extract magic numbers to named constants
+OUTLIER_THRESHOLD_SIGMA = 3  # Remove points > 3 standard deviations from median
+
 
 # =============================================================================
 # Correlation Types
@@ -291,8 +294,9 @@ class CorrelationCalculator:
                     y = returns.iloc[:, j].values
 
                     # Use Spearman with outlier removal
-                    mask = (np.abs(x - np.median(x)) < 3 * np.std(x)) & \
-                           (np.abs(y - np.median(y)) < 3 * np.std(y))
+                    # FIX: Use named constant instead of magic number
+                    mask = (np.abs(x - np.median(x)) < OUTLIER_THRESHOLD_SIGMA * np.std(x)) & \
+                           (np.abs(y - np.median(y)) < OUTLIER_THRESHOLD_SIGMA * np.std(y))
 
                     if np.sum(mask) >= self.config.min_observations:
                         corr_matrix[i, j] = np.corrcoef(x[mask], y[mask])[0, 1]

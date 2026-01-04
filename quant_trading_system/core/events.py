@@ -561,24 +561,26 @@ class EventBus:
         logger.info("Event bus stopped processing")
 
     def get_metrics(self) -> dict[str, Any]:
-        """Get event bus metrics.
+        """Get event bus metrics. THREAD-SAFE.
 
         Returns:
             Dictionary with event bus metrics.
         """
-        avg_latency = 0.0
-        if self._metrics["events_processed"] > 0:
-            avg_latency = self._metrics["total_latency_ms"] / self._metrics["events_processed"]
+        # FIX: Acquire lock to prevent race conditions when reading metrics
+        with self._lock:
+            avg_latency = 0.0
+            if self._metrics["events_processed"] > 0:
+                avg_latency = self._metrics["total_latency_ms"] / self._metrics["events_processed"]
 
-        return {
-            "events_published": self._metrics["events_published"],
-            "events_processed": self._metrics["events_processed"],
-            "events_failed": self._metrics["events_failed"],
-            "avg_latency_ms": avg_latency,
-            "queue_size": self._queue.qsize(),
-            "dead_letter_count": len(self._dead_letter_queue),
-            "handler_errors": dict(self._metrics["handler_errors"]),
-        }
+            return {
+                "events_published": self._metrics["events_published"],
+                "events_processed": self._metrics["events_processed"],
+                "events_failed": self._metrics["events_failed"],
+                "avg_latency_ms": avg_latency,
+                "queue_size": self._queue.qsize(),
+                "dead_letter_count": len(self._dead_letter_queue),
+                "handler_errors": dict(self._metrics["handler_errors"]),
+            }
 
     def get_dead_letter_queue(self) -> list[DeadLetterEntry]:
         """Get the dead letter queue entries.
@@ -603,7 +605,7 @@ class EventBus:
         event_type: EventType | None = None,
         limit: int | None = None,
     ) -> list[Event]:
-        """Get event history, optionally filtered by type.
+        """Get event history, optionally filtered by type. THREAD-SAFE.
 
         Args:
             event_type: Optional type to filter by.
@@ -612,7 +614,10 @@ class EventBus:
         Returns:
             List of events from history.
         """
-        events = self._event_history
+        # FIX: Acquire lock and make a snapshot to prevent race conditions
+        with self._lock:
+            events = list(self._event_history)  # Snapshot under lock
+
         if event_type:
             events = [e for e in events if e.event_type == event_type]
         if limit:

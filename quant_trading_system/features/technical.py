@@ -1578,7 +1578,9 @@ class HistoricalVolatility(TechnicalIndicator):
             n = len(close)
             hv = np.full(n, np.nan)
             for i in range(period, n):
-                hv[i] = np.std(log_returns[i - period + 1 : i + 1], ddof=1)
+                # FIX: Exclude current bar to prevent look-ahead when using for signals
+                # Use [i - period : i] instead of [i - period + 1 : i + 1]
+                hv[i] = np.std(log_returns[i - period : i], ddof=1)
 
             if self.annualize:
                 hv = hv * np.sqrt(self.bars_per_year)

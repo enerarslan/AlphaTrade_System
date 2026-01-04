@@ -141,7 +141,8 @@ class DatabaseManager:
         SECURITY: Supports SSL/TLS for production database connections.
         """
         db_settings = self._settings.database
-        url = db_settings.url
+        # FIX: Use connection_string (real password) instead of url (masked with ***)
+        url = db_settings.connection_string
 
         # SECURITY FIX: Add SSL/TLS connection options for production
         connect_args = {}
@@ -186,7 +187,8 @@ class DatabaseManager:
         """
         db_settings = self._settings.database
         # Convert to async URL (postgresql+asyncpg://)
-        async_url = db_settings.url.replace("postgresql://", "postgresql+asyncpg://")
+        # FIX: Use connection_string (real password) instead of url (masked with ***)
+        async_url = db_settings.connection_string.replace("postgresql://", "postgresql+asyncpg://")
 
         # SECURITY FIX: Add SSL/TLS connection options for production (asyncpg format)
         connect_args = {}

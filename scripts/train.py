@@ -995,8 +995,12 @@ class ModelTrainer:
 
         except ImportError:
             self.logger.warning("SHAP not installed, skipping explainability")
+        except (TypeError, ValueError) as e:
+            # FIX: More specific error handling for data issues
+            self.logger.warning(f"SHAP computation failed due to data issue: {e}")
         except Exception as e:
-            self.logger.warning(f"SHAP computation failed: {e}")
+            # FIX: Log full traceback for unexpected errors
+            self.logger.error(f"Unexpected SHAP error: {e}", exc_info=True)
 
     def _save_model(self) -> str:
         """Phase 10: Save trained model and artifacts."""

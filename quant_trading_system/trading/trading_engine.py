@@ -521,9 +521,10 @@ class TradingEngine:
 
         # P0 FIX: Activate global kill switch singleton
         # This ensures ALL components respect the kill switch, not just this engine
+        # FIX: Use correct parameter name 'activated_by' instead of 'message'
         self._global_kill_switch.activate(
             reason=KillSwitchReason.MANUAL_ACTIVATION,
-            message=reason,
+            activated_by=reason,
         )
 
         with self._state_lock:
@@ -717,9 +718,11 @@ class TradingEngine:
         """
         # P0 FIX: Check global kill switch FIRST - before any order processing
         if self._global_kill_switch.is_active():
+            # FIX: Use state.reason instead of non-existent _reason attribute
+            reason = self._global_kill_switch.state.reason
             logger.warning(
                 f"Kill switch active - blocking order submission: "
-                f"{self._global_kill_switch._reason}"
+                f"{reason.value if reason else 'unknown'}"
             )
             return
 
@@ -756,26 +759,36 @@ class TradingEngine:
         # Submit orders with P0 FIX: PreTradeRiskChecker validation
         for request in order_requests:
             try:
+                current_price = self._prices.get(request.symbol)
+
+                # Create managed order first (required for risk check)
+                managed = self.order_manager.create_order(
+                    request=request,
+                    portfolio=portfolio,
+                    current_price=current_price,
+                )
+
                 # P0 FIX: Pre-trade risk check with portfolio lock for atomicity
-                # This prevents race conditions between risk check and order submission
+                # FIX: Use check_all() instead of non-existent check_order()
                 with self._risk_checker.portfolio_lock:
-                    risk_result = self._risk_checker.check_order(request, portfolio)
-                    if not risk_result.passed:
+                    risk_results = self._risk_checker.check_all(
+                        managed.order, portfolio, current_price or Decimal("0")
+                    )
+
+                    # Check if any risk check failed
+                    failed_checks = [r for r in risk_results if not r.passed]
+                    if failed_checks:
+                        reasons = "; ".join(r.reason for r in failed_checks if r.reason)
                         logger.warning(
                             f"Order rejected by PreTradeRiskChecker: {request.symbol} "
-                            f"- {risk_result.reason}"
+                            f"- {reasons}"
                         )
                         continue
 
-                    managed = self.order_manager.create_order(
-                        request=request,
-                        portfolio=portfolio,
-                        current_price=self._prices.get(request.symbol),
-                    )
                     await self.order_manager.submit_order(
                         managed=managed,
-                        current_price=self._prices.get(request.symbol),
-                )
+                        current_price=current_price,
+                    )
 
                 if self._session:
                     self._session.orders_submitted += 1

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -308,7 +309,7 @@ def select_optimal_region(
 
 
 class RegionalHealthMonitor:
-    """Monitor health and latency of regional deployments."""
+    """Monitor health and latency of regional deployments. THREAD-SAFE."""
 
     def __init__(self, settings: RegionalSettings | None = None):
         """Initialize monitor.
@@ -319,25 +320,29 @@ class RegionalHealthMonitor:
         self.settings = settings or RegionalSettings()
         self._latencies: dict[str, list[float]] = {}
         self._health_status: dict[str, bool] = {}
+        # FIX: Add lock for thread safety
+        self._lock = threading.RLock()
 
     def record_latency(self, region_id: str, latency_ms: float) -> None:
-        """Record a latency measurement for a region.
+        """Record a latency measurement for a region. THREAD-SAFE.
 
         Args:
             region_id: Region identifier
             latency_ms: Measured latency in milliseconds
         """
-        if region_id not in self._latencies:
-            self._latencies[region_id] = []
+        # FIX: Protect shared state with lock
+        with self._lock:
+            if region_id not in self._latencies:
+                self._latencies[region_id] = []
 
-        self._latencies[region_id].append(latency_ms)
+            self._latencies[region_id].append(latency_ms)
 
-        # Keep last 100 measurements
-        if len(self._latencies[region_id]) > 100:
-            self._latencies[region_id] = self._latencies[region_id][-100:]
+            # Keep last 100 measurements
+            if len(self._latencies[region_id]) > 100:
+                self._latencies[region_id] = self._latencies[region_id][-100:]
 
     def get_average_latency(self, region_id: str) -> float | None:
-        """Get average latency for a region.
+        """Get average latency for a region. THREAD-SAFE.
 
         Args:
             region_id: Region identifier
@@ -345,22 +350,26 @@ class RegionalHealthMonitor:
         Returns:
             Average latency in ms or None if no data
         """
-        latencies = self._latencies.get(region_id)
-        if latencies:
-            return sum(latencies) / len(latencies)
-        return None
+        # FIX: Protect shared state with lock
+        with self._lock:
+            latencies = self._latencies.get(region_id)
+            if latencies:
+                return sum(latencies) / len(latencies)
+            return None
 
     def set_health_status(self, region_id: str, healthy: bool) -> None:
-        """Set health status for a region.
+        """Set health status for a region. THREAD-SAFE.
 
         Args:
             region_id: Region identifier
             healthy: Whether the region is healthy
         """
-        self._health_status[region_id] = healthy
+        # FIX: Protect shared state with lock
+        with self._lock:
+            self._health_status[region_id] = healthy
 
     def is_healthy(self, region_id: str) -> bool:
-        """Check if a region is healthy.
+        """Check if a region is healthy. THREAD-SAFE.
 
         Args:
             region_id: Region identifier
@@ -368,7 +377,9 @@ class RegionalHealthMonitor:
         Returns:
             True if healthy (or unknown), False if unhealthy
         """
-        return self._health_status.get(region_id, True)
+        # FIX: Protect shared state with lock
+        with self._lock:
+            return self._health_status.get(region_id, True)
 
     def should_failover(self, current_region: str) -> str | None:
         """Check if failover is needed and return target region.

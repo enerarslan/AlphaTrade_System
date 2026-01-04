@@ -281,10 +281,10 @@ class IntradayDrawdownMonitor:
             # Calculate drawdowns
             state = self._calculate_drawdowns(equity, now)
 
-            # Check thresholds and trigger alerts
-            asyncio.create_task(self._check_thresholds(state))
+        # FIX: Create async task OUTSIDE the lock to prevent potential deadlock
+        asyncio.create_task(self._check_thresholds(state))
 
-            return state
+        return state
 
     def _calculate_drawdowns(self, equity: Decimal, now: datetime) -> DrawdownState:
         """Calculate all drawdown metrics.

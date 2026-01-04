@@ -520,7 +520,16 @@ class PostTradeAnalyzer:
 
         Returns:
             Complete TCA report
+
+        Raises:
+            ValueError: If order quantity or fill price is invalid
         """
+        # FIX: Validate inputs before TCA analysis
+        if order.quantity <= 0:
+            raise ValueError(f"Order quantity must be positive, got {order.quantity}")
+        if fill_price <= 0:
+            raise ValueError(f"Fill price must be positive, got {fill_price}")
+
         order_value = order.quantity * fill_price
         side_sign = 1 if order.side == OrderSide.BUY else -1
 

@@ -368,7 +368,8 @@ class KellyCriterionSizer(BasePositionSizer):
             self.win_rate = len(wins) / len(self._trade_history)
             avg_win = np.mean(wins)
             avg_loss = abs(np.mean(losses))
-            if avg_loss > 0:
+            # FIX: Use epsilon for float comparison to avoid precision issues
+            if avg_loss > 1e-10:
                 self.win_loss_ratio = avg_win / avg_loss
 
     def calculate_kelly_pct(self) -> float:

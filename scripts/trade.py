@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
 import time
@@ -570,14 +571,22 @@ class TradingSession:
             logger.warning("Trading session already running")
             return
 
-        # Confirm live trading
+        # FIX: Require explicit confirmation for live trading
         if self.mode == TradingMode.LIVE:
             logger.warning("=" * 60)
             logger.warning("LIVE TRADING MODE - REAL MONEY AT RISK")
             logger.warning("=" * 60)
 
-            # In production, this would require explicit confirmation
-            # For now, we proceed with a warning
+            # Check for explicit confirmation via environment variable
+            confirm_env = os.environ.get("ALPHATRADE_CONFIRM_LIVE", "").lower()
+            if confirm_env != "yes":
+                logger.error(
+                    "LIVE TRADING BLOCKED: Set ALPHATRADE_CONFIRM_LIVE=yes environment "
+                    "variable to enable live trading with real money."
+                )
+                return
+
+            logger.critical("LIVE TRADING CONFIRMED - Proceeding with real money")
 
         # Run pre-market checks
         if not await self.run_pre_market_checks():
@@ -625,6 +634,13 @@ class TradingSession:
                 # 1. Check kill switch
                 if self.kill_switch.is_active():
                     logger.warning("Kill switch active, stopping trading loop")
+                    # FIX: Cancel all pending orders before breaking
+                    try:
+                        if hasattr(self, 'order_manager') and self.order_manager:
+                            cancelled = await self.order_manager.cancel_all_orders()
+                            logger.warning(f"Kill switch: Cancelled {cancelled} pending orders")
+                    except Exception as e:
+                        logger.error(f"Failed to cancel orders on kill switch: {e}")
                     break
 
                 # 2. Update regime detection
