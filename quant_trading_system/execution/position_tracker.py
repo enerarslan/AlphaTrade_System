@@ -643,17 +643,37 @@ class PositionTracker:
                         broker_qty = -broker_qty
 
                     if internal_qty != broker_qty:
-                        result.discrepancies.append({
+                        discrepancy = {
                             "symbol": symbol,
                             "internal_qty": str(internal_qty),
                             "broker_qty": str(broker_qty),
                             "diff": str(internal_qty - broker_qty),
-                        })
+                        }
+                        result.discrepancies.append(discrepancy)
 
                         if auto_correct:
-                            # Update to broker state
-                            state.position = broker_pos.to_position()
-                            result.auto_corrected.append(symbol)
+                            # P1 FIX: Validate that the position delta is reasonable
+                            # Don't blindly accept broker state that could be corrupt
+                            actual_delta = abs(broker_qty - internal_qty)
+                            max_reasonable_delta = Decimal("1000")  # Max shares to auto-correct
+
+                            if actual_delta > max_reasonable_delta:
+                                # Large discrepancy - refuse to auto-correct
+                                logger.error(
+                                    f"Reconciliation blocked for {symbol}: delta {actual_delta} "
+                                    f"exceeds max reasonable delta {max_reasonable_delta}. "
+                                    "Manual intervention required."
+                                )
+                                discrepancy["auto_correct_blocked"] = True
+                                discrepancy["reason"] = f"Delta too large: {actual_delta}"
+                            else:
+                                # Small discrepancy - allow auto-correct with warning
+                                logger.warning(
+                                    f"Auto-correcting {symbol} position from "
+                                    f"{internal_qty} to {broker_qty} (delta: {actual_delta})"
+                                )
+                                state.position = broker_pos.to_position()
+                                result.auto_corrected.append(symbol)
                     else:
                         result.matches += 1
                 else:

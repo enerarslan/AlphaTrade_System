@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
@@ -229,7 +229,7 @@ class AlphaFactor(ABC):
 
         # Get timestamps
         timestamps = df["timestamp"].to_list() if "timestamp" in df.columns else [
-            datetime.now() for _ in range(len(raw_alpha))
+            datetime.now(timezone.utc) for _ in range(len(raw_alpha))
         ]
 
         # Create signals
@@ -244,7 +244,7 @@ class AlphaFactor(ABC):
                 alpha_id=self._id,
                 alpha_name=self.name,
                 symbol=symbol,
-                timestamp=ts if isinstance(ts, datetime) else datetime.now(),
+                timestamp=ts if isinstance(ts, datetime) else datetime.now(timezone.utc),
                 value=float(val),
                 confidence=float(conf),
                 horizon=horizon_bars,
@@ -563,8 +563,8 @@ class AlphaFactor(ABC):
         if len(valid_alpha) < 20:
             return AlphaMetrics(
                 alpha_name=self.name,
-                period_start=datetime.now(),
-                period_end=datetime.now(),
+                period_start=datetime.now(timezone.utc),
+                period_end=datetime.now(timezone.utc),
             )
 
         # Information Coefficient (Spearman rank correlation)
@@ -600,13 +600,13 @@ class AlphaFactor(ABC):
 
         # Get timestamps
         timestamps = df["timestamp"].to_list() if "timestamp" in df.columns else []
-        period_start = timestamps[0] if timestamps else datetime.now()
-        period_end = timestamps[-1] if timestamps else datetime.now()
+        period_start = timestamps[0] if timestamps else datetime.now(timezone.utc)
+        period_end = timestamps[-1] if timestamps else datetime.now(timezone.utc)
 
         return AlphaMetrics(
             alpha_name=self.name,
-            period_start=period_start if isinstance(period_start, datetime) else datetime.now(),
-            period_end=period_end if isinstance(period_end, datetime) else datetime.now(),
+            period_start=period_start if isinstance(period_start, datetime) else datetime.now(timezone.utc),
+            period_end=period_end if isinstance(period_end, datetime) else datetime.now(timezone.utc),
             information_coefficient=ic,
             information_ratio=ir,
             mean_return=mean_ret,

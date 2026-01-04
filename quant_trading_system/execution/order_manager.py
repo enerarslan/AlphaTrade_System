@@ -14,10 +14,11 @@ Integrates with Alpaca client for execution and event bus for notifications.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable
@@ -262,6 +263,212 @@ class OrderValidator:
         )
 
 
+class IdempotencyKeyManager:
+    """
+    P1-H3 Enhancement: Idempotency Key Manager for Order Deduplication.
+
+    Generates and tracks idempotency keys to prevent duplicate orders
+    during network retries or system failures. Keys are stored in Redis
+    (if available) or in-memory with automatic expiration.
+
+    Each key is a SHA-256 hash of order attributes that should be unique:
+    - Symbol
+    - Side
+    - Quantity
+    - Order type
+    - Client timestamp (rounded to 100ms windows)
+
+    Keys expire after 24 hours to allow legitimate re-submissions.
+
+    Example:
+        >>> manager = IdempotencyKeyManager(redis_client=redis)
+        >>> key = manager.generate_key(order_request)
+        >>> if manager.is_duplicate(key):
+        ...     raise OrderSubmissionError("Duplicate order detected")
+        >>> manager.register_key(key, order_id)
+    """
+
+    # Default TTL for idempotency keys (24 hours)
+    DEFAULT_TTL_HOURS: int = 24
+    # Time window for deduplication (100ms) - orders within same window are considered duplicates
+    DEDUP_WINDOW_MS: int = 100
+
+    def __init__(
+        self,
+        redis_client: Any | None = None,
+        ttl_hours: int | None = None,
+        enable_memory_fallback: bool = True,
+    ):
+        """Initialize IdempotencyKeyManager.
+
+        Args:
+            redis_client: Redis client for persistent key storage.
+                         If None, uses in-memory storage with fallback.
+            ttl_hours: Time-to-live for keys in hours. Default 24.
+            enable_memory_fallback: Use in-memory cache if Redis unavailable.
+        """
+        self._redis = redis_client
+        self._ttl_hours = ttl_hours or self.DEFAULT_TTL_HOURS
+        self._ttl_seconds = self._ttl_hours * 3600
+        self._enable_memory_fallback = enable_memory_fallback
+
+        # In-memory fallback storage: {key: (order_id, expiry_time)}
+        self._memory_cache: dict[str, tuple[str, datetime]] = {}
+        self._lock = threading.RLock()
+
+        logger.info(
+            f"IdempotencyKeyManager initialized with TTL={self._ttl_hours}h, "
+            f"Redis={'enabled' if redis_client else 'disabled'}"
+        )
+
+    def generate_key(self, request: "OrderRequest") -> str:
+        """Generate idempotency key from order request.
+
+        Creates a deterministic key based on order attributes that should
+        be unique for legitimate orders. Two orders within the same 100ms
+        window with identical attributes will generate the same key.
+
+        Args:
+            request: Order request to generate key for.
+
+        Returns:
+            SHA-256 hash string as idempotency key.
+        """
+        # Round timestamp to deduplication window
+        ts_ms = int(request.created_at.timestamp() * 1000)
+        ts_rounded = ts_ms // self.DEDUP_WINDOW_MS * self.DEDUP_WINDOW_MS
+
+        # Create deterministic string from order attributes
+        key_components = [
+            request.symbol.upper(),
+            request.side.value,
+            str(request.quantity),
+            request.order_type.value,
+            str(ts_rounded),
+            request.strategy_id or "default",
+        ]
+        key_string = "|".join(key_components)
+
+        # Generate SHA-256 hash
+        key_hash = hashlib.sha256(key_string.encode()).hexdigest()
+
+        return f"idem:{key_hash[:32]}"
+
+    def is_duplicate(self, key: str) -> bool:
+        """Check if idempotency key already exists.
+
+        Args:
+            key: Idempotency key to check.
+
+        Returns:
+            True if key exists (duplicate order), False otherwise.
+        """
+        # Try Redis first
+        if self._redis:
+            try:
+                return self._redis.exists(key)
+            except Exception as e:
+                logger.warning(f"Redis check failed, using memory fallback: {e}")
+
+        # Fallback to memory
+        if self._enable_memory_fallback:
+            with self._lock:
+                self._cleanup_expired()
+                return key in self._memory_cache
+
+        return False
+
+    def register_key(self, key: str, order_id: str | UUID) -> bool:
+        """Register idempotency key after successful order creation.
+
+        Args:
+            key: Idempotency key to register.
+            order_id: Order ID to associate with key.
+
+        Returns:
+            True if registration succeeded, False otherwise.
+        """
+        order_id_str = str(order_id)
+
+        # Try Redis first
+        if self._redis:
+            try:
+                # Use SET NX (only set if not exists) with expiration
+                result = self._redis.set(
+                    key,
+                    order_id_str,
+                    nx=True,
+                    ex=self._ttl_seconds,
+                )
+                if result:
+                    logger.debug(f"Registered idempotency key {key[:16]}... for order {order_id_str[:8]}")
+                    return True
+                else:
+                    logger.warning(f"Key {key[:16]}... already exists (race condition)")
+                    return False
+            except Exception as e:
+                logger.warning(f"Redis registration failed, using memory fallback: {e}")
+
+        # Fallback to memory
+        if self._enable_memory_fallback:
+            with self._lock:
+                if key in self._memory_cache:
+                    return False
+                expiry = datetime.now(timezone.utc) + timedelta(hours=self._ttl_hours)
+                self._memory_cache[key] = (order_id_str, expiry)
+                logger.debug(f"Registered idempotency key {key[:16]}... in memory for order {order_id_str[:8]}")
+                return True
+
+        return False
+
+    def get_existing_order(self, key: str) -> str | None:
+        """Get existing order ID for idempotency key if it exists.
+
+        Args:
+            key: Idempotency key to look up.
+
+        Returns:
+            Order ID if key exists, None otherwise.
+        """
+        # Try Redis first
+        if self._redis:
+            try:
+                result = self._redis.get(key)
+                if result:
+                    return result.decode() if isinstance(result, bytes) else result
+            except Exception as e:
+                logger.warning(f"Redis lookup failed, using memory fallback: {e}")
+
+        # Fallback to memory
+        if self._enable_memory_fallback:
+            with self._lock:
+                self._cleanup_expired()
+                if key in self._memory_cache:
+                    return self._memory_cache[key][0]
+
+        return None
+
+    def _cleanup_expired(self) -> None:
+        """Remove expired keys from memory cache."""
+        now = datetime.now(timezone.utc)
+        expired_keys = [
+            key for key, (_, expiry) in self._memory_cache.items()
+            if expiry < now
+        ]
+        for key in expired_keys:
+            del self._memory_cache[key]
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get manager statistics."""
+        with self._lock:
+            self._cleanup_expired()
+            return {
+                "redis_enabled": self._redis is not None,
+                "memory_keys": len(self._memory_cache),
+                "ttl_hours": self._ttl_hours,
+            }
+
+
 class SmartOrderRouter:
     """Routes orders to optimal execution strategy."""
 
@@ -365,9 +572,12 @@ class OrderManager:
         event_bus: EventBus | None = None,
         validator: OrderValidator | None = None,
         router: SmartOrderRouter | None = None,
+        idempotency_manager: IdempotencyKeyManager | None = None,
+        redis_client: Any | None = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
         order_timeout_minutes: int | None = None,
+        enable_idempotency: bool = True,
     ) -> None:
         """Initialize order manager.
 
@@ -376,10 +586,14 @@ class OrderManager:
             event_bus: Event bus for order events.
             validator: Order validator.
             router: Smart order router.
+            idempotency_manager: P1-H3 Enhancement - Idempotency key manager.
+                                If None and enable_idempotency=True, creates default.
+            redis_client: Redis client for idempotency key storage.
             max_retries: Maximum retry attempts.
             retry_delay: Base delay between retries.
             order_timeout_minutes: MAJOR FIX - Auto-cancel orders older than this.
                                    Default is 30 minutes. Set to 0 to disable.
+            enable_idempotency: P1-H3 Enhancement - Enable duplicate order detection.
         """
         self.client = client
         self.event_bus = event_bus
@@ -392,6 +606,15 @@ class OrderManager:
             order_timeout_minutes if order_timeout_minutes is not None
             else self.DEFAULT_ORDER_TIMEOUT_MINUTES
         )
+
+        # P1-H3 Enhancement: Idempotency key management for duplicate detection
+        self.enable_idempotency = enable_idempotency
+        if enable_idempotency:
+            self.idempotency_manager = idempotency_manager or IdempotencyKeyManager(
+                redis_client=redis_client
+            )
+        else:
+            self.idempotency_manager = None
 
         # Order tracking
         self._orders: dict[UUID, ManagedOrder] = {}
@@ -443,6 +666,8 @@ class OrderManager:
         performed. This prevents orders from being created without proper
         buying power, position limit, and concentration checks.
 
+        P1-H3 Enhancement: Checks idempotency to prevent duplicate orders.
+
         Args:
             request: Order request.
             portfolio: Current portfolio for validation (REQUIRED).
@@ -452,7 +677,7 @@ class OrderManager:
             Created managed order.
 
         Raises:
-            OrderSubmissionError: If validation fails.
+            OrderSubmissionError: If validation fails or duplicate detected.
             ValueError: If portfolio is not provided.
         """
         # CRITICAL: Ensure portfolio is provided for risk checks
@@ -461,6 +686,22 @@ class OrderManager:
                 "Portfolio is required for order creation. "
                 "Risk checks cannot be bypassed."
             )
+
+        # P1-H3 Enhancement: Check for duplicate orders
+        idempotency_key: str | None = None
+        if self.idempotency_manager:
+            idempotency_key = self.idempotency_manager.generate_key(request)
+            existing_order_id = self.idempotency_manager.get_existing_order(idempotency_key)
+            if existing_order_id:
+                logger.warning(
+                    f"Duplicate order detected for {request.symbol} {request.side.value} {request.quantity}. "
+                    f"Original order: {existing_order_id}. Rejecting duplicate."
+                )
+                raise OrderSubmissionError(
+                    f"Duplicate order detected. Original order ID: {existing_order_id}. "
+                    f"If this is intentional, wait 100ms or use a different strategy_id.",
+                    symbol=request.symbol,
+                )
 
         # Validate order with mandatory risk checks
         validation = self.validator.validate(request, portfolio, current_price)
@@ -495,10 +736,17 @@ class OrderManager:
             state=OrderState.VALIDATED,
         )
 
-        # Track order - use synchronous lock acquisition for create_order
-        # (runs in sync context, but dict access is atomic in CPython)
-        self._orders[order.order_id] = managed
-        self._client_id_map[order.client_order_id] = order.order_id
+        # P1 FIX (January 2026 Audit): Use proper lock for thread safety
+        # Previous comment claimed "dict access is atomic in CPython" but this is
+        # only partially true for single operations. Multiple dict accesses between
+        # _orders and _client_id_map are NOT atomic together, creating a race condition.
+        with self._sync_lock:
+            self._orders[order.order_id] = managed
+            self._client_id_map[order.client_order_id] = order.order_id
+
+            # P1-H3 Enhancement: Register idempotency key after successful creation
+            if self.idempotency_manager and idempotency_key:
+                self.idempotency_manager.register_key(idempotency_key, order.order_id)
 
         logger.info(f"Created order {order.order_id}: {request.symbol} {request.side.value} {request.quantity}")
 
@@ -957,15 +1205,15 @@ class OrderManager:
             if managed.submission_time is not None:
                 elapsed = now - managed.submission_time
                 if elapsed > timeout_delta:
+                    # P0 FIX: cancel_order() does not accept reason parameter
+                    # Log the reason separately before calling cancel
+                    timeout_reason = f"Auto-cancelled: timeout after {self.order_timeout_minutes} minutes"
                     logger.warning(
                         f"Order {managed.order.order_id} timed out after "
-                        f"{elapsed.total_seconds() / 60:.1f} minutes - auto-cancelling"
+                        f"{elapsed.total_seconds() / 60:.1f} minutes - {timeout_reason}"
                     )
                     try:
-                        await self.cancel_order(
-                            managed.order.order_id,
-                            reason=f"Auto-cancelled: timeout after {self.order_timeout_minutes} minutes"
-                        )
+                        await self.cancel_order(managed.order.order_id)
                     except Exception as e:
                         logger.error(
                             f"Failed to auto-cancel timed out order "

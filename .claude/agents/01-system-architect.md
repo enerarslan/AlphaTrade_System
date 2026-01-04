@@ -126,5 +126,41 @@ A task is complete when:
 | `core/events.py` | Event system | `EventBus.publish()`, `subscribe()` |
 | `core/data_types.py` | Core dataclasses | `Order`, `Position`, `Portfolio`, `TradeSignal` |
 | `core/exceptions.py` | Error hierarchy | All custom exceptions |
+| `core/registry.py` | Component registry | `register()`, `get()` |
+| `core/circuit_breaker.py` | API resilience | `CircuitBreaker.call()` |
+| `core/system_integrator.py` | Enhancement orchestration | `SystemIntegrator` |
 | `trading/trading_engine.py` | Main orchestrator | `run()`, `process_signal()` |
 | `config/settings.py` | Configuration | `Settings`, `RiskSettings` |
+| `config/regional.py` | Multi-region config | `RegionConfig`, `RegionalSettings` |
+
+## Enhancement Components (P1/P2/P3)
+
+The architect oversees these integrated enhancement modules:
+
+| Priority | Component | File | Purpose |
+|----------|-----------|------|---------|
+| P1 | VIX Integration | `data/vix_feed.py`, `alpha/vix_integration.py` | Regime detection |
+| P1 | Sector Rebalancing | `risk/sector_rebalancer.py` | Concentration limits |
+| P1 | TCA Framework | `execution/tca.py` | Transaction cost analysis |
+| P2 | Alternative Data | `data/alternative_data.py` | News, social, satellite |
+| P2 | Drawdown Monitor | `risk/drawdown_monitor.py` | Intraday alerts |
+| P2 | IC-Based Ensemble | `models/ensemble.py` | Dynamic model weighting |
+| P3 | Correlation Monitor | `risk/correlation_monitor.py` | Portfolio correlation |
+| P3 | Market Impact | `execution/market_impact.py` | Almgren-Chriss model |
+| P3 | GPU Features | `features/optimized_pipeline.py` | RAPIDS/cuDF acceleration |
+
+## SystemIntegrator Pattern
+
+All enhancements are coordinated via `SystemIntegrator`:
+
+```python
+from quant_trading_system.core.system_integrator import get_system_integrator
+
+# Initialize all enhancement components
+integrator = get_system_integrator()
+await integrator.initialize()
+
+# Access components
+vix_monitor = integrator.vix_monitor
+drawdown_monitor = integrator.drawdown_monitor
+```

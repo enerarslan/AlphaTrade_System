@@ -122,23 +122,49 @@ class AlgoExecutionState:
 
 
 class ExecutionAlgorithm(ABC):
-    """Base class for execution algorithms."""
+    """Base class for execution algorithms.
+
+    P0 FIX: Added portfolio_getter to ensure all slices pass risk checks.
+    """
 
     def __init__(
         self,
         order_manager: OrderManager,
         client: AlpacaClient,
+        portfolio_getter: Callable[[], Any] | None = None,
     ) -> None:
         """Initialize algorithm.
 
         Args:
             order_manager: Order manager for submitting slices.
             client: Alpaca client for market data.
+            portfolio_getter: P0 FIX - Callable that returns current portfolio.
+                             Required for risk checks on each slice.
         """
         self.order_manager = order_manager
         self.client = client
+        self._portfolio_getter = portfolio_getter
         self._running = False
         self._task: asyncio.Task | None = None
+
+    def _get_current_portfolio(self) -> Any:
+        """Get current portfolio for risk checks.
+
+        P0 FIX: Ensures slices always have a valid portfolio for risk checks.
+
+        Returns:
+            Current portfolio state.
+
+        Raises:
+            ValueError: If no portfolio_getter configured.
+        """
+        if self._portfolio_getter is None:
+            raise ValueError(
+                "portfolio_getter is required for execution algorithms. "
+                "Risk checks cannot be bypassed. Configure portfolio_getter "
+                "in the algorithm constructor."
+            )
+        return self._portfolio_getter()
 
     @abstractmethod
     async def execute(
@@ -214,6 +240,9 @@ class ExecutionAlgorithm(ABC):
     ) -> ManagedOrder | None:
         """Submit a single slice order.
 
+        P0 FIX: Now passes portfolio to create_order() to ensure all slices
+        pass pre-trade risk checks.
+
         Args:
             state: Execution state.
             slice_order: Slice to submit.
@@ -233,7 +262,9 @@ class ExecutionAlgorithm(ABC):
                 notes=f"Algo slice {slice_order.slice_id}",
             )
 
-            managed = self.order_manager.create_order(request)
+            # P0 FIX: Get current portfolio for risk checks
+            portfolio = self._get_current_portfolio()
+            managed = self.order_manager.create_order(request, portfolio=portfolio)
             managed = await self.order_manager.submit_order(managed)
 
             slice_order.order_id = managed.order.order_id

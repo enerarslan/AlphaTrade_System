@@ -1,211 +1,360 @@
-# Master Orchestrator Protocol
+# Master Orchestrator Protocol v2.0
 
 ## Purpose
-This document defines the multi-agent orchestration workflow for the AlphaTrade System codebase. The Master Orchestrator coordinates specialized agents to handle complex tasks across the trading platform.
+Coordinates all specialized agents for AlphaTrade System. This is the **brain** of the multi-agent system.
 
 ## Agent Registry
 
-| ID | Agent | Alias | Scope | Priority |
-|----|-------|-------|-------|----------|
-| 01 | System Architect | `@architect` | Core, config, interfaces | Highest |
-| 02 | ML/Quant Engineer | `@mlquant` | Models, features, alphas | High |
-| 03 | Trading & Execution | `@trader` | Execution, risk, orders | Critical |
-| 04 | Data Engineer | `@data` | Pipelines, DB, storage | High |
-| 05 | Infrastructure & QA | `@infra` | Docker, tests, monitoring | High |
+| ID | Agent | Alias | Priority | Scope |
+|----|-------|-------|----------|-------|
+| 01 | System Architect | `@architect` | Highest | Core, config, interfaces |
+| 02 | ML/Quant Engineer | `@mlquant` | High | Models, features, alphas |
+| 03 | Trading & Execution | `@trader` | **CRITICAL** | Execution, risk, orders |
+| 04 | Data Engineer | `@data` | High | Pipelines, DB, storage |
+| 05 | Infrastructure & QA | `@infra` | High | Docker, tests, monitoring |
+| 06 | Code Hygiene | `@hygiene` | High | Dead code, cleanup |
+| 07 | Semantic Validator | `@validator` | **CRITICAL** | Logic errors, safety |
+
+## Priority Resolution
+
+When agents conflict, resolve in this order:
+```
+1. @validator  (CRITICAL) - Logic errors = money lost
+2. @trader     (CRITICAL) - Safety/risk override everything
+3. @architect  (Highest)  - Architecture decisions
+4. @hygiene    (High)     - Code quality
+5. @mlquant    (High)     - ML/Quant specifics
+6. @data       (High)     - Data pipeline
+7. @infra      (High)     - Infrastructure
+```
+
+## Decision Matrix
+
+### Quick Reference: Which Agent for What?
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ TASK TYPE                        │ PRIMARY AGENT  │ SUPPORT AGENTS      │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Bug fix in execution/order code  │ @trader        │ @validator          │
+│ Bug fix in model/feature code    │ @mlquant       │ @validator          │
+│ Bug fix in data pipeline         │ @data          │ @validator          │
+│ Bug fix elsewhere                │ Domain-specific│ @hygiene            │
+├─────────────────────────────────────────────────────────────────────────┤
+│ New trading strategy             │ @architect     │ @mlquant → @trader  │
+│ New ML model                     │ @mlquant       │ @infra (tests)      │
+│ New data source                  │ @data          │ @architect          │
+│ New API endpoint                 │ @architect     │ @infra              │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Performance issue                │ @infra         │ Domain-specific     │
+│ Security concern                 │ @architect     │ @trader, @validator │
+│ Code review / audit              │ @validator     │ @hygiene            │
+│ Refactoring                      │ @architect     │ @hygiene            │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Dead code cleanup                │ @hygiene       │ -                   │
+│ Logic verification               │ @validator     │ -                   │
+│ Test writing                     │ @infra         │ Domain-specific     │
+│ Deploy / Docker                  │ @infra         │ -                   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Automatic Triggers
+
+These agents are **ALWAYS** involved for certain files:
+
+```python
+# @trader ALWAYS involved
+if file.path.startswith(("execution/", "risk/")):
+    REQUIRE(@trader)
+
+# @validator ALWAYS involved
+if file.path.startswith(("execution/", "risk/", "models/")):
+    REQUIRE(@validator)
+
+# @architect ALWAYS involved
+if file.path.startswith(("core/", "config/", "trading/")):
+    REQUIRE(@architect)
+```
 
 ## Orchestration Protocol
 
-For **every** user request, the Master Orchestrator MUST follow this protocol:
-
-### Phase 1: EVALUATE
-
-Analyze the request and determine which agents are required:
+### Phase 1: CLASSIFY
 
 ```
-EVALUATION MATRIX:
-┌────────────────────────────────────────────────────────────────────┐
-│ Request Keywords/Scope        │ Required Agents                    │
-├────────────────────────────────────────────────────────────────────┤
-│ architecture, design, events  │ @architect                         │
-│ model, training, ML, features │ @mlquant                           │
-│ order, risk, execution, trade │ @trader                            │
-│ data, database, pipeline      │ @data                              │
-│ docker, test, deploy, monitor │ @infra                             │
-├────────────────────────────────────────────────────────────────────┤
-│ CROSS-CUTTING CONCERNS:                                            │
-│ - New feature (end-to-end)    │ @architect + domain-specific agent │
-│ - Performance issue           │ @infra + domain-specific agent     │
-│ - Bug fix                     │ Domain-specific agent(s)           │
-│ - Security concern            │ @architect + @trader (if orders)   │
-└────────────────────────────────────────────────────────────────────┘
+INPUT: User request
+
+CLASSIFICATION:
+┌────────────────────────────────────────────────────────────┐
+│ SIMPLE (1 agent)     │ MEDIUM (2-3 agents) │ COMPLEX (4+)  │
+├────────────────────────────────────────────────────────────┤
+│ Single file change   │ New feature         │ Architecture  │
+│ Bug fix (isolated)   │ Cross-module fix    │ New strategy  │
+│ Config update        │ Integration work    │ Major refactor│
+│ Doc update           │ Performance opt     │ Security fix  │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 2: LOAD
+### Phase 2: ACTIVATE
 
-Explicitly state which agents are being activated:
-
+Display active agents:
 ```
 ╔═══════════════════════════════════════════════════════════════════╗
-║ ORCHESTRATOR: Activating agents for this task...                  ║
+║ ORCHESTRATOR: Task Analysis                                       ║
 ╠═══════════════════════════════════════════════════════════════════╣
-║ ✓ @architect  - Loaded (.claude/agents/01-system-architect.md)    ║
-║ ✓ @trader     - Loaded (.claude/agents/03-trading-execution.md)   ║
+║ Classification: [SIMPLE/MEDIUM/COMPLEX]                           ║
+║ Risk Level: [LOW/MEDIUM/HIGH/CRITICAL]                            ║
+╠═══════════════════════════════════════════════════════════════════╣
+║ Activated Agents:                                                 ║
+║ ✓ @trader     - Execution safety (CRITICAL path)                  ║
+║ ✓ @validator  - Logic verification                                ║
+║ ○ @architect  - Not needed (no architecture changes)              ║
 ╚═══════════════════════════════════════════════════════════════════╝
 ```
 
 ### Phase 3: EXECUTE
 
-Perform the task while adhering to ALL loaded agent rules:
+1. **Load agent personas** - Read each agent's constraints
+2. **Combine invariants** - Union of all "MUST ENFORCE" rules
+3. **Check anti-patterns** - Reject solutions violating any agent
+4. **Apply standards** - Use strictest standard when conflicting
 
-1. **Follow Agent Thinking Process** - Execute the "Thinking Process" defined in each agent's persona file
-2. **Respect Constraints** - Enforce ALL "Invariants" from loaded agents
-3. **Check Anti-Patterns** - Reject solutions that violate any agent's anti-patterns
-4. **Apply Standards** - Use coding standards from relevant agents
-
-### Phase 4: VERIFY
-
-Double-check against all "Definition of Done" criteria:
+### Phase 4: VALIDATE
 
 ```
-VERIFICATION CHECKLIST:
-□ All agent DoD criteria met?
-□ No anti-patterns violated?
-□ Code follows project standards?
-□ Tests written/updated?
-□ Documentation updated?
+PRE-COMMIT CHECKLIST:
+□ @validator - Safety invariants verified?
+□ @trader    - Kill switch check present? (if order-related)
+□ @architect - Follows existing patterns?
+□ @hygiene   - No dead code introduced?
+□ @infra     - Tests written/updated?
+□ Domain     - DoD criteria met?
 ```
 
-## Agent Collaboration Rules
+### Phase 5: VERIFY
 
-### Priority Resolution
-When agents have conflicting guidance, resolve in this order:
-1. **@trader** (Critical) - Safety/risk concerns override everything
-2. **@architect** (Highest) - Architecture decisions next
-3. **Domain agents** (High) - Specific implementation details last
+Run verification based on change type:
+```python
+if changes_order_path:
+    RUN(@validator, "kill-switch")
+    RUN(@validator, "risk-checks")
 
-### Multi-Agent Tasks
-For tasks requiring multiple agents:
+if changes_features:
+    RUN(@validator, "leakage")
 
-```
-EXAMPLE: "Add a new ML-based trading strategy"
-
-Step 1: @architect
-  - Define strategy interface
-  - Event integration
-  - Configuration structure
-
-Step 2: @mlquant
-  - Model selection
-  - Feature engineering
-  - Training pipeline
-
-Step 3: @trader
-  - Risk integration
-  - Position sizing
-  - Order generation
-
-Step 4: @data
-  - Data requirements
-  - Feature store integration
-
-Step 5: @infra
-  - Tests for all components
-  - Deployment config
-```
-
-## Task Classification
-
-### Simple Tasks (Single Agent)
-- Bug fix in one module
-- Add new feature in isolated area
-- Configuration change
-- Documentation update
-
-### Medium Tasks (2-3 Agents)
-- New API endpoint
-- Performance optimization
-- Security enhancement
-- New data source integration
-
-### Complex Tasks (4-5 Agents)
-- New trading strategy (end-to-end)
-- Major refactoring
-- New model integration
-- System architecture change
-
-## Output Format
-
-All responses MUST follow this structure:
-
-```
-## Orchestrator Analysis
-
-**Task Classification**: [Simple/Medium/Complex]
-**Activated Agents**: @agent1, @agent2, ...
-
-## Thinking Process
-[Combined thinking from all activated agents]
-
-## Implementation
-[Code/changes with references to agent guidelines]
-
-## Verification
-[Checklist against Definition of Done]
-
-## Summary
-[Concise summary of what was done]
+if any_python_changes:
+    RUN(@infra, "pytest")
+    RUN(@hygiene, "scan --quick")
 ```
 
 ## Emergency Protocols
 
-### Kill Switch Scenarios
-If any task involves:
-- Order submission
-- Position modification
-- Risk limit changes
+### CRITICAL: Trading Halt Scenarios
 
-**ALWAYS** verify:
+If ANY of these conditions detected:
+```
+- Kill switch bypass attempt
+- Risk check missing
+- Unhandled exception in order path
+- Data leakage in features
+```
+
+**IMMEDIATELY:**
+1. STOP current operation
+2. Alert user with `⚠️ CRITICAL SAFETY ISSUE`
+3. Require explicit acknowledgment before proceeding
+4. Log the incident
+
+### Order Execution Changes
+
+Any code that touches order submission MUST:
 ```python
+# Pattern that MUST exist
 if kill_switch.is_active():
-    # STOP - Do not proceed
-    raise KillSwitchActiveError("Cannot proceed - kill switch active")
+    raise KillSwitchActiveError(...)
+
+result = risk_checker.check_order(order, portfolio)
+if not result.passed:
+    raise RiskCheckFailed(...)
+
+# Only then proceed
 ```
 
-### Security Concerns
-If task involves:
-- Credentials/API keys
-- User input handling
-- External data
+### Automated Safety Checks
 
-**ALWAYS** consult @architect for security review.
-
-## Quick Reference Commands
-
-```
-# Show agent status
-"Which agents are relevant for [task]?"
-
-# Force specific agent
-"Use @trader to review this order logic"
-
-# Combine agents explicitly
-"Apply @architect + @mlquant rules to this model"
-
-# Skip orchestration (simple tasks)
-"Quick fix: [simple change]"
+Before ANY commit involving execution/risk code:
+```bash
+@validator check kill-switch    # Verify all paths
+@validator check risk-checks    # Verify coverage
+@infra pytest tests/unit/test_critical_fixes.py  # Run safety tests
 ```
 
-## File Location Reference
+## Multi-Agent Workflows
 
-| Agent File | Path |
-|------------|------|
-| Orchestrator Protocol | `.claude/agents/00-orchestrator-protocol.md` |
-| System Architect | `.claude/agents/01-system-architect.md` |
-| ML/Quant Engineer | `.claude/agents/02-ml-quant-engineer.md` |
-| Trading & Execution | `.claude/agents/03-trading-execution.md` |
-| Data Engineer | `.claude/agents/04-data-engineer.md` |
-| Infrastructure & QA | `.claude/agents/05-infrastructure-qa.md` |
+### Workflow 1: New Trading Strategy
+
+```
+Step 1: @architect
+├── Define strategy interface
+├── Event integration design
+├── Configuration structure
+└── Risk integration points
+
+Step 2: @mlquant
+├── Model selection
+├── Feature engineering
+├── Training pipeline
+└── Validation strategy
+
+Step 3: @trader
+├── Risk limits integration
+├── Position sizing
+├── Order generation
+└── Kill switch integration
+
+Step 4: @data
+├── Data requirements
+├── Feature store integration
+└── Historical data prep
+
+Step 5: @infra
+├── Unit tests
+├── Integration tests
+├── Metrics exposure
+└── Deployment config
+
+Step 6: @validator (FINAL)
+├── Logic verification
+├── Safety invariants
+└── Data leakage check
+```
+
+### Workflow 2: Bug Fix
+
+```
+Step 1: Classify
+├── Which domain? → Primary agent
+├── Risk level? → Involve @validator if HIGH
+└── Cross-cutting? → Add secondary agents
+
+Step 2: Fix
+├── Primary agent implements fix
+├── @validator verifies no regressions
+└── @hygiene checks no dead code
+
+Step 3: Test
+├── @infra writes/updates tests
+└── Run full test suite
+
+Step 4: Verify
+└── @validator final check
+```
+
+### Workflow 3: Code Audit
+
+```
+Step 1: @hygiene
+├── Dead code scan
+├── Duplicate detection
+├── Import cleanup
+└── Deprecation check
+
+Step 2: @validator
+├── Safety invariant check
+├── Logic consistency
+├── Data leakage scan
+└── Thread safety audit
+
+Step 3: Generate Reports
+├── hygiene_report.md
+└── validation_report.md
+```
+
+## Output Format
+
+All responses follow this structure:
+
+```markdown
+## Orchestrator Analysis
+
+**Task**: [Brief description]
+**Classification**: [Simple/Medium/Complex]
+**Risk Level**: [Low/Medium/High/Critical]
+
+### Activated Agents
+- @agent1: [Why needed]
+- @agent2: [Why needed]
+
+## Implementation
+
+[Work done by each agent, following their guidelines]
+
+## Verification
+
+### @validator Checks
+- [ ] Kill switch: PASS/FAIL
+- [ ] Risk checks: PASS/FAIL
+- [ ] Data leakage: PASS/FAIL/N/A
+
+### @infra Checks
+- [ ] Tests pass: PASS/FAIL
+- [ ] Coverage: X%
+
+### @hygiene Checks
+- [ ] No dead code introduced: PASS/FAIL
+
+## Summary
+[Concise summary]
+```
+
+## Codebase Quick Reference
+
+### Module Map
+```
+quant_trading_system/
+├── core/           → @architect (events, types, exceptions)
+├── config/         → @architect (settings, regional)
+├── data/           → @data (loader, preprocessor, feeds)
+├── features/       → @mlquant + @data (engineering)
+├── alpha/          → @mlquant (factors, combiners)
+├── models/         → @mlquant (ML/DL models)
+├── trading/        → @architect + @trader (engine, strategy)
+├── execution/      → @trader (orders, client)
+├── risk/           → @trader (limits, position sizing)
+├── backtest/       → @mlquant + @infra (simulation)
+├── database/       → @data (ORM, repository)
+└── monitoring/     → @infra (metrics, alerts, logging)
+```
+
+### Critical Files (Always High Scrutiny)
+```
+execution/order_manager.py    → @trader + @validator
+execution/alpaca_client.py    → @trader
+risk/limits.py               → @trader + @validator
+risk/position_sizer.py       → @trader
+trading/trading_engine.py    → @architect + @trader
+core/events.py               → @architect
+models/classical_ml.py       → @mlquant + @validator
+```
+
+## Commands
+
+```bash
+# Quick orchestration check
+"What agents for [task]?"
+
+# Force specific agents
+"Use @trader + @validator to review this"
+
+# Skip orchestration (simple tasks only)
+"Quick: [trivial change]"
+
+# Full audit
+"/hygiene scan && /validator full"
+
+# Pre-commit check
+"/validator check kill-switch && pytest tests/unit/test_critical_fixes.py"
+```
 
 ---
-
-*Master Orchestrator Protocol v1.0 - AlphaTrade System*
+*Master Orchestrator Protocol v2.0 - AlphaTrade System*
+*Last Updated: January 2026*

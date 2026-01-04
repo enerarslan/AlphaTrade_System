@@ -12,9 +12,6 @@ This module extends the base technical.py indicators.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
-
 import numpy as np
 import polars as pl
 

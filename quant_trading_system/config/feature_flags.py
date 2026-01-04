@@ -20,7 +20,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -146,8 +146,8 @@ class FeatureFlag:
             rollout=RolloutConfig.from_dict(data.get("rollout", {})),
             default_value=data.get("default_value"),
             metadata=data.get("metadata", {}),
-            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.utcnow(),
-            updated_at=datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else datetime.utcnow(),
+            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.now(timezone.utc),
+            updated_at=datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else datetime.now(timezone.utc),
             owner=data.get("owner", ""),
             tags=data.get("tags", []),
         )
@@ -219,7 +219,7 @@ class InMemoryFlagStorage(FeatureFlagStorage):
 
     def save_flag(self, flag: FeatureFlag) -> None:
         with self._lock:
-            flag.updated_at = datetime.utcnow()
+            flag.updated_at = datetime.now(timezone.utc)
             self._flags[flag.name] = flag
 
     def delete_flag(self, name: str) -> bool:
@@ -260,7 +260,7 @@ class FileFlagStorage(FeatureFlagStorage):
             with open(self._file_path, "w") as f:
                 data = {
                     "flags": {name: flag.to_dict() for name, flag in self._flags.items()},
-                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
                 json.dump(data, f, indent=2)
         except Exception as e:
@@ -276,7 +276,7 @@ class FileFlagStorage(FeatureFlagStorage):
 
     def save_flag(self, flag: FeatureFlag) -> None:
         with self._lock:
-            flag.updated_at = datetime.utcnow()
+            flag.updated_at = datetime.now(timezone.utc)
             self._flags[flag.name] = flag
             self._save()
 
@@ -624,7 +624,7 @@ class FeatureFlagManager:
 
     def _calculate_gradual_percentage(self, rollout: RolloutConfig) -> float:
         """Calculate current percentage for gradual rollout."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         if rollout.gradual_start_time is None or rollout.gradual_end_time is None:
             return rollout.gradual_start_percentage

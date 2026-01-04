@@ -585,6 +585,10 @@ def calculate_return(
 ) -> float:
     """Calculate simple return between two prices.
 
+    P1 FIX: Preserves Decimal precision through calculation, only converting
+    to float at the final output. This prevents compounding rounding errors
+    in PnL calculations.
+
     Args:
         entry_price: Entry price.
         exit_price: Exit price.
@@ -592,11 +596,16 @@ def calculate_return(
     Returns:
         Return as decimal (e.g., 0.05 for 5%).
     """
-    entry = float(entry_price)
-    exit_ = float(exit_price)
+    # P1 FIX: Convert to Decimal first to preserve precision
+    # Use str() conversion to avoid float precision issues
+    entry = Decimal(str(entry_price)) if not isinstance(entry_price, Decimal) else entry_price
+    exit_ = Decimal(str(exit_price)) if not isinstance(exit_price, Decimal) else exit_price
+
     if entry == 0:
         return 0.0
-    return (exit_ - entry) / entry
+
+    # Calculate in Decimal, convert only at output
+    return float((exit_ - entry) / entry)
 
 
 def calculate_log_return(
@@ -604,6 +613,9 @@ def calculate_log_return(
     exit_price: Decimal | float,
 ) -> float:
     """Calculate log return between two prices.
+
+    P1 FIX: Preserves Decimal precision through calculation, only converting
+    to float at the final output.
 
     Args:
         entry_price: Entry price.
@@ -613,11 +625,18 @@ def calculate_log_return(
         Log return.
     """
     import math
-    entry = float(entry_price)
-    exit_ = float(exit_price)
+
+    # P1 FIX: Convert to Decimal first to preserve precision
+    entry = Decimal(str(entry_price)) if not isinstance(entry_price, Decimal) else entry_price
+    exit_ = Decimal(str(exit_price)) if not isinstance(exit_price, Decimal) else exit_price
+
     if entry <= 0 or exit_ <= 0:
         return 0.0
-    return math.log(exit_ / entry)
+
+    # For log, we need to convert to float for math.log
+    # but the ratio calculation preserves Decimal precision
+    ratio = float(exit_ / entry)
+    return math.log(ratio)
 
 
 def basis_points_to_decimal(bps: int | float) -> float:
@@ -1346,16 +1365,31 @@ def validate_range(
 
 
 class CircuitBreakerState:
-    """Circuit breaker states."""
+    """Circuit breaker states.
+
+    P3 DEPRECATION: This class is deprecated. Use core/circuit_breaker.py instead:
+        from quant_trading_system.core.circuit_breaker import CircuitState
+    """
     CLOSED = "closed"      # Normal operation
     OPEN = "open"          # Failing, requests blocked
     HALF_OPEN = "half_open"  # Testing recovery
 
 
 class CircuitBreakerError(Exception):
-    """Raised when circuit breaker is open."""
+    """Raised when circuit breaker is open.
+
+    P3 DEPRECATION: This class is deprecated. Use core/circuit_breaker.py instead:
+        from quant_trading_system.core.circuit_breaker import CircuitBreakerException
+    """
 
     def __init__(self, message: str, service_name: str, time_until_retry: float):
+        import warnings
+        warnings.warn(
+            "CircuitBreakerError from utils.py is deprecated. "
+            "Use quant_trading_system.core.circuit_breaker.CircuitBreakerException instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         super().__init__(message)
         self.service_name = service_name
         self.time_until_retry = time_until_retry
@@ -1363,6 +1397,20 @@ class CircuitBreakerError(Exception):
 
 class CircuitBreaker:
     """Circuit breaker for protecting external service calls.
+
+    P3 DEPRECATION: This class is deprecated. Use core/circuit_breaker.py instead:
+        from quant_trading_system.core.circuit_breaker import (
+            CircuitBreaker,
+            CircuitBreakerConfig,
+            circuit_breaker_registry
+        )
+
+    The dedicated circuit_breaker.py module provides:
+    - Configurable failure/success thresholds
+    - Half-open state strategies
+    - Centralized registry
+    - Decorator for easy integration
+    - Comprehensive statistics tracking
 
     JPMorgan-level enhancement: Implements the circuit breaker pattern
     to prevent cascading failures and provide graceful degradation

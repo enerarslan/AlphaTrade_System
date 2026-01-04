@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
@@ -214,7 +214,7 @@ class ModelRegistry:
             Unique version ID
         """
         model_name = model.name
-        version_id = f"{model.version}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        version_id = f"{model.version}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
         # Create model directory
         model_dir = self.base_path / model_name / version_id
@@ -230,7 +230,7 @@ class ModelRegistry:
             "model_name": model_name,
             "model_version": model.version,
             "model_type": model.model_type.value,
-            "registered_at": datetime.utcnow().isoformat(),
+            "registered_at": datetime.now(timezone.utc).isoformat(),
             "metrics": metrics or model.training_metrics,
             "tags": tags or [],
             "description": description,

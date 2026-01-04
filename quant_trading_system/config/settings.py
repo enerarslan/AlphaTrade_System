@@ -36,7 +36,12 @@ CONFIG_DIR = Path(__file__).resolve().parent
 
 
 class DatabaseSettings(BaseModel):
-    """Database configuration settings."""
+    """Database configuration settings.
+
+    P0 FIX: Credentials are now protected from accidental logging.
+    Use `connection_string` for actual database connections.
+    Use `url` (masked) for logging/display purposes.
+    """
 
     host: str = "localhost"
     port: int = 5432
@@ -48,7 +53,20 @@ class DatabaseSettings(BaseModel):
 
     @property
     def url(self) -> str:
-        """Get the database connection URL."""
+        """Get the database URL with MASKED password.
+
+        P0 FIX: Use this for logging/display purposes ONLY.
+        For actual connections, use connection_string.
+        """
+        return f"postgresql://{self.user}:***@{self.host}:{self.port}/{self.name}"
+
+    @property
+    def connection_string(self) -> str:
+        """Get the full database connection URL with credentials.
+
+        P0 FIX: Use this for actual database connections.
+        WARNING: Never log this value directly.
+        """
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 

@@ -52,7 +52,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Generic, Type, TypeVar
 from uuid import UUID, uuid4
@@ -78,7 +78,7 @@ class Message:
     """Base class for all CQRS messages."""
 
     message_id: UUID = field(default_factory=uuid4)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     correlation_id: UUID | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

@@ -167,6 +167,48 @@ timestamp,open,high,low,close,volume,vwap,trade_count
 2024-08-01T09:30:00Z,223.45,224.10,223.20,223.85,1250000,223.67,8500
 ```
 
+## Advanced Data Sources (January 2026)
+
+### VIX Integration (`data/vix_feed.py`)
+```python
+from quant_trading_system.data.vix_feed import VIXFeed, VIXRegime
+
+vix_feed = VIXFeed()
+current_vix = await vix_feed.get_current()
+regime = vix_feed.get_regime()  # COMPLACENT, LOW, NORMAL, ELEVATED, HIGH, EXTREME, CRISIS
+```
+
+### Alternative Data (`data/alternative_data.py`)
+| Provider | Class | Data Type |
+|----------|-------|-----------|
+| News | `NewsProvider` | Sentiment from news articles |
+| Social | `SocialMediaProvider` | Twitter/Reddit sentiment |
+| Web Traffic | `WebTrafficProvider` | Site analytics |
+| Satellite | `SatelliteProvider` | Retail traffic, industrial |
+| Credit Card | `CreditCardProvider` | Consumer spending |
+| Supply Chain | `SupplyChainProvider` | Shipping, inventory |
+
+```python
+from quant_trading_system.data.alternative_data import create_alt_data_aggregator
+
+aggregator = create_alt_data_aggregator(["news", "social"])
+signal = await aggregator.get_composite_signal("AAPL")
+```
+
+### Intrinsic Time Bars (`data/intrinsic_bars.py`)
+```python
+from quant_trading_system.data.intrinsic_bars import (
+    TickBarGenerator,
+    VolumeBarGenerator,
+    DollarBarGenerator,
+    ImbalanceBarGenerator,
+)
+
+# Volume bars (activity-based sampling)
+volume_bars = VolumeBarGenerator(threshold=100_000)
+bars = volume_bars.generate(tick_data)
+```
+
 ## Definition of Done
 
 A task is complete when:

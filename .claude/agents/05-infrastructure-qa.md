@@ -171,11 +171,28 @@ tests/
 │   ├── test_execution.py
 │   ├── test_models.py
 │   ├── test_risk.py
-│   └── ... (17 files total)
+│   ├── test_critical_fixes.py  # P0/P1 safety tests (27 tests)
+│   └── ... (18+ files total)
 └── integration/                # Integration tests (slower, real deps)
     ├── test_data_pipeline.py
     ├── test_monitoring_integration.py
     └── test_websocket_reconnection.py
+```
+
+### Critical Safety Tests (January 2026)
+```bash
+# ALWAYS run before any execution/risk changes
+pytest tests/unit/test_critical_fixes.py -v
+
+# Tests cover:
+# - Kill switch bypass prevention (P0 #2)
+# - Portfolio lock for atomic operations (P0 #3)
+# - Credential masking (P0 #14)
+# - Reconciliation validation (P1 #7)
+# - Decimal precision (P1 #11)
+# - Registry deadlock prevention (P1 #13)
+# - Zero volatility handling (P1 #15)
+# - VaR intraday adjustment (P1 #10)
 ```
 
 ### Test Commands
@@ -305,4 +322,50 @@ throughput_rps             # Requests per second
 test_coverage_percent      # Code coverage
 deploy_frequency           # Deployments per week
 change_failure_rate        # Failed deployments / total
+```
+
+## GPU Acceleration (WSL2 Environment)
+
+### Environment Setup
+```
+Location:        /root/AlphaTrade_System (WSL2 Ubuntu-22.04)
+Conda Env:       alphatrade
+Python:          3.11.14
+CUDA:            11.8+
+```
+
+### Verified GPU Components
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| cuDF (RAPIDS) | 24.04+ | GPU feature computation |
+| PyTorch | 2.7+ | Model training/inference |
+| Numba | 0.63+ | JIT CPU fallback |
+| CuPy | 13.6+ | GPU array operations |
+
+### GPU Commands
+```bash
+# Access WSL2 environment
+wsl -d Ubuntu-22.04
+
+# Activate conda environment
+source /root/miniconda3/bin/activate alphatrade
+
+# Run with GPU acceleration
+cd /root/AlphaTrade_System
+python scripts/run_backtest.py --use-gpu
+python scripts/train_models.py --use-gpu
+
+# Check GPU availability
+python -c "import torch; print(torch.cuda.is_available())"
+python -c "import cudf; print(cudf.__version__)"
+```
+
+### GPU Feature Detection in Code
+```python
+from quant_trading_system.features.optimized_pipeline import CUDF_AVAILABLE, ComputeMode
+
+if CUDF_AVAILABLE:
+    compute_mode = ComputeMode.GPU
+else:
+    compute_mode = ComputeMode.VECTORIZED  # Numba fallback
 ```

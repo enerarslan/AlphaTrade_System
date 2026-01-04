@@ -45,7 +45,11 @@ class FillType(str, Enum):
 
 @dataclass
 class MarketConditions:
-    """Current market conditions for simulation."""
+    """Current market conditions for simulation.
+
+    P2 FIX: Added previous_close and gap_pct fields to support overnight
+    gap risk simulation in backtests.
+    """
 
     price: Decimal
     bid: Decimal | None = None
@@ -55,6 +59,9 @@ class MarketConditions:
     volatility: float = 0.02  # Daily volatility
     spread_bps: float = 5.0  # Bid-ask spread in bps
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # P2 FIX: Gap risk simulation fields
+    previous_close: Decimal | None = None  # Previous day's close price
+    is_market_open: bool = True  # Whether this is market open bar
 
     @property
     def spread(self) -> Decimal:
@@ -69,6 +76,25 @@ class MarketConditions:
         if self.bid and self.ask:
             return (self.bid + self.ask) / 2
         return self.price
+
+    @property
+    def gap_pct(self) -> float:
+        """Get overnight gap percentage.
+
+        P2 FIX: Returns the percentage gap between previous close and current open.
+        Positive = gap up, Negative = gap down.
+        """
+        if self.previous_close and self.previous_close > 0:
+            return float((self.price - self.previous_close) / self.previous_close)
+        return 0.0
+
+    @property
+    def has_significant_gap(self) -> bool:
+        """Check if there's a significant overnight gap (>1%).
+
+        P2 FIX: Used to trigger additional risk checks on gap days.
+        """
+        return abs(self.gap_pct) > 0.01
 
 
 @dataclass
@@ -826,6 +852,9 @@ class MarketSimulator:
     ) -> FillResult:
         """Simulate complete order execution.
 
+        P2 FIX: Now handles overnight gap risk by applying additional slippage
+        and potential rejection on gap days.
+
         Args:
             order: Order to execute.
             conditions: Market conditions.
@@ -836,6 +865,31 @@ class MarketSimulator:
         # Get latency
         latency_ms = self.latency_simulator.get_total_latency()
         execution_time = conditions.timestamp + timedelta(milliseconds=latency_ms)
+
+        # P2 FIX: Check for overnight gap risk
+        gap_slippage = Decimal("0")
+        if conditions.has_significant_gap and conditions.is_market_open:
+            # On significant gap days at market open, apply additional slippage
+            gap_pct = abs(conditions.gap_pct)
+            # Additional slippage proportional to gap size (up to 50bps extra per 1% gap)
+            gap_slippage = conditions.price * Decimal(str(gap_pct * 0.005))
+
+            # If gap exceeds 5%, there's a chance of rejection due to circuit breaker
+            if gap_pct > 0.05:
+                import random
+                if random.random() < 0.3:  # 30% rejection chance on >5% gaps
+                    return FillResult(
+                        fill_type=FillType.REJECTED,
+                        fill_price=Decimal("0"),
+                        fill_quantity=Decimal("0"),
+                        slippage=Decimal("0"),
+                        market_impact=Decimal("0"),
+                        commission=Decimal("0"),
+                        latency_ms=latency_ms,
+                        timestamp=execution_time,
+                        partial_remaining=order.quantity,
+                        rejection_reason=f"Market circuit breaker: {gap_pct:.1%} gap",
+                    )
 
         # Simulate fill
         fill_type, fill_quantity = self.fill_simulator.simulate_fill(order, conditions)
@@ -860,16 +914,19 @@ class MarketSimulator:
         # Calculate slippage
         slippage = self.slippage_model.calculate_slippage(order, conditions)
 
+        # P2 FIX: Add gap slippage on gap days
+        total_slippage = slippage + gap_slippage
+
         # Calculate market impact if using impact model
         market_impact = Decimal("0")
         if isinstance(self.slippage_model, MarketImpactModel):
             market_impact = self.slippage_model.calculate_permanent_impact(order, conditions)
 
-        # Apply slippage to price
+        # Apply total slippage to price (includes gap slippage)
         if order.side == OrderSide.BUY:
-            fill_price = base_price + slippage
+            fill_price = base_price + total_slippage
         else:
-            fill_price = base_price - slippage
+            fill_price = base_price - total_slippage
 
         # Calculate commission
         trade_value = fill_quantity * fill_price
@@ -884,7 +941,7 @@ class MarketSimulator:
             fill_type=fill_type,
             fill_price=fill_price,
             fill_quantity=fill_quantity,
-            slippage=slippage * fill_quantity,
+            slippage=total_slippage * fill_quantity,  # P2 FIX: Includes gap slippage
             market_impact=market_impact * fill_quantity,
             commission=commission,
             latency_ms=latency_ms,

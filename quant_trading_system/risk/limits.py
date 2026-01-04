@@ -354,7 +354,10 @@ class ConsecutiveLossCircuitBreaker:
 class PreTradeRiskChecker:
     """Pre-trade risk checks before order submission.
 
-    THREAD-SAFE: Uses RLock to protect daily counters.
+    THREAD-SAFE: Uses RLock to protect daily counters and portfolio checks.
+
+    P0 FIX: Added _portfolio_lock to prevent race conditions where two concurrent
+    orders both pass position limits that would be exceeded when combined.
     """
 
     def __init__(
@@ -369,6 +372,9 @@ class PreTradeRiskChecker:
         self.config = config or RiskLimitsConfig()
         # THREAD SAFETY: Use lock for daily counter operations
         self._lock = threading.RLock()
+        # P0 FIX: Portfolio-level lock to serialize position limit checks
+        # This prevents two concurrent orders from both passing limits
+        self._portfolio_lock = threading.RLock()
         self._daily_trades: int = 0
         self._daily_turnover: Decimal = Decimal("0")
         self._last_reset_date: datetime = datetime.now(timezone.utc).date()  # type: ignore
@@ -385,6 +391,24 @@ class PreTradeRiskChecker:
                 self._daily_turnover = Decimal("0")
                 self._last_reset_date = today  # type: ignore
 
+    @property
+    def portfolio_lock(self) -> threading.RLock:
+        """Get portfolio lock for atomic check-and-submit operations.
+
+        P0 FIX: Callers should acquire this lock before calling check_all()
+        and hold it until order submission is complete to prevent race conditions.
+
+        Example:
+            with risk_checker.portfolio_lock:
+                results = risk_checker.check_all(order, portfolio, price)
+                if all(r.passed for r in results):
+                    order_manager.submit_order(order)
+
+        Returns:
+            RLock for portfolio serialization.
+        """
+        return self._portfolio_lock
+
     def check_all(
         self,
         order: Order,
@@ -392,6 +416,9 @@ class PreTradeRiskChecker:
         current_price: Decimal,
     ) -> list[RiskCheckResult]:
         """Run all pre-trade checks.
+
+        P0 FIX: This method now uses _portfolio_lock internally, but callers
+        should also acquire portfolio_lock if they need atomic check+submit.
 
         Args:
             order: Order to check.
@@ -403,15 +430,18 @@ class PreTradeRiskChecker:
         """
         self._reset_daily_counters_if_needed()
 
-        results = [
-            self.check_buying_power(order, portfolio, current_price),
-            self.check_position_limit(order, portfolio, current_price),
-            self.check_concentration(order, portfolio, current_price),
-            self.check_blacklist(order),
-            self.check_trading_hours(),
-            self.check_order_size(order, current_price),
-            self.check_daily_limits(order, portfolio, current_price),
-        ]
+        # P0 FIX: Serialize all position-related checks to prevent race conditions
+        # where concurrent orders both pass limits that would be exceeded when combined
+        with self._portfolio_lock:
+            results = [
+                self.check_buying_power(order, portfolio, current_price),
+                self.check_position_limit(order, portfolio, current_price),
+                self.check_concentration(order, portfolio, current_price),
+                self.check_blacklist(order),
+                self.check_trading_hours(),
+                self.check_order_size(order, current_price),
+                self.check_daily_limits(order, portfolio, current_price),
+            ]
 
         return results
 
@@ -1195,12 +1225,18 @@ class KillSwitch:
                 return True, "No active violation"
 
             if self._violation_checker is None:
-                # If no checker is configured, allow reset with warning
-                logger.warning(
-                    "No violation checker configured - allowing reset without verification. "
-                    "This is a safety gap. Configure a violation_checker for JPMorgan-level safety."
+                # P0 FIX: Do NOT allow reset without violation verification
+                # This prevents accidental reset while violation condition is still active.
+                # To reset without a checker, use force=True with correct override_code.
+                logger.error(
+                    "Kill switch reset blocked: No violation checker configured. "
+                    "Configure a violation_checker OR use force=True with override_code "
+                    "to explicitly acknowledge risk."
                 )
-                return True, "No violation checker configured"
+                return False, (
+                    "No violation checker configured. Cannot verify violation is cleared. "
+                    "Use force=True with override_code to bypass this safety check."
+                )
 
             try:
                 is_cleared, message = self._violation_checker(self.state.reason)

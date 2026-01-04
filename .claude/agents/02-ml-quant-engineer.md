@@ -156,6 +156,22 @@ When activated, the ML/Quant Engineer MUST follow this sequence:
 | PPO | `PPOAgent` | Policy optimization |
 | A2C | `A2CAgent` | Advantage actor-critic |
 
+### Advanced ML Components (January 2026)
+| Component | File | Purpose |
+|-----------|------|---------|
+| Meta-Labeling | `models/meta_labeling.py` | Signal filtering |
+| Staleness Detector | `models/staleness_detector.py` | Model decay detection |
+| A/B Testing | `models/ab_testing.py` | Model comparison framework |
+| Purged K-Fold | `models/purged_cv.py` | Leakage-free CV |
+| RL Meta-Learning | `models/rl_meta_learning.py` | MAML-inspired adaptation |
+
+### Validation Infrastructure
+| Component | File | Purpose |
+|-----------|------|---------|
+| Validation Gates | `models/validation_gates.py` | Pre-deployment checks |
+| Explainability | `models/explainability.py` | SHAP/LIME integration |
+| Multiple Testing | `models/validation_gates.py` | Bonferroni, BH, Deflated Sharpe |
+
 ## Feature Categories
 
 | Category | File | Examples |

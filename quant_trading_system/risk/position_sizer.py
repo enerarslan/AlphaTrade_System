@@ -476,9 +476,20 @@ class VolatilityBasedSizer(BasePositionSizer):
         market_data = market_data or {}
 
         # Get realized volatility from market data
-        realized_vol = market_data.get("volatility", self.target_volatility)
-        if realized_vol <= 0:
-            realized_vol = self.target_volatility
+        realized_vol = market_data.get("volatility")
+
+        # P1 FIX: Handle zero or missing volatility conservatively
+        # When we don't have volatility data, assume volatility is HIGHER than
+        # target (2x) to be conservative and reduce position sizes.
+        # This prevents oversizing on volatile market opens.
+        if realized_vol is None or realized_vol <= 0:
+            # Assume double target volatility = half position size
+            realized_vol = self.target_volatility * 2.0
+            logger.warning(
+                f"Zero or missing volatility detected. Using conservative "
+                f"estimate of {realized_vol:.2%} (2x target). Position will be "
+                f"sized at 50% of normal to reduce risk."
+            )
 
         # Calculate volatility ratio
         vol_ratio = self.target_volatility / realized_vol

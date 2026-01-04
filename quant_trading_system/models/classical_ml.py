@@ -779,11 +779,17 @@ class ElasticNetModel(TradingModel):
 
         if calibration_method == "platt":
             # Platt scaling: apply sigmoid to convert regression output to probability
-            # Scale predictions to reasonable range for sigmoid
-            if not hasattr(self, "_calibration_scale"):
-                # Use training prediction statistics for scaling
-                train_std = max(np.std(predictions), 1e-6)
-                self._calibration_scale = train_std
+            # P1 FIX: Check if model was properly calibrated with held-out data
+            if not hasattr(self, "_calibration_scale") or self._calibration_scale is None:
+                # P1 FIX: Use a conservative default rather than training data statistics
+                # This avoids look-ahead bias but may be less accurate.
+                # For best results, call calibrate() with held-out data first.
+                logger.warning(
+                    "Model not calibrated with held-out data. Using default scale=1.0. "
+                    "For accurate probabilities, call calibrate(X_cal, y_cal) with "
+                    "a held-out calibration set."
+                )
+                self._calibration_scale = 1.0
 
             # Sigmoid transformation: P(positive) = 1 / (1 + exp(-prediction/scale))
             scaled_preds = predictions / self._calibration_scale
@@ -821,16 +827,25 @@ class ElasticNetModel(TradingModel):
     ) -> "ElasticNetModel":
         """Calibrate the model using holdout calibration data.
 
-        JPMorgan-level enhancement: Proper probability calibration using
-        scikit-learn's calibration framework for more accurate confidence scores.
+        P1 FIX: Proper probability calibration using held-out calibration set
+        to avoid target leakage. This method MUST be called with data that
+        was not used for training.
 
         Args:
-            X_cal: Calibration features
+            X_cal: Calibration features (MUST be held-out from training)
             y_cal: Calibration targets (binary: 0/1 or continuous)
             method: Calibration method ("isotonic" or "sigmoid")
 
         Returns:
             self for method chaining
+
+        Example:
+            >>> # Split data: train, calibration, test
+            >>> X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3)
+            >>> X_cal, X_test, y_cal, y_test = train_test_split(X_temp, y_temp, test_size=0.5)
+            >>> model.fit(X_train, y_train)
+            >>> model.calibrate(X_cal, y_cal)  # Use held-out calibration set
+            >>> proba = model.predict_proba_calibrated(X_test)
         """
         if not self._is_fitted:
             raise ValueError("Model must be fitted before calibration")
@@ -840,6 +855,10 @@ class ElasticNetModel(TradingModel):
 
         # Get predictions on calibration set
         cal_predictions = self.predict(X_cal)
+
+        # P1 FIX: Store calibration scale for use in predict_proba
+        # This is computed from HELD-OUT data, not training data
+        self._calibration_scale = max(np.std(cal_predictions), 1e-6)
 
         # Binarize targets if continuous
         if not np.all(np.isin(y_cal, [0, 1])):
@@ -862,6 +881,11 @@ class ElasticNetModel(TradingModel):
 
         self._calibration_method = method
         self._is_calibrated = True
+        logger.info(
+            f"Model calibrated with method={method}, "
+            f"calibration_scale={self._calibration_scale:.4f} "
+            f"(computed from {len(X_cal)} held-out samples)"
+        )
 
         return self
 
@@ -892,6 +916,91 @@ class ElasticNetModel(TradingModel):
         prob_negative = 1.0 - prob_positive
 
         return np.column_stack([prob_negative, prob_positive])
+
+    def save(self, path: str | Path) -> None:
+        """Save model with calibration state.
+
+        P1 FIX: Includes calibration state so loaded models can generate
+        calibrated probabilities.
+
+        Args:
+            path: Path to save model (without extension)
+        """
+        from pathlib import Path
+        import pickle
+
+        # Call parent save
+        super().save(path)
+
+        # P1 FIX: Save calibration state separately
+        path = Path(path)
+        calibration_path = path.with_suffix(".calibration.pkl")
+
+        calibration_state = {
+            "calibrator": getattr(self, "_calibrator", None),
+            "calibration_method": getattr(self, "_calibration_method", None),
+            "calibration_scale": getattr(self, "_calibration_scale", None),
+            "is_calibrated": getattr(self, "_is_calibrated", False),
+        }
+
+        with open(calibration_path, "wb") as f:
+            pickle.dump(calibration_state, f)
+
+        logger.info(f"Saved calibration state to {calibration_path}")
+
+    def load(
+        self,
+        path: str | Path,
+        strict_version: bool = False,
+        allow_minor_mismatch: bool = True,
+    ) -> "ElasticNetModel":
+        """Load model with calibration state.
+
+        P1 FIX: Restores calibration state so loaded models can generate
+        calibrated probabilities.
+
+        Args:
+            path: Path to saved model (without extension)
+            strict_version: If True, require exact version match
+            allow_minor_mismatch: If True, allow minor version differences
+
+        Returns:
+            self for method chaining
+        """
+        from pathlib import Path
+        import pickle
+
+        # Call parent load
+        super().load(path, strict_version, allow_minor_mismatch)
+
+        # P1 FIX: Load calibration state if available
+        path = Path(path)
+        calibration_path = path.with_suffix(".calibration.pkl")
+
+        if calibration_path.exists():
+            with open(calibration_path, "rb") as f:
+                calibration_state = pickle.load(f)
+
+            self._calibrator = calibration_state.get("calibrator")
+            self._calibration_method = calibration_state.get("calibration_method")
+            self._calibration_scale = calibration_state.get("calibration_scale")
+            self._is_calibrated = calibration_state.get("is_calibrated", False)
+
+            logger.info(
+                f"Loaded calibration state: is_calibrated={self._is_calibrated}, "
+                f"method={self._calibration_method}"
+            )
+        else:
+            logger.warning(
+                f"No calibration state found at {calibration_path}. "
+                "Model will need to be recalibrated for accurate probabilities."
+            )
+            self._calibrator = None
+            self._calibration_method = None
+            self._calibration_scale = None
+            self._is_calibrated = False
+
+        return self
 
 
 def create_sample_weights(

@@ -767,12 +767,19 @@ class TestKillSwitch:
         assert not kill_switch.is_active()
 
     def test_reset_with_zero_cooldown(self):
-        """Test kill switch reset when cooldown is set to zero."""
-        kill_switch = KillSwitch(cooldown_minutes=0)
+        """Test kill switch reset when cooldown is set to zero.
+
+        P0 FIX: Reset now requires a violation_checker to verify the
+        condition has cleared, OR force=True with override_code.
+        """
+        # Create violation checker that confirms violation is cleared
+        violation_checker = lambda reason: (True, "Violation cleared for testing")
+
+        kill_switch = KillSwitch(cooldown_minutes=0, violation_checker=violation_checker)
         kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
         assert kill_switch.is_active()
 
-        # Reset should work immediately with zero cooldown
+        # Reset should work immediately with zero cooldown AND violation_checker
         success, message = kill_switch.reset("authorized_user")
         assert success
         assert not kill_switch.is_active()

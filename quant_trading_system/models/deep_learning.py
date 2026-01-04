@@ -414,6 +414,8 @@ class LSTMModel(TimeSeriesModel):
         self._multi_gpu = multi_gpu and self.device.type == "cuda"
         self._scaler: torch.cuda.amp.GradScaler | None = None
         self._network: nn.Module | None = None
+        # P0 FIX: Initialize device manager for GPU memory stats
+        self._device_manager = DeviceManager()
 
         # Log device info
         logger.info(f"LSTM model initialized on device: {self.device}")
@@ -949,6 +951,8 @@ class TransformerModel(TimeSeriesModel):
         self._multi_gpu = multi_gpu and self.device.type == "cuda"
         self._scaler: torch.cuda.amp.GradScaler | None = None
         self._network: nn.Module | None = None
+        # P0 FIX: Initialize device manager for GPU memory stats
+        self._device_manager = DeviceManager()
 
         # Log device info
         logger.info(f"Transformer model initialized on device: {self.device}")
@@ -1463,6 +1467,8 @@ class TCNModel(TimeSeriesModel):
         self._multi_gpu = multi_gpu and self.device.type == "cuda"
         self._scaler: torch.cuda.amp.GradScaler | None = None
         self._network: nn.Module | None = None
+        # P0 FIX: Initialize device manager for GPU memory stats
+        self._device_manager = DeviceManager()
 
         # Log device info
         logger.info(f"TCN model initialized on device: {self.device}")

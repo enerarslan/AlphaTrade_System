@@ -185,6 +185,9 @@ class ComponentRegistry:
     ) -> Any:
         """Get a component instance by name and type.
 
+        P1 FIX: Releases lock before calling get_instance() to prevent deadlock
+        when factory function tries to register additional components.
+
         Args:
             name: Name of the component.
             component_type: Type of the component.
@@ -196,6 +199,9 @@ class ComponentRegistry:
         Raises:
             ConfigurationError: If component is not found.
         """
+        # P1 FIX: Get the ComponentInfo reference inside the lock, then release
+        # the lock before calling get_instance(). This prevents deadlock when
+        # the factory tries to register or retrieve other components.
         with self._lock:
             # Check for alias
             if name in self._aliases:
@@ -210,7 +216,11 @@ class ComponentRegistry:
                     details={"component_name": name, "component_type": component_type.value},
                 )
 
-            return type_registry[name].get_instance(**kwargs)
+            # Get reference while holding lock
+            component_info = type_registry[name]
+
+        # P1 FIX: Call get_instance() OUTSIDE the lock
+        return component_info.get_instance(**kwargs)
 
     def get_by_alias(self, alias: str, **kwargs: Any) -> Any:
         """Get a component instance by alias.

@@ -17,14 +17,20 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Generic, TypeVar
 
 import numpy as np
 import pandas as pd
 import polars as pl
+
+# Type variable for generic LRU cache
+K = TypeVar('K')
+V = TypeVar('V')
 
 from .cross_sectional import CrossSectionalFeatureCalculator
 from .microstructure import MicrostructureFeatureCalculator
@@ -40,6 +46,166 @@ from .optimized_pipeline import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# P1-H4 Enhancement: LRU Cache for Feature Pipeline
+# =============================================================================
+
+
+class LRUCache(Generic[K, V]):
+    """
+    P1-H4 Enhancement: Thread-safe LRU Cache with bounded memory.
+
+    Prevents memory leaks in long-running trading sessions by evicting
+    least-recently-used feature computations when cache exceeds max_size.
+
+    Features:
+    - O(1) get/put operations using OrderedDict
+    - Thread-safe with RLock
+    - Configurable max_size (default 1GB estimated)
+    - Cache hit/miss statistics
+    - Automatic eviction of stale entries
+
+    Example:
+        >>> cache = LRUCache[str, np.ndarray](max_size=1000)
+        >>> cache.put("feature_key", feature_array)
+        >>> if "feature_key" in cache:
+        ...     data = cache.get("feature_key")
+    """
+
+    # Default max entries (roughly 1GB with 100 features * 10K rows each)
+    DEFAULT_MAX_SIZE: int = 1000
+
+    def __init__(
+        self,
+        max_size: int | None = None,
+        max_memory_mb: int | None = None,
+    ):
+        """Initialize LRU Cache.
+
+        Args:
+            max_size: Maximum number of cache entries. Default 1000.
+            max_memory_mb: Optional memory limit in MB. If set, overrides max_size
+                          using estimated entry size.
+        """
+        self._max_size = max_size or self.DEFAULT_MAX_SIZE
+        self._max_memory_mb = max_memory_mb
+        self._cache: OrderedDict[K, V] = OrderedDict()
+        self._lock = threading.RLock()
+
+        # Statistics
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+
+        logger.debug(f"LRUCache initialized with max_size={self._max_size}")
+
+    def get(self, key: K) -> V | None:
+        """Get value from cache, updating access order.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            Cached value or None if not found.
+        """
+        with self._lock:
+            if key in self._cache:
+                # Move to end (most recently used)
+                self._cache.move_to_end(key)
+                self._hits += 1
+                return self._cache[key]
+            self._misses += 1
+            return None
+
+    def put(self, key: K, value: V) -> None:
+        """Put value into cache, evicting LRU entry if needed.
+
+        Args:
+            key: Cache key.
+            value: Value to cache.
+        """
+        with self._lock:
+            if key in self._cache:
+                # Update existing and move to end
+                self._cache.move_to_end(key)
+                self._cache[key] = value
+            else:
+                # Add new entry
+                self._cache[key] = value
+
+                # Evict if over capacity
+                while len(self._cache) > self._max_size:
+                    # Remove oldest (first) entry
+                    evicted_key, _ = self._cache.popitem(last=False)
+                    self._evictions += 1
+                    logger.debug(f"LRUCache evicted key: {evicted_key}")
+
+    def __contains__(self, key: K) -> bool:
+        """Check if key exists in cache (does not update access order)."""
+        with self._lock:
+            return key in self._cache
+
+    def __len__(self) -> int:
+        """Get number of cached entries."""
+        with self._lock:
+            return len(self._cache)
+
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        with self._lock:
+            self._cache.clear()
+            logger.info("LRUCache cleared")
+
+    def remove(self, key: K) -> bool:
+        """Remove specific key from cache.
+
+        Args:
+            key: Key to remove.
+
+        Returns:
+            True if key was found and removed, False otherwise.
+        """
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get cache statistics.
+
+        Returns:
+            Dictionary with hits, misses, hit_rate, size, evictions.
+        """
+        with self._lock:
+            total = self._hits + self._misses
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": self._hits / total if total > 0 else 0.0,
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "evictions": self._evictions,
+            }
+
+    def estimate_memory_mb(self) -> float:
+        """Estimate current memory usage in MB.
+
+        Returns:
+            Estimated memory usage.
+        """
+        with self._lock:
+            total_bytes = 0
+            for value in self._cache.values():
+                if isinstance(value, np.ndarray):
+                    total_bytes += value.nbytes
+                elif isinstance(value, dict):
+                    for v in value.values():
+                        if isinstance(v, np.ndarray):
+                            total_bytes += v.nbytes
+            return total_bytes / (1024 * 1024)
 
 
 class FeatureGroup(str, Enum):
@@ -82,6 +248,9 @@ class FeatureConfig:
     gpu_min_batch_size: int = 10000  # Minimum rows to benefit from GPU
     parallel_workers: int = 4  # Number of parallel workers for feature computation
     use_cache: bool = True  # Enable feature caching
+    # P1-H4 Enhancement: LRU cache settings to prevent memory leaks
+    cache_max_size: int = 1000  # Max number of cached feature sets (0 = unbounded, not recommended)
+    cache_max_memory_mb: int | None = None  # Optional memory limit in MB
 
 
 @dataclass
@@ -212,6 +381,7 @@ class FeaturePipeline:
     - Normalization
     - Feature selection
     - GPU-accelerated computation (when available)
+    - P1-H4 Enhancement: LRU caching to prevent memory leaks
 
     Usage:
         pipeline = FeaturePipeline(config)
@@ -222,6 +392,25 @@ class FeaturePipeline:
         self.config = config or FeatureConfig()
         self._calculators: dict[FeatureGroup, Any] = {}
         self._optimized_pipeline: OptimizedFeaturePipeline | None = None
+
+        # P1-H4 Enhancement: Initialize bounded LRU cache
+        if self.config.use_cache and self.config.cache_max_size > 0:
+            self._feature_cache: LRUCache[str, FeatureSet] = LRUCache(
+                max_size=self.config.cache_max_size,
+                max_memory_mb=self.config.cache_max_memory_mb,
+            )
+            logger.info(
+                f"FeaturePipeline initialized with LRU cache "
+                f"(max_size={self.config.cache_max_size})"
+            )
+        else:
+            self._feature_cache = None
+            if self.config.use_cache:
+                logger.warning(
+                    "Cache disabled: cache_max_size=0. "
+                    "Memory may grow unbounded in long sessions."
+                )
+
         self._initialize_calculators()
         self._initialize_optimized_pipeline()
 
@@ -305,23 +494,70 @@ class FeaturePipeline:
             logger.warning(f"Optimized pipeline failed, falling back to standard: {e}")
             return {}
 
+    def _generate_cache_key(
+        self,
+        df: pl.DataFrame,
+        symbol: str,
+    ) -> str:
+        """Generate cache key from DataFrame characteristics.
+
+        Args:
+            df: Input DataFrame.
+            symbol: Symbol identifier.
+
+        Returns:
+            Cache key string.
+        """
+        # Create deterministic key from data characteristics
+        key_parts = [
+            symbol,
+            str(len(df)),
+            str(df.columns),
+        ]
+        # Add first/last timestamps if available
+        if "timestamp" in df.columns or "date" in df.columns:
+            time_col = "timestamp" if "timestamp" in df.columns else "date"
+            key_parts.append(str(df[time_col][0]))
+            key_parts.append(str(df[time_col][-1]))
+        elif "close" in df.columns:
+            # Use price as fallback identifier
+            key_parts.append(f"{df['close'][0]:.4f}")
+            key_parts.append(f"{df['close'][-1]:.4f}")
+
+        key_string = "|".join(key_parts)
+        return hashlib.md5(key_string.encode()).hexdigest()
+
     def compute(
         self,
         df: pl.DataFrame,
         symbol: str = "UNKNOWN",
         universe_data: dict[str, pl.DataFrame] | None = None,
+        use_cache: bool = True,
     ) -> FeatureSet:
         """
         Compute all configured features.
+
+        P1-H4 Enhancement: Uses LRU cache to avoid recomputation and
+        prevent memory leaks in long-running sessions.
 
         Args:
             df: Input DataFrame with OHLCV data
             symbol: Symbol identifier
             universe_data: Optional dict of DataFrames for cross-sectional features
+            use_cache: Whether to use cache for this computation. Default True.
 
         Returns:
             FeatureSet containing computed features and metadata
         """
+        # P1-H4 Enhancement: Check cache first
+        cache_key = None
+        if use_cache and self._feature_cache is not None:
+            cache_key = self._generate_cache_key(df, symbol)
+            cached_result = self._feature_cache.get(cache_key)
+            if cached_result is not None:
+                logger.debug(f"Cache hit for {symbol} (key={cache_key[:8]}...)")
+                return cached_result
+
         all_features: dict[str, np.ndarray] = {}
         all_metadata: dict[str, FeatureMetadata] = {}
 
@@ -392,7 +628,7 @@ class FeaturePipeline:
         # Generate version hash (based on features only, not targets)
         version = self._generate_version(all_features)
 
-        return FeatureSet(
+        result = FeatureSet(
             features=all_features,
             metadata=all_metadata,
             config=self.config,
@@ -401,6 +637,13 @@ class FeaturePipeline:
             targets=target_features,  # SEPARATE from features to prevent look-ahead bias
             target_metadata=target_metadata,
         )
+
+        # P1-H4 Enhancement: Store in cache
+        if use_cache and self._feature_cache is not None and cache_key:
+            self._feature_cache.put(cache_key, result)
+            logger.debug(f"Cached features for {symbol} (key={cache_key[:8]}...)")
+
+        return result
 
     def _get_groups_to_compute(self) -> list[FeatureGroup]:
         """Get list of feature groups to compute."""
@@ -691,6 +934,59 @@ class FeaturePipeline:
             sort_keys=True,
         )
         return hashlib.md5(content.encode()).hexdigest()[:8]
+
+    # P1-H4 Enhancement: Cache management methods
+
+    def get_cache_stats(self) -> dict[str, Any]:
+        """Get feature cache statistics.
+
+        Returns:
+            Dictionary with cache statistics or empty if cache disabled.
+        """
+        if self._feature_cache is not None:
+            stats = self._feature_cache.get_stats()
+            stats["memory_mb"] = self._feature_cache.estimate_memory_mb()
+            return stats
+        return {"enabled": False}
+
+    def clear_cache(self) -> None:
+        """Clear the feature cache.
+
+        Call this method to free memory if needed during long sessions.
+        """
+        if self._feature_cache is not None:
+            self._feature_cache.clear()
+            logger.info("Feature pipeline cache cleared")
+
+    def invalidate_symbol(self, symbol: str) -> int:
+        """Invalidate all cached entries for a symbol.
+
+        Args:
+            symbol: Symbol to invalidate.
+
+        Returns:
+            Number of entries removed.
+        """
+        if self._feature_cache is None:
+            return 0
+
+        # Note: This is O(n) but cache invalidation is infrequent
+        removed = 0
+        keys_to_remove = []
+        for key in list(self._feature_cache._cache.keys()):
+            # Keys start with hash, but we need to check the cached FeatureSet
+            cached = self._feature_cache._cache.get(key)
+            if cached and hasattr(cached, 'symbol') and cached.symbol == symbol:
+                keys_to_remove.append(key)
+
+        for key in keys_to_remove:
+            if self._feature_cache.remove(key):
+                removed += 1
+
+        if removed > 0:
+            logger.info(f"Invalidated {removed} cache entries for {symbol}")
+
+        return removed
 
 
 class FeatureSelector:

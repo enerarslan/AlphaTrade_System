@@ -11,9 +11,10 @@ Implements microstructure features organized by category:
 
 from __future__ import annotations
 
+import calendar
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import numpy as np
@@ -1466,10 +1467,8 @@ class OptionsExpirationFeatures(MicrostructureFeature):
         return results
 
     @staticmethod
-    def _get_third_friday(year: int, month: int) -> datetime | None:
+    def _get_third_friday(year: int, month: int) -> date | None:
         """Get the third Friday of a given month."""
-        import calendar
-
         cal = calendar.Calendar()
         fridays = [
             day

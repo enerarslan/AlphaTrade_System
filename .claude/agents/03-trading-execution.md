@@ -52,6 +52,41 @@ def submit_order(order: Order) -> None:
 - Consecutive losing trades exceed threshold
 - Manual activation via API
 
+### Kill Switch Reset Protocol (P0 FIX - January 2026)
+```python
+# Reset requires violation_checker OR force + override_code
+def reset_kill_switch():
+    # Method 1: With violation checker (recommended)
+    def check_violation(reason: KillSwitchReason) -> tuple[bool, str]:
+        # Return (True, msg) if violation cleared, (False, msg) if still active
+        return (True, "Drawdown recovered to acceptable levels")
+
+    kill_switch = KillSwitch(violation_checker=check_violation)
+    success, msg = kill_switch.reset("admin@company.com")
+
+    # Method 2: Force reset (emergency only)
+    # Requires KILL_SWITCH_OVERRIDE_CODE env variable
+    success, msg = kill_switch.reset(
+        "admin@company.com",
+        force=True,
+        override_code=os.environ["KILL_SWITCH_OVERRIDE_CODE"]
+    )
+```
+
+### Portfolio Lock Protocol (P0 FIX - January 2026)
+```python
+# Use portfolio_lock for atomic check-and-submit operations
+from quant_trading_system.risk.limits import PreTradeRiskChecker
+
+checker = PreTradeRiskChecker()
+
+# Prevent race condition between risk check and order submission
+with checker.portfolio_lock:
+    result = checker.check_order(order, portfolio)
+    if result.passed:
+        order_manager.submit(order)  # Atomic with risk check
+```
+
 ### Order Flow Requirements
 ```
 Signal → PreTradeRiskCheck → KillSwitchCheck → OrderManager → Alpaca → Fill → PositionTracker

@@ -38,6 +38,12 @@ from quant_trading_system.core.events import (
     create_system_event,
 )
 from quant_trading_system.core.exceptions import ExecutionError, TradingSystemError, StrategyError
+from quant_trading_system.risk.limits import (
+    KillSwitch,
+    KillSwitchReason,
+    PreTradeRiskChecker,
+    RiskLimitsConfig,
+)
 from quant_trading_system.execution.alpaca_client import AlpacaClient
 from quant_trading_system.execution.order_manager import ManagedOrder, OrderManager, OrderRequest
 from quant_trading_system.execution.position_tracker import PositionTracker
@@ -225,6 +231,18 @@ class TradingEngine:
         # MAJOR FIX: Strategy exception tracking for kill switch escalation
         self._consecutive_strategy_exceptions: int = 0
         self._last_successful_iteration: datetime | None = None
+
+        # P0 FIX (January 2026 Audit): Global KillSwitch integration
+        # The trading engine was using its own local kill switch flag without
+        # integrating with the global KillSwitch singleton. This created a
+        # critical safety gap where orders could be submitted when the global
+        # kill switch was active.
+        self._global_kill_switch = KillSwitch()
+
+        # P0 FIX (January 2026 Audit): PreTradeRiskChecker integration
+        # Pre-trade risk checks were implemented but never used in the order flow.
+        # Now ALL orders must pass through PreTradeRiskChecker before submission.
+        self._risk_checker = PreTradeRiskChecker(RiskLimitsConfig())
 
         # Register for order events
         order_manager.on_fill(self._on_order_fill)
@@ -489,6 +507,10 @@ class TradingEngine:
     def trigger_kill_switch(self, reason: str) -> None:
         """Trigger kill switch to stop all trading.
 
+        P0 FIX (January 2026 Audit): Now activates BOTH local and global kill switches.
+        Previously only set a local flag, allowing orders to be submitted when global
+        kill switch should have blocked them.
+
         THREAD SAFETY: May be called from multiple contexts (risk checks,
         callbacks, external triggers). Uses lock for state consistency.
 
@@ -496,6 +518,13 @@ class TradingEngine:
             reason: Reason for triggering kill switch.
         """
         logger.critical(f"KILL SWITCH TRIGGERED: {reason}")
+
+        # P0 FIX: Activate global kill switch singleton
+        # This ensures ALL components respect the kill switch, not just this engine
+        self._global_kill_switch.activate(
+            reason=KillSwitchReason.MANUAL_ACTIVATION,
+            message=reason,
+        )
 
         with self._state_lock:
             if self._session:
@@ -678,10 +707,27 @@ class TradingEngine:
     ) -> None:
         """Execute rebalancing trades.
 
+        P0 FIX (January 2026 Audit): Added kill switch check and PreTradeRiskChecker.
+        Previously, orders could be submitted even when kill switch was active or
+        without proper risk validation.
+
         Args:
             target: Target portfolio.
             portfolio: Current portfolio.
         """
+        # P0 FIX: Check global kill switch FIRST - before any order processing
+        if self._global_kill_switch.is_active():
+            logger.warning(
+                f"Kill switch active - blocking order submission: "
+                f"{self._global_kill_switch._reason}"
+            )
+            return
+
+        # P0 FIX: Also check local kill switch flag for redundancy
+        if self._session and self._session.kill_switch_triggered:
+            logger.warning("Local kill switch triggered - blocking order submission")
+            return
+
         if self.config.mode == TradingMode.DRY_RUN:
             logger.info("DRY RUN: Would execute rebalance trades")
             return
@@ -707,17 +753,28 @@ class TradingEngine:
             strategy_id="TradingEngine",
         )
 
-        # Submit orders
+        # Submit orders with P0 FIX: PreTradeRiskChecker validation
         for request in order_requests:
             try:
-                managed = self.order_manager.create_order(
-                    request=request,
-                    portfolio=portfolio,
-                    current_price=self._prices.get(request.symbol),
-                )
-                await self.order_manager.submit_order(
-                    managed=managed,
-                    current_price=self._prices.get(request.symbol),
+                # P0 FIX: Pre-trade risk check with portfolio lock for atomicity
+                # This prevents race conditions between risk check and order submission
+                with self._risk_checker.portfolio_lock:
+                    risk_result = self._risk_checker.check_order(request, portfolio)
+                    if not risk_result.passed:
+                        logger.warning(
+                            f"Order rejected by PreTradeRiskChecker: {request.symbol} "
+                            f"- {risk_result.reason}"
+                        )
+                        continue
+
+                    managed = self.order_manager.create_order(
+                        request=request,
+                        portfolio=portfolio,
+                        current_price=self._prices.get(request.symbol),
+                    )
+                    await self.order_manager.submit_order(
+                        managed=managed,
+                        current_price=self._prices.get(request.symbol),
                 )
 
                 if self._session:
