@@ -90,6 +90,7 @@ from quant_trading_system.data.loader import DataLoader
 from quant_trading_system.features.feature_pipeline import (
     FeaturePipeline,
     FeatureConfig,
+    FeatureGroup,
 )
 from quant_trading_system.features.optimized_pipeline import (
     OptimizedFeaturePipeline,
@@ -134,7 +135,10 @@ from quant_trading_system.backtest.engine import (
     BacktestConfig,
     BacktestMode,
     ExecutionMode,
-    BacktestResult,
+    PandasDataHandler,
+    PolarsDataHandler,
+    Strategy,
+    BacktestState,
 )
 from quant_trading_system.backtest.simulator import (
     MarketSimulator,
@@ -151,16 +155,16 @@ from quant_trading_system.backtest.analyzer import (
     TradeMetrics,
 )
 from quant_trading_system.backtest.performance_attribution import (
-    PerformanceAttributor,
-    BrinsonFachlerAttribution,
+    PerformanceAttributionService as PerformanceAttributor,
+    BrinsonAttribution,
 )
 
 # Risk
 from quant_trading_system.risk.limits import RiskLimitsConfig
 from quant_trading_system.risk.position_sizer import (
-    PositionSizer,
+    BasePositionSizer as PositionSizer,
     SizingMethod,
-    PositionSizerConfig,
+    SizingConstraints as PositionSizerConfig,
 )
 
 # Execution
@@ -186,7 +190,111 @@ from quant_trading_system.monitoring.tracing import (
 # LOGGER
 # ==============================================================================
 
-logger = get_logger("backtest", LogCategory.BACKTEST)
+logger = get_logger("backtest", LogCategory.SYSTEM)
+
+
+# ==============================================================================
+# TYPE ALIASES & STRATEGY
+# ==============================================================================
+
+# Type alias for backward compatibility
+BacktestResult = BacktestState
+
+
+class SignalBasedStrategy(Strategy):
+    """
+    Trading strategy that uses pre-computed signals.
+
+    This strategy takes a dictionary of signals per symbol and generates
+    TradeSignal objects based on the signal values at each bar.
+    """
+
+    def __init__(
+        self,
+        signals: dict[str, pd.DataFrame],
+        signal_threshold: float = 0.1,
+        signal_column: str = "signal",
+    ):
+        """Initialize signal-based strategy.
+
+        Args:
+            signals: Dictionary mapping symbols to DataFrames with signals.
+            signal_threshold: Minimum absolute signal value to generate trade.
+            signal_column: Column name containing signal values.
+        """
+        self.signals = signals
+        self.signal_threshold = signal_threshold
+        self.signal_column = signal_column
+        self._current_indices: dict[str, int] = {s: 0 for s in signals.keys()}
+
+    def generate_signals(
+        self,
+        data_handler: PandasDataHandler,
+        portfolio: Portfolio,
+    ) -> list[TradeSignal]:
+        """Generate trading signals based on pre-computed signal values.
+
+        Args:
+            data_handler: Data handler with market data.
+            portfolio: Current portfolio state.
+
+        Returns:
+            List of trading signals.
+        """
+        trade_signals = []
+
+        for symbol in data_handler.get_symbols():
+            if symbol not in self.signals:
+                continue
+
+            bar = data_handler.get_current_bar(symbol)
+            if bar is None:
+                continue
+
+            # Get signal for current timestamp
+            signal_df = self.signals[symbol]
+            idx = self._current_indices.get(symbol, 0)
+
+            if idx >= len(signal_df):
+                continue
+
+            signal_value = signal_df.iloc[idx][self.signal_column]
+            self._current_indices[symbol] = idx + 1
+
+            # Skip if signal is too weak
+            if abs(signal_value) < self.signal_threshold:
+                continue
+
+            # Determine direction
+            if signal_value > self.signal_threshold:
+                direction = Direction.LONG
+                strength = min(signal_value, 1.0)
+            elif signal_value < -self.signal_threshold:
+                direction = Direction.SHORT
+                strength = max(signal_value, -1.0)
+            else:
+                continue
+
+            trade_signal = TradeSignal(
+                symbol=symbol,
+                direction=direction,
+                strength=strength,
+                confidence=abs(signal_value),
+                timestamp=bar.timestamp,
+                horizon=1,  # Default 1-bar horizon for signal-based strategy
+                model_source="alpha_combiner",  # Source identifier
+            )
+            trade_signals.append(trade_signal)
+
+        return trade_signals
+
+    def on_bar(self, symbol: str, bar: OHLCVBar) -> None:
+        """Called for each new bar."""
+        pass
+
+    def on_fill(self, order: Order) -> None:
+        """Called when an order is filled."""
+        pass
 
 
 # ==============================================================================
@@ -214,6 +322,7 @@ class BacktestSession:
     strategy_name: str = "momentum"
     execution_mode: str = "realistic"
     use_gpu: bool = False
+    use_database: bool = True  # Load data from PostgreSQL + TimescaleDB
 
     # Advanced options
     slippage_bps: float = 5.0
@@ -324,6 +433,7 @@ class BacktestRunner:
         """Load historical data for all symbols."""
         self.session.data_loader = DataLoader(
             data_dir=Path("data/raw"),
+            use_database=self.session.use_database,
         )
 
         for symbol in self.session.symbols:
@@ -360,7 +470,7 @@ class BacktestRunner:
             logger.info("Using CPU feature pipeline")
             pipeline = FeaturePipeline(
                 config=FeatureConfig(
-                    feature_groups=["technical", "statistical", "microstructure"],
+                    groups=[FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL],
                 ),
             )
 
@@ -368,9 +478,16 @@ class BacktestRunner:
 
         for symbol, df in self.data.items():
             try:
-                features = pipeline.compute_features(df)
-                self.features[symbol] = features
-                logger.info(f"Computed {features.shape[1]} features for {symbol}")
+                # Convert polars DataFrame to polars for FeaturePipeline
+                import polars as pl
+                if not isinstance(df, pl.DataFrame):
+                    df_pl = pl.from_pandas(df) if hasattr(df, 'to_pandas') else pl.DataFrame(df)
+                else:
+                    df_pl = df
+                feature_set = pipeline.compute(df_pl, symbol=symbol)
+                # Convert to pandas for backtest engine
+                self.features[symbol] = feature_set.to_polars().to_pandas() if feature_set.num_features > 0 else df_pl.to_pandas()
+                logger.info(f"Computed {feature_set.num_features} features for {symbol}")
 
             except Exception as e:
                 logger.error(f"Failed to compute features for {symbol}: {e}")
@@ -391,18 +508,40 @@ class BacktestRunner:
         # Regime detector for adaptive signals
         self.session.regime_detector = CompositeRegimeDetector()
 
+        import polars as pl
+
         for symbol in self.features:
             try:
                 df = self.data[symbol]
                 features = self.features[symbol]
 
-                # Compute alpha signals
-                import polars as pl
-                df_pl = pl.from_pandas(df.reset_index())
+                # Handle both Polars and Pandas DataFrames
+                if isinstance(df, pl.DataFrame):
+                    df_pl = df
+                    # Get timestamps for signal DataFrame
+                    if "timestamp" in df_pl.columns:
+                        timestamps = df_pl["timestamp"].to_list()
+                    else:
+                        timestamps = list(range(len(df_pl)))
+                elif hasattr(df, 'reset_index'):
+                    # Pandas DataFrame
+                    df_pl = pl.from_pandas(df.reset_index())
+                    timestamps = df.index.tolist()
+                else:
+                    logger.warning(f"Unsupported DataFrame type for {symbol}")
+                    continue
+
+                # Convert features to dict if needed
+                if isinstance(features, pl.DataFrame):
+                    features_dict = {col: features[col].to_numpy() for col in features.columns}
+                elif hasattr(features, 'to_dict'):
+                    features_dict = features.to_dict("series")
+                else:
+                    features_dict = {}
 
                 alpha_signals = {}
                 for alpha in alphas:
-                    signal = alpha.compute(df_pl, features.to_dict("series"))
+                    signal = alpha.compute(df_pl, features_dict)
                     alpha_signals[alpha.name] = signal
 
                 # Combine signals
@@ -416,7 +555,7 @@ class BacktestRunner:
 
                 self.signals[symbol] = pd.DataFrame({
                     "signal": combined,
-                    "timestamp": df.index if hasattr(df, 'index') else range(len(df)),
+                    "timestamp": timestamps[:len(combined)],
                 })
 
                 logger.info(f"Generated signals for {symbol}")
@@ -442,27 +581,49 @@ class BacktestRunner:
             commission_bps=self.session.commission_bps,
             slippage_bps=self.session.slippage_bps,
             max_leverage=1.0,
+            start_date=self.session.start_date,
+            end_date=self.session.end_date,
         )
 
-        # Create simulator
+        # Create market simulator
         if exec_mode == ExecutionMode.REALISTIC:
-            simulator = create_realistic_simulator()
+            market_simulator = create_realistic_simulator(
+                commission_bps=self.session.commission_bps,
+                base_slippage_bps=self.session.slippage_bps,
+            )
         elif exec_mode == ExecutionMode.OPTIMISTIC:
-            simulator = create_optimistic_simulator()
+            market_simulator = create_optimistic_simulator()
         else:
-            simulator = create_pessimistic_simulator()
+            market_simulator = create_pessimistic_simulator(
+                commission_bps=self.session.commission_bps * 2,
+                base_slippage_bps=self.session.slippage_bps * 2,
+            )
 
-        # Create backtest engine
+        # Use PolarsDataHandler for native Polars support (no conversion overhead)
+        data_handler = PolarsDataHandler(
+            data=self.data,
+            start_date=self.session.start_date,
+            end_date=self.session.end_date,
+        )
+
+        # Create signal-based strategy
+        strategy = SignalBasedStrategy(
+            signals=self.signals,
+            signal_threshold=0.1,
+        )
+
+        # Create backtest engine with proper parameters
+        # P1: Pass regime detector for regime-specific analysis
         self.session.backtest_engine = BacktestEngine(
+            data_handler=data_handler,
+            strategy=strategy,
             config=config,
-            simulator=simulator,
+            market_simulator=market_simulator,
+            regime_detector=self.session.regime_detector,
         )
 
         # Run backtest
-        result = self.session.backtest_engine.run(
-            data=self.data,
-            signals=self.signals,
-        )
+        result = self.session.backtest_engine.run()
 
         return result
 
@@ -470,27 +631,90 @@ class BacktestRunner:
         """Analyze backtest results comprehensively."""
         self.session.analyzer = PerformanceAnalyzer()
 
-        # Compute all metrics
-        return_metrics = self.session.analyzer.compute_return_metrics(result)
-        risk_metrics = self.session.analyzer.compute_risk_adjusted_metrics(result)
-        drawdown_metrics = self.session.analyzer.compute_drawdown_metrics(result)
-        trade_metrics = self.session.analyzer.compute_trade_metrics(result)
+        try:
+            # Use the analyze method which generates a PerformanceReport
+            report = self.session.analyzer.analyze(result)
+
+            # Extract metrics from report
+            analysis = {
+                "return_metrics": report.return_metrics.to_dict(),
+                "risk_metrics": report.risk_adjusted_metrics.to_dict(),
+                "drawdown_metrics": report.drawdown_metrics.to_dict(),
+                "trade_metrics": report.trade_metrics.to_dict(),
+            }
+
+            # Add benchmark metrics if available
+            if report.benchmark_metrics:
+                analysis["benchmark_metrics"] = report.benchmark_metrics.to_dict()
+
+            # Add statistical tests (includes DSR/PBO from P0)
+            analysis["statistical_tests"] = report.statistical_tests.to_dict()
+
+            # P1: Regime-specific analysis
+            if hasattr(result, 'regime_history') and result.regime_history:
+                try:
+                    regime_states = [r for _, r in result.regime_history]
+                    regime_metrics = self.session.analyzer.analyze_by_regime(
+                        result, regime_states
+                    )
+                    analysis["regime_metrics"] = [rm.to_dict() for rm in regime_metrics]
+                    logger.info(f"Computed regime metrics for {len(regime_metrics)} regimes")
+                except Exception as e:
+                    logger.warning(f"Regime analysis failed: {e}")
+                    analysis["regime_metrics"] = []
+            else:
+                analysis["regime_metrics"] = []
+
+            # P1: Cost sensitivity analysis
+            try:
+                cost_sensitivity = self.session.analyzer.analyze_cost_sensitivity(result)
+                analysis["cost_sensitivity"] = cost_sensitivity.to_dict()
+                logger.info(
+                    f"Cost sensitivity: break-even = {cost_sensitivity.break_even_cost_bps:.1f} bps"
+                )
+            except Exception as e:
+                logger.warning(f"Cost sensitivity analysis failed: {e}")
+                analysis["cost_sensitivity"] = {}
+
+        except Exception as e:
+            # Fallback: compute basic metrics manually if analyzer fails
+            logger.warning(f"Performance analyzer failed, using fallback: {e}")
+
+            equity_curve = [e for _, e in result.equity_curve] if result.equity_curve else []
+            total_return = (equity_curve[-1] / equity_curve[0] - 1) if equity_curve and equity_curve[0] > 0 else 0
+
+            # Basic metrics
+            analysis = {
+                "return_metrics": {
+                    "total_return": total_return,
+                    "annualized_return": 0,
+                    "best_day": 0,
+                    "worst_day": 0,
+                },
+                "risk_metrics": {
+                    "sharpe_ratio": 0,
+                    "sortino_ratio": 0,
+                    "calmar_ratio": 0,
+                },
+                "drawdown_metrics": {
+                    "max_drawdown": 0,
+                    "avg_drawdown": 0,
+                },
+                "trade_metrics": {
+                    "total_trades": len(result.trades) if result.trades else 0,
+                    "win_rate": 0,
+                    "profit_factor": 0,
+                },
+            }
 
         # Performance attribution
         try:
             attributor = PerformanceAttributor()
             attribution = attributor.compute_attribution(result)
+            analysis["attribution"] = attribution
         except Exception as e:
             logger.warning(f"Performance attribution failed: {e}")
-            attribution = {}
-
-        analysis = {
-            "return_metrics": return_metrics.to_dict() if hasattr(return_metrics, 'to_dict') else vars(return_metrics),
-            "risk_metrics": risk_metrics.to_dict() if hasattr(risk_metrics, 'to_dict') else vars(risk_metrics),
-            "drawdown_metrics": drawdown_metrics.to_dict() if hasattr(drawdown_metrics, 'to_dict') else vars(drawdown_metrics),
-            "trade_metrics": trade_metrics.to_dict() if hasattr(trade_metrics, 'to_dict') else vars(trade_metrics),
-            "attribution": attribution,
-        }
+            analysis["attribution"] = {}
 
         # Print summary
         self._print_summary(analysis)
@@ -526,6 +750,39 @@ class BacktestRunner:
         print(f"  Total Trades:      {tm.get('total_trades', 0)}")
         print(f"  Win Rate:          {tm.get('win_rate', 0):.2%}")
         print(f"  Profit Factor:     {tm.get('profit_factor', 0):.2f}")
+
+        # P0: Statistical Validation (DSR/PBO)
+        st = analysis.get("statistical_tests", {})
+        if st.get("deflated_sharpe_ratio") or st.get("pbo"):
+            print(f"\nStatistical Validation (P0):")
+            dsr = st.get("deflated_sharpe_ratio", 0)
+            dsr_pvalue = st.get("dsr_pvalue", 1.0)
+            pbo = st.get("pbo", 0.5)
+            pbo_interp = st.get("pbo_interpretation", "")
+            print(f"  Deflated Sharpe:   {dsr:.3f} (p={dsr_pvalue:.3f})")
+            print(f"  PBO (Overfitting): {pbo:.1%} - {pbo_interp}")
+
+        # P1: Cost Sensitivity
+        cs = analysis.get("cost_sensitivity", {})
+        if cs:
+            print(f"\nCost Sensitivity (P1):")
+            print(f"  Break-Even Cost:   {cs.get('break_even_cost_bps', 0):.1f} bps")
+            sharpe_at_costs = cs.get("sharpe_at_costs", {})
+            if sharpe_at_costs:
+                # Show key cost levels
+                for cost, sharpe in sorted(sharpe_at_costs.items())[:3]:
+                    print(f"    Sharpe @ {cost} bps: {sharpe:.3f}")
+
+        # P1: Regime Metrics
+        regime_metrics = analysis.get("regime_metrics", [])
+        if regime_metrics:
+            print(f"\nRegime Analysis (P1):")
+            for rm in regime_metrics[:4]:  # Show top 4 regimes
+                regime = rm.get("regime", "unknown")
+                sharpe = rm.get("sharpe_ratio", 0)
+                n_bars = rm.get("n_bars", 0)
+                ret = rm.get("total_return", 0)
+                print(f"  {regime}: Sharpe={sharpe:.2f}, Return={ret:.2%}, Bars={n_bars}")
 
         print("=" * 60)
 
@@ -647,7 +904,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         Exit code (0 for success)
     """
     # Setup logging
-    setup_logging(log_level=args.log_level, log_format=LogFormat.CONSOLE)
+    setup_logging(level=args.log_level, log_format=LogFormat.TEXT)
 
     # Parse dates
     try:
@@ -662,6 +919,9 @@ def run_backtest(args: argparse.Namespace) -> int:
         logger.error(f"End date ({args.end}) must be after start date ({args.start})")
         return 1
 
+    # Determine database usage (--no-database overrides --use-database)
+    use_database = getattr(args, "use_database", True) and not getattr(args, "no_database", False)
+
     # Create session
     session = BacktestSession(
         start_date=start_date,
@@ -671,6 +931,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         strategy_name=args.strategy,
         execution_mode=args.execution_mode,
         use_gpu=args.gpu,
+        use_database=use_database,
         slippage_bps=args.slippage_bps,
         commission_bps=args.commission_bps,
         monte_carlo_sims=args.monte_carlo,

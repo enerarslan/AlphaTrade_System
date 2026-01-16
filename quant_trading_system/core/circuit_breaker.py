@@ -517,6 +517,15 @@ class CircuitBreakerRegistry:
                 for name, breaker in self._breakers.items()
             }
 
+    def get_all_breakers(self) -> dict[str, CircuitBreaker]:
+        """Get all registered circuit breakers.
+
+        Returns:
+            Dictionary of name -> CircuitBreaker.
+        """
+        with self._registry_lock:
+            return dict(self._breakers)
+
     def reset_all(self) -> None:
         """Reset all circuit breakers."""
         with self._registry_lock:

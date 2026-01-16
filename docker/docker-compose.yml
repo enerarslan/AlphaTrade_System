@@ -74,7 +74,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-trading_password}
       - PGDATA=/var/lib/postgresql/data/pgdata
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init_db:/docker-entrypoint-initdb.d:ro

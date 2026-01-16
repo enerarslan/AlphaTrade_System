@@ -189,7 +189,11 @@ class BenchmarkMetrics:
 
 @dataclass
 class StatisticalTests:
-    """Statistical significance tests."""
+    """Statistical significance tests.
+
+    P0 Enhancement: Added Deflated Sharpe Ratio (DSR) and Probability of
+    Backtest Overfitting (PBO) for institutional-grade validation.
+    """
 
     returns_tstat: float
     returns_pvalue: float
@@ -201,6 +205,15 @@ class StatisticalTests:
     jarque_bera_pvalue: float
     is_normal: bool
 
+    # P0: Deflated Sharpe Ratio - accounts for multiple testing bias
+    deflated_sharpe_ratio: float = 0.0
+    dsr_pvalue: float = 1.0
+    n_trials_tested: int = 1
+
+    # P0: Probability of Backtest Overfitting
+    pbo: float = 0.5
+    pbo_interpretation: str = "Not calculated"
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -210,12 +223,71 @@ class StatisticalTests:
             "bootstrap_mean_return": self.bootstrap_mean_return,
             "monte_carlo_prob_positive": self.monte_carlo_prob_positive,
             "is_normal": self.is_normal,
+            # P0: DSR metrics
+            "deflated_sharpe_ratio": self.deflated_sharpe_ratio,
+            "dsr_pvalue": self.dsr_pvalue,
+            "n_trials_tested": self.n_trials_tested,
+            # P0: PBO metrics
+            "pbo": self.pbo,
+            "pbo_interpretation": self.pbo_interpretation,
+        }
+
+
+@dataclass
+class RegimeMetrics:
+    """P1 Enhancement: Per-regime performance metrics.
+
+    Breaks down performance by market regime for institutional-grade
+    all-weather strategy validation.
+    """
+
+    regime: str
+    n_bars: int
+    total_return: float
+    sharpe_ratio: float
+    win_rate: float
+    max_drawdown: float
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "regime": self.regime,
+            "n_bars": self.n_bars,
+            "total_return": self.total_return,
+            "sharpe_ratio": self.sharpe_ratio,
+            "win_rate": self.win_rate,
+            "max_drawdown": self.max_drawdown,
+        }
+
+
+@dataclass
+class CostSensitivity:
+    """P1 Enhancement: Transaction cost sensitivity analysis.
+
+    Determines the break-even cost level and how strategy performance
+    degrades with increasing transaction costs.
+    """
+
+    break_even_cost_bps: float
+    sharpe_at_costs: dict[float, float]  # cost_bps -> sharpe
+    return_at_costs: dict[float, float]  # cost_bps -> return
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "break_even_cost_bps": self.break_even_cost_bps,
+            "sharpe_at_costs": self.sharpe_at_costs,
+            "return_at_costs": self.return_at_costs,
         }
 
 
 @dataclass
 class PerformanceReport:
-    """Complete performance report."""
+    """Complete performance report.
+
+    P0/P1 Enhancement: Added regime_metrics and cost_sensitivity
+    for institutional-grade analysis.
+    """
 
     return_metrics: ReturnMetrics
     risk_adjusted_metrics: RiskAdjustedMetrics
@@ -226,10 +298,13 @@ class PerformanceReport:
     start_date: datetime
     end_date: datetime
     trading_days: int
+    # P1: Optional advanced metrics
+    regime_metrics: list[RegimeMetrics] | None = None
+    cost_sensitivity: CostSensitivity | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        result = {
             "return_metrics": self.return_metrics.to_dict(),
             "risk_adjusted_metrics": self.risk_adjusted_metrics.to_dict(),
             "drawdown_metrics": self.drawdown_metrics.to_dict(),
@@ -240,10 +315,16 @@ class PerformanceReport:
             "end_date": self.end_date.isoformat(),
             "trading_days": self.trading_days,
         }
+        # P1: Add optional advanced metrics
+        if self.regime_metrics:
+            result["regime_metrics"] = [rm.to_dict() for rm in self.regime_metrics]
+        if self.cost_sensitivity:
+            result["cost_sensitivity"] = self.cost_sensitivity.to_dict()
+        return result
 
     def summary(self) -> str:
         """Get a summary string of key metrics."""
-        return f"""
+        summary = f"""
 Performance Summary ({self.start_date.date()} to {self.end_date.date()})
 {'=' * 60}
 Total Return:      {self.return_metrics.total_return:>10.2%}
@@ -256,7 +337,14 @@ Win Rate:          {self.trade_metrics.win_rate:>10.2%}
 Profit Factor:     {self.trade_metrics.profit_factor:>10.2f}
 Total Trades:      {self.trade_metrics.total_trades:>10d}
 {'=' * 60}
+Statistical Validation (P0):
+  Deflated Sharpe: {self.statistical_tests.deflated_sharpe_ratio:>10.2f}
+  DSR p-value:     {self.statistical_tests.dsr_pvalue:>10.4f}
+  PBO:             {self.statistical_tests.pbo:>10.2%}
+  PBO Status:      {self.statistical_tests.pbo_interpretation}
+{'=' * 60}
 """
+        return summary
 
 
 class PerformanceAnalyzer:
@@ -280,12 +368,16 @@ class PerformanceAnalyzer:
         self,
         backtest_state: BacktestState,
         benchmark_returns: np.ndarray | None = None,
+        n_trials: int = 1,
     ) -> PerformanceReport:
         """Generate complete performance report.
+
+        P0/P1 Enhancement: Added DSR, PBO, and optional regime/cost analysis.
 
         Args:
             backtest_state: Completed backtest state.
             benchmark_returns: Optional benchmark returns for comparison.
+            n_trials: Number of strategies/parameters tested (for multiple testing).
 
         Returns:
             Complete performance report.
@@ -310,7 +402,12 @@ class PerformanceAnalyzer:
         if benchmark_returns is not None and len(benchmark_returns) > 0:
             benchmark_metrics = self._calculate_benchmark_metrics(returns, benchmark_returns)
 
-        statistical_tests = self._calculate_statistical_tests(returns)
+        # P0: Pass sharpe_ratio and n_trials for DSR/PBO calculation
+        statistical_tests = self._calculate_statistical_tests(
+            returns,
+            sharpe_ratio=risk_adjusted.sharpe_ratio,
+            n_trials=n_trials,
+        )
 
         return PerformanceReport(
             return_metrics=return_metrics,
@@ -669,8 +766,22 @@ class PerformanceAnalyzer:
     def _calculate_statistical_tests(
         self,
         returns: np.ndarray,
+        sharpe_ratio: float = 0.0,
+        n_trials: int = 1,
     ) -> StatisticalTests:
-        """Calculate statistical significance tests."""
+        """Calculate statistical significance tests.
+
+        P0 Enhancement: Added Deflated Sharpe Ratio (DSR) and Probability
+        of Backtest Overfitting (PBO) for institutional-grade validation.
+
+        Args:
+            returns: Array of period returns.
+            sharpe_ratio: Observed Sharpe ratio for DSR calculation.
+            n_trials: Number of trials/strategies tested (for multiple testing).
+
+        Returns:
+            StatisticalTests with all validation metrics.
+        """
         # T-test for mean return
         t_stat, p_value = stats.ttest_1samp(returns, 0)
 
@@ -703,6 +814,16 @@ class PerformanceAnalyzer:
         jb_stat, jb_pvalue = stats.jarque_bera(returns)
         is_normal = jb_pvalue > 0.05
 
+        # P0: Calculate Deflated Sharpe Ratio (DSR)
+        dsr, dsr_pvalue = self._calculate_deflated_sharpe(
+            observed_sharpe=sharpe_ratio,
+            returns=returns,
+            n_trials=n_trials,
+        )
+
+        # P0: Calculate Probability of Backtest Overfitting (PBO)
+        pbo, pbo_interpretation = self._calculate_pbo(returns)
+
         return StatisticalTests(
             returns_tstat=float(t_stat),
             returns_pvalue=float(p_value),
@@ -713,6 +834,336 @@ class PerformanceAnalyzer:
             jarque_bera_stat=float(jb_stat),
             jarque_bera_pvalue=float(jb_pvalue),
             is_normal=is_normal,
+            # P0: DSR metrics
+            deflated_sharpe_ratio=dsr,
+            dsr_pvalue=dsr_pvalue,
+            n_trials_tested=n_trials,
+            # P0: PBO metrics
+            pbo=pbo,
+            pbo_interpretation=pbo_interpretation,
+        )
+
+    def _calculate_deflated_sharpe(
+        self,
+        observed_sharpe: float,
+        returns: np.ndarray,
+        n_trials: int = 1,
+    ) -> tuple[float, float]:
+        """P0: Calculate Deflated Sharpe Ratio (DSR).
+
+        DSR accounts for the variance in backtest Sharpe ratios when
+        multiple trials are run. Based on Bailey & López de Prado (2014).
+
+        Args:
+            observed_sharpe: The observed Sharpe ratio.
+            returns: Array of returns for skewness/kurtosis.
+            n_trials: Number of strategies/parameters tested.
+
+        Returns:
+            Tuple of (deflated_sharpe_ratio, p_value).
+        """
+        try:
+            from quant_trading_system.models.purged_cv import MultipleTestingCorrector
+
+            # Calculate return distribution characteristics
+            skewness = float(stats.skew(returns)) if len(returns) > 2 else 0.0
+            kurtosis = float(stats.kurtosis(returns)) + 3.0 if len(returns) > 3 else 3.0  # Excess -> raw
+
+            corrector = MultipleTestingCorrector(n_trials=max(1, n_trials))
+            dsr, dsr_pvalue = corrector.deflated_sharpe_ratio(
+                observed_sharpe=observed_sharpe,
+                n_trials=n_trials,
+                skewness=skewness,
+                kurtosis=kurtosis,
+                n_returns=len(returns),
+            )
+
+            return float(dsr), float(dsr_pvalue)
+
+        except ImportError:
+            logger.warning("MultipleTestingCorrector not available, using fallback DSR")
+            # Fallback: simple DSR approximation
+            return observed_sharpe, 0.5
+
+    def _calculate_pbo(
+        self,
+        returns: np.ndarray,
+        n_partitions: int = 16,
+    ) -> tuple[float, str]:
+        """P0: Calculate Probability of Backtest Overfitting (PBO).
+
+        PBO estimates the probability that a strategy's good backtest
+        performance is due to overfitting rather than genuine skill.
+
+        Uses Combinatorial Symmetric Cross-Validation (CSCV) approach
+        from Bailey et al. (2014).
+
+        Args:
+            returns: Array of period returns.
+            n_partitions: Number of partitions for CSCV (must be even).
+
+        Returns:
+            Tuple of (pbo, interpretation_string).
+        """
+        n = len(returns)
+
+        # Need sufficient data for meaningful PBO
+        if n < n_partitions * 5:
+            return 0.5, "Insufficient data for PBO calculation"
+
+        try:
+            from itertools import combinations
+
+            # Ensure even number of partitions
+            n_partitions = n_partitions if n_partitions % 2 == 0 else n_partitions - 1
+            if n_partitions < 4:
+                return 0.5, "Too few partitions for PBO"
+
+            # Split returns into partitions
+            partition_size = n // n_partitions
+            partitions = [
+                returns[i * partition_size:(i + 1) * partition_size]
+                for i in range(n_partitions)
+            ]
+
+            # Generate all combinations of train/test splits
+            half = n_partitions // 2
+            train_combos = list(combinations(range(n_partitions), half))
+
+            # Limit combinations for computational efficiency
+            max_combos = 100
+            if len(train_combos) > max_combos:
+                np.random.seed(42)  # Reproducibility
+                indices = np.random.choice(len(train_combos), max_combos, replace=False)
+                train_combos = [train_combos[i] for i in indices]
+
+            logits = []
+
+            for train_indices in train_combos:
+                test_indices = [i for i in range(n_partitions) if i not in train_indices]
+
+                # Aggregate train and test returns
+                train_returns = np.concatenate([partitions[i] for i in train_indices])
+                test_returns = np.concatenate([partitions[i] for i in test_indices])
+
+                # Calculate Sharpe for this split
+                train_sharpe = (
+                    np.mean(train_returns) / np.std(train_returns) * np.sqrt(self.periods_per_year)
+                    if np.std(train_returns) > 0 else 0
+                )
+                test_sharpe = (
+                    np.mean(test_returns) / np.std(test_returns) * np.sqrt(self.periods_per_year)
+                    if np.std(test_returns) > 0 else 0
+                )
+
+                # Compare performance: is OOS worse than IS?
+                # Logit: positive if OOS underperforms
+                if train_sharpe > 0:
+                    performance_ratio = test_sharpe / train_sharpe if train_sharpe != 0 else 0
+                    # Convert to logit: log(p / (1-p)) where p is "probability of overfit"
+                    # If test_sharpe << train_sharpe, likely overfit
+                    prob_overfit = 1.0 / (1.0 + performance_ratio) if performance_ratio > 0 else 0.9
+                    prob_overfit = np.clip(prob_overfit, 0.01, 0.99)
+                    logit = np.log(prob_overfit / (1 - prob_overfit))
+                    logits.append(logit)
+
+            if not logits:
+                return 0.5, "Could not compute PBO logits"
+
+            # PBO = probability that best IS strategy underperforms median OOS
+            # Approximated by proportion of negative performance ratios
+            pbo = np.mean(np.array(logits) > 0)
+
+            # Interpretation
+            if pbo < 0.15:
+                interpretation = "LOW RISK: Strategy likely has genuine edge"
+            elif pbo < 0.30:
+                interpretation = "MODERATE RISK: Some overfitting possible"
+            elif pbo < 0.50:
+                interpretation = "HIGH RISK: Significant overfitting likely"
+            else:
+                interpretation = "CRITICAL: Strategy is almost certainly overfit"
+
+            return float(pbo), interpretation
+
+        except Exception as e:
+            logger.warning(f"PBO calculation failed: {e}")
+            return 0.5, f"PBO calculation error: {str(e)}"
+
+    def analyze_by_regime(
+        self,
+        backtest_state: BacktestState,
+        regime_history: list[tuple[datetime, Any]],
+    ) -> list[RegimeMetrics]:
+        """P1: Break down performance by market regime.
+
+        Institutional-grade analysis that shows how strategy performs
+        in different market conditions (bull, bear, high vol, etc.).
+
+        Args:
+            backtest_state: Completed backtest state.
+            regime_history: List of (timestamp, RegimeState) tuples.
+
+        Returns:
+            List of RegimeMetrics, one per regime encountered.
+        """
+        from collections import defaultdict
+
+        if not regime_history:
+            return []
+
+        # Extract equity curve
+        equity_curve = np.array([e for _, e in backtest_state.equity_curve])
+        timestamps = [t for t, _ in backtest_state.equity_curve]
+
+        if len(equity_curve) < 2:
+            return []
+
+        # Calculate returns
+        returns = np.diff(equity_curve) / equity_curve[:-1]
+
+        # Map timestamps to indices
+        timestamp_to_idx = {ts: i for i, ts in enumerate(timestamps[:-1])}
+
+        # Group returns by regime
+        regime_returns: dict[str, list[float]] = defaultdict(list)
+
+        for ts, regime_state in regime_history:
+            if ts in timestamp_to_idx:
+                idx = timestamp_to_idx[ts]
+                if idx < len(returns):
+                    regime_name = (
+                        regime_state.regime.name
+                        if hasattr(regime_state, 'regime') and hasattr(regime_state.regime, 'name')
+                        else str(regime_state)
+                    )
+                    regime_returns[regime_name].append(returns[idx])
+
+        # Calculate metrics per regime
+        regime_metrics = []
+        for regime_name, rets in regime_returns.items():
+            if len(rets) < 5:
+                continue  # Need minimum data
+
+            rets_array = np.array(rets)
+
+            # Total return
+            total_return = np.prod(1 + rets_array) - 1
+
+            # Sharpe ratio
+            if np.std(rets_array) > 0:
+                sharpe = np.mean(rets_array) / np.std(rets_array) * np.sqrt(self.periods_per_year)
+            else:
+                sharpe = 0.0
+
+            # Win rate
+            win_rate = np.mean(rets_array > 0)
+
+            # Max drawdown
+            cumulative = np.cumprod(1 + rets_array)
+            peak = np.maximum.accumulate(cumulative)
+            drawdown = (cumulative - peak) / peak
+            max_dd = abs(np.min(drawdown)) if len(drawdown) > 0 else 0.0
+
+            regime_metrics.append(RegimeMetrics(
+                regime=regime_name,
+                n_bars=len(rets),
+                total_return=float(total_return),
+                sharpe_ratio=float(sharpe),
+                win_rate=float(win_rate),
+                max_drawdown=float(max_dd),
+            ))
+
+        # Sort by number of bars (most data first)
+        regime_metrics.sort(key=lambda x: x.n_bars, reverse=True)
+
+        return regime_metrics
+
+    def analyze_cost_sensitivity(
+        self,
+        backtest_state: BacktestState,
+        cost_range_bps: list[float] | None = None,
+    ) -> CostSensitivity:
+        """P1: Analyze sensitivity to transaction costs.
+
+        Determines break-even cost level and how strategy performance
+        degrades with increasing costs.
+
+        Args:
+            backtest_state: Completed backtest state.
+            cost_range_bps: List of cost levels to test (in basis points).
+
+        Returns:
+            CostSensitivity with break-even and cost impact analysis.
+        """
+        if cost_range_bps is None:
+            cost_range_bps = [0.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0]
+
+        # Extract equity curve
+        equity_curve = np.array([e for _, e in backtest_state.equity_curve])
+
+        if len(equity_curve) < 2:
+            return CostSensitivity(
+                break_even_cost_bps=0.0,
+                sharpe_at_costs={},
+                return_at_costs={},
+            )
+
+        # Base returns (already includes some costs)
+        returns = np.diff(equity_curve) / equity_curve[:-1]
+        base_return = np.prod(1 + returns) - 1
+        base_sharpe = (
+            np.mean(returns) / np.std(returns) * np.sqrt(self.periods_per_year)
+            if np.std(returns) > 0 else 0
+        )
+
+        # Number of trades determines cost impact
+        n_trades = len(backtest_state.trades) if backtest_state.trades else 0
+
+        if n_trades == 0:
+            return CostSensitivity(
+                break_even_cost_bps=float('inf'),
+                sharpe_at_costs={c: base_sharpe for c in cost_range_bps},
+                return_at_costs={c: base_return for c in cost_range_bps},
+            )
+
+        # Estimate cost impact per trade
+        avg_trade_size = base_return / n_trades if n_trades > 0 else 0
+
+        sharpe_at_costs = {}
+        return_at_costs = {}
+        break_even_cost = 0.0
+
+        for cost_bps in cost_range_bps:
+            # Cost impact per trade (bps to decimal)
+            cost_per_trade = cost_bps / 10000
+
+            # Adjust returns by subtracting cost per bar with trades
+            # Simplified: distribute cost impact across all bars proportionally
+            total_cost = n_trades * cost_per_trade
+            cost_per_bar = total_cost / len(returns) if len(returns) > 0 else 0
+
+            adjusted_returns = returns - cost_per_bar
+            adjusted_total_return = np.prod(1 + adjusted_returns) - 1
+
+            if np.std(adjusted_returns) > 0:
+                adjusted_sharpe = (
+                    np.mean(adjusted_returns) / np.std(adjusted_returns) * np.sqrt(self.periods_per_year)
+                )
+            else:
+                adjusted_sharpe = 0.0
+
+            sharpe_at_costs[cost_bps] = float(adjusted_sharpe)
+            return_at_costs[cost_bps] = float(adjusted_total_return)
+
+            # Track break-even (where returns go negative)
+            if adjusted_total_return > 0:
+                break_even_cost = cost_bps
+
+        return CostSensitivity(
+            break_even_cost_bps=float(break_even_cost),
+            sharpe_at_costs=sharpe_at_costs,
+            return_at_costs=return_at_costs,
         )
 
 

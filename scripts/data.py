@@ -158,7 +158,8 @@ class DataManager:
         try:
             from quant_trading_system.data.loader import DataLoader
 
-            loader = DataLoader()
+            data_dir = PROJECT_ROOT / "data" / "raw"
+            loader = DataLoader(data_dir=data_dir)
             df = loader.load_symbol(symbol, start_date, end_date)
         except ImportError:
             pass
@@ -283,9 +284,11 @@ class DataManager:
         """
         self.logger.info(f"Validating data for {symbol}")
 
+        # Handle both pandas and polars
+        row_count = df.height if hasattr(df, 'height') else len(df)
         results = {
             "symbol": symbol,
-            "rows": len(df),
+            "rows": row_count,
             "valid": True,
             "issues": [],
             "warnings": [],
@@ -300,10 +303,11 @@ class DataManager:
             results["issues"].append(f"Missing columns: {missing_cols}")
             return results
 
-        # Check minimum rows
-        if len(df) < self.config.min_rows:
+        # Check minimum rows - handle both pandas and polars
+        row_count = df.height if hasattr(df, 'height') else len(df)
+        if row_count < self.config.min_rows:
             results["valid"] = False
-            results["issues"].append(f"Insufficient data: {len(df)} rows (min: {self.config.min_rows})")
+            results["issues"].append(f"Insufficient data: {row_count} rows (min: {self.config.min_rows})")
 
         # OHLCV relationship validation
         if self.config.validate_ohlcv:
@@ -317,13 +321,23 @@ class DataManager:
             if gaps:
                 results["warnings"].extend(gaps)
 
-        # Missing values
-        missing_counts = df[required_cols].isnull().sum()
-        if missing_counts.any():
-            for col, count in missing_counts.items():
-                if count > 0:
-                    pct = count / len(df) * 100
-                    results["warnings"].append(f"Missing values in {col}: {count} ({pct:.1f}%)")
+        # Missing values - handle both pandas and polars
+        is_polars = hasattr(df, 'filter') and not hasattr(df, 'sort_values')
+        if is_polars:
+            import polars as pl
+            for col in required_cols:
+                if col in df.columns:
+                    count = df[col].null_count()
+                    if count > 0:
+                        pct = count / df.height * 100
+                        results["warnings"].append(f"Missing values in {col}: {count} ({pct:.1f}%)")
+        else:
+            missing_counts = df[required_cols].isnull().sum()
+            if missing_counts.any():
+                for col, count in missing_counts.items():
+                    if count > 0:
+                        pct = count / len(df) * 100
+                        results["warnings"].append(f"Missing values in {col}: {count} ({pct:.1f}%)")
 
         # Outlier detection
         if self.config.remove_outliers:
@@ -331,12 +345,21 @@ class DataManager:
             if outliers:
                 results["warnings"].extend(outliers)
 
-        # Summary
+        # Summary - handle both pandas and polars
         results["columns"] = list(df.columns)
-        results["date_range"] = {
-            "start": str(df["timestamp"].min()),
-            "end": str(df["timestamp"].max()),
-        }
+        is_polars = hasattr(df, 'filter') and not hasattr(df, 'sort_values')
+        if is_polars:
+            results["date_range"] = {
+                "start": str(df["timestamp"].min()),
+                "end": str(df["timestamp"].max()),
+            }
+            results["rows"] = df.height
+        else:
+            results["date_range"] = {
+                "start": str(df["timestamp"].min()),
+                "end": str(df["timestamp"].max()),
+            }
+            results["rows"] = len(df)
 
         self.logger.info(f"Validation complete: {len(results['issues'])} issues, {len(results['warnings'])} warnings")
 
@@ -344,39 +367,68 @@ class DataManager:
 
     def _validate_ohlcv_relationships(self, df: pd.DataFrame) -> list[str]:
         """Validate OHLCV relationships."""
+        import polars as pl
         issues = []
 
-        # High must be >= Low
-        violations = (df["high"] < df["low"]).sum()
-        if violations > 0:
-            issues.append(f"High < Low violations: {violations} rows")
+        # Check if this is a Polars DataFrame
+        is_polars = hasattr(df, 'filter') and not hasattr(df, 'sort_values')
 
-        # High must be >= Open and Close
-        high_open = (df["high"] < df["open"]).sum()
-        high_close = (df["high"] < df["close"]).sum()
-        if high_open > 0:
-            issues.append(f"High < Open violations: {high_open} rows")
-        if high_close > 0:
-            issues.append(f"High < Close violations: {high_close} rows")
+        if is_polars:
+            # Polars style validation
+            violations = df.filter(pl.col("high") < pl.col("low")).height
+            if violations > 0:
+                issues.append(f"High < Low violations: {violations} rows")
 
-        # Low must be <= Open and Close
-        low_open = (df["low"] > df["open"]).sum()
-        low_close = (df["low"] > df["close"]).sum()
-        if low_open > 0:
-            issues.append(f"Low > Open violations: {low_open} rows")
-        if low_close > 0:
-            issues.append(f"Low > Close violations: {low_close} rows")
+            high_open = df.filter(pl.col("high") < pl.col("open")).height
+            high_close = df.filter(pl.col("high") < pl.col("close")).height
+            if high_open > 0:
+                issues.append(f"High < Open violations: {high_open} rows")
+            if high_close > 0:
+                issues.append(f"High < Close violations: {high_close} rows")
 
-        # Volume must be non-negative
-        neg_volume = (df["volume"] < 0).sum()
-        if neg_volume > 0:
-            issues.append(f"Negative volume: {neg_volume} rows")
+            low_open = df.filter(pl.col("low") > pl.col("open")).height
+            low_close = df.filter(pl.col("low") > pl.col("close")).height
+            if low_open > 0:
+                issues.append(f"Low > Open violations: {low_open} rows")
+            if low_close > 0:
+                issues.append(f"Low > Close violations: {low_close} rows")
 
-        # Prices must be positive
-        for col in ["open", "high", "low", "close"]:
-            neg_price = (df[col] <= 0).sum()
-            if neg_price > 0:
-                issues.append(f"Non-positive {col}: {neg_price} rows")
+            neg_volume = df.filter(pl.col("volume") < 0).height
+            if neg_volume > 0:
+                issues.append(f"Negative volume: {neg_volume} rows")
+
+            for col in ["open", "high", "low", "close"]:
+                neg_price = df.filter(pl.col(col) <= 0).height
+                if neg_price > 0:
+                    issues.append(f"Non-positive {col}: {neg_price} rows")
+        else:
+            # Pandas style validation
+            violations = (df["high"] < df["low"]).sum()
+            if violations > 0:
+                issues.append(f"High < Low violations: {violations} rows")
+
+            high_open = (df["high"] < df["open"]).sum()
+            high_close = (df["high"] < df["close"]).sum()
+            if high_open > 0:
+                issues.append(f"High < Open violations: {high_open} rows")
+            if high_close > 0:
+                issues.append(f"High < Close violations: {high_close} rows")
+
+            low_open = (df["low"] > df["open"]).sum()
+            low_close = (df["low"] > df["close"]).sum()
+            if low_open > 0:
+                issues.append(f"Low > Open violations: {low_open} rows")
+            if low_close > 0:
+                issues.append(f"Low > Close violations: {low_close} rows")
+
+            neg_volume = (df["volume"] < 0).sum()
+            if neg_volume > 0:
+                issues.append(f"Negative volume: {neg_volume} rows")
+
+            for col in ["open", "high", "low", "close"]:
+                neg_price = (df[col] <= 0).sum()
+                if neg_price > 0:
+                    issues.append(f"Non-positive {col}: {neg_price} rows")
 
         return issues
 
@@ -385,8 +437,29 @@ class DataManager:
         if "timestamp" not in df.columns:
             return []
 
-        df_sorted = df.sort_values("timestamp")
-        time_diffs = df_sorted["timestamp"].diff()
+        # Handle both pandas and polars DataFrames
+        try:
+            # Polars style
+            if hasattr(df, 'sort'):
+                df_sorted = df.sort("timestamp")
+                timestamps = df_sorted["timestamp"].to_list()
+                if len(timestamps) < 2:
+                    return []
+                time_diffs = [(timestamps[i] - timestamps[i-1]) for i in range(1, len(timestamps))]
+                # Convert timedelta to pandas Timedelta for comparison
+                max_gap = pd.Timedelta(hours=self.config.max_gap_hours)
+                large_gaps = [d for d in time_diffs if d > max_gap]
+                issues = []
+                if len(large_gaps) > 0:
+                    issues.append(f"Large time gaps detected: {len(large_gaps)} gaps > {self.config.max_gap_hours}h")
+                return issues
+            else:
+                # Pandas style
+                df_sorted = df.sort_values("timestamp")
+                time_diffs = df_sorted["timestamp"].diff()
+        except Exception:
+            df_sorted = df.sort_values("timestamp") if hasattr(df, 'sort_values') else df
+            time_diffs = df_sorted["timestamp"].diff() if hasattr(df_sorted["timestamp"], 'diff') else []
 
         # Find large gaps (more than max_gap_hours)
         max_gap = pd.Timedelta(hours=self.config.max_gap_hours)
@@ -400,21 +473,40 @@ class DataManager:
 
     def _detect_outliers(self, df: pd.DataFrame) -> list[str]:
         """Detect outliers in price data."""
+        import polars as pl
         issues = []
+
+        # Check if this is a Polars DataFrame
+        is_polars = hasattr(df, 'filter') and not hasattr(df, 'sort_values')
 
         for col in ["open", "high", "low", "close"]:
             if col not in df.columns:
                 continue
 
-            mean = df[col].mean()
-            std = df[col].std()
+            if is_polars:
+                mean = df[col].mean()
+                std = df[col].std()
+                if std is None or std == 0:
+                    continue
 
-            lower = mean - self.config.outlier_std * std
-            upper = mean + self.config.outlier_std * std
+                lower = mean - self.config.outlier_std * std
+                upper = mean + self.config.outlier_std * std
 
-            outliers = ((df[col] < lower) | (df[col] > upper)).sum()
+                outliers = df.filter((pl.col(col) < lower) | (pl.col(col) > upper)).height
+            else:
+                mean = df[col].mean()
+                std = df[col].std()
+                if pd.isna(std) or std == 0:
+                    continue
+
+                lower = mean - self.config.outlier_std * std
+                upper = mean + self.config.outlier_std * std
+
+                outliers = ((df[col] < lower) | (df[col] > upper)).sum()
+
             if outliers > 0:
-                pct = outliers / len(df) * 100
+                total_rows = df.height if is_polars else len(df)
+                pct = outliers / total_rows * 100
                 issues.append(f"Outliers in {col}: {outliers} ({pct:.1f}%)")
 
         return issues
@@ -1189,6 +1281,161 @@ def cmd_list(args: argparse.Namespace) -> int:
 # ============================================================================
 
 
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """
+    Migrate CSV data to PostgreSQL + TimescaleDB.
+
+    @data: Part of the PostgreSQL migration for the hybrid architecture.
+    """
+    logger.info("Starting data migration to PostgreSQL...")
+
+    try:
+        from scripts.migrate_to_postgres import migrate_csv_to_postgres, check_database_connection
+
+        # Check database connection
+        if not check_database_connection():
+            logger.error("Cannot connect to database")
+            return 1
+
+        source_dir = Path(getattr(args, "source", "data/raw"))
+        symbols = getattr(args, "symbols", None)
+        batch_size = getattr(args, "batch_size", 50000)
+        verify = getattr(args, "verify", False)
+
+        results = migrate_csv_to_postgres(
+            source_dir,
+            symbols=symbols,
+            batch_size=batch_size,
+            verify=verify,
+        )
+
+        successful = sum(1 for v in results.values() if v > 0)
+        total_rows = sum(v for v in results.values() if v > 0)
+
+        logger.info(f"Migration complete: {successful} symbols, {total_rows} rows")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
+        return 1
+
+
+def cmd_export_training(args: argparse.Namespace) -> int:
+    """
+    Export PostgreSQL data to Parquet files for ML training.
+
+    @data: Part of the hybrid architecture for ML training.
+    """
+    logger.info("Exporting training data to Parquet...")
+
+    try:
+        from scripts.export_training_data import export_ohlcv_data, export_features_data
+
+        output_dir = Path(getattr(args, "output", "data/training"))
+        symbols = getattr(args, "symbols", None)
+        start_date = getattr(args, "start_date", None)
+        end_date = getattr(args, "end_date", None)
+
+        # Parse dates if provided
+        if start_date and isinstance(start_date, str):
+            start_date = datetime.fromisoformat(start_date)
+        if end_date and isinstance(end_date, str):
+            end_date = datetime.fromisoformat(end_date)
+
+        ohlcv_only = getattr(args, "ohlcv_only", False)
+        features_only = getattr(args, "features_only", False)
+
+        total_exported = 0
+
+        if not features_only:
+            ohlcv_results = export_ohlcv_data(output_dir, symbols, start_date, end_date)
+            total_exported += len(ohlcv_results)
+            logger.info(f"Exported OHLCV for {len(ohlcv_results)} symbols")
+
+        if not ohlcv_only:
+            features_results = export_features_data(output_dir, symbols, start_date, end_date)
+            total_exported += len(features_results)
+            logger.info(f"Exported features for {len(features_results)} symbols")
+
+        logger.info(f"Export complete: {total_exported} files")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        return 1
+
+
+def cmd_db_status(args: argparse.Namespace) -> int:
+    """
+    Check database connection and status.
+
+    @data: Utility command for database health checks.
+    """
+    # Load .env to get correct DATABASE_URL
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+
+    logger.info("Checking database status...")
+
+    try:
+        from sqlalchemy import text, func, select
+        from quant_trading_system.database.connection import get_db_manager
+
+        db = get_db_manager()
+        with db.session() as session:
+            # Check basic connection
+            result = session.execute(text("SELECT 1"))
+            logger.info("Database connection: OK")
+
+            # Check TimescaleDB extension
+            result = session.execute(
+                text("SELECT extname FROM pg_extension WHERE extname = 'timescaledb'")
+            )
+            if result.fetchone():
+                logger.info("TimescaleDB extension: OK")
+            else:
+                logger.warning("TimescaleDB extension: NOT ENABLED")
+
+            # Check hypertables
+            try:
+                result = session.execute(
+                    text("SELECT hypertable_name FROM timescaledb_information.hypertables")
+                )
+                hypertables = [row[0] for row in result]
+                logger.info(f"Hypertables: {hypertables}")
+            except Exception:
+                logger.warning("Could not query hypertables (may not exist yet)")
+
+            # Check row counts
+            from quant_trading_system.database.models import OHLCVBar, Feature
+
+            ohlcv_count = session.scalar(select(func.count()).select_from(OHLCVBar))
+            feature_count = session.scalar(select(func.count()).select_from(Feature))
+
+            logger.info(f"OHLCV rows: {ohlcv_count or 0}")
+            logger.info(f"Feature rows: {feature_count or 0}")
+
+            # Check available symbols
+            result = session.execute(
+                text("SELECT DISTINCT symbol FROM ohlcv_bars ORDER BY symbol")
+            )
+            symbols = [row[0] for row in result]
+            if symbols:
+                logger.info(f"Symbols in database: {len(symbols)}")
+                for sym in symbols[:10]:  # Show first 10
+                    logger.info(f"  - {sym}")
+                if len(symbols) > 10:
+                    logger.info(f"  ... and {len(symbols) - 10} more")
+            else:
+                logger.info("No symbols in database yet")
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Database check failed: {e}")
+        return 1
+
+
 def run_data_command(args: argparse.Namespace) -> int:
     """
     Main entry point for data commands.
@@ -1212,6 +1459,10 @@ def run_data_command(args: argparse.Namespace) -> int:
         "altdata": cmd_altdata,
         "vix": cmd_vix,
         "list": cmd_list,
+        # Database commands (PostgreSQL + TimescaleDB)
+        "migrate": cmd_migrate,
+        "export-training": cmd_export_training,
+        "db-status": cmd_db_status,
     }
 
     handler = commands.get(command)

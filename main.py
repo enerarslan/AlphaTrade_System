@@ -46,6 +46,11 @@ License: Proprietary
 
 from __future__ import annotations
 
+# Load environment variables FIRST, before any other imports
+# This ensures DATABASE_URL and other settings are correct
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 import argparse
 import asyncio
 import signal
@@ -84,8 +89,8 @@ def setup_logging(log_level: str = "INFO", log_format: str = "CONSOLE"):
         setup_logging as _setup_logging,
         LogFormat,
     )
-    fmt = getattr(LogFormat, log_format.upper(), LogFormat.CONSOLE)
-    _setup_logging(log_level=log_level, log_format=fmt)
+    fmt = getattr(LogFormat, log_format.upper(), LogFormat.TEXT)
+    _setup_logging(level=log_level, log_format=fmt)
 
 
 # ==============================================================================
@@ -198,10 +203,13 @@ def cmd_data(args: argparse.Namespace) -> int:
     @data: Data loading, preprocessing, and quality control.
 
     Operations:
-      - load      : Load historical data from sources
-      - validate  : Validate data quality (gaps, outliers, OHLCV rules)
-      - preprocess: Clean and normalize data
-      - export    : Export data to various formats
+      - load           : Load historical data from sources
+      - validate       : Validate data quality (gaps, outliers, OHLCV rules)
+      - preprocess     : Clean and normalize data
+      - export         : Export data to various formats
+      - migrate        : Migrate CSV data to PostgreSQL + TimescaleDB
+      - export-training: Export PostgreSQL data to Parquet for ML training
+      - db-status      : Check database connection and status
 
     Sources:
       - alpaca    : Alpaca Markets API
@@ -209,13 +217,15 @@ def cmd_data(args: argparse.Namespace) -> int:
       - database  : PostgreSQL/TimescaleDB
 
     Features:
+      - PostgreSQL + TimescaleDB for live operations
+      - Parquet export for ML training (GPU-accelerated)
       - Intrinsic time bars (volume, dollar, imbalance, run bars)
       - Alternative data integration (news, social, satellite)
       - Data lineage tracking for regulatory compliance
       - Automatic gap filling and outlier handling
     """
-    from scripts.data import run_data_management
-    return run_data_management(args)
+    from scripts.data import run_data_command
+    return run_data_command(args)
 
 
 def cmd_features(args: argparse.Namespace) -> int:
@@ -242,8 +252,8 @@ def cmd_features(args: argparse.Namespace) -> int:
       - Numba JIT for CPU fallback
       - Automatic device selection
     """
-    from scripts.features import run_features
-    return run_features(args)
+    from scripts.features import run_features_command
+    return run_features_command(args)
 
 
 def cmd_health(args: argparse.Namespace) -> int:
@@ -265,8 +275,8 @@ def cmd_health(args: argparse.Namespace) -> int:
       - Alert configuration validation
       - Audit log verification
     """
-    from scripts.health import run_health_check
-    return run_health_check(args)
+    from scripts.health import run_health_command
+    return run_health_command(args)
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:
@@ -502,6 +512,17 @@ For more information, visit: https://github.com/alphatrade/docs
         action="store_true",
         help="Use GPU acceleration for feature computation",
     )
+    backtest_parser.add_argument(
+        "--use-database",
+        action="store_true",
+        default=True,
+        help="Load data from PostgreSQL + TimescaleDB (default: True)",
+    )
+    backtest_parser.add_argument(
+        "--no-database",
+        action="store_true",
+        help="Load data from CSV files instead of database",
+    )
     backtest_parser.set_defaults(func=cmd_backtest)
 
     # --------------------------------------------------------------------------
@@ -568,6 +589,17 @@ For more information, visit: https://github.com/alphatrade/docs
         default=Path("models"),
         help="Output directory for trained models",
     )
+    train_parser.add_argument(
+        "--use-database",
+        action="store_true",
+        default=True,
+        help="Load data from PostgreSQL + TimescaleDB (default: True)",
+    )
+    train_parser.add_argument(
+        "--no-database",
+        action="store_true",
+        help="Load data from CSV files instead of database",
+    )
     train_parser.set_defaults(func=cmd_train)
 
     # --------------------------------------------------------------------------
@@ -580,7 +612,7 @@ For more information, visit: https://github.com/alphatrade/docs
     )
     data_subparsers = data_parser.add_subparsers(
         title="Operations",
-        dest="operation",
+        dest="data_command",
         metavar="<operation>",
     )
 
@@ -652,6 +684,87 @@ For more information, visit: https://github.com/alphatrade/docs
         type=Path,
         required=True,
         help="Output path",
+    )
+
+    # data migrate - Migrate CSV to PostgreSQL
+    data_migrate = data_subparsers.add_parser(
+        "migrate",
+        help="Migrate CSV data to PostgreSQL + TimescaleDB",
+    )
+    data_migrate.add_argument(
+        "--source",
+        type=Path,
+        default=Path("data/raw"),
+        help="Source directory containing CSV files (default: data/raw)",
+    )
+    data_migrate.add_argument(
+        "--symbols",
+        nargs="+",
+        help="Specific symbols to migrate (default: all)",
+    )
+    data_migrate.add_argument(
+        "--batch-size",
+        type=int,
+        default=50000,
+        help="Batch size for bulk inserts (default: 50000)",
+    )
+    data_migrate.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify migration after each symbol",
+    )
+    data_migrate.add_argument(
+        "--export-after",
+        action="store_true",
+        help="Export to Parquet after migration",
+    )
+
+    # data export-training - Export PostgreSQL to Parquet for ML
+    data_export_training = data_subparsers.add_parser(
+        "export-training",
+        help="Export PostgreSQL data to Parquet for ML training",
+    )
+    data_export_training.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/training"),
+        help="Output directory for Parquet files (default: data/training)",
+    )
+    data_export_training.add_argument(
+        "--symbols",
+        nargs="+",
+        help="Symbols to export (default: all)",
+    )
+    data_export_training.add_argument(
+        "--start",
+        type=str,
+        help="Start date (YYYY-MM-DD)",
+    )
+    data_export_training.add_argument(
+        "--end",
+        type=str,
+        help="End date (YYYY-MM-DD)",
+    )
+    data_export_training.add_argument(
+        "--ohlcv-only",
+        action="store_true",
+        help="Export only OHLCV data (no features)",
+    )
+    data_export_training.add_argument(
+        "--features-only",
+        action="store_true",
+        help="Export only feature data (no OHLCV)",
+    )
+
+    # data db-status - Database status check
+    data_db_status = data_subparsers.add_parser(
+        "db-status",
+        help="Check PostgreSQL + TimescaleDB database status",
+    )
+    data_db_status.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Show detailed database information",
     )
 
     data_parser.set_defaults(func=cmd_data)

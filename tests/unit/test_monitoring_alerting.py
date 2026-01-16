@@ -33,9 +33,11 @@ class TestAlertSeverity:
 
     def test_severity_values(self):
         """Test severity enum values."""
+        # FIX: Updated to match actual enum values (HIGH/MEDIUM/LOW instead of WARNING/INFO)
         assert AlertSeverity.CRITICAL == "CRITICAL"
-        assert AlertSeverity.WARNING == "WARNING"
-        assert AlertSeverity.INFO == "INFO"
+        assert AlertSeverity.HIGH == "HIGH"
+        assert AlertSeverity.MEDIUM == "MEDIUM"
+        assert AlertSeverity.LOW == "LOW"
 
 
 class TestAlertChannel:
@@ -152,16 +154,17 @@ class TestAlert:
 
     def test_alert_to_dict(self):
         """Test converting alert to dictionary."""
+        # FIX: Use LOW instead of INFO (enum values changed)
         alert = Alert(
             alert_type=AlertType.DAILY_SUMMARY,
-            severity=AlertSeverity.INFO,
+            severity=AlertSeverity.LOW,
             title="Daily Summary",
             message="Daily trading summary",
             context={"trades": 10, "pnl": 500.0},
         )
         d = alert.to_dict()
         assert d["alert_type"] == "DAILY_SUMMARY"
-        assert d["severity"] == "INFO"
+        assert d["severity"] == "LOW"
         assert d["title"] == "Daily Summary"
         assert d["context"]["trades"] == 10
 

@@ -767,3 +767,323 @@ def compute_information_ratio(
     calculator = AlphaMetricsCalculator()
     result = calculator.compute_ir(alpha_signal, forward_returns, window)
     return result.ir
+
+
+# =============================================================================
+# P0: Signal Decay Monitoring (Renaissance-Style Auto-Disable)
+# =============================================================================
+
+
+@dataclass
+class SignalDecayAlert:
+    """
+    Alert when signal quality deteriorates.
+
+    Used by SignalDecayMonitor to communicate signal health status
+    and provide actionable recommendations.
+    """
+
+    status: str  # "healthy", "warning", "decay_detected"
+    baseline_ic: float  # Reference IC established during calibration
+    current_ic: float  # Recent rolling IC
+    decay_pct: float  # Percentage decline from baseline
+    ic_zscore: float  # How many std deviations from baseline
+    recommendation: str | None = None  # Action recommendation
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "status": self.status,
+            "baseline_ic": self.baseline_ic,
+            "current_ic": self.current_ic,
+            "decay_pct": self.decay_pct,
+            "ic_zscore": self.ic_zscore,
+            "recommendation": self.recommendation,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+class SignalDecayMonitor:
+    """
+    Monitors signal quality over time and detects decay.
+
+    Implements Renaissance Technologies-style signal quality monitoring:
+    - Establishes baseline IC during calibration period
+    - Tracks rolling IC and compares to baseline
+    - Detects statistically significant decay
+    - Provides auto-disable recommendations for deteriorating signals
+
+    This is critical for:
+    - Preventing losses from stale/broken signals
+    - Early warning of regime changes affecting signal
+    - Automated model lifecycle management
+
+    Usage:
+        monitor = SignalDecayMonitor(window_size=60, decay_threshold=-0.5)
+
+        # During live trading
+        for predictions, returns in trading_loop:
+            alert = monitor.update(predictions, returns)
+
+            if alert.status == "decay_detected":
+                logger.warning(f"Signal decay: {alert.recommendation}")
+                disable_signal()
+
+    Reference:
+        - "Advances in Financial Machine Learning" by López de Prado
+        - Renaissance Technologies signal monitoring practices (public disclosures)
+    """
+
+    # Status constants
+    STATUS_HEALTHY = "healthy"
+    STATUS_WARNING = "warning"
+    STATUS_DECAY = "decay_detected"
+
+    def __init__(
+        self,
+        window_size: int = 60,
+        decay_threshold: float = -0.5,
+        warning_threshold: float = -0.3,
+        min_samples: int = 20,
+        zscore_threshold: float = -2.0,
+    ):
+        """
+        Initialize Signal Decay Monitor.
+
+        Args:
+            window_size: Rolling window for IC calculation (bars)
+            decay_threshold: Percentage decline to trigger decay alert (-0.5 = 50% decline)
+            warning_threshold: Percentage decline to trigger warning (-0.3 = 30% decline)
+            min_samples: Minimum samples before monitoring starts
+            zscore_threshold: Z-score below which decay is detected
+        """
+        self.window_size = window_size
+        self.decay_threshold = decay_threshold
+        self.warning_threshold = warning_threshold
+        self.min_samples = min_samples
+        self.zscore_threshold = zscore_threshold
+
+        # Internal state
+        self._ic_history: list[float] = []
+        self._baseline_ic: float | None = None
+        self._baseline_std: float | None = None
+        self._is_calibrated: bool = False
+        self._predictions_buffer: list[np.ndarray] = []
+        self._returns_buffer: list[np.ndarray] = []
+        self._calculator = AlphaMetricsCalculator(min_observations=min(10, min_samples // 2))
+
+        logger.debug(
+            f"SignalDecayMonitor initialized: window={window_size}, "
+            f"decay_threshold={decay_threshold}, warning={warning_threshold}"
+        )
+
+    def reset(self) -> None:
+        """Reset monitor to initial state."""
+        self._ic_history.clear()
+        self._baseline_ic = None
+        self._baseline_std = None
+        self._is_calibrated = False
+        self._predictions_buffer.clear()
+        self._returns_buffer.clear()
+        logger.info("SignalDecayMonitor reset")
+
+    def calibrate(
+        self,
+        predictions: np.ndarray,
+        actual_returns: np.ndarray,
+    ) -> float:
+        """
+        Calibrate baseline IC from historical data.
+
+        Should be called once during initialization with historical
+        in-sample or validation data.
+
+        Args:
+            predictions: Historical predictions
+            actual_returns: Historical actual returns
+
+        Returns:
+            Baseline IC value
+        """
+        if len(predictions) < self.min_samples:
+            logger.warning(
+                f"Insufficient data for calibration: {len(predictions)} < {self.min_samples}"
+            )
+            return 0.0
+
+        # Compute rolling ICs
+        rolling_ics = self._calculator.compute_rolling_ic(
+            predictions, actual_returns, window=self.window_size
+        )
+        valid_ics = rolling_ics[~np.isnan(rolling_ics)]
+
+        if len(valid_ics) < 3:
+            logger.warning("Insufficient valid ICs for calibration")
+            return 0.0
+
+        self._baseline_ic = float(np.mean(valid_ics))
+        self._baseline_std = float(np.std(valid_ics, ddof=1))
+        self._is_calibrated = True
+
+        # Initialize IC history with calibration data
+        self._ic_history = list(valid_ics[-self.window_size:])
+
+        logger.info(
+            f"SignalDecayMonitor calibrated: baseline_ic={self._baseline_ic:.4f}, "
+            f"baseline_std={self._baseline_std:.4f}"
+        )
+
+        return self._baseline_ic
+
+    def update(
+        self,
+        predictions: np.ndarray,
+        actual_returns: np.ndarray,
+    ) -> SignalDecayAlert:
+        """
+        Update monitor with new predictions and check for decay.
+
+        Call this periodically (e.g., end of each day) with recent
+        predictions and their realized returns.
+
+        Args:
+            predictions: Recent predictions
+            actual_returns: Realized returns corresponding to predictions
+
+        Returns:
+            SignalDecayAlert with current status and recommendations
+        """
+        # Compute current IC
+        ic_result = self._calculator.compute_ic(predictions, actual_returns, return_lag=1)
+        current_ic = ic_result.rank_ic
+
+        # Store in history
+        self._ic_history.append(current_ic)
+
+        # Keep only recent history
+        if len(self._ic_history) > self.window_size * 2:
+            self._ic_history = self._ic_history[-self.window_size * 2:]
+
+        # Auto-calibrate if not calibrated
+        if not self._is_calibrated:
+            if len(self._ic_history) >= self.min_samples:
+                baseline_ics = self._ic_history[:self.min_samples]
+                self._baseline_ic = float(np.mean(baseline_ics))
+                self._baseline_std = float(np.std(baseline_ics, ddof=1))
+                self._is_calibrated = True
+                logger.info(
+                    f"Auto-calibrated: baseline_ic={self._baseline_ic:.4f}"
+                )
+            else:
+                # Not enough data yet
+                return SignalDecayAlert(
+                    status=self.STATUS_HEALTHY,
+                    baseline_ic=0.0,
+                    current_ic=current_ic,
+                    decay_pct=0.0,
+                    ic_zscore=0.0,
+                    recommendation="Calibrating - insufficient data",
+                )
+
+        # Compute recent rolling IC
+        recent_ics = self._ic_history[-self.window_size:]
+        recent_ic = float(np.mean(recent_ics)) if recent_ics else current_ic
+
+        # Calculate decay metrics
+        baseline_ic = self._baseline_ic or 0.0
+        baseline_std = self._baseline_std or 1.0
+
+        # Decay percentage (negative means decline)
+        if abs(baseline_ic) > 1e-10:
+            decay_pct = (recent_ic - baseline_ic) / abs(baseline_ic)
+        else:
+            decay_pct = 0.0
+
+        # Z-score of current IC relative to baseline
+        if baseline_std > 1e-10:
+            ic_zscore = (recent_ic - baseline_ic) / baseline_std
+        else:
+            ic_zscore = 0.0
+
+        # Determine status and recommendation
+        status = self.STATUS_HEALTHY
+        recommendation = None
+
+        if decay_pct <= self.decay_threshold or ic_zscore <= self.zscore_threshold:
+            status = self.STATUS_DECAY
+            recommendation = (
+                f"CRITICAL: Signal decay detected ({decay_pct:.1%} decline). "
+                f"Recommend disabling signal and investigating root cause. "
+                f"Z-score: {ic_zscore:.2f}"
+            )
+            logger.warning(
+                f"Signal decay detected: decay={decay_pct:.1%}, zscore={ic_zscore:.2f}"
+            )
+
+        elif decay_pct <= self.warning_threshold:
+            status = self.STATUS_WARNING
+            recommendation = (
+                f"WARNING: Signal quality declining ({decay_pct:.1%}). "
+                f"Monitor closely and prepare for potential disable. "
+                f"Z-score: {ic_zscore:.2f}"
+            )
+            logger.info(
+                f"Signal warning: decay={decay_pct:.1%}, zscore={ic_zscore:.2f}"
+            )
+
+        return SignalDecayAlert(
+            status=status,
+            baseline_ic=baseline_ic,
+            current_ic=recent_ic,
+            decay_pct=decay_pct,
+            ic_zscore=ic_zscore,
+            recommendation=recommendation,
+        )
+
+    def get_ic_history(self) -> list[float]:
+        """Get IC history for analysis."""
+        return self._ic_history.copy()
+
+    def get_baseline(self) -> tuple[float, float]:
+        """Get baseline IC and std."""
+        return (self._baseline_ic or 0.0, self._baseline_std or 0.0)
+
+    def is_calibrated(self) -> bool:
+        """Check if monitor is calibrated."""
+        return self._is_calibrated
+
+    def get_health_summary(self) -> dict[str, Any]:
+        """
+        Get summary of signal health.
+
+        Returns:
+            Dictionary with health metrics
+        """
+        recent_ics = self._ic_history[-self.window_size:] if self._ic_history else []
+
+        return {
+            "is_calibrated": self._is_calibrated,
+            "baseline_ic": self._baseline_ic,
+            "baseline_std": self._baseline_std,
+            "current_ic": float(np.mean(recent_ics)) if recent_ics else None,
+            "ic_trend": self._compute_ic_trend(),
+            "n_observations": len(self._ic_history),
+        }
+
+    def _compute_ic_trend(self) -> str:
+        """Compute recent IC trend."""
+        if len(self._ic_history) < 10:
+            return "insufficient_data"
+
+        recent = self._ic_history[-10:]
+        first_half = np.mean(recent[:5])
+        second_half = np.mean(recent[5:])
+
+        diff = second_half - first_half
+        if diff > 0.02:
+            return "improving"
+        elif diff < -0.02:
+            return "declining"
+        else:
+            return "stable"

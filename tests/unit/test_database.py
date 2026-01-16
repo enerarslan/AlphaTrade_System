@@ -92,14 +92,23 @@ class TestRedisManager:
 
     def test_redis_manager_requires_redis_package(self):
         """Test RedisManager raises ImportError when redis not available."""
-        if REDIS_AVAILABLE:
-            pytest.skip("Redis is installed, skipping import test")
+        # FIX: Always run this test by mocking REDIS_AVAILABLE
+        # This tests the error handling path when Redis is not installed
+        import quant_trading_system.database.connection as conn_module
 
-        with patch("quant_trading_system.database.connection.REDIS_AVAILABLE", False):
-            from quant_trading_system.database.connection import RedisManager
+        # Save original value
+        original_redis_available = conn_module.REDIS_AVAILABLE
 
-            with pytest.raises(ImportError):
-                RedisManager()
+        try:
+            # Mock Redis as unavailable
+            conn_module.REDIS_AVAILABLE = False
+
+            # RedisManager.__init__ should raise ImportError when Redis is not available
+            with pytest.raises(ImportError, match="redis package is required"):
+                conn_module.RedisManager()
+        finally:
+            # Restore original value
+            conn_module.REDIS_AVAILABLE = original_redis_available
 
 
 class TestOHLCVBarModel:

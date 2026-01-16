@@ -5,6 +5,10 @@ This module configures the Alembic environment for running migrations
 with our SQLAlchemy models and database connection.
 """
 
+# Load environment variables from .env file first
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config, pool
@@ -26,18 +30,25 @@ target_metadata = Base.metadata
 
 
 def get_url():
-    """Get database URL from environment or settings."""
+    """Get database URL from environment, alembic.ini, or settings."""
     import os
-
-    from quant_trading_system.config.settings import get_settings
 
     # First check environment variable
     url = os.getenv("DATABASE_URL")
     if url:
         return url
 
+    # Check alembic.ini config
+    try:
+        config_url = config.get_main_option("sqlalchemy.url")
+        if config_url:
+            return config_url
+    except Exception:
+        pass
+
     # Fall back to settings
     try:
+        from quant_trading_system.config.settings import get_settings
         settings = get_settings()
         return settings.database.url
     except Exception:

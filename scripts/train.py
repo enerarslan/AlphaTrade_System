@@ -123,6 +123,9 @@ class TrainingConfig:
     use_gpu: bool = False
     gpu_device: int = 0
 
+    # Database integration
+    use_database: bool = True  # Load data from PostgreSQL + TimescaleDB
+
     # Explainability
     compute_shap: bool = True
     n_shap_samples: int = 1000
@@ -250,7 +253,8 @@ class ModelTrainer:
         try:
             from quant_trading_system.data.loader import DataLoader
 
-            loader = DataLoader()
+            data_dir = PROJECT_ROOT / "data" / "raw"
+            loader = DataLoader(data_dir=data_dir, use_database=self.config.use_database)
 
             # Determine symbols
             symbols = self.config.symbols
@@ -268,7 +272,13 @@ class ModelTrainer:
                         end_date=self.config.end_date or None,
                     )
                     if df is not None and len(df) > 0:
-                        df["symbol"] = symbol
+                        # Handle both Polars and Pandas DataFrames
+                        import polars as pl
+                        if hasattr(df, 'with_columns'):  # Polars DataFrame
+                            df = df.with_columns(pl.lit(symbol).alias("symbol"))
+                            df = df.to_pandas()  # Convert to pandas for downstream compatibility
+                        else:  # Pandas DataFrame
+                            df["symbol"] = symbol
                         dfs.append(df)
                 except Exception as e:
                     self.logger.warning(f"Failed to load {symbol}: {e}")
@@ -318,45 +328,58 @@ class ModelTrainer:
         """Phase 2: Compute features for model training."""
         self.logger.info("Phase 2: Computing features...")
 
+        # Use FULL feature pipeline for JPMorgan-level training
+        # This includes ALL feature groups: technical, statistical, microstructure
         try:
-            from quant_trading_system.features.feature_pipeline import (
-                FeatureConfig,
-                FeaturePipeline,
-            )
-
-            # Configure feature groups
-            feature_config = FeatureConfig(
-                groups=["trend", "momentum", "volatility", "volume", "statistical"],
-                normalization="zscore",
-                handle_nan="drop",
-                variance_threshold=0.01,
-                correlation_threshold=0.95,
-            )
-
-            pipeline = FeaturePipeline(feature_config)
-
-            # Compute features per symbol
-            feature_dfs = []
-            for symbol in self.data["symbol"].unique():
-                symbol_data = self.data[self.data["symbol"] == symbol].copy()
-
-                try:
-                    features = pipeline.compute(symbol_data)
-                    features["symbol"] = symbol
-                    feature_dfs.append(features)
-                except Exception as e:
-                    self.logger.warning(f"Feature computation failed for {symbol}: {e}")
-
-            if not feature_dfs:
-                raise ValueError("No features computed for any symbol")
-
-            self.features = pd.concat(feature_dfs, ignore_index=True)
-            self.logger.info(f"Computed {len(self.features.columns)} features")
-
-        except ImportError:
-            # Fallback: Compute basic features
-            self.logger.info("Using fallback feature computation")
+            self._compute_features_full_pipeline()
+        except Exception as e:
+            self.logger.warning(f"Full pipeline failed ({e}), falling back to basic features")
             self._compute_features_fallback()
+
+    def _compute_features_full_pipeline(self) -> None:
+        """Compute ALL features using the optimized technical calculator (fast)."""
+        from quant_trading_system.features.technical import TechnicalIndicatorCalculator
+        import polars as pl
+
+        self.logger.info("Using OPTIMIZED feature computation (200+ technical features)")
+
+        # Use the fast TechnicalIndicatorCalculator directly
+        calc = TechnicalIndicatorCalculator()
+
+        features_list = []
+        for symbol in self.data["symbol"].unique():
+            self.logger.info(f"Computing features for {symbol}...")
+            df = self.data[self.data["symbol"] == symbol].copy()
+            df = df.sort_values("timestamp").reset_index(drop=True)
+
+            # Convert to polars for calculator
+            df_pl = pl.from_pandas(df)
+
+            try:
+                # Compute ALL technical features (fast vectorized implementation)
+                feature_cols = calc.compute_all(df_pl)
+
+                # Merge with original data
+                features_df = df.copy()
+                for col, values in feature_cols.items():
+                    features_df[col] = values
+
+                features_df["symbol"] = symbol
+                features_list.append(features_df)
+                self.logger.info(f"  {symbol}: {len(feature_cols)} features computed")
+
+            except Exception as e:
+                self.logger.error(f"Failed to compute features for {symbol}: {e}")
+                # Add basic features as fallback for this symbol
+                df["returns"] = df["close"].pct_change()
+                df["volatility"] = df["returns"].rolling(20).std()
+                df["symbol"] = symbol
+                features_list.append(df)
+
+        if features_list:
+            self.features = pd.concat(features_list, ignore_index=True)
+            self.features = self.features.dropna()
+            self.logger.info(f"Total: {len(self.features.columns)} features computed for {len(features_list)} symbols")
 
     def _compute_features_fallback(self) -> None:
         """Fallback feature computation with basic indicators."""
@@ -640,16 +663,20 @@ class ModelTrainer:
             # P1-H1: Ensure minimum embargo period
             embargo_pct = max(self.config.embargo_pct, 0.01)
 
+            # Calculate purge_gap from purge_pct (convert percentage to number of periods)
+            # Typical 15-min data has ~26 bars/day, so 2% = ~5 bars
+            purge_gap = max(1, int(self.config.purge_pct * 100))  # purge_gap as integer bars
+
             if self.config.cv_method == "purged_kfold":
                 return PurgedKFold(
                     n_splits=self.config.n_splits,
-                    purge_pct=self.config.purge_pct,
+                    purge_gap=purge_gap,
                     embargo_pct=embargo_pct,
                 )
             elif self.config.cv_method == "combinatorial":
                 return CombinatorialPurgedKFold(
                     n_splits=self.config.n_splits,
-                    purge_pct=self.config.purge_pct,
+                    purge_gap=purge_gap,
                     embargo_pct=embargo_pct,
                 )
             elif self.config.cv_method == "walk_forward":
@@ -660,7 +687,7 @@ class ModelTrainer:
             else:
                 return PurgedKFold(
                     n_splits=self.config.n_splits,
-                    purge_pct=self.config.purge_pct,
+                    purge_gap=purge_gap,
                     embargo_pct=embargo_pct,
                 )
 
@@ -767,26 +794,45 @@ class ModelTrainer:
 
     def _get_predictions_proba(self, model, X) -> np.ndarray:
         """Get prediction probabilities from model."""
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X)
-            if proba.ndim == 2:
-                return proba[:, 1]
-            return proba
-        elif hasattr(model, "predict"):
-            return model.predict(X)
+        try:
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(X)
+                if proba.ndim == 2:
+                    return proba[:, 1]
+                return proba
+        except (NotImplementedError, AttributeError):
+            pass  # Model doesn't support predict_proba, use predict
+
+        if hasattr(model, "predict"):
+            # For regressors, normalize predictions to [0, 1] range
+            predictions = model.predict(X)
+            if isinstance(predictions, np.ndarray):
+                # Clip and normalize to [0, 1]
+                predictions = np.clip(predictions, -1, 1)
+                predictions = (predictions + 1) / 2  # Map [-1, 1] to [0, 1]
+            return predictions
+
         return np.zeros(len(X))
 
     def _calculate_fold_metrics(
         self, y_true, y_pred, y_proba
     ) -> dict:
         """Calculate metrics for a single fold."""
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, mean_squared_error, r2_score
+
+        # Convert continuous predictions to binary for classification metrics
+        # Use 0.5 as threshold (predictions are normalized to [0, 1])
+        y_pred_binary = (np.array(y_pred) >= 0.5).astype(int) if not np.array_equal(y_pred, y_pred.astype(int)) else y_pred
+        y_true_binary = (np.array(y_true) >= 0.5).astype(int) if not np.array_equal(y_true, y_true.astype(int)) else y_true
 
         metrics = {
-            "accuracy": accuracy_score(y_true, y_pred),
-            "precision": precision_score(y_true, y_pred, zero_division=0),
-            "recall": recall_score(y_true, y_pred, zero_division=0),
-            "f1": f1_score(y_true, y_pred, zero_division=0),
+            "accuracy": accuracy_score(y_true_binary, y_pred_binary),
+            "precision": precision_score(y_true_binary, y_pred_binary, zero_division=0),
+            "recall": recall_score(y_true_binary, y_pred_binary, zero_division=0),
+            "f1": f1_score(y_true_binary, y_pred_binary, zero_division=0),
+            # Also include regression metrics
+            "mse": mean_squared_error(y_true, y_pred),
+            "r2": r2_score(y_true, y_pred) if len(set(y_true)) > 1 else 0.0,
         }
 
         # Calculate pseudo-Sharpe from predictions
@@ -1158,7 +1204,8 @@ def run_training(args: argparse.Namespace) -> int:
         use_meta_labeling=getattr(args, "meta_labeling", False),
         apply_multiple_testing=getattr(args, "multiple_testing", True),
         correction_method=getattr(args, "correction_method", "deflated_sharpe"),
-        use_gpu=getattr(args, "use_gpu", False),
+        use_gpu=getattr(args, "gpu", False) or getattr(args, "use_gpu", False),
+        use_database=getattr(args, "use_database", True) and not getattr(args, "no_database", False),
         compute_shap=getattr(args, "shap", True),
         output_dir=getattr(args, "output_dir", "models"),
     )

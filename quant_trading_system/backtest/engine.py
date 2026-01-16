@@ -173,6 +173,9 @@ class BacktestState:
     signals_generated: int = 0
     orders_filled: int = 0
 
+    # P1: Regime tracking for regime-specific analysis
+    regime_history: list[tuple[datetime, Any]] = field(default_factory=list)
+
     @property
     def position_count(self) -> int:
         """Get number of open positions."""
@@ -296,6 +299,137 @@ class PandasDataHandler(DataHandler):
         self._latest_bars = {s: deque(maxlen=1000) for s in self._symbols}
 
 
+class PolarsDataHandler(DataHandler):
+    """Data handler using Polars DataFrames for high-performance backtesting."""
+
+    def __init__(
+        self,
+        data: dict[str, Any],  # Polars DataFrames
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> None:
+        """Initialize Polars data handler.
+
+        Args:
+            data: Dictionary mapping symbols to Polars DataFrames with OHLCV data.
+            start_date: Optional start date filter.
+            end_date: Optional end date filter.
+        """
+        try:
+            import polars as pl
+            self._pl = pl
+        except ImportError:
+            raise ImportError("Polars is required for PolarsDataHandler")
+
+        self._data = data
+        self._symbols = list(data.keys())
+        self._current_index = 0
+        self._latest_bars: dict[str, deque] = {s: deque(maxlen=1000) for s in self._symbols}
+
+        # Filter and align data
+        self._prepare_data(start_date, end_date)
+
+    def _prepare_data(
+        self,
+        start_date: datetime | None,
+        end_date: datetime | None,
+    ) -> None:
+        """Prepare and align data across symbols."""
+        pl = self._pl
+
+        # Get all timestamps from each symbol
+        all_timestamps = []
+        for symbol, df in self._data.items():
+            if "timestamp" in df.columns:
+                ts = df["timestamp"].to_list()
+                all_timestamps.append(set(ts))
+
+        if not all_timestamps:
+            self._dates = []
+            self._max_index = 0
+            return
+
+        # Find common timestamps across all symbols
+        common_timestamps = all_timestamps[0]
+        for ts_set in all_timestamps[1:]:
+            common_timestamps = common_timestamps.intersection(ts_set)
+
+        # Convert to sorted list
+        dates = sorted(list(common_timestamps))
+
+        # Apply date filters
+        if start_date:
+            start_naive = start_date.replace(tzinfo=None) if hasattr(start_date, 'tzinfo') and start_date.tzinfo else start_date
+            dates = [d for d in dates if d >= start_naive]
+        if end_date:
+            end_naive = end_date.replace(tzinfo=None) if hasattr(end_date, 'tzinfo') and end_date.tzinfo else end_date
+            dates = [d for d in dates if d <= end_naive]
+
+        self._dates = dates
+        self._max_index = len(self._dates)
+
+        # Pre-index data for fast lookup
+        self._data_indexed: dict[str, dict] = {}
+        for symbol, df in self._data.items():
+            if "timestamp" in df.columns:
+                # Create a lookup dict for O(1) access
+                self._data_indexed[symbol] = {}
+                for i in range(len(df)):
+                    row = df.row(i, named=True)
+                    ts = row.get("timestamp")
+                    if ts in common_timestamps:
+                        self._data_indexed[symbol][ts] = row
+
+    def get_symbols(self) -> list[str]:
+        """Get list of symbols."""
+        return self._symbols.copy()
+
+    def get_latest_bars(self, symbol: str, n: int = 1) -> list[OHLCVBar]:
+        """Get the latest N bars for a symbol."""
+        if symbol not in self._latest_bars:
+            return []
+        bars = list(self._latest_bars[symbol])
+        return bars[-n:]
+
+    def update_bars(self) -> bool:
+        """Update bars for all symbols."""
+        if self._current_index >= self._max_index:
+            return False
+
+        current_date = self._dates[self._current_index]
+
+        for symbol in self._symbols:
+            if symbol not in self._data_indexed:
+                continue
+
+            row = self._data_indexed[symbol].get(current_date)
+            if row is not None:
+                # Create OHLCVBar from Polars row
+                bar = OHLCVBar(
+                    symbol=symbol,
+                    timestamp=current_date if isinstance(current_date, datetime) else datetime.now(timezone.utc),
+                    open=Decimal(str(round(row.get("open", row.get("Open", 0)), 8))),
+                    high=Decimal(str(round(row.get("high", row.get("High", 0)), 8))),
+                    low=Decimal(str(round(row.get("low", row.get("Low", 0)), 8))),
+                    close=Decimal(str(round(row.get("close", row.get("Close", 0)), 8))),
+                    volume=int(row.get("volume", row.get("Volume", 0))),
+                )
+                self._latest_bars[symbol].append(bar)
+
+        self._current_index += 1
+        return True
+
+    def get_current_bar(self, symbol: str) -> OHLCVBar | None:
+        """Get the current bar for a symbol."""
+        bars = self.get_latest_bars(symbol, 1)
+        return bars[0] if bars else None
+
+    def reset(self) -> None:
+        """Reset to beginning of data."""
+        self._current_index = 0
+        self._latest_bars = {s: deque(maxlen=1000) for s in self._symbols}
+
+
 class Strategy(ABC):
     """Abstract base class for trading strategies."""
 
@@ -334,6 +468,7 @@ class BacktestEngine:
         strategy: Strategy,
         config: BacktestConfig | None = None,
         market_simulator: MarketSimulator | None = None,
+        regime_detector: Any = None,
     ) -> None:
         """Initialize backtesting engine.
 
@@ -342,10 +477,13 @@ class BacktestEngine:
             strategy: Trading strategy to test.
             config: Backtest configuration.
             market_simulator: Optional custom market simulator.
+            regime_detector: Optional regime detector for regime-specific analysis.
+                            Should have a detect(data) method returning RegimeState.
         """
         self.data_handler = data_handler
         self.strategy = strategy
         self.config = config or BacktestConfig()
+        self._regime_detector = regime_detector
 
         # JPMORGAN FIX: Initialize market simulator based on execution mode
         if market_simulator is not None:
@@ -461,6 +599,19 @@ class BacktestEngine:
             # Invoke callbacks
             for callback in self._on_bar_callbacks:
                 callback(symbol, bar)
+
+        # P1: Track regime state if detector available
+        if self._regime_detector is not None:
+            try:
+                # Try to detect regime from current data
+                # The detector should accept price data and return a RegimeState
+                regime_state = self._detect_current_regime()
+                if regime_state is not None:
+                    self._state.regime_history.append(
+                        (self._state.timestamp, regime_state)
+                    )
+            except Exception as e:
+                logger.debug(f"Regime detection failed: {e}")
 
         # Generate signals after processing all bars
         signals = self.strategy.generate_signals(
@@ -1015,6 +1166,49 @@ class BacktestEngine:
     def add_fill_callback(self, callback: Callable) -> None:
         """Add callback for fill events."""
         self._on_fill_callbacks.append(callback)
+
+    def _detect_current_regime(self) -> Any:
+        """
+        Detect current market regime using the regime detector.
+
+        Returns:
+            RegimeState if detection succeeds, None otherwise.
+        """
+        if self._regime_detector is None:
+            return None
+
+        # Build data for regime detection from price history
+        # Use first symbol's price history as representative
+        symbols = self.data_handler.get_symbols()
+        if not symbols:
+            return None
+
+        symbol = symbols[0]
+        if symbol not in self._price_history:
+            return None
+
+        prices = list(self._price_history[symbol])
+        if len(prices) < 10:  # Need minimum data
+            return None
+
+        # Create DataFrame-like structure for regime detector
+        import pandas as pd
+        price_df = pd.DataFrame({
+            'close': prices,
+        })
+
+        # Calculate returns for volatility estimation
+        price_df['returns'] = price_df['close'].pct_change()
+
+        # Try different detector interfaces
+        if hasattr(self._regime_detector, 'detect'):
+            return self._regime_detector.detect(price_df)
+        elif hasattr(self._regime_detector, 'detect_regime'):
+            return self._regime_detector.detect_regime(price_df)
+        elif callable(self._regime_detector):
+            return self._regime_detector(price_df)
+
+        return None
 
 
 class VectorizedBacktest:

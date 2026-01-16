@@ -198,10 +198,12 @@ class SystemHealthChecker:
         start = time.time()
 
         try:
-            from quant_trading_system.database.connection import get_connection
+            from sqlalchemy import text
+            from quant_trading_system.database.connection import get_db_manager
 
-            conn = await get_connection()
-            await conn.execute("SELECT 1")
+            db_manager = get_db_manager()
+            with db_manager.session() as session:
+                session.execute(text("SELECT 1"))
 
             latency = (time.time() - start) * 1000
 
@@ -213,11 +215,11 @@ class SystemHealthChecker:
                 details={"type": "postgresql"},
             )
 
-        except ImportError:
+        except ImportError as e:
             return HealthCheckResult(
                 component="database",
                 status=HealthStatus.UNKNOWN,
-                message="Database module not available",
+                message=f"Database module import error: {e}",
                 latency_ms=(time.time() - start) * 1000,
             )
 
@@ -330,7 +332,8 @@ class SystemHealthChecker:
         try:
             from quant_trading_system.data.loader import DataLoader
 
-            loader = DataLoader()
+            data_dir = PROJECT_ROOT / "data" / "raw"
+            loader = DataLoader(data_dir=data_dir, use_database=True)
             symbols = loader.get_available_symbols()
 
             latency = (time.time() - start) * 1000
@@ -759,9 +762,12 @@ class SystemHealthChecker:
         start = time.time()
 
         try:
-            from quant_trading_system.monitoring.audit import AuditLogger
+            from quant_trading_system.monitoring.audit import AuditLogger, FileAuditStorage
 
-            audit_logger = AuditLogger()
+            audit_dir = PROJECT_ROOT / "logs" / "audit"
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            storage = FileAuditStorage(storage_dir=audit_dir)
+            audit_logger = AuditLogger(storage=storage)
 
             # Verify chain integrity
             if hasattr(audit_logger, "verify_chain"):
@@ -818,15 +824,17 @@ class SystemHealthChecker:
         start = time.time()
 
         try:
-            from quant_trading_system.data.vix_feed import VIXFeed
-            from quant_trading_system.alpha.vix_integration import VIXRegime
+            import asyncio
+            from quant_trading_system.data.vix_feed import create_vix_feed, VIXRegime
 
-            vix_feed = VIXFeed()
-            current_vix = vix_feed.get_current() if hasattr(vix_feed, "get_current") else None
+            vix_feed = create_vix_feed(feed_type="mock")
+
+            # Fetch VIX directly for health check (async)
+            vix_data = await vix_feed.fetch_vix()
 
             latency = (time.time() - start) * 1000
 
-            if current_vix is None:
+            if vix_data is None:
                 return HealthCheckResult(
                     component="vix_regime",
                     status=HealthStatus.UNKNOWN,
@@ -834,7 +842,7 @@ class SystemHealthChecker:
                     latency_ms=latency,
                 )
 
-            vix_value = float(current_vix.get("close", 20))
+            vix_value = float(vix_data.value)
 
             # Determine regime
             if vix_value >= 35:
@@ -955,12 +963,12 @@ def cmd_check(args: argparse.Namespace) -> int:
             continue
 
         status_icon = {
-            HealthStatus.HEALTHY: "✓",
-            HealthStatus.DEGRADED: "⚠",
-            HealthStatus.UNHEALTHY: "✗",
-            HealthStatus.CRITICAL: "🔴",
-            HealthStatus.UNKNOWN: "?",
-        }.get(status, "?")
+            HealthStatus.HEALTHY: "[OK]",
+            HealthStatus.DEGRADED: "[WARN]",
+            HealthStatus.UNHEALTHY: "[FAIL]",
+            HealthStatus.CRITICAL: "[CRIT]",
+            HealthStatus.UNKNOWN: "[???]",
+        }.get(status, "[???]")
 
         print(f"\n{status_icon} {status.value} ({len(by_status[status])} components)")
         print("-" * 40)
@@ -1007,7 +1015,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("\nQuick Status:")
     print("-" * 40)
     for result in results:
-        status_icon = "✓" if result.status == HealthStatus.HEALTHY else "✗"
+        status_icon = "[OK]" if result.status == HealthStatus.HEALTHY else "[FAIL]"
         print(f"  {status_icon} {result.component}: {result.status.value}")
 
     return 0
@@ -1036,10 +1044,10 @@ def cmd_risk(args: argparse.Namespace) -> int:
     print("-" * 60)
     for result in results:
         status_icon = {
-            HealthStatus.HEALTHY: "✓",
-            HealthStatus.DEGRADED: "⚠",
-            HealthStatus.CRITICAL: "🔴",
-        }.get(result.status, "?")
+            HealthStatus.HEALTHY: "[OK]",
+            HealthStatus.DEGRADED: "[WARN]",
+            HealthStatus.CRITICAL: "[CRIT]",
+        }.get(result.status, "[???]")
 
         print(f"\n{status_icon} {result.component.upper()}")
         print(f"   Status: {result.status.value}")
@@ -1092,19 +1100,22 @@ def cmd_audit(args: argparse.Namespace) -> int:
     logger.info("=" * 80)
 
     try:
-        from quant_trading_system.monitoring.audit import AuditLogger
+        from quant_trading_system.monitoring.audit import AuditLogger, FileAuditStorage
 
-        audit_logger = AuditLogger()
+        audit_dir = PROJECT_ROOT / "logs" / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        storage = FileAuditStorage(storage_dir=audit_dir)
+        audit_logger = AuditLogger(storage=storage)
 
         if hasattr(audit_logger, "verify_chain"):
             is_valid = audit_logger.verify_chain()
 
             if is_valid:
-                logger.info("✓ Audit log integrity VERIFIED")
+                logger.info("[OK] Audit log integrity VERIFIED")
                 logger.info("  All entries have valid hash chains")
                 return 0
             else:
-                logger.error("✗ AUDIT LOG INTEGRITY COMPROMISED")
+                logger.error("[FAIL] AUDIT LOG INTEGRITY COMPROMISED")
                 logger.error("  Hash chain verification failed!")
                 return 1
         else:

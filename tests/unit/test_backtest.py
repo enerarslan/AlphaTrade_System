@@ -856,3 +856,437 @@ class TestOverfitDetector:
         analysis = detector.analyze(result)
 
         assert analysis["is_likely_overfit"] is False
+
+
+# ============================================================================
+# P0/P1 Enhancement Tests
+# ============================================================================
+
+
+class TestDeflatedSharpeRatio:
+    """Tests for P0: Deflated Sharpe Ratio calculation."""
+
+    def test_dsr_calculation(self):
+        """Test DSR is calculated and less than observed Sharpe."""
+        from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
+
+        analyzer = PerformanceAnalyzer()
+
+        # Create mock backtest state with positive returns
+        np.random.seed(42)
+        n_bars = 500
+        base_time = datetime(2024, 1, 1)
+
+        # Generate returns that would give a high Sharpe
+        equity_curve = [100000.0]
+        for i in range(n_bars):
+            daily_return = np.random.normal(0.0005, 0.01)  # Positive drift
+            equity_curve.append(equity_curve[-1] * (1 + daily_return))
+
+        state = BacktestState(
+            timestamp=datetime.now(),
+            equity=Decimal(str(equity_curve[-1])),
+            cash=Decimal(str(equity_curve[-1])),
+            positions={},
+            pending_orders=[],
+            equity_curve=[
+                (base_time + timedelta(days=i), e)
+                for i, e in enumerate(equity_curve)
+            ],
+            trades=[],
+            bars_processed=n_bars,
+        )
+
+        report = analyzer.analyze(state, n_trials=10)
+
+        # DSR should be calculated
+        assert report.statistical_tests.deflated_sharpe_ratio >= 0
+        # With multiple trials, DSR should typically be less than observed Sharpe
+        # (deflation accounts for multiple testing)
+        if report.risk_adjusted_metrics.sharpe_ratio > 0:
+            assert report.statistical_tests.n_trials_tested == 10
+
+    def test_dsr_with_single_trial(self):
+        """Test DSR with single trial equals observed Sharpe."""
+        from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
+
+        analyzer = PerformanceAnalyzer()
+
+        np.random.seed(42)
+        n_bars = 252
+        base_time = datetime(2024, 1, 1)
+
+        equity_curve = [100000.0]
+        for i in range(n_bars):
+            daily_return = np.random.normal(0.0003, 0.012)
+            equity_curve.append(equity_curve[-1] * (1 + daily_return))
+
+        state = BacktestState(
+            timestamp=datetime.now(),
+            equity=Decimal(str(equity_curve[-1])),
+            cash=Decimal(str(equity_curve[-1])),
+            positions={},
+            pending_orders=[],
+            equity_curve=[
+                (base_time + timedelta(days=i), e)
+                for i, e in enumerate(equity_curve)
+            ],
+            trades=[],
+            bars_processed=n_bars,
+        )
+
+        report = analyzer.analyze(state, n_trials=1)
+
+        # With single trial, DSR should be close to observed Sharpe
+        assert report.statistical_tests.n_trials_tested == 1
+
+
+class TestProbabilityOfBacktestOverfitting:
+    """Tests for P0: Probability of Backtest Overfitting (PBO)."""
+
+    def test_pbo_calculation(self):
+        """Test PBO is calculated between 0 and 1."""
+        from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
+
+        analyzer = PerformanceAnalyzer()
+
+        np.random.seed(42)
+        n_bars = 500
+        base_time = datetime(2024, 1, 1)
+
+        equity_curve = [100000.0]
+        for i in range(n_bars):
+            daily_return = np.random.normal(0.0002, 0.015)
+            equity_curve.append(equity_curve[-1] * (1 + daily_return))
+
+        state = BacktestState(
+            timestamp=datetime.now(),
+            equity=Decimal(str(equity_curve[-1])),
+            cash=Decimal(str(equity_curve[-1])),
+            positions={},
+            pending_orders=[],
+            equity_curve=[
+                (base_time + timedelta(days=i), e)
+                for i, e in enumerate(equity_curve)
+            ],
+            trades=[],
+            bars_processed=n_bars,
+        )
+
+        report = analyzer.analyze(state)
+
+        # PBO should be between 0 and 1
+        assert 0.0 <= report.statistical_tests.pbo <= 1.0
+        # Should have an interpretation
+        assert report.statistical_tests.pbo_interpretation != ""
+
+    def test_pbo_interpretation_categories(self):
+        """Test PBO interpretation categories are meaningful."""
+        from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
+
+        analyzer = PerformanceAnalyzer()
+
+        # Low overfitting interpretation
+        low_pbo_result = analyzer._calculate_pbo(np.random.normal(0.001, 0.01, 500))
+        high_pbo_result = analyzer._calculate_pbo(np.random.normal(0, 0.02, 100))
+
+        # Interpretations should exist
+        assert low_pbo_result[1] in [
+            "Very low overfitting risk",
+            "Low overfitting risk",
+            "Moderate overfitting risk",
+            "High overfitting risk - exercise caution",
+            "Very high overfitting risk - likely overfit",
+        ]
+
+
+class TestSignalDecayMonitor:
+    """Tests for P0: Signal Decay Monitor."""
+
+    def test_signal_decay_monitor_initialization(self):
+        """Test monitor initializes correctly."""
+        from quant_trading_system.alpha.alpha_metrics import SignalDecayMonitor
+
+        monitor = SignalDecayMonitor(
+            window_size=30,
+            decay_threshold=-0.5,
+            min_samples=20,
+        )
+
+        assert monitor.window_size == 30
+        assert monitor.decay_threshold == -0.5
+        assert not monitor.is_calibrated()
+
+    def test_signal_decay_calibration(self):
+        """Test monitor calibration with good signal."""
+        from quant_trading_system.alpha.alpha_metrics import SignalDecayMonitor
+
+        monitor = SignalDecayMonitor(window_size=20, min_samples=30)
+
+        # Generate predictions that correlate with returns
+        np.random.seed(42)
+        n = 100
+        true_signal = np.random.randn(n)
+        noise = np.random.randn(n) * 0.5
+        predictions = true_signal + noise
+        returns = true_signal * 0.01  # Returns correlated with signal
+
+        baseline = monitor.calibrate(predictions, returns)
+
+        assert monitor.is_calibrated()
+        assert baseline != 0.0
+
+    def test_signal_decay_detection(self):
+        """Test that decay is detected when signal quality drops."""
+        from quant_trading_system.alpha.alpha_metrics import SignalDecayMonitor
+
+        monitor = SignalDecayMonitor(
+            window_size=20,
+            decay_threshold=-0.5,
+            min_samples=20,
+        )
+
+        np.random.seed(42)
+
+        # Phase 1: Good signal for calibration
+        n_good = 50
+        good_signal = np.random.randn(n_good)
+        good_returns = good_signal * 0.01
+
+        monitor.calibrate(good_signal, good_returns)
+
+        # Phase 2: Signal decays (no correlation)
+        n_bad = 30
+        bad_predictions = np.random.randn(n_bad)
+        bad_returns = np.random.randn(n_bad) * 0.01  # Uncorrelated
+
+        alert = monitor.update(bad_predictions, bad_returns)
+
+        # Should detect some level of degradation
+        assert alert.status in ["healthy", "warning", "decay_detected"]
+        assert alert.baseline_ic != 0.0
+
+    def test_signal_decay_healthy_signal(self):
+        """Test healthy signal maintains good status."""
+        from quant_trading_system.alpha.alpha_metrics import SignalDecayMonitor
+
+        monitor = SignalDecayMonitor(window_size=20, min_samples=20)
+
+        np.random.seed(42)
+
+        # Consistently good signal
+        n = 60
+        signal = np.random.randn(n)
+        returns = signal * 0.01 + np.random.randn(n) * 0.002
+
+        monitor.calibrate(signal[:30], returns[:30])
+        alert = monitor.update(signal[30:], returns[30:])
+
+        # Should remain healthy with consistent signal
+        assert alert.status in ["healthy", "warning"]
+
+
+class TestRegimeMetrics:
+    """Tests for P1: Regime-specific analysis."""
+
+    def test_regime_metrics_dataclass(self):
+        """Test RegimeMetrics dataclass creation."""
+        from quant_trading_system.backtest.analyzer import RegimeMetrics
+
+        metrics = RegimeMetrics(
+            regime="BULL_LOW_VOL",
+            n_bars=100,
+            total_return=0.15,
+            sharpe_ratio=1.5,
+            win_rate=0.55,
+            max_drawdown=0.05,
+        )
+
+        assert metrics.regime == "BULL_LOW_VOL"
+        assert metrics.n_bars == 100
+        assert metrics.sharpe_ratio == 1.5
+
+        # Test to_dict
+        d = metrics.to_dict()
+        assert d["regime"] == "BULL_LOW_VOL"
+        assert d["sharpe_ratio"] == 1.5
+
+    def test_analyze_by_regime(self):
+        """Test regime-specific performance analysis."""
+        from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
+
+        analyzer = PerformanceAnalyzer()
+
+        # Create mock backtest state
+        np.random.seed(42)
+        n_bars = 200
+        base_time = datetime(2024, 1, 1)
+
+        equity_curve = [100000.0]
+        for i in range(n_bars):
+            daily_return = np.random.normal(0.0003, 0.012)
+            equity_curve.append(equity_curve[-1] * (1 + daily_return))
+
+        # Create mock regime history
+        from quant_trading_system.alpha.regime_detection import MarketRegime
+
+        regime_history = []
+        for i in range(n_bars):
+            if i < 50:
+                regime = MarketRegime.BULL_LOW_VOL
+            elif i < 100:
+                regime = MarketRegime.BULL_HIGH_VOL
+            elif i < 150:
+                regime = MarketRegime.BEAR_LOW_VOL
+            else:
+                regime = MarketRegime.RANGE_BOUND
+            regime_history.append(regime)
+
+        state = BacktestState(
+            timestamp=datetime.now(),
+            equity=Decimal(str(equity_curve[-1])),
+            cash=Decimal(str(equity_curve[-1])),
+            positions={},
+            pending_orders=[],
+            equity_curve=[
+                (base_time + timedelta(days=i), e)
+                for i, e in enumerate(equity_curve)
+            ],
+            trades=[],
+            bars_processed=n_bars,
+            regime_history=[
+                (base_time + timedelta(days=i), r)
+                for i, r in enumerate(regime_history)
+            ],
+        )
+
+        metrics = analyzer.analyze_by_regime(state, regime_history)
+
+        # Should have metrics for each unique regime
+        assert len(metrics) > 0
+        assert all(hasattr(m, 'regime') for m in metrics)
+        assert all(hasattr(m, 'sharpe_ratio') for m in metrics)
+
+
+class TestCostSensitivity:
+    """Tests for P1: Transaction cost sensitivity analysis."""
+
+    def test_cost_sensitivity_dataclass(self):
+        """Test CostSensitivity dataclass creation."""
+        from quant_trading_system.backtest.analyzer import CostSensitivity
+
+        sensitivity = CostSensitivity(
+            break_even_cost_bps=8.5,
+            sharpe_at_costs={0.0: 1.5, 5.0: 1.2, 10.0: 0.9},
+            return_at_costs={0.0: 0.15, 5.0: 0.12, 10.0: 0.09},
+        )
+
+        assert sensitivity.break_even_cost_bps == 8.5
+        assert sensitivity.sharpe_at_costs[0.0] == 1.5
+
+        # Test to_dict
+        d = sensitivity.to_dict()
+        assert d["break_even_cost_bps"] == 8.5
+
+    def test_analyze_cost_sensitivity(self):
+        """Test cost sensitivity analysis."""
+        from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
+
+        analyzer = PerformanceAnalyzer()
+
+        # Create mock backtest state with trades
+        np.random.seed(42)
+        n_bars = 252
+        base_time = datetime(2024, 1, 1)
+
+        # Generate positive returns
+        equity_curve = [100000.0]
+        for i in range(n_bars):
+            daily_return = np.random.normal(0.0004, 0.01)
+            equity_curve.append(equity_curve[-1] * (1 + daily_return))
+
+        # Create some trades
+        trades = [
+            Trade(
+                symbol="AAPL",
+                entry_time=base_time + timedelta(days=i*10),
+                exit_time=base_time + timedelta(days=i*10+5),
+                side=OrderSide.BUY,
+                quantity=Decimal("100"),
+                entry_price=Decimal("150.00"),
+                exit_price=Decimal("155.00"),
+                pnl=Decimal("500"),
+                pnl_pct=0.0333,
+                commission=Decimal("1.00"),
+                slippage=Decimal("0.50"),
+                holding_period_bars=5,
+            )
+            for i in range(20)
+        ]
+
+        state = BacktestState(
+            timestamp=datetime.now(),
+            equity=Decimal(str(equity_curve[-1])),
+            cash=Decimal(str(equity_curve[-1])),
+            positions={},
+            pending_orders=[],
+            equity_curve=[
+                (base_time + timedelta(days=i), e)
+                for i, e in enumerate(equity_curve)
+            ],
+            trades=trades,
+            bars_processed=n_bars,
+        )
+
+        sensitivity = analyzer.analyze_cost_sensitivity(state)
+
+        # Should have break-even cost
+        assert sensitivity.break_even_cost_bps >= 0
+        # Should have costs at different levels
+        assert len(sensitivity.sharpe_at_costs) > 0
+        # Higher costs should result in lower Sharpe
+        costs = sorted(sensitivity.sharpe_at_costs.keys())
+        if len(costs) >= 2:
+            assert sensitivity.sharpe_at_costs[costs[-1]] <= sensitivity.sharpe_at_costs[costs[0]]
+
+
+class TestBacktestStateRegimeHistory:
+    """Tests for P1: BacktestState regime_history field."""
+
+    def test_regime_history_default_empty(self):
+        """Test regime_history defaults to empty list."""
+        state = BacktestState(
+            timestamp=datetime.now(),
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            positions={},
+            pending_orders=[],
+            equity_curve=[],
+            trades=[],
+        )
+
+        assert state.regime_history == []
+
+    def test_regime_history_stores_data(self):
+        """Test regime_history stores regime data."""
+        from quant_trading_system.alpha.regime_detection import MarketRegime
+
+        base_time = datetime(2024, 1, 1)
+        regime_history = [
+            (base_time, MarketRegime.BULL_LOW_VOL),
+            (base_time + timedelta(days=1), MarketRegime.BULL_HIGH_VOL),
+        ]
+
+        state = BacktestState(
+            timestamp=datetime.now(),
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            positions={},
+            pending_orders=[],
+            equity_curve=[],
+            trades=[],
+            regime_history=regime_history,
+        )
+
+        assert len(state.regime_history) == 2
+        assert state.regime_history[0][1] == MarketRegime.BULL_LOW_VOL

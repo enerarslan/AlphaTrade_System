@@ -258,7 +258,8 @@ class TestTradeLogger:
 
     def test_log_trade_entry(self):
         """Test logging a trade entry."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # FIX: Use ignore_cleanup_errors for Windows compatibility
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             logger = TradeLogger(log_dir=Path(tmpdir))
             entry = logger.log_trade_entry(
                 symbol="AAPL",
@@ -273,7 +274,8 @@ class TestTradeLogger:
 
     def test_log_trade_exit(self):
         """Test logging a trade exit."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # FIX: Use ignore_cleanup_errors for Windows compatibility
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             logger = TradeLogger(log_dir=Path(tmpdir))
             entry = logger.log_trade_entry(
                 symbol="MSFT",

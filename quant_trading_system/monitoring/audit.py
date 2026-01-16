@@ -494,19 +494,26 @@ class DatabaseAuditStorage(AuditStorage):
     """
     Database-based audit storage.
 
-    Placeholder for database implementation.
-    Would use SQLAlchemy with a dedicated audit table.
+    FIX: Changed from silent placeholder to explicit NotImplementedError.
+    Use FileAuditStorage for production until database implementation is complete.
     """
 
     def __init__(self, connection_string: str):
-        """Initialize database storage."""
-        self.connection_string = connection_string
-        logger.warning("DatabaseAuditStorage not fully implemented - using placeholder")
+        """Initialize database storage.
+
+        Raises:
+            NotImplementedError: Database audit storage is not yet implemented.
+        """
+        # FIX: Fail explicitly instead of silently doing nothing
+        raise NotImplementedError(
+            "DatabaseAuditStorage is not yet implemented. "
+            "Use FileAuditStorage for production audit logging. "
+            "Example: AuditLogger(FileAuditStorage('/var/log/alphatrade/audit'))"
+        )
 
     def store(self, event: AuditEvent) -> None:
         """Store an audit event."""
-        # Placeholder - would insert into database
-        pass
+        raise NotImplementedError("DatabaseAuditStorage not implemented")
 
     def retrieve(
         self,
@@ -516,11 +523,11 @@ class DatabaseAuditStorage(AuditStorage):
         limit: int = 1000,
     ) -> list[AuditEvent]:
         """Retrieve audit events."""
-        return []
+        raise NotImplementedError("DatabaseAuditStorage not implemented")
 
     def get_last_hash(self) -> str | None:
         """Get last hash."""
-        return None
+        raise NotImplementedError("DatabaseAuditStorage not implemented")
 
 
 class AuditLogger:
