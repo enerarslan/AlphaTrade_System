@@ -1,127 +1,258 @@
-import { useEffect } from "react";
-import { useStore } from "@/lib/store";
-import { 
-  AreaChart, // Using Area for Distribution curve
+import { useEffect, useMemo } from "react";
+import {
   Area,
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
+  AreaChart,
+  CartesianGrid,
   ResponsiveContainer,
-  ReferenceLine
+  Tooltip,
+  XAxis,
+  YAxis,
+  BarChart,
+  Bar,
 } from "recharts";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { AlertTriangle, ShieldAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { ShieldAlert, TrendingDown, Activity, AlertTriangle } from "lucide-react";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useStore } from "@/lib/store";
 
 export default function RiskWarRoomPage() {
-  const { fetchRisk, varData } = useStore();
+  const {
+    varData,
+    riskMetrics,
+    riskConcentration,
+    riskCorrelation,
+    riskStress,
+    riskAttribution,
+    alerts,
+    fetchVar,
+    fetchRiskMetrics,
+    fetchRiskConcentration,
+    fetchRiskCorrelation,
+    fetchRiskStress,
+    fetchRiskAttribution,
+    fetchAlerts,
+  } = useStore();
 
   useEffect(() => {
-    fetchRisk();
-    const interval = setInterval(fetchRisk, 10000); // 10s refresh for risk
-    return () => clearInterval(interval);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    void Promise.all([
+      fetchVar(),
+      fetchRiskMetrics(),
+      fetchRiskConcentration(),
+      fetchRiskCorrelation(),
+      fetchRiskStress(),
+      fetchRiskAttribution(),
+      fetchAlerts(),
+    ]);
+    const timer = setInterval(
+      () =>
+        void Promise.all([
+          fetchVar(),
+          fetchRiskMetrics(),
+          fetchRiskConcentration(),
+          fetchRiskCorrelation(),
+          fetchRiskStress(),
+          fetchRiskAttribution(),
+          fetchAlerts(),
+        ]),
+      12000,
+    );
+    return () => clearInterval(timer);
+  }, [fetchVar, fetchRiskMetrics, fetchRiskConcentration, fetchRiskCorrelation, fetchRiskStress, fetchRiskAttribution, fetchAlerts]);
+
+  const distribution = varData?.distribution_curve ?? [];
+  const sectorExposure = useMemo(
+    () =>
+      Object.entries(riskMetrics?.sector_exposures ?? {}).map(([sector, value]) => ({
+        sector,
+        value: Number((value * 100).toFixed(2)),
+      })),
+    [riskMetrics],
+  );
+
+  const highSeverityAlerts = alerts.filter((x) => x.severity === "CRITICAL" || x.severity === "HIGH").slice(0, 8);
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-500">
-      
-      {/* Header */}
-      <div className="flex items-center justify-between">
-         <div>
-             <h2 className="text-3xl font-bold tracking-tight text-white glow-text">Risk War Room</h2>
-             <p className="text-muted-foreground">Quantitative Risk Management & Stress Testing</p>
-         </div>
-         <Badge variant="outline" className="border-red-500 text-red-500 px-4 py-1 animate-pulse">
-            <ShieldAlert size={14} className="mr-2"/> LIVE MONITORING
-         </Badge>
-      </div>
+    <div className="space-y-6">
+      <section className="rounded-2xl border border-rose-200 bg-rose-50/80 p-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-rose-700">Risk Command</p>
+            <h1 className="mt-1 text-3xl font-bold text-rose-900">Risk War Room</h1>
+            <p className="mt-1 text-sm text-rose-800">
+              VaR, drawdown, exposure concentration, and incident stream in one place.
+            </p>
+          </div>
+          <Badge variant="warning">
+            <ShieldAlert size={12} className="mr-1" />
+            Live Monitoring
+          </Badge>
+        </div>
+      </section>
 
-      {/* Risk Metrics */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {[
-          { title: "VaR (95%)", value: varData ? `$${varData.var_95.toLocaleString()}` : "--", desc: "Daily Potential Loss", icon: TrendingDown, color: "text-red-400" },
-          { title: "CVaR (Expected Shortfall)", value: varData ? `$${varData.cvar_95.toLocaleString()}` : "--", desc: "Tail Risk Mean", icon: AlertTriangle, color: "text-orange-400" },
-          { title: "Portfolio Beta", value: "1.24", desc: "vs S&P 500", icon: Activity, color: "text-blue-400" },
-          { title: "Leverage", value: "1.8x", desc: "Max 2.5x", icon: Activity, color: "text-purple-400" },
-        ].map((stat, i) => (
-          <Card key={i} className="bg-black/40 border-white/10 backdrop-blur-sm">
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">{stat.title}</CardTitle>
-              <stat.icon className={`h-4 w-4 ${stat.color}`} />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-white mb-1">{stat.value}</div>
-              <p className="text-xs text-muted-foreground">{stat.desc}</p>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
-      {/* Main Charts */}
-      <div className="grid gap-6 md:grid-cols-2 h-[500px]">
-        {/* VaR Distribution */}
-        <Card className="bg-black/40 border-white/10 backdrop-blur-sm">
-           <CardHeader>
-            <CardTitle className="text-white">P&L Distribution (Monte Carlo)</CardTitle>
-            <CardDescription>Forward-looking 1-day simulation (10,000 paths)</CardDescription>
+      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>VaR 95%</CardDescription>
+            <CardTitle className="text-3xl">${(varData?.var_95 ?? 0).toLocaleString()}</CardTitle>
           </CardHeader>
-           <CardContent className="h-[400px]">
-             {varData ? (
-                 <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={varData.distribution_curve}>
-                         <defs>
-                            <linearGradient id="colorProb" x1="0" y1="0" x2="0" y2="1">
-                                <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.4}/>
-                                <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0}/>
-                            </linearGradient>
-                         </defs>
-                         <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
-                         <XAxis dataKey="pnl" stroke="#666" fontSize={10} tickFormatter={(val) => `$${Math.round(val/1000)}k`} />
-                         <YAxis hide />
-                         <Tooltip 
-                            contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.2)' }}
-                            labelStyle={{ color: '#fff' }}
-                         />
-                         <ReferenceLine x={-varData.var_95} stroke="red" strokeDasharray="3 3" label={{ value: 'VaR 95%', fill: 'red', fontSize: 10, position: 'insideTopLeft' }} />
-                         <Area type="monotone" dataKey="probability" stroke="#8b5cf6" fillOpacity={1} fill="url(#colorProb)" />
-                    </AreaChart>
-                 </ResponsiveContainer>
-             ) : (
-                 <div className="flex h-full items-center justify-center text-muted-foreground">Running Simulations...</div>
-             )}
-           </CardContent>
+        </Card>
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>VaR 99%</CardDescription>
+            <CardTitle className="text-3xl">${(varData?.var_99 ?? 0).toLocaleString()}</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>CVaR 95%</CardDescription>
+            <CardTitle className="text-3xl">${(varData?.cvar_95 ?? 0).toLocaleString()}</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Current Drawdown</CardDescription>
+            <CardTitle className="text-3xl">{((riskMetrics?.current_drawdown ?? 0) * 100).toFixed(2)}%</CardTitle>
+          </CardHeader>
+        </Card>
+      </section>
+
+      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Largest Symbol</CardDescription>
+            <CardTitle className="text-2xl">{(riskConcentration?.largest_symbol_pct ?? 0).toFixed(2)}%</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Top 3 Concentration</CardDescription>
+            <CardTitle className="text-2xl">{(riskConcentration?.top3_symbols_pct ?? 0).toFixed(2)}%</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Cluster Correlation</CardDescription>
+            <CardTitle className="text-2xl">{(riskCorrelation?.cluster_risk_score ?? 0).toFixed(3)}</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Resilience Score</CardDescription>
+            <CardTitle className="text-2xl">{(riskStress?.resilience_score ?? 0).toFixed(2)}</CardTitle>
+          </CardHeader>
+        </Card>
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader>
+            <CardTitle>Loss Distribution</CardTitle>
+            <CardDescription>One-day probability curve</CardDescription>
+          </CardHeader>
+          <CardContent className="h-[300px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={distribution}>
+                <defs>
+                  <linearGradient id="distFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#dc2626" stopOpacity={0.45} />
+                    <stop offset="95%" stopColor="#dc2626" stopOpacity={0.05} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#e5e7eb" strokeDasharray="3 3" />
+                <XAxis dataKey="pnl" tick={{ fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} />
+                <Tooltip />
+                <Area type="monotone" dataKey="probability" stroke="#b91c1c" strokeWidth={2.2} fill="url(#distFill)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </CardContent>
         </Card>
 
-        {/* Stress Scenarios */}
-        <Card className="bg-black/40 border-white/10 backdrop-blur-sm">
-           <CardHeader>
-            <CardTitle className="text-white">Historical Stress Tests</CardTitle>
-            <CardDescription>Portfolio impact during past crises</CardDescription>
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader>
+            <CardTitle>Sector Concentration</CardTitle>
+            <CardDescription>Current exposure % by sector</CardDescription>
           </CardHeader>
-           <CardContent className="space-y-6 pt-4">
-              {varData && Object.entries(varData.stress_scenarios).map(([scenario, impact]) => (
-                  <div key={scenario} className="space-y-2">
-                      <div className="flex justify-between items-end">
-                          <span className="text-sm font-medium text-gray-300">{scenario}</span>
-                          <span className={`font-mono font-bold ${impact < -20 ? 'text-red-500' : 'text-orange-400'}`}>
-                              {impact}%
-                          </span>
-                      </div>
-                      <div className="h-2 w-full bg-white/10 rounded-full overflow-hidden">
-                          <div 
-                            className={`h-full ${impact < -20 ? 'bg-red-500' : 'bg-orange-400'}`} 
-                            style={{ width: `${Math.abs(impact) * 2}%` }} // Scale for visual
-                          />
-                      </div>
-                  </div>
-              ))}
-              {!varData && [1,2,3,4].map(i => (
-                  <div key={i} className="h-8 w-full bg-white/5 animate-pulse rounded" />
-              ))}
-           </CardContent>
+          <CardContent className="h-[300px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={sectorExposure}>
+                <CartesianGrid stroke="#e5e7eb" strokeDasharray="3 3" />
+                <XAxis dataKey="sector" tick={{ fontSize: 10 }} />
+                <YAxis tick={{ fontSize: 11 }} />
+                <Tooltip />
+                <Bar dataKey="value" fill="#0f766e" radius={[6, 6, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
         </Card>
-      </div>
+      </section>
+
+      <Card className="border-slate-200 bg-white/90">
+        <CardHeader>
+          <CardTitle>High Severity Alerts</CardTitle>
+          <CardDescription>Critical/high risk incidents requiring operator action</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {highSeverityAlerts.length === 0 ? (
+            <p className="text-sm text-slate-500">No high severity risk incident.</p>
+          ) : (
+            highSeverityAlerts.map((alert) => (
+              <div key={alert.alert_id} className="flex items-start justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 p-3">
+                <div>
+                  <p className="text-sm font-semibold text-rose-900">{alert.title}</p>
+                  <p className="text-sm text-rose-800">{alert.message}</p>
+                </div>
+                <Badge variant="warning">
+                  <AlertTriangle size={12} className="mr-1" />
+                  {alert.severity}
+                </Badge>
+              </div>
+            ))
+          )}
+        </CardContent>
+      </Card>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader>
+            <CardTitle>Stress Scenario Losses</CardTitle>
+            <CardDescription>Scenario PnL impact in dollars</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {Object.entries(riskStress?.scenarios ?? {}).length === 0 ? (
+              <p className="text-sm text-slate-500">No stress scenario data.</p>
+            ) : (
+              Object.entries(riskStress?.scenarios ?? {}).map(([name, value]) => (
+                <div key={name} className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 p-3">
+                  <p className="text-sm font-medium text-slate-700">{name.replaceAll("_", " ")}</p>
+                  <p className="font-mono text-sm text-rose-700">${Number(value).toLocaleString()}</p>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader>
+            <CardTitle>Risk Attribution</CardTitle>
+            <CardDescription>Pre-trade and post-trade breach signals</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p className="text-xs uppercase tracking-wider text-slate-500">Breaches</p>
+              <p className="mt-1 text-2xl font-semibold text-rose-800">{riskAttribution?.breaches_count ?? 0}</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p className="text-xs uppercase tracking-wider text-slate-500">Pre-Trade Checks</p>
+              <p className="mt-1 text-sm text-slate-700">{riskAttribution?.pre_trade_checks?.length ?? 0} evaluated</p>
+            </div>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p className="text-xs uppercase tracking-wider text-slate-500">Post-Trade Findings</p>
+              <p className="mt-1 text-sm text-slate-700">{riskAttribution?.post_trade_findings?.length ?? 0} flagged</p>
+            </div>
+          </CardContent>
+        </Card>
+      </section>
     </div>
   );
 }

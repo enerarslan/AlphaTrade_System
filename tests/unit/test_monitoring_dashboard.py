@@ -197,6 +197,64 @@ class TestDashboardEndpoints:
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
+    def test_auth_mfa_status_endpoint(self, client):
+        """Test /auth/mfa/status endpoint."""
+        response = client.get("/auth/mfa/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "username" in data
+        assert "role" in data
+        assert "mfa_enabled" in data
+
+    def test_auth_sso_status_endpoint(self, client):
+        """Test /auth/sso/status endpoint."""
+        response = client.get("/auth/sso/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "enabled" in data
+        assert "configured" in data
+        assert "username_claim" in data
+
+    def test_auth_sso_start_disabled_endpoint(self, client):
+        """Test /auth/sso/start when SSO is disabled."""
+        response = client.get("/auth/sso/start")
+        assert response.status_code in (404, 503)
+
+    def test_auth_mfa_enrollment_init_endpoint(self, client):
+        """Test /auth/mfa/enroll/init endpoint."""
+        response = client.post("/auth/mfa/enroll/init")
+        assert response.status_code == 200
+        data = response.json()
+        assert "secret" in data
+        assert "provisioning_uri" in data
+
+    def test_auth_security_status_endpoint(self, client):
+        """Test /auth/security/status endpoint."""
+        response = client.get("/auth/security/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "jwt_key_count" in data
+        assert "active_key_fingerprint" in data
+
+    def test_auth_security_rotate_jwt_endpoint(self, client):
+        """Test /auth/security/rotate-jwt endpoint."""
+        response = client.post(
+            "/auth/security/rotate-jwt",
+            json={"new_secret": "x" * 40},
+        )
+        assert response.status_code == 200
+
+    def test_admin_users_endpoints(self, client):
+        """Test admin users list and role update endpoints."""
+        response = client.get("/admin/users")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+        response = client.post(
+            "/admin/users/test_user/role",
+            json={"role": "operator", "reason": "unit_test"},
+        )
+        assert response.status_code == 200
+
     def test_risk_endpoint(self, client):
         """Test /risk endpoint."""
         response = client.get("/risk")
@@ -204,6 +262,99 @@ class TestDashboardEndpoints:
         data = response.json()
         assert "portfolio_var_95" in data
         assert "current_drawdown" in data
+
+    def test_execution_quality_endpoint(self, client):
+        """Test /execution/quality endpoint."""
+        response = client.get("/execution/quality")
+        assert response.status_code == 200
+        data = response.json()
+        assert "arrival_price_delta_bps" in data
+        assert "latency_distribution_ms" in data
+
+    def test_advanced_risk_endpoints(self, client):
+        """Test advanced risk endpoints."""
+        for endpoint in ["/risk/concentration", "/risk/correlation", "/risk/stress", "/risk/attribution"]:
+            response = client.get(endpoint)
+            assert response.status_code == 200
+
+    def test_control_audit_endpoint(self, client):
+        """Test /control/audit endpoint."""
+        response = client.get("/control/audit")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_control_audit_export_json_endpoint(self, client):
+        """Test /control/audit/export endpoint (json)."""
+        response = client.get("/control/audit/export?format=json")
+        assert response.status_code == 200
+        data = response.json()
+        assert "generated_at" in data
+        assert "records" in data
+
+    def test_control_audit_export_jsonl_endpoint(self, client):
+        """Test /control/audit/export endpoint (jsonl)."""
+        response = client.get("/control/audit/export?format=jsonl")
+        assert response.status_code == 200
+        assert "application/x-ndjson" in response.headers.get("content-type", "")
+
+    def test_control_audit_siem_status_endpoint(self, client):
+        """Test /control/audit/siem/status endpoint."""
+        response = client.get("/control/audit/siem/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "enabled" in data
+        assert "queue_depth" in data
+
+    def test_control_audit_siem_flush_endpoint(self, client):
+        """Test /control/audit/siem/flush endpoint."""
+        response = client.post("/control/audit/siem/flush")
+        assert response.status_code == 200
+        data = response.json()
+        assert data.get("status") == "flushed"
+
+    def test_model_governance_endpoints(self, client):
+        """Test model governance endpoints."""
+        response = client.get("/models/registry")
+        assert response.status_code == 200
+        response = client.get("/models/drift")
+        assert response.status_code == 200
+        response = client.get("/models/validation-gates")
+        assert response.status_code == 200
+        response = client.get("/models/champion-challenger")
+        assert response.status_code == 200
+
+    def test_model_promote_endpoint_not_found_without_registry(self, client):
+        """Promotion should fail cleanly when requested version does not exist."""
+        response = client.post(
+            "/models/champion/promote",
+            json={
+                "model_name": "nonexistent",
+                "version_id": "v0",
+                "reason": "unit_test",
+            },
+        )
+        assert response.status_code in (404, 422)
+
+    def test_sre_endpoints(self, client):
+        """Test SRE endpoints."""
+        response = client.get("/sre/slo")
+        assert response.status_code == 200
+        response = client.get("/sre/incidents")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+        response = client.get("/sre/incidents/timeline")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+        response = client.get("/sre/runbooks")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    def test_sre_runbook_execute_endpoint(self, client):
+        """Test runbook execution endpoint."""
+        response = client.post("/sre/runbooks/execute", json={"action": "health_check"})
+        assert response.status_code == 200
+        data = response.json()
+        assert "job_id" in data
 
     def test_alerts_endpoint(self, client):
         """Test /alerts endpoint."""

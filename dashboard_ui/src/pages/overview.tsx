@@ -1,148 +1,187 @@
-import { useEffect } from "react";
-import { useStore } from "@/lib/store";
-import { 
-  Tooltip, 
+import { useEffect, useMemo } from "react";
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
   ResponsiveContainer,
-  RadarChart, 
-  PolarGrid, 
-  PolarAngleAxis, 
-  PolarRadiusAxis, 
-  Radar
+  Tooltip,
+  XAxis,
+  YAxis,
 } from "recharts";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Activity, TrendingUp, Zap, Target, Brain, Cpu } from "lucide-react";
+import { Activity, DollarSign, ShieldAlert, Wifi } from "lucide-react";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { useStore } from "@/lib/store";
 
 export default function OverviewPage() {
-  const { fetchAll, explainability, health } = useStore();
+  const {
+    fetchSnapshot,
+    portfolio,
+    riskMetrics,
+    tca,
+    ws,
+    tradingStatus,
+    alerts,
+    varData,
+    explainability,
+  } = useStore();
 
   useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, 5000); // 5s refresh
-    return () => clearInterval(interval);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    void fetchSnapshot();
+    const timer = setInterval(() => void fetchSnapshot(), 15000);
+    return () => clearInterval(timer);
+  }, [fetchSnapshot]);
 
-  // Prepare Radar Data
-  const radarData = explainability 
-    ? Object.entries(explainability.global_importance).map(([feature, value]) => ({
-        feature: feature.replace(/_/g, ' '),
-        value: value * 100,
-        fullMark: 100,
-      })) 
-    : [];
+  const wsConnected = ws.portfolio && ws.orders && ws.signals && ws.alerts;
+  const unresolvedAlerts = alerts.filter((x) => x.status !== "RESOLVED").length;
+
+  const stressChartData = useMemo(
+    () =>
+      Object.entries(varData?.stress_scenarios ?? {}).map(([name, impact]) => ({
+        name,
+        impact: Math.abs(impact),
+      })),
+    [varData],
+  );
+
+  const driftData = useMemo(
+    () =>
+      Object.entries(explainability?.recent_shift ?? {}).map(([feature, value]) => ({
+        feature,
+        value: Number((value * 100).toFixed(2)),
+      })),
+    [explainability],
+  );
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-500">
-      
-      {/* Header / Connectivity */}
-      <div className="flex items-center justify-between">
+    <div className="space-y-6">
+      <section className="rounded-2xl border border-slate-200 bg-white/90 p-6 shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
-              <h2 className="text-3xl font-bold tracking-tight text-white glow-text">AI Command Center</h2>
-              <p className="text-muted-foreground">Operational Overview & Alpha Signals</p>
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Live Command Center</p>
+            <h1 className="mt-2 text-3xl font-bold tracking-tight text-slate-900">Institutional Trading Control</h1>
+            <p className="mt-1 text-sm text-slate-600">
+              Unified monitoring for portfolio, risk, execution quality, and operational incidents.
+            </p>
           </div>
-          <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full border border-white/10">
-                  <div className={`h-2 w-2 rounded-full ${health?.status === 'healthy' ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
-                  <span className="text-xs font-mono text-muted-foreground">{health?.status || 'CONNECTING...'}</span>
-              </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={wsConnected ? "success" : "warning"}>
+              <Wifi size={12} className="mr-1" />
+              {wsConnected ? "Streams Online" : "Streams Degraded"}
+            </Badge>
+            <Badge variant={tradingStatus?.running ? "success" : "outline"}>
+              <Activity size={12} className="mr-1" />
+              {tradingStatus?.running ? "Engine Running" : "Engine Idle"}
+            </Badge>
+            <Badge variant={unresolvedAlerts > 0 ? "warning" : "success"}>
+              <ShieldAlert size={12} className="mr-1" />
+              {unresolvedAlerts} Open Alerts
+            </Badge>
           </div>
-      </div>
-      
-      {/* KPI Row */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {[
-          { title: "Active Model", value: explainability?.model_name || "Loading...", icon: Brain, color: "text-purple-500" },
-          { title: "Alpha Confidence", value: "87.4%", change: "+2.1%", icon: Zap, color: "text-yellow-500" },
-          { title: "System Latency", value: "12ms", change: "Optimal", icon: Activity, color: "text-green-500" },
-          { title: "Risk Regime", value: "Low Vol", change: "Leverage OK", icon: Target, color: "text-blue-500" },
-        ].map((stat, i) => (
-          <Card key={i} className="bg-black/40 border-white/10 backdrop-blur-sm neon-border">
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">{stat.title}</CardTitle>
-              <stat.icon className={`h-4 w-4 ${stat.color}`} />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-white">{stat.value}</div>
-              <p className="text-xs text-muted-foreground mt-1">{stat.change}</p>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
+        </div>
+      </section>
 
-      {/* Main Grid */}
-      <div className="grid gap-6 md:grid-cols-7 lg:grid-cols-7 h-[500px]">
-        
-        {/* Alpha Radar Chart */}
-        <Card className="col-span-4 bg-black/40 border-white/10 backdrop-blur-sm">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-white">
-              <Cpu size={18} className="text-purple-500" />
-              Feature Importance Radar
-            </CardTitle>
-            <CardDescription>Real-time influence of market factors on AI decision making</CardDescription>
+      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Portfolio Equity</CardDescription>
+            <CardTitle className="text-3xl">${(portfolio?.equity ?? 0).toLocaleString()}</CardTitle>
           </CardHeader>
-          <CardContent className="h-[400px]">
-            {radarData.length > 0 ? (
-                <ResponsiveContainer width="100%" height="100%">
-                <RadarChart cx="50%" cy="50%" outerRadius="80%" data={radarData}>
-                    <PolarGrid stroke="rgba(255,255,255,0.1)" />
-                    <PolarAngleAxis dataKey="feature" tick={{ fill: '#888', fontSize: 10 }} />
-                    <PolarRadiusAxis angle={30} domain={[0, 50]} tick={false} axisLine={false} />
-                    <Radar
-                        name="Importance"
-                        dataKey="value"
-                        stroke="#8b5cf6"
-                        strokeWidth={2}
-                        fill="#8b5cf6"
-                        fillOpacity={0.3}
-                    />
-                    <Tooltip 
-                         contentStyle={{ backgroundColor: 'rgba(0,0,0,0.9)', border: '1px solid rgba(255,255,255,0.2)' }}
-                         itemStyle={{ color: '#fff' }}
-                    />
-                </RadarChart>
-                </ResponsiveContainer>
+          <CardContent className="text-sm text-slate-600">
+            <span className="inline-flex items-center gap-1">
+              <DollarSign size={14} />
+              Buying Power ${(portfolio?.buying_power ?? 0).toLocaleString()}
+            </span>
+          </CardContent>
+        </Card>
+
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Daily PnL</CardDescription>
+            <CardTitle className="text-3xl">${(portfolio?.daily_pnl ?? 0).toLocaleString()}</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-slate-600">
+            Total ${(portfolio?.total_pnl ?? 0).toLocaleString()}
+          </CardContent>
+        </Card>
+
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Current Drawdown</CardDescription>
+            <CardTitle className="text-3xl">{((riskMetrics?.current_drawdown ?? 0) * 100).toFixed(2)}%</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-slate-600">
+            Max 30d {((riskMetrics?.max_drawdown_30d ?? 0) * 100).toFixed(2)}%
+          </CardContent>
+        </Card>
+
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader className="pb-2">
+            <CardDescription>Execution Fill Probability</CardDescription>
+            <CardTitle className="text-3xl">{((tca?.fill_probability ?? 0) * 100).toFixed(1)}%</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-slate-600">
+            Slippage {tca?.slippage_bps?.toFixed(2) ?? "--"} bps
+          </CardContent>
+        </Card>
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader>
+            <CardTitle className="text-xl">Stress Scenario Impact</CardTitle>
+            <CardDescription>Absolute downside (%) across predefined shocks</CardDescription>
+          </CardHeader>
+          <CardContent className="h-[280px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={stressChartData}>
+                <defs>
+                  <linearGradient id="stressFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#fb923c" stopOpacity={0.55} />
+                    <stop offset="100%" stopColor="#fb923c" stopOpacity={0.05} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#dbe2f3" strokeDasharray="3 3" />
+                <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} />
+                <Tooltip />
+                <Area type="monotone" dataKey="impact" stroke="#ea580c" fill="url(#stressFill)" strokeWidth={2.2} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+
+        <Card className="border-slate-200 bg-white/90">
+          <CardHeader>
+            <CardTitle className="text-xl">Model Factor Drift</CardTitle>
+            <CardDescription>Recent change (%) in explainability weights</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {driftData.length === 0 ? (
+              <p className="text-sm text-slate-500">No explainability artifact detected yet.</p>
             ) : (
-                <div className="h-full flex items-center justify-center text-muted-foreground">
-                    Waiting for Model Telemetry...
+              driftData.map((row) => (
+                <div key={row.feature} className="space-y-1">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium text-slate-700">{row.feature.replaceAll("_", " ")}</span>
+                    <span className={row.value >= 0 ? "text-emerald-700" : "text-rose-700"}>
+                      {row.value >= 0 ? "+" : ""}
+                      {row.value.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded bg-slate-100">
+                    <div
+                      className={row.value >= 0 ? "h-full bg-emerald-500" : "h-full bg-rose-500"}
+                      style={{ width: `${Math.min(Math.abs(row.value) * 5, 100)}%` }}
+                    />
+                  </div>
                 </div>
+              ))
             )}
           </CardContent>
         </Card>
-
-        {/* Recent Shifts (Trend) */}
-        <Card className="col-span-3 bg-black/40 border-white/10 backdrop-blur-sm flex flex-col">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-white">
-              <TrendingUp size={18} className="text-blue-500" />
-              Factor Drift
-            </CardTitle>
-            <CardDescription>Delta change in feature importance (1h)</CardDescription>
-          </CardHeader>
-          <CardContent className="flex-1 overflow-auto">
-             <div className="space-y-4">
-                 {explainability?.recent_shift && Object.entries(explainability.recent_shift).map(([k, v]) => (
-                     <div key={k} className="flex items-center justify-between">
-                         <span className="text-sm text-gray-400 capitalize">{k.replace(/_/g, ' ')}</span>
-                         <div className="flex items-center gap-2">
-                             <div className={`h-1.5 w-16 rounded-full bg-white/10 overflow-hidden`}>
-                                 <div 
-                                    className={`h-full ${v > 0 ? 'bg-green-500' : 'bg-red-500'}`} 
-                                    style={{ width: `${Math.min(Math.abs(v) * 500, 100)}%` }} 
-                                 />
-                             </div>
-                             <span className={`text-xs font-mono w-12 text-right ${v > 0 ? 'text-green-500' : 'text-red-500'}`}>
-                                 {v > 0 ? '+' : ''}{(v * 100).toFixed(1)}%
-                             </span>
-                         </div>
-                     </div>
-                 ))}
-                 {!explainability && [1,2,3].map(i => (
-                     <div key={i} className="h-8 w-full bg-white/5 animate-pulse rounded" />
-                 ))}
-             </div>
-          </CardContent>
-        </Card>
-      </div>
+      </section>
     </div>
   );
 }
+

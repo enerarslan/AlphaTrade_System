@@ -1,0 +1,151 @@
+version: '3.8'
+
+# Production override for secure dashboard edge stack
+# Usage:
+#   docker-compose -f docker/docker-compose.yml -f docker/docker-compose.production.yml up -d
+
+services:
+  trading_app:
+    ports: []
+
+  dashboard_api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: trading_dashboard_api
+    restart: always
+    command: ["python", "main.py", "dashboard", "--host", "0.0.0.0", "--port", "8000", "--log-level", "INFO"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - APP_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - REQUIRE_AUTH=${REQUIRE_AUTH:-true}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_SECRET_KEYS=${JWT_SECRET_KEYS:-}
+      - API_KEYS=${API_KEYS:-}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-https://localhost,http://localhost}
+      - DASHBOARD_RATE_LIMIT_ENABLED=${DASHBOARD_RATE_LIMIT_ENABLED:-true}
+      - DASHBOARD_RATE_LIMIT_WINDOW_SECONDS=${DASHBOARD_RATE_LIMIT_WINDOW_SECONDS:-60}
+      - DASHBOARD_RATE_LIMIT_PER_WINDOW=${DASHBOARD_RATE_LIMIT_PER_WINDOW:-180}
+      - DASHBOARD_USERS=${DASHBOARD_USERS:-}
+      - DASHBOARD_USER_ROLES=${DASHBOARD_USER_ROLES:-}
+      - DASHBOARD_MFA_SECRETS=${DASHBOARD_MFA_SECRETS:-}
+      - OIDC_ENABLED=${OIDC_ENABLED:-false}
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:-}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-}
+      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI:-https://localhost/api/auth/sso/callback}
+      - OIDC_SCOPES=${OIDC_SCOPES:-openid profile email}
+      - OIDC_USERNAME_CLAIM=${OIDC_USERNAME_CLAIM:-preferred_username}
+      - OIDC_ROLE_CLAIM=${OIDC_ROLE_CLAIM:-groups}
+      - OIDC_ROLE_MAP=${OIDC_ROLE_MAP:-}
+      - OIDC_DEFAULT_ROLE=${OIDC_DEFAULT_ROLE:-viewer}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-https://localhost}
+      - OIDC_ALLOWED_RETURN_ORIGINS=${OIDC_ALLOWED_RETURN_ORIGINS:-https://localhost}
+      - DASHBOARD_SIEM_ENABLED=${DASHBOARD_SIEM_ENABLED:-false}
+      - DASHBOARD_SIEM_ENDPOINT=${DASHBOARD_SIEM_ENDPOINT:-}
+      - DASHBOARD_SIEM_API_KEY=${DASHBOARD_SIEM_API_KEY:-}
+      - DASHBOARD_SIEM_API_KEY_HEADER=${DASHBOARD_SIEM_API_KEY_HEADER:-Authorization}
+      - DASHBOARD_SIEM_FORMAT=${DASHBOARD_SIEM_FORMAT:-generic}
+      - DASHBOARD_SIEM_BATCH_SIZE=${DASHBOARD_SIEM_BATCH_SIZE:-25}
+      - DASHBOARD_SIEM_FLUSH_INTERVAL_SECONDS=${DASHBOARD_SIEM_FLUSH_INTERVAL_SECONDS:-5}
+      - DASHBOARD_SIEM_VERIFY_TLS=${DASHBOARD_SIEM_VERIFY_TLS:-true}
+    expose:
+      - "8000"
+    volumes:
+      - trading_logs:/app/logs
+      - model_artifacts:/app/models_artifacts
+    networks:
+      - trading_network
+      - monitoring_network
+      - edge_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 8s
+      retries: 5
+      start_period: 20s
+
+  dashboard_ui:
+    build:
+      context: ..
+      dockerfile: docker/production/Dockerfile.ui
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: trading_dashboard_ui
+    restart: always
+    expose:
+      - "80"
+    networks:
+      - edge_network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/healthz > /dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
+
+  reverse_proxy:
+    build:
+      context: ..
+      dockerfile: docker/production/Dockerfile.proxy
+    container_name: trading_edge_proxy
+    restart: always
+    depends_on:
+      dashboard_api:
+        condition: service_healthy
+      dashboard_ui:
+        condition: service_healthy
+    environment:
+      - DASHBOARD_DOMAIN=${DASHBOARD_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - edge_certs:/etc/nginx/certs
+      - edge_acme:/var/www/certbot
+    networks:
+      - edge_network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/healthz > /dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 4
+      start_period: 15s
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: trading_certbot
+    restart: unless-stopped
+    profiles: ["tls"]
+    volumes:
+      - edge_certs:/etc/nginx/certs
+      - edge_acme:/var/www/certbot
+    entrypoint: /bin/sh
+    command: >
+      -c "trap exit TERM;
+      while :; do
+      sleep 12h & wait $$!;
+      certbot renew --webroot -w /var/www/certbot
+      --config-dir /etc/nginx/certs --work-dir /var/www/certbot/work --logs-dir /var/www/certbot/logs
+      --quiet;
+      done"
+    networks:
+      - edge_network
+
+networks:
+  edge_network:
+    driver: bridge
+    name: trading_edge_network
+
+volumes:
+  edge_certs:
+    name: trading_edge_certs
+  edge_acme:
+    name: trading_edge_acme

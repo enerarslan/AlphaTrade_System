@@ -73,6 +73,7 @@ class DeployConfig:
 
     # Docker
     compose_file: str = "docker-compose.yml"
+    docker_profile: str = "default"
     registry: str = ""
 
     # Kubernetes
@@ -278,17 +279,46 @@ class DockerManager:
         self.config = config
         self.logger = logging.getLogger("DockerManager")
 
+    def _resolve_compose_files(self) -> list[Path]:
+        """Resolve compose files based on profile and explicit override."""
+        requested = [x.strip() for x in str(self.config.compose_file).split(",") if x.strip()]
+        if not requested:
+            requested = ["docker-compose.yml"]
+
+        if self.config.docker_profile == "production":
+            # Production profile always layers the production override on top of base compose.
+            if "docker-compose.yml" not in requested:
+                requested.insert(0, "docker-compose.yml")
+            if "docker-compose.production.yml" not in requested:
+                requested.append("docker-compose.production.yml")
+
+        resolved: list[Path] = []
+        for name in requested:
+            path = self.config.docker_dir / name
+            if path.exists():
+                resolved.append(path)
+            else:
+                self.logger.warning(f"Compose file not found: {path}")
+        return resolved
+
+    def _compose_prefix(self) -> list[str]:
+        """Build docker-compose command prefix with all compose files."""
+        compose_files = self._resolve_compose_files()
+        cmd = ["docker-compose"]
+        for compose in compose_files:
+            cmd.extend(["-f", str(compose)])
+        return cmd
+
     def up(self, services: list[str] | None = None, detach: bool = True) -> bool:
         """Start Docker services."""
         self.logger.info("Starting Docker services...")
 
-        compose_path = self.config.docker_dir / self.config.compose_file
-
-        if not compose_path.exists():
-            self.logger.error(f"Docker Compose file not found: {compose_path}")
+        compose_files = self._resolve_compose_files()
+        if not compose_files:
+            self.logger.error("No valid Docker Compose files were resolved")
             return False
 
-        cmd = ["docker-compose", "-f", str(compose_path), "up"]
+        cmd = self._compose_prefix() + ["up"]
 
         if detach:
             cmd.append("-d")
@@ -319,13 +349,12 @@ class DockerManager:
         """Stop Docker services."""
         self.logger.info("Stopping Docker services...")
 
-        compose_path = self.config.docker_dir / self.config.compose_file
-
-        if not compose_path.exists():
-            self.logger.error(f"Docker Compose file not found: {compose_path}")
+        compose_files = self._resolve_compose_files()
+        if not compose_files:
+            self.logger.error("No valid Docker Compose files were resolved")
             return False
 
-        cmd = ["docker-compose", "-f", str(compose_path), "down"]
+        cmd = self._compose_prefix() + ["down"]
 
         if remove_volumes:
             cmd.append("-v")
@@ -353,7 +382,7 @@ class DockerManager:
         """Get Docker service status."""
         try:
             result = subprocess.run(
-                ["docker-compose", "-f", str(self.config.docker_dir / self.config.compose_file), "ps", "--format", "json"],
+                self._compose_prefix() + ["ps", "--format", "json"],
                 capture_output=True,
                 text=True,
                 cwd=str(self.config.docker_dir),
@@ -378,8 +407,7 @@ class DockerManager:
 
     def logs(self, service: str | None = None, tail: int = 100) -> str:
         """Get Docker service logs."""
-        cmd = ["docker-compose", "-f", str(self.config.docker_dir / self.config.compose_file),
-               "logs", "--tail", str(tail)]
+        cmd = self._compose_prefix() + ["logs", "--tail", str(tail)]
 
         if service:
             cmd.append(service)
@@ -400,7 +428,7 @@ class DockerManager:
         """Build Docker images."""
         self.logger.info("Building Docker images...")
 
-        cmd = ["docker-compose", "-f", str(self.config.docker_dir / self.config.compose_file), "build"]
+        cmd = self._compose_prefix() + ["build"]
 
         if no_cache:
             cmd.append("--no-cache")
@@ -915,10 +943,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 def cmd_docker(args: argparse.Namespace) -> int:
     """Docker commands."""
-    config = DeployConfig()
+    profile = getattr(args, "profile", "default")
+    compose_file = getattr(args, "compose_file", "docker-compose.yml")
+    config = DeployConfig(docker_profile=profile, compose_file=compose_file)
     docker = DockerManager(config)
 
-    action = getattr(args, "docker_action", "status")
+    action = getattr(args, "docker_action", None) or getattr(args, "action", "status")
 
     if action == "up":
         services = getattr(args, "services", None)
@@ -944,7 +974,8 @@ def cmd_docker(args: argparse.Namespace) -> int:
 
     elif action == "build":
         no_cache = getattr(args, "no_cache", False)
-        success = docker.build(no_cache=no_cache)
+        services = getattr(args, "services", None)
+        success = docker.build(services=services, no_cache=no_cache)
         return 0 if success else 1
 
     return 1
@@ -1083,6 +1114,20 @@ def run_deploy_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def run_deployment(args: argparse.Namespace) -> int:
+    """Compatibility wrapper for `main.py` deploy command argument schema."""
+    # main.py uses `operation` and `action`; standalone script uses deploy_command/docker_action.
+    if getattr(args, "deploy_command", None) is None and getattr(args, "operation", None):
+        setattr(args, "deploy_command", getattr(args, "operation"))
+    if getattr(args, "docker_action", None) is None and getattr(args, "action", None):
+        setattr(args, "docker_action", getattr(args, "action"))
+    if getattr(args, "k8s_action", None) is None and getattr(args, "action", None) and getattr(args, "deploy_command", "") == "k8s":
+        setattr(args, "k8s_action", getattr(args, "action"))
+    if getattr(args, "db_action", None) is None and getattr(args, "action", None) and getattr(args, "deploy_command", "") in {"db", "migrate"}:
+        setattr(args, "db_action", "migrate")
+    return run_deploy_command(args)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AlphaTrade Deployment")
     subparsers = parser.add_subparsers(dest="deploy_command")
@@ -1095,6 +1140,8 @@ if __name__ == "__main__":
     docker_parser.add_argument("docker_action", choices=["up", "down", "status", "logs", "build"])
     docker_parser.add_argument("--services", nargs="+")
     docker_parser.add_argument("--volumes", action="store_true")
+    docker_parser.add_argument("--profile", choices=["default", "production"], default="default")
+    docker_parser.add_argument("--compose-file", type=str, default="docker-compose.yml")
 
     # K8s commands
     k8s_parser = subparsers.add_parser("k8s", help="Kubernetes operations")

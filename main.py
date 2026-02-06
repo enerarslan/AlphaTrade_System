@@ -983,6 +983,42 @@ For more information, visit: https://github.com/alphatrade/docs
         choices=["build", "up", "down", "logs", "status"],
         help="Docker action",
     )
+    deploy_docker.add_argument(
+        "--profile",
+        choices=["default", "production"],
+        default="default",
+        help="Compose profile (default: default)",
+    )
+    deploy_docker.add_argument(
+        "--compose-file",
+        default="docker-compose.yml",
+        help="Compose file name, or comma-separated list for custom stacking",
+    )
+    deploy_docker.add_argument(
+        "--services",
+        nargs="+",
+        help="Optional list of services for up/build",
+    )
+    deploy_docker.add_argument(
+        "--service",
+        help="Single service for logs",
+    )
+    deploy_docker.add_argument(
+        "--tail",
+        type=int,
+        default=200,
+        help="Number of log lines for deploy docker logs (default: 200)",
+    )
+    deploy_docker.add_argument(
+        "--volumes",
+        action="store_true",
+        help="Remove volumes when running deploy docker down",
+    )
+    deploy_docker.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Use no-cache when running deploy docker build",
+    )
     deploy_parser.add_argument(
         "--dry-run",
         action="store_true",

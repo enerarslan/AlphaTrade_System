@@ -238,6 +238,40 @@ class TestDashboardAPIIntegration:
         response = client.get("/logs")
         assert response.status_code == 200
 
+        # 11. Advanced model governance
+        response = client.get("/models/registry")
+        assert response.status_code == 200
+        response = client.get("/models/drift")
+        assert response.status_code == 200
+        response = client.get("/models/validation-gates")
+        assert response.status_code == 200
+        response = client.get("/models/champion-challenger")
+        assert response.status_code == 200
+
+        # 12. SRE/incident endpoints
+        response = client.get("/sre/slo")
+        assert response.status_code == 200
+        response = client.get("/sre/incidents")
+        assert response.status_code == 200
+        response = client.get("/sre/incidents/timeline")
+        assert response.status_code == 200
+        response = client.get("/sre/runbooks")
+        assert response.status_code == 200
+
+        # 13. Security/admin endpoints
+        response = client.get("/auth/security/status")
+        assert response.status_code == 200
+        response = client.get("/admin/users")
+        assert response.status_code == 200
+        response = client.get("/auth/sso/status")
+        assert response.status_code == 200
+
+        # 14. Audit export and SIEM status
+        response = client.get("/control/audit/export?format=json")
+        assert response.status_code == 200
+        response = client.get("/control/audit/siem/status")
+        assert response.status_code == 200
+
     def test_metrics_endpoint_format(self, client):
         """Test that metrics endpoint returns valid Prometheus format."""
         response = client.get("/metrics")
