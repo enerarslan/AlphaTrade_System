@@ -525,40 +525,44 @@ class SignalGenerator:
         CRITICAL FIX: Validates and clamps signal bounds to prevent
         invalid signals from corrupting position sizing.
         """
+        signal_to_use = signal
+
         # CRITICAL FIX: Validate and clamp signal bounds
         # Confidence must be in [0, 1]
-        if not (0.0 <= signal.confidence <= 1.0):
+        if not (0.0 <= signal_to_use.confidence <= 1.0):
+            clamped_confidence = max(0.0, min(1.0, signal_to_use.confidence))
             logger.warning(
-                f"Signal {signal.symbol} has invalid confidence {signal.confidence}, "
+                f"Signal {signal_to_use.symbol} has invalid confidence {signal_to_use.confidence}, "
                 f"clamping to [0, 1]"
             )
-            signal.confidence = max(0.0, min(1.0, signal.confidence))
+            signal_to_use = signal_to_use.model_copy(update={"confidence": clamped_confidence})
 
         # Strength should be in [-1, 1] (allows negative for shorts)
-        if not (-1.0 <= signal.strength <= 1.0):
+        if not (-1.0 <= signal_to_use.strength <= 1.0):
+            clamped_strength = max(-1.0, min(1.0, signal_to_use.strength))
             logger.warning(
-                f"Signal {signal.symbol} has invalid strength {signal.strength}, "
+                f"Signal {signal_to_use.symbol} has invalid strength {signal_to_use.strength}, "
                 f"clamping to [-1, 1]"
             )
-            signal.strength = max(-1.0, min(1.0, signal.strength))
+            signal_to_use = signal_to_use.model_copy(update={"strength": clamped_strength})
 
         # Determine priority
-        if signal.confidence > 0.8 and abs(signal.strength) > 0.7:
+        if signal_to_use.confidence > 0.8 and abs(signal_to_use.strength) > 0.7:
             priority = SignalPriority.HIGH
-        elif signal.confidence < 0.5 or abs(signal.strength) < 0.3:
+        elif signal_to_use.confidence < 0.5 or abs(signal_to_use.strength) < 0.3:
             priority = SignalPriority.LOW
         else:
             priority = SignalPriority.NORMAL
 
         # Set expiration
-        expires_at = signal.timestamp + timedelta(seconds=self.config.default_signal_ttl)
+        expires_at = signal_to_use.timestamp + timedelta(seconds=self.config.default_signal_ttl)
 
         metadata = SignalMetadata(
             priority=priority,
             expires_at=expires_at,
         )
 
-        return EnrichedSignal(signal=signal, metadata=metadata)
+        return EnrichedSignal(signal=signal_to_use, metadata=metadata)
 
     def _filter_signal(
         self,

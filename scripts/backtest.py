@@ -954,8 +954,8 @@ def run_backtest(args: argparse.Namespace) -> int:
         return 1
 
 
-if __name__ == "__main__":
-    # Create argument parser for standalone execution
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for backtest script."""
     parser = argparse.ArgumentParser(description="AlphaTrade Backtesting Script")
     parser.add_argument("--start", "-s", required=True, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", "-e", required=True, help="End date (YYYY-MM-DD)")
@@ -969,6 +969,15 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path)
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--log-level", default="INFO")
+    return parser
 
-    args = parser.parse_args()
-    sys.exit(run_backtest(args))
+
+def main(argv: list[str] | None = None) -> int:
+    """Console entrypoint for quant-backtest."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run_backtest(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

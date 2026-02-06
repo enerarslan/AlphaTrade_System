@@ -43,6 +43,7 @@ from quant_trading_system.backtest.simulator import (
     create_optimistic_simulator,
     create_pessimistic_simulator,
 )
+from quant_trading_system.core.reproducibility import set_global_seed
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,8 @@ class BacktestConfig:
     # Risk parameters
     max_position_pct: float = 0.10
     max_drawdown_halt: float = 0.20
+    max_participation_rate: float = 0.10  # Max % of bar volume per order
+    max_adv_order_pct: float = 0.02  # Max % of ADV per order
 
     # Time filters
     start_date: datetime | None = None
@@ -97,6 +100,9 @@ class BacktestConfig:
     simulate_partial_fills: bool = True  # Allow partial order fills
     simulate_latency: bool = True  # Simulate execution latency
     avg_daily_volume: int = 1000000  # Default ADV for volume-based slippage
+
+    # Reproducibility
+    random_seed: int | None = 42
 
 
 @dataclass
@@ -562,8 +568,11 @@ class BacktestEngine:
 
     def _initialize(self) -> None:
         """Initialize backtest state."""
+        # Reproducible simulation paths (fills/latency/optimizer randomness).
+        set_global_seed(self.config.random_seed, deterministic_torch=False)
+
         self._state = BacktestState(
-            timestamp=datetime.now(timezone.utc),
+            timestamp=self.config.start_date or datetime.now(timezone.utc),
             equity=self.config.initial_capital,
             cash=self.config.initial_capital,
             positions={},
@@ -789,6 +798,16 @@ class BacktestEngine:
             if position is None and not self.config.allow_short:
                 return False
             if position is not None and position.quantity < fill_quantity and not self.config.allow_short:
+                return False
+
+        # Liquidity participation constraints.
+        conditions = self._market_conditions.get(order.symbol)
+        if conditions is not None:
+            liq_cap = self._get_liquidity_cap_quantity(
+                bar_volume=conditions.volume,
+                avg_daily_volume=conditions.avg_daily_volume,
+            )
+            if liq_cap <= 0 or fill_quantity > liq_cap:
                 return False
 
         if self._state.equity <= 0:
@@ -1082,6 +1101,9 @@ class BacktestEngine:
         if not self.config.allow_fractional:
             quantity = Decimal(int(quantity))
 
+        # Enforce participation/ADV caps for realistic capacity control.
+        quantity = self._cap_quantity_to_liquidity(quantity, bar)
+
         # Enforce gross leverage cap before submitting order.
         quantity = self._cap_quantity_to_leverage(
             symbol=signal.symbol,
@@ -1117,6 +1139,45 @@ class BacktestEngine:
         new_qty = current_qty + quantity if side == OrderSide.BUY else current_qty - quantity
         abs_increase = max(Decimal("0"), abs(new_qty) - abs(current_qty))
         return abs_increase * price
+
+    def _get_liquidity_cap_quantity(
+        self,
+        bar_volume: int | float | Decimal,
+        avg_daily_volume: int | float | Decimal | None = None,
+    ) -> Decimal:
+        """Compute the max executable quantity from liquidity constraints."""
+        caps: list[Decimal] = []
+
+        if self.config.max_participation_rate > 0:
+            volume_cap = Decimal(str(bar_volume)) * Decimal(str(self.config.max_participation_rate))
+            caps.append(max(Decimal("0"), volume_cap))
+
+        adv_reference = avg_daily_volume if avg_daily_volume is not None else self.config.avg_daily_volume
+        if self.config.max_adv_order_pct > 0 and adv_reference and adv_reference > 0:
+            adv_cap = Decimal(str(adv_reference)) * Decimal(str(self.config.max_adv_order_pct))
+            caps.append(max(Decimal("0"), adv_cap))
+
+        if not caps:
+            return Decimal("Infinity")
+
+        return min(caps)
+
+    def _cap_quantity_to_liquidity(
+        self,
+        requested_qty: Decimal,
+        bar: OHLCVBar,
+    ) -> Decimal:
+        """Cap order quantity to market-liquidity constraints."""
+        if requested_qty <= 0:
+            return Decimal("0")
+
+        cap = self._get_liquidity_cap_quantity(bar_volume=bar.volume)
+        qty = min(requested_qty, cap)
+
+        if not self.config.allow_fractional:
+            qty = Decimal(int(qty))
+
+        return max(Decimal("0"), qty)
 
     def _cap_quantity_to_leverage(
         self,

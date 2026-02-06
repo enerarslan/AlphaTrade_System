@@ -23,11 +23,15 @@ import asyncio
 import hashlib
 import hmac
 import json
-import secrets
-from datetime import datetime, timedelta, timezone
+import math
 import os
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 try:
     import bcrypt
@@ -51,6 +55,7 @@ from .health import SystemHealthChecker, HealthStatus, HealthCheckResult
 
 
 logger = get_logger("dashboard", LogCategory.SYSTEM)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Create FastAPI app
 app = FastAPI(
@@ -678,6 +683,47 @@ class FeatureImportanceResponse(BaseModel):
     model_name: str
     global_importance: dict[str, float]  # feature: score
     recent_shift: dict[str, float]  # feature: change_pct
+
+
+class TradingStartRequest(BaseModel):
+    """Start/Restart request for the trading process."""
+
+    mode: str = Field(default="paper", pattern="^(live|paper|dry-run)$")
+    symbols: list[str] = Field(default_factory=lambda: ["AAPL", "MSFT", "GOOGL"])
+    strategy: str = Field(default="momentum")
+    capital: float = Field(default=100000.0, gt=0)
+
+
+class ControlActionResponse(BaseModel):
+    """Response for control actions."""
+
+    status: str
+    detail: str
+    timestamp: str
+
+
+class CommandJobRequest(BaseModel):
+    """Request to run an operational command asynchronously."""
+
+    command: str = Field(
+        ...,
+        description="One of: backtest, train, data, features, health, deploy",
+    )
+    args: list[str] = Field(default_factory=list)
+
+
+class CommandJobResponse(BaseModel):
+    """Async job status response."""
+
+    job_id: str
+    command: str
+    args: list[str]
+    status: str
+    created_at: str
+    started_at: str | None
+    ended_at: str | None
+    exit_code: int | None
+    output: str
 
 
 # =============================================================================

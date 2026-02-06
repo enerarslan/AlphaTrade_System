@@ -500,6 +500,29 @@ class TestSignalGenerator:
         assert "num_strategies" in stats
         assert "pending_signals" in stats
 
+    def test_enrich_signal_clamps_without_mutating_frozen_signal(self):
+        """Invalid signal values should be clamped via immutable copy."""
+        generator = SignalGenerator()
+
+        invalid_signal = TradeSignal.model_construct(
+            signal_id=uuid4(),
+            timestamp=datetime.now(timezone.utc),
+            symbol="AAPL",
+            direction=Direction.LONG,
+            strength=1.8,  # invalid
+            confidence=1.5,  # invalid
+            horizon=5,
+            model_source="test",
+            features_snapshot={},
+            metadata={},
+        )
+
+        enriched = generator._enrich_signal(invalid_signal)
+
+        assert enriched.signal is not invalid_signal
+        assert enriched.signal.confidence == 1.0
+        assert enriched.signal.strength == 1.0
+
 
 class TestSignalQueue:
     """Tests for SignalQueue."""

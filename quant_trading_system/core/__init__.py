@@ -47,6 +47,7 @@ from .exceptions import (
 )
 from .events import EventBus, Event, EventType
 from .registry import ComponentRegistry, registry
+from .reproducibility import child_seed, set_global_seed
 from .system_integrator import (
     IntegratorState,
     SystemIntegrator,
@@ -101,6 +102,9 @@ __all__ = [
     # Registry
     "ComponentRegistry",
     "registry",
+    # Reproducibility
+    "set_global_seed",
+    "child_seed",
     # System Integrator
     "IntegratorState",
     "SystemIntegrator",

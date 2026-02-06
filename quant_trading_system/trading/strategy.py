@@ -179,21 +179,29 @@ class Strategy(ABC):
             return False
         return True
 
-    def record_signal(self, signal: TradeSignal) -> None:
+    def record_signal(self, signal: TradeSignal) -> TradeSignal:
         """Record a generated signal.
 
         Args:
             signal: Generated signal.
+
+        Returns:
+            Signal recorded by the strategy (may be copied to update timestamp).
         """
         # Keep signal time anchored to market data time for backtest/live parity.
         history = self._bar_history.get(signal.symbol, [])
+        signal_to_store = signal
         if history:
-            signal.timestamp = history[-1].timestamp
+            market_timestamp = history[-1].timestamp
+            if signal.timestamp != market_timestamp:
+                signal_to_store = signal.model_copy(update={"timestamp": market_timestamp})
 
-        self._last_signals[signal.symbol] = signal
-        self._signal_cooldowns[signal.symbol] = self.config.cooldown_bars
+        self._last_signals[signal_to_store.symbol] = signal_to_store
+        self._signal_cooldowns[signal_to_store.symbol] = self.config.cooldown_bars
         self.metrics.signals_generated += 1
-        self.metrics.last_signal_time = signal.timestamp
+        self.metrics.last_signal_time = signal_to_store.timestamp
+
+        return signal_to_store
 
     def start(self) -> None:
         """Start the strategy."""
@@ -384,8 +392,8 @@ class MomentumStrategy(Strategy):
                         "ma_diff_pct": ma_diff_pct,
                     },
                 )
+                signal = self.record_signal(signal)
                 signals.append(signal)
-                self.record_signal(signal)
 
         return signals
 
@@ -503,8 +511,8 @@ class MeanReversionStrategy(Strategy):
                         "lower_band": lower_band,
                     },
                 )
+                signal = self.record_signal(signal)
                 signals.append(signal)
-                self.record_signal(signal)
 
         return signals
 
@@ -601,8 +609,8 @@ class MLStrategy(Strategy):
                         "model_predictions": {p.model_name: p.prediction for p in symbol_preds},
                     },
                 )
+                signal = self.record_signal(signal)
                 signals.append(signal)
-                self.record_signal(signal)
 
         return signals
 
@@ -673,8 +681,8 @@ class CompositeStrategy(Strategy):
                 combined = None
 
             if combined:
+                combined = self.record_signal(combined)
                 combined_signals.append(combined)
-                self.record_signal(combined)
 
         return combined_signals
 

@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import signal
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import redis.asyncio as redis
@@ -45,6 +46,8 @@ class RedisEventBridge:
         self.pubsub: redis.client.PubSub | None = None
         self._running = False
         self._tasks: list[asyncio.Task] = []
+        # Keep a short-lived set of recently seen event IDs to avoid loops.
+        self._recent_event_ids: dict[str, datetime] = {}
 
     async def start(self) -> None:
         """Start the Redis bridge."""
@@ -122,6 +125,8 @@ class RedisEventBridge:
         
         # Serialize event
         try:
+            self._cleanup_recent_event_ids()
+            self._recent_event_ids[str(event.event_id)] = datetime.now(timezone.utc)
             payload = json.dumps(event.to_dict())
             
             # Publish to all configured output channels
@@ -164,16 +169,30 @@ class RedisEventBridge:
             # Assumption: Remote events follow the same schema
             if "event_type" in data:
                 event = Event.from_dict(data)
-                
-                # Mark as external to prevent loops?
-                # Ideally we check source, but for now simple republish
-                # Be careful not to publish THIS event back to Redis (loop)
-                
-                # For now, we just log it or route to specific handlers
-                # TODO: Implement loop detection if we need bi-directional mirroring
-                
+
+                self._cleanup_recent_event_ids()
+                event_id = str(event.event_id)
+                if event_id in self._recent_event_ids:
+                    logger.debug(f"Skipping duplicate/looped remote event: {event.event_type}")
+                    return
+
+                self._recent_event_ids[event_id] = datetime.now(timezone.utc)
                 logger.debug(f"Received remote event: {event.event_type}")
+
+                # Republish into local EventBus so dashboard and local handlers update state.
+                await self.event_bus.publish_async(event)
                 
         except Exception as e:
             logger.error(f"Failed to process Redis message: {e}")
+
+    def _cleanup_recent_event_ids(self) -> None:
+        """Prune old event IDs from loop-prevention cache."""
+        now = datetime.now(timezone.utc)
+        stale = [
+            event_id
+            for event_id, seen_at in self._recent_event_ids.items()
+            if (now - seen_at).total_seconds() > 300
+        ]
+        for event_id in stale:
+            self._recent_event_ids.pop(event_id, None)
 

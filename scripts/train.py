@@ -1312,8 +1312,8 @@ def validate_model(args: argparse.Namespace) -> int:
         return 1
 
 
-if __name__ == "__main__":
-    # Direct execution for testing
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for training script."""
     parser = argparse.ArgumentParser(description="AlphaTrade Model Training")
     parser.add_argument("--model", type=str, default="xgboost",
                        choices=["xgboost", "lightgbm", "random_forest", "lstm",
@@ -1322,6 +1322,15 @@ if __name__ == "__main__":
     parser.add_argument("--optimize", action="store_true")
     parser.add_argument("--use-gpu", action="store_true")
     parser.add_argument("--meta-labeling", action="store_true")
+    return parser
 
-    args = parser.parse_args()
-    sys.exit(run_training(args))
+
+def main(argv: list[str] | None = None) -> int:
+    """Console entrypoint for quant-train."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run_training(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

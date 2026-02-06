@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from quant_trading_system.core.reproducibility import child_seed, set_global_seed
 from quant_trading_system.models.base import ModelType, TradingModel
 from quant_trading_system.models.purged_cv import create_purged_cv
 
@@ -753,6 +755,10 @@ class HyperparameterOptimizer:
         metric: str = "sharpe_ratio",
         n_trials: int = 50,
         method: str = "random",
+        random_state: int | None = None,
+        assumed_cost_bps: float = 5.0,
+        turnover_penalty_bps: float = 0.0,
+        annualization_factor: float = 252.0,
     ):
         """
         Initialize optimizer.
@@ -763,22 +769,31 @@ class HyperparameterOptimizer:
             metric: Optimization metric
             n_trials: Number of trials
             method: "grid", "random", or "bayesian"
+            random_state: Random seed for deterministic optimization.
+            assumed_cost_bps: Per-turnover transaction cost in basis points.
+            turnover_penalty_bps: Additional turnover penalty in basis points.
+            annualization_factor: Annualization factor for Sharpe calculations.
         """
         self.model_class = model_class
         self.param_space = param_space
         self.metric = metric
         self.n_trials = n_trials
         self.method = method
+        self.random_state = random_state
+        self.assumed_cost_bps = assumed_cost_bps
+        self.turnover_penalty_bps = turnover_penalty_bps
+        self.annualization_factor = annualization_factor
 
         self.best_params: dict[str, Any] = {}
         self.best_score: float = float("-inf")
         self.trials: list[dict] = []
+        self._rng = np.random.default_rng(random_state)
 
     def optimize(
         self,
         X: np.ndarray,
         y: np.ndarray,
-        cv_splitter: TimeSeriesSplitter,
+        cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
     ) -> dict[str, Any]:
         """
@@ -793,6 +808,8 @@ class HyperparameterOptimizer:
         Returns:
             Best parameters found
         """
+        set_global_seed(self.random_state, deterministic_torch=False)
+
         if self.method == "grid":
             return self._grid_search(X, y, cv_splitter, scoring_func)
         elif self.method == "random":
@@ -833,6 +850,50 @@ class HyperparameterOptimizer:
 
         return np.mean(scores)
 
+    def _sample_param(
+        self,
+        param_config: Any,
+    ) -> Any:
+        """Sample one parameter value using optimizer RNG."""
+        if isinstance(param_config, list):
+            if not param_config:
+                return None
+            sample = self._rng.choice(param_config)
+            return sample.item() if hasattr(sample, "item") else sample
+
+        if isinstance(param_config, tuple) and len(param_config) == 2:
+            low, high = param_config
+            if isinstance(low, int) and isinstance(high, int):
+                return int(self._rng.integers(low, high + 1))
+            return float(self._rng.uniform(low, high))
+
+        if isinstance(param_config, dict):
+            if param_config.get("type") == "log":
+                low, high = param_config["range"]
+                return float(np.exp(self._rng.uniform(np.log(low), np.log(high))))
+            return param_config.get("default")
+
+        return param_config
+
+    def _simulate_net_returns(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+    ) -> np.ndarray:
+        """Simulate directional net returns including costs and turnover penalty."""
+        if len(y_true) < 2:
+            return np.array([])
+
+        signals = np.sign(y_pred[:-1])
+        gross_returns = signals * y_true[1:]
+
+        # Turnover includes entries, flips, and exits.
+        turnover = np.abs(np.diff(np.concatenate([[0.0], signals])))
+        total_cost_bps = self.assumed_cost_bps + self.turnover_penalty_bps
+        costs = turnover * (total_cost_bps / 10000.0)
+
+        return gross_returns - costs
+
     def _default_score(
         self,
         y_true: np.ndarray,
@@ -852,10 +913,7 @@ class HyperparameterOptimizer:
             return float(1 - np.mean((y_true - y_pred) ** 2) / y_var)
 
         # Trading metrics: simulate directional strategy returns.
-        if len(y_true) < 2:
-            return float("-inf")
-
-        simulated_returns = np.sign(y_pred[:-1]) * y_true[1:]
+        simulated_returns = self._simulate_net_returns(y_true, y_pred)
         if len(simulated_returns) == 0:
             return float("-inf")
 
@@ -863,7 +921,7 @@ class HyperparameterOptimizer:
             std = np.std(simulated_returns)
             if std <= 1e-12:
                 return float("-inf")
-            return float(np.mean(simulated_returns) / std * np.sqrt(252))
+            return float(np.mean(simulated_returns) / std * np.sqrt(self.annualization_factor))
 
         if metric == "win_rate":
             return float(np.mean(simulated_returns > 0))
@@ -890,22 +948,7 @@ class HyperparameterOptimizer:
             # Sample random parameters
             params = {}
             for param_name, param_config in self.param_space.items():
-                if isinstance(param_config, list):
-                    params[param_name] = np.random.choice(param_config)
-                elif isinstance(param_config, tuple) and len(param_config) == 2:
-                    low, high = param_config
-                    if isinstance(low, int) and isinstance(high, int):
-                        params[param_name] = np.random.randint(low, high + 1)
-                    else:
-                        params[param_name] = np.random.uniform(low, high)
-                elif isinstance(param_config, dict):
-                    if param_config.get("type") == "log":
-                        low, high = param_config["range"]
-                        params[param_name] = np.exp(np.random.uniform(np.log(low), np.log(high)))
-                    else:
-                        params[param_name] = param_config.get("default")
-                else:
-                    params[param_name] = param_config
+                params[param_name] = self._sample_param(param_config)
 
             # Evaluate
             try:
@@ -1006,13 +1049,35 @@ class HyperparameterOptimizer:
             self.trials.append({"params": params, "score": score})
             return score
 
-        study = optuna.create_study(direction="maximize")
+        sampler: Any = None
+        if self.random_state is not None:
+            sampler = optuna.samplers.TPESampler(seed=self.random_state)
+
+        study = optuna.create_study(direction="maximize", sampler=sampler)
         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
 
         self.best_params = study.best_params
         self.best_score = study.best_value
 
         return self.best_params
+
+
+@dataclass
+class NestedFoldResult:
+    """Result container for one outer fold in nested CV."""
+
+    fold: int
+    best_params: dict[str, Any]
+    optimization_score: float
+    holdout_metrics: dict[str, float]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fold": self.fold,
+            "best_params": self.best_params,
+            "optimization_score": self.optimization_score,
+            "holdout_metrics": self.holdout_metrics,
+        }
 
 
 class ModelManager:
@@ -1137,6 +1202,8 @@ class ModelManager:
         gap: int = 5,
         embargo_pct: float = 0.01,
         prediction_horizon: int = 1,
+        assumed_cost_bps: float = 5.0,
+        annualization_factor: float = 252.0,
     ) -> dict[str, Any]:
         """
         Perform cross-validation.
@@ -1191,7 +1258,14 @@ class ModelManager:
             predictions = model.predict(X_test)
 
             # Calculate metrics
-            fold_metrics = self._calculate_metrics(y_test, predictions, metrics, model.model_type)
+            fold_metrics = self._calculate_metrics(
+                y_test,
+                predictions,
+                metrics,
+                model.model_type,
+                assumed_cost_bps=assumed_cost_bps,
+                annualization_factor=annualization_factor,
+            )
             for metric, value in fold_metrics.items():
                 results[metric].append(value)
 
@@ -1204,12 +1278,147 @@ class ModelManager:
 
         return summary
 
+    def nested_cross_validate(
+        self,
+        model_class: type[TradingModel],
+        X: np.ndarray,
+        y: np.ndarray,
+        param_space: dict[str, Any],
+        outer_method: SplitMethod = SplitMethod.WALK_FORWARD,
+        inner_method: SplitMethod = SplitMethod.PURGED_KFOLD,
+        outer_splits: int = 5,
+        inner_splits: int = 4,
+        optimization_method: str = "random",
+        optimization_metric: str = "sharpe_ratio",
+        n_trials: int = 30,
+        gap: int = 5,
+        embargo_pct: float = 0.01,
+        prediction_horizon: int = 1,
+        random_state: int | None = 42,
+        assumed_cost_bps: float = 5.0,
+        turnover_penalty_bps: float = 0.0,
+        annualization_factor: float = 252.0,
+    ) -> dict[str, Any]:
+        """Run institutional nested CV with inner optimization and outer OOS scoring."""
+
+        def _build_splitter(method: SplitMethod, n_splits: int) -> Any:
+            if method == SplitMethod.PURGED_KFOLD:
+                return create_purged_cv(
+                    cv_type="purged_kfold",
+                    n_splits=n_splits,
+                    purge_gap=gap,
+                    embargo_pct=embargo_pct,
+                    prediction_horizon=prediction_horizon,
+                )
+            if method == SplitMethod.WALK_FORWARD:
+                return create_purged_cv(
+                    cv_type="walk_forward",
+                    n_splits=n_splits,
+                    purge_gap=gap,
+                    embargo_pct=embargo_pct,
+                    prediction_horizon=prediction_horizon,
+                )
+            return TimeSeriesSplitter(method=method, n_splits=n_splits, gap=gap)
+
+        set_global_seed(random_state, deterministic_torch=False)
+        outer_splitter = _build_splitter(outer_method, outer_splits)
+        outer_pairs = list(outer_splitter.split(X, y))
+        if not outer_pairs:
+            raise ValueError("No outer folds generated for nested cross-validation")
+
+        fold_results: list[NestedFoldResult] = []
+
+        for fold_idx, (train_idx, test_idx) in enumerate(outer_pairs):
+            X_train, y_train = X[train_idx], y[train_idx]
+            X_test, y_test = X[test_idx], y[test_idx]
+
+            fold_seed = child_seed(random_state, fold_idx + 1)
+            inner_splitter = _build_splitter(inner_method, inner_splits)
+            optimizer = HyperparameterOptimizer(
+                model_class=model_class,
+                param_space=param_space,
+                metric=optimization_metric,
+                n_trials=n_trials,
+                method=optimization_method,
+                random_state=fold_seed,
+                assumed_cost_bps=assumed_cost_bps,
+                turnover_penalty_bps=turnover_penalty_bps,
+                annualization_factor=annualization_factor,
+            )
+
+            best_params = optimizer.optimize(X_train, y_train, inner_splitter)
+            model = model_class(**best_params) if best_params else model_class()
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+
+            holdout_metrics = self._calculate_holdout_metrics(
+                y_test,
+                y_pred,
+                model.model_type,
+                assumed_cost_bps=assumed_cost_bps,
+                annualization_factor=annualization_factor,
+            )
+
+            fold_results.append(
+                NestedFoldResult(
+                    fold=fold_idx,
+                    best_params=best_params,
+                    optimization_score=float(optimizer.best_score),
+                    holdout_metrics=holdout_metrics,
+                )
+            )
+
+        metric_aliases = {
+            "sharpe": "sharpe_ratio",
+            "sharpe_ratio": "sharpe_ratio",
+            "win_rate": "win_rate",
+            "profit_factor": "profit_factor",
+            "mse": "mse",
+            "r2": "r2",
+        }
+        metric_key = metric_aliases.get(optimization_metric.lower(), optimization_metric.lower())
+        outer_scores = np.array([
+            fr.holdout_metrics.get(metric_key, float("-inf")) for fr in fold_results
+        ], dtype=float)
+
+        valid_scores = np.nan_to_num(outer_scores, nan=float("-inf"), neginf=float("-inf"))
+        best_idx = int(np.argmax(valid_scores))
+        robust_idx = int(np.argsort(valid_scores)[len(valid_scores) // 2])
+
+        summary: dict[str, Any] = {
+            "selection_metric": metric_key,
+            "outer_score_mean": float(np.mean(valid_scores[np.isfinite(valid_scores)]))
+            if np.any(np.isfinite(valid_scores))
+            else float("-inf"),
+            "outer_score_std": float(np.std(valid_scores[np.isfinite(valid_scores)]))
+            if np.any(np.isfinite(valid_scores))
+            else float("inf"),
+        }
+
+        all_metric_keys = set().union(*(fr.holdout_metrics.keys() for fr in fold_results))
+        for key in all_metric_keys:
+            values = np.array([fr.holdout_metrics.get(key, np.nan) for fr in fold_results], dtype=float)
+            finite = values[np.isfinite(values)]
+            summary[f"{key}_mean"] = float(np.mean(finite)) if len(finite) else float("nan")
+            summary[f"{key}_std"] = float(np.std(finite)) if len(finite) else float("nan")
+
+        return {
+            "outer_folds": [fr.to_dict() for fr in fold_results],
+            "summary": summary,
+            "best_fold_params": fold_results[best_idx].best_params,
+            "robust_params": fold_results[robust_idx].best_params,
+            "best_fold": fold_results[best_idx].fold,
+            "robust_fold": fold_results[robust_idx].fold,
+        }
+
     def _calculate_metrics(
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
         metrics: list[str],
         model_type: ModelType,
+        assumed_cost_bps: float = 5.0,
+        annualization_factor: float = 252.0,
     ) -> dict[str, float]:
         """Calculate specified metrics."""
         from sklearn.metrics import (
@@ -1223,7 +1432,11 @@ class ModelManager:
         results = {}
         trading_returns: np.ndarray | None = None
         if model_type == ModelType.REGRESSOR and len(y_true) > 1:
-            trading_returns = np.sign(y_pred[:-1]) * y_true[1:]
+            signals = np.sign(y_pred[:-1])
+            gross_returns = signals * y_true[1:]
+            turnover = np.abs(np.diff(np.concatenate([[0.0], signals])))
+            costs = turnover * (assumed_cost_bps / 10000.0)
+            trading_returns = gross_returns - costs
 
         for metric in metrics:
             if metric == "mse":
@@ -1242,7 +1455,7 @@ class ModelManager:
                 else:
                     std = np.std(trading_returns)
                     results[metric] = (
-                        float(np.mean(trading_returns) / std * np.sqrt(252))
+                        float(np.mean(trading_returns) / std * np.sqrt(annualization_factor))
                         if std > 1e-8
                         else 0.0
                     )
@@ -1284,6 +1497,10 @@ class ModelManager:
         gap: int = 5,
         reject_overfitted: bool = True,
         overfitting_config: dict[str, float] | None = None,
+        random_state: int | None = 42,
+        assumed_cost_bps: float = 5.0,
+        turnover_penalty_bps: float = 0.0,
+        annualization_factor: float = 252.0,
     ) -> tuple[TradingModel, dict[str, float]]:
         """
         Optimize hyperparameters and train final model.
@@ -1313,6 +1530,10 @@ class ModelManager:
             gap: Gap between train/val and holdout to prevent leakage
             reject_overfitted: If True, raise error for overfitted models
             overfitting_config: Configuration for OverfittingDetector
+            random_state: Random seed for deterministic optimization/training.
+            assumed_cost_bps: Assumed transaction costs in basis points.
+            turnover_penalty_bps: Additional turnover penalty in basis points.
+            annualization_factor: Annualization factor for Sharpe metrics.
 
         Returns:
             Tuple of (trained model, holdout test metrics)
@@ -1322,6 +1543,7 @@ class ModelManager:
         """
         import logging
         logger = logging.getLogger(__name__)
+        set_global_seed(random_state, deterministic_torch=False)
 
         n_samples = len(X)
 
@@ -1353,6 +1575,10 @@ class ModelManager:
             metric=optimization_metric,
             n_trials=n_trials,
             method=optimization_method,
+            random_state=random_state,
+            assumed_cost_bps=assumed_cost_bps,
+            turnover_penalty_bps=turnover_penalty_bps,
+            annualization_factor=annualization_factor,
         )
 
         if cv_method == SplitMethod.PURGED_KFOLD:
@@ -1385,7 +1611,11 @@ class ModelManager:
         # Evaluate on holdout test set for unbiased performance estimate
         holdout_predictions = model.predict(X_holdout)
         holdout_metrics = self._calculate_holdout_metrics(
-            y_holdout, holdout_predictions, model.model_type
+            y_holdout,
+            holdout_predictions,
+            model.model_type,
+            assumed_cost_bps=assumed_cost_bps,
+            annualization_factor=annualization_factor,
         )
 
         logger.info(f"Holdout test metrics (out-of-sample): {holdout_metrics}")
@@ -1446,6 +1676,7 @@ class ModelManager:
         y_pred: np.ndarray,
         model_type: "ModelType",
         assumed_cost_bps: float = 5.0,
+        annualization_factor: float = 26 * 252,
     ) -> dict[str, float]:
         """
         JPMORGAN FIX: Calculate comprehensive metrics on holdout test set.
@@ -1487,9 +1718,9 @@ class ModelManager:
 
                 if len(simulated_returns) > 0 and np.std(simulated_returns) > 1e-10:
                     # Sharpe ratio (annualized assuming 15-min bars, ~26 bars/day, 252 days/year)
-                    annualization_factor = np.sqrt(26 * 252)
+                    annualization = np.sqrt(annualization_factor)
                     metrics["sharpe_ratio"] = float(
-                        np.mean(simulated_returns) / np.std(simulated_returns) * annualization_factor
+                        np.mean(simulated_returns) / np.std(simulated_returns) * annualization
                     )
 
                     # Maximum drawdown

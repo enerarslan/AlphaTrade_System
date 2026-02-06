@@ -328,6 +328,50 @@ class TestBacktestConfig:
         assert config.commission_bps > 0
         assert config.slippage_bps > 0
 
+    def test_liquidity_cap_limits_order_size(self):
+        """Order sizing should respect bar participation constraints."""
+        dates = pd.date_range("2023-01-01", periods=3, freq="D")
+        data = {
+            "AAPL": pd.DataFrame(
+                {
+                    "open": [10.0, 10.0, 10.0],
+                    "high": [10.5, 10.5, 10.5],
+                    "low": [9.5, 9.5, 9.5],
+                    "close": [10.0, 10.0, 10.0],
+                    "volume": [100, 100, 100],
+                },
+                index=dates,
+            )
+        }
+
+        handler = PandasDataHandler(data)
+        strategy = SimpleStrategy()
+        config = BacktestConfig(
+            initial_capital=Decimal("100000"),
+            max_position_pct=1.0,
+            max_participation_rate=0.05,  # 5 shares max on 100 volume bar
+            max_adv_order_pct=1.0,
+            allow_fractional=False,
+            use_market_simulator=False,
+        )
+        engine = BacktestEngine(data_handler=handler, strategy=strategy, config=config)
+        engine._initialize()
+
+        assert handler.update_bars() is True
+        signal = TradeSignal(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            strength=0.9,
+            confidence=0.9,
+            horizon=1,
+            model_source="test",
+        )
+        engine._process_signal(signal)
+
+        assert engine._state is not None
+        assert len(engine._state.pending_orders) == 1
+        assert engine._state.pending_orders[0].quantity == Decimal("5")
+
 
 class TestPandasDataHandler:
     """Tests for PandasDataHandler."""

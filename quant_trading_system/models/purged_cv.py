@@ -880,10 +880,14 @@ class MultipleTestingCorrector:
 
         # Expected maximum Sharpe ratio under null (no skill)
         # E[max(Z_1, ..., Z_n)] for standard normal
-        gamma_approx = np.euler_gamma  # Euler-Mascheroni constant
-        expected_max = np.sqrt(2 * np.log(n_trials)) - (
-            gamma_approx + np.log(np.pi / 2)
-        ) / (2 * np.sqrt(2 * np.log(n_trials)))
+        if n_trials <= 1:
+            # Single-trial case has no multiple-testing inflation adjustment.
+            expected_max = 0.0
+        else:
+            gamma_approx = np.euler_gamma  # Euler-Mascheroni constant
+            expected_max = np.sqrt(2 * np.log(n_trials)) - (
+                gamma_approx + np.log(np.pi / 2)
+            ) / (2 * np.sqrt(2 * np.log(n_trials)))
 
         # Standard error of Sharpe ratio
         # SR ~ N(SR*, SE(SR*)) where SE = sqrt((1 + 0.5*SR^2 - skew*SR + (kurt-3)/4*SR^2) / T)

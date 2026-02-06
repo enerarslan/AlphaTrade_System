@@ -21,6 +21,8 @@ from quant_trading_system.models.classical_ml import (
     create_sample_weights,
 )
 from quant_trading_system.models.model_manager import (
+    HyperparameterOptimizer,
+    ModelManager,
     ModelRegistry,
     SplitMethod,
     TimeSeriesSplitter,
@@ -77,6 +79,25 @@ def temp_model_dir():
     """Create temporary directory for model storage."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
+
+
+class DummyConstantModel(TradingModel):
+    """Lightweight deterministic model for optimizer tests."""
+
+    def __init__(self, name: str = "dummy_constant", bias: float = 0.0) -> None:
+        super().__init__(name=name, model_type=ModelType.REGRESSOR)
+        self.bias = float(bias)
+
+    def fit(self, X, y, **kwargs):
+        self._is_fitted = True
+        return self
+
+    def predict(self, X):
+        X_arr = np.asarray(X)
+        return np.full(X_arr.shape[0], self.bias, dtype=float)
+
+    def get_feature_importance(self):
+        return {}
 
 
 # ==================== Base Model Tests ====================
@@ -424,6 +445,94 @@ class TestTimeSeriesSplitter:
         # Training window should expand
         train_sizes = [len(train_idx) for train_idx, _ in splits]
         assert train_sizes == sorted(train_sizes)  # Monotonically increasing
+
+
+class TestHyperparameterOptimizer:
+    """Tests for optimizer determinism and cost-aware scoring."""
+
+    def test_default_score_penalizes_turnover_costs(self):
+        """Higher assumed costs should reduce trading score."""
+        y_true = np.array([0.0, 0.015, -0.01, 0.005, -0.02], dtype=float)
+        y_pred = np.array([1.0, -1.0, 1.0, -1.0, 1.0], dtype=float)
+
+        no_cost = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space={"bias": [0.0]},
+            metric="sharpe_ratio",
+            n_trials=1,
+            method="random",
+            random_state=42,
+            assumed_cost_bps=0.0,
+        )
+        with_cost = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space={"bias": [0.0]},
+            metric="sharpe_ratio",
+            n_trials=1,
+            method="random",
+            random_state=42,
+            assumed_cost_bps=50.0,
+        )
+
+        no_cost_score = no_cost._default_score(y_true, y_pred)
+        with_cost_score = with_cost._default_score(y_true, y_pred)
+
+        assert with_cost_score < no_cost_score
+
+    def test_random_search_is_deterministic_with_seed(self, sample_regression_data):
+        """Same seed should produce identical optimization results."""
+        X, y = sample_regression_data
+        splitter = TimeSeriesSplitter(method=SplitMethod.WALK_FORWARD, n_splits=2)
+        space = {"bias": (-1.0, 1.0)}
+
+        opt1 = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space=space,
+            metric="mse",
+            n_trials=15,
+            method="random",
+            random_state=123,
+        )
+        opt2 = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space=space,
+            metric="mse",
+            n_trials=15,
+            method="random",
+            random_state=123,
+        )
+
+        best1 = opt1.optimize(X, y, splitter)
+        best2 = opt2.optimize(X, y, splitter)
+
+        assert best1 == best2
+
+
+class TestModelManagerInstitutionalValidation:
+    """Tests for institutional nested validation workflow."""
+
+    def test_nested_cross_validate_returns_summary(self, sample_regression_data, temp_model_dir):
+        """Nested CV should return robust parameter and summary payload."""
+        X, y = sample_regression_data
+        manager = ModelManager(registry_path=temp_model_dir)
+
+        result = manager.nested_cross_validate(
+            model_class=DummyConstantModel,
+            X=X,
+            y=y,
+            param_space={"bias": [-0.5, 0.0, 0.5]},
+            outer_splits=2,
+            inner_splits=2,
+            n_trials=4,
+            optimization_method="random",
+            optimization_metric="mse",
+            random_state=7,
+        )
+
+        assert "outer_folds" in result
+        assert len(result["outer_folds"]) == 2
+        assert "summary" in result
+        assert "robust_params" in result
 
 
 class TestModelRegistry:

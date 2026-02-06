@@ -85,7 +85,6 @@ from quant_trading_system.core.events import (
 from quant_trading_system.core.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerConfig,
-    circuit_breaker_registry,
 )
 from quant_trading_system.core.system_integrator import (
     SystemIntegrator,
@@ -102,14 +101,9 @@ from quant_trading_system.risk.limits import (
     RiskLimitsConfig,
     RiskCheckResult,
 )
-from quant_trading_system.risk.position_sizer import (
-    PositionSizer,
-    SizingMethod,
-    PositionSizerConfig,
-)
 from quant_trading_system.risk.drawdown_monitor import (
     IntradayDrawdownMonitor,
-    DrawdownConfig,
+    DrawdownMonitorConfig,
 )
 from quant_trading_system.risk.sector_rebalancer import (
     SectorRebalancer,
@@ -136,7 +130,6 @@ from quant_trading_system.trading.trading_engine import (
     TradingMode,
     EngineState,
 )
-from quant_trading_system.trading.strategy import TradingStrategy
 from quant_trading_system.trading.signal_generator import SignalGenerator
 
 # Alpha & Regime Detection
@@ -157,12 +150,11 @@ from quant_trading_system.alpha.mean_reversion_alphas import (
 )
 
 # Data
-from quant_trading_system.data.vix_feed import VIXFeed, VIXRegime
-from quant_trading_system.data.live_feed import LiveDataFeed
+from quant_trading_system.data.vix_feed import BaseVIXFeed, VIXRegime, create_vix_feed
 
 # Models
 from quant_trading_system.models.staleness_detector import ModelStalenessDetector
-from quant_trading_system.models.ab_testing import ABTestManager, ABTestConfig
+from quant_trading_system.models.ab_testing import ExperimentManager
 
 # Monitoring
 from quant_trading_system.monitoring.logger import (
@@ -180,7 +172,7 @@ from quant_trading_system.monitoring.alerting import (
     alert_info,
 )
 from quant_trading_system.monitoring.audit import (
-    get_audit_logger,
+    create_audit_logger,
     AuditEventType,
 )
 from quant_trading_system.monitoring.tracing import (
@@ -256,10 +248,10 @@ class TradingSession:
         self.drawdown_monitor: Optional[IntradayDrawdownMonitor] = None
         self.sector_monitor: Optional[SectorExposureMonitor] = None
         self.regime_detector: Optional[CompositeRegimeDetector] = None
-        self.vix_feed: Optional[VIXFeed] = None
+        self.vix_feed: Optional[BaseVIXFeed] = None
         self.tca_manager: Optional[TCAManager] = None
         self.staleness_detector: Optional[ModelStalenessDetector] = None
-        self.ab_test_manager: Optional[ABTestManager] = None
+        self.ab_test_manager: Optional[ExperimentManager] = None
         self.metrics_collector = None
         self.alert_manager = None
         self.audit_logger = None
@@ -313,7 +305,7 @@ class TradingSession:
             # 3. Setup monitoring
             self.metrics_collector = get_metrics_collector()
             self.alert_manager = get_alert_manager()
-            self.audit_logger = get_audit_logger()
+            self.audit_logger = create_audit_logger()
 
             # 4. Setup tracing
             configure_tracing(
@@ -362,7 +354,7 @@ class TradingSession:
 
             # Drawdown monitor (P2-E)
             self.drawdown_monitor = IntradayDrawdownMonitor(
-                config=DrawdownConfig(
+                config=DrawdownMonitorConfig(
                     warning_threshold=0.03,
                     critical_threshold=0.05,
                     emergency_threshold=0.08,
@@ -382,7 +374,7 @@ class TradingSession:
             self.regime_detector = CompositeRegimeDetector()
 
             # VIX feed (P1-A)
-            self.vix_feed = VIXFeed()
+            self.vix_feed = create_vix_feed(feed_type="mock", event_bus=self.event_bus)
 
             # 9. Initialize model components
             logger.info("Initializing model components...")
@@ -391,7 +383,7 @@ class TradingSession:
             self.staleness_detector = ModelStalenessDetector()
 
             # A/B test manager (P3-2.3)
-            self.ab_test_manager = ABTestManager()
+            self.ab_test_manager = ExperimentManager()
 
             # 10. Initialize trading engine
             logger.info("Initializing trading engine...")
@@ -835,14 +827,39 @@ def run_trading(args: argparse.Namespace) -> int:
         loop.close()
 
 
-if __name__ == "__main__":
-    # Create argument parser for standalone execution
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for trading script."""
     parser = argparse.ArgumentParser(description="AlphaTrade Trading Script")
     parser.add_argument("--mode", "-m", choices=["live", "paper", "dry-run"], default="paper")
     parser.add_argument("--symbols", "-s", nargs="+", default=["AAPL", "MSFT", "GOOGL"])
     parser.add_argument("--capital", type=float, default=100000.0)
     parser.add_argument("--strategy", default="momentum")
     parser.add_argument("--log-level", default="INFO")
+    return parser
 
-    args = parser.parse_args()
-    sys.exit(run_trading(args))
+
+def main(argv: list[str] | None = None) -> int:
+    """Console entrypoint for generic trading mode."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run_trading(args)
+
+
+def main_paper(argv: list[str] | None = None) -> int:
+    """Console entrypoint pinned to paper mode."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.mode = "paper"
+    return run_trading(args)
+
+
+def main_live(argv: list[str] | None = None) -> int:
+    """Console entrypoint pinned to live mode."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.mode = "live"
+    return run_trading(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -132,10 +132,10 @@ Repository = "https://github.com/alphatrade/quant-trading-system.git"
 Issues = "https://github.com/alphatrade/quant-trading-system/issues"
 
 [project.scripts]
-quant-train = "scripts.train_models:main"
-quant-backtest = "scripts.run_backtest:main"
-quant-paper = "scripts.run_paper_trading:main"
-quant-live = "scripts.run_live_trading:main"
+quant-train = "scripts.train:main"
+quant-backtest = "scripts.backtest:main"
+quant-paper = "scripts.trade:main_paper"
+quant-live = "scripts.trade:main_live"
 
 [tool.setuptools.packages.find]
 where = ["."]
