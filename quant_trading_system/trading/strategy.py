@@ -185,10 +185,15 @@ class Strategy(ABC):
         Args:
             signal: Generated signal.
         """
+        # Keep signal time anchored to market data time for backtest/live parity.
+        history = self._bar_history.get(signal.symbol, [])
+        if history:
+            signal.timestamp = history[-1].timestamp
+
         self._last_signals[signal.symbol] = signal
         self._signal_cooldowns[signal.symbol] = self.config.cooldown_bars
         self.metrics.signals_generated += 1
-        self.metrics.last_signal_time = datetime.now(timezone.utc)
+        self.metrics.last_signal_time = signal.timestamp
 
     def start(self) -> None:
         """Start the strategy."""

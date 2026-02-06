@@ -46,7 +46,7 @@ from quant_trading_system.risk.position_sizer import (
 )
 from quant_trading_system.risk.risk_monitor import (
     AlertSeverity,
-    DrawdownState,
+    DrawdownState as RiskMonitorDrawdownState,
     PositionRiskAnalyzer,
     RiskAlert,
     RiskMonitor,
@@ -80,11 +80,14 @@ from quant_trading_system.risk.drawdown_monitor import (
     DrawdownAlert,
     DrawdownMonitorConfig,
     DrawdownSeverity,
-    DrawdownState,
+    DrawdownState as IntradayDrawdownState,
     DrawdownType,
     IntradayDrawdownMonitor,
     create_drawdown_monitor,
 )
+
+# Backward-compatibility alias: historically exported as DrawdownState.
+DrawdownState = IntradayDrawdownState
 
 __all__ = [
     # Position Sizing
@@ -115,6 +118,7 @@ __all__ = [
     # Risk Monitoring
     "AlertSeverity",
     "DrawdownState",
+    "RiskMonitorDrawdownState",
     "PositionRiskAnalyzer",
     "RiskAlert",
     "RiskMonitor",
@@ -155,7 +159,7 @@ __all__ = [
     # Intraday Drawdown Monitoring (P2-E Enhancement)
     "DrawdownSeverity",
     "DrawdownType",
-    "DrawdownState",
+    "IntradayDrawdownState",
     "DrawdownAlert",
     "DrawdownMonitorConfig",
     "IntradayDrawdownMonitor",

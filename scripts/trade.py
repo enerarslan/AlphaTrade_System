@@ -92,6 +92,7 @@ from quant_trading_system.core.system_integrator import (
     SystemIntegratorConfig,
     create_system_integrator,
 )
+from quant_trading_system.core.redis_bridge import RedisEventBridge
 
 # Risk Management (@trader CRITICAL)
 from quant_trading_system.risk.limits import (
@@ -262,6 +263,7 @@ class TradingSession:
         self.metrics_collector = None
         self.alert_manager = None
         self.audit_logger = None
+        self.redis_bridge: Optional[RedisEventBridge] = None
 
         # Configuration
         self.config = config or self._create_default_config()
@@ -303,6 +305,10 @@ class TradingSession:
 
             # 2. Setup event bus
             self.event_bus = EventBus()
+
+            # 2.1 Setup Redis Bridge
+            self.redis_bridge = RedisEventBridge(self.event_bus)
+            await self.redis_bridge.start()
 
             # 3. Setup monitoring
             self.metrics_collector = get_metrics_collector()
@@ -748,6 +754,9 @@ class TradingSession:
 
             if self.vix_feed:
                 await self.vix_feed.close()
+
+            if self.redis_bridge:
+                await self.redis_bridge.stop()
 
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")

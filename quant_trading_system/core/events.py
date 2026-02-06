@@ -382,6 +382,7 @@ class EventBus:
             handlers = list(self._handlers.get(event.event_type, [])) + list(self._global_handlers)
 
         for handler_name, handler, _ in handlers:
+            start_time = time.time()
             try:
                 result = handler(event)
                 # If handler is async, we need special handling
@@ -389,13 +390,30 @@ class EventBus:
                     # Create task if event loop is running
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(self._run_async_handler(handler_name, handler, event))
+                        loop.create_task(
+                            self._run_async_handler(
+                                handler_name=handler_name,
+                                handler_result=result,
+                                event=event,
+                                start_time=start_time,
+                            )
+                        )
                     except RuntimeError:
                         # No event loop running, run synchronously with new loop
-                        asyncio.run(result)
-                # RACE CONDITION FIX: Update metrics inside lock
-                with self._lock:
-                    self._metrics["events_processed"] += 1
+                        asyncio.run(
+                            self._run_async_handler(
+                                handler_name=handler_name,
+                                handler_result=result,
+                                event=event,
+                                start_time=start_time,
+                            )
+                        )
+                else:
+                    latency_ms = (time.time() - start_time) * 1000
+                    # RACE CONDITION FIX: Update metrics inside lock
+                    with self._lock:
+                        self._metrics["total_latency_ms"] += latency_ms
+                        self._metrics["events_processed"] += 1
             except Exception as e:
                 self._handle_error(event, handler_name, e)
 
@@ -442,19 +460,19 @@ class EventBus:
     async def _run_async_handler(
         self,
         handler_name: str,
-        handler: EventHandler,
+        handler_result: Any,
         event: Event,
+        start_time: float | None = None,
     ) -> None:
         """Run an async handler and handle errors.
 
         RACE CONDITION FIX: Metrics updates are now inside lock.
         """
-        start_time = time.time()
+        started_at = start_time if start_time is not None else time.time()
         try:
-            result = handler(event)
-            if asyncio.iscoroutine(result):
-                await result
-            latency_ms = (time.time() - start_time) * 1000
+            if asyncio.iscoroutine(handler_result):
+                await handler_result
+            latency_ms = (time.time() - started_at) * 1000
             # RACE CONDITION FIX: Update metrics inside lock
             with self._lock:
                 self._metrics["total_latency_ms"] += latency_ms
@@ -497,10 +515,10 @@ class EventBus:
                 if asyncio.iscoroutine(result):
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(self._run_error_callback(callback_name, callback, event, handler_name, error))
+                        loop.create_task(self._run_error_callback(callback_name, result))
                     except RuntimeError:
                         # No event loop running, run synchronously with new loop
-                        asyncio.run(result)
+                        asyncio.run(self._run_error_callback(callback_name, result))
             except Exception as callback_error:
                 # Error callback failures should not propagate - log and continue
                 logger.warning(
@@ -511,19 +529,15 @@ class EventBus:
     async def _run_error_callback(
         self,
         callback_name: str,
-        callback: ErrorCallback,
-        event: Event,
-        handler_name: str,
-        error: Exception,
+        callback_result: Any,
     ) -> None:
         """Run an async error callback safely.
 
         Errors in error callbacks are logged but do not propagate.
         """
         try:
-            result = callback(event, handler_name, error)
-            if asyncio.iscoroutine(result):
-                await result
+            if asyncio.iscoroutine(callback_result):
+                await callback_result
         except Exception as callback_error:
             logger.warning(
                 f"Async error callback '{callback_name}' failed: {callback_error}",

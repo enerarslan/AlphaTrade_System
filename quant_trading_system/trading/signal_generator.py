@@ -288,6 +288,7 @@ class SignalGenerator:
         self._pending_signals: dict[str, list[EnrichedSignal]] = {}
         self._signal_history: list[EnrichedSignal] = []
         self._last_signal_time: dict[str, datetime] = {}
+        self._clock_time: datetime = datetime.now(timezone.utc)
 
         # Aggregator
         self._aggregator = SignalAggregator(self.config.conflict_resolution)
@@ -355,6 +356,9 @@ class SignalGenerator:
             List of generated signals.
         """
         all_signals: list[TradeSignal] = []
+        self._clock_time = (
+            max(bar.timestamp for bar in bars.values()) if bars else datetime.now(timezone.utc)
+        )
 
         # Update and generate from strategies
         for strategy in self._strategies.values():
@@ -390,12 +394,10 @@ class SignalGenerator:
                 if aggregated:
                     symbol_signals = [aggregated]
 
-            # Rate limit
-            if not self._check_rate_limit(symbol):
-                continue
-
             # Enrich signals
             for signal in symbol_signals:
+                if not self._check_rate_limit(symbol, signal.timestamp):
+                    continue
                 if self._filter_signal(signal, signal_filter):
                     enriched = self._enrich_signal(signal)
                     enriched_signals.append(enriched)
@@ -406,7 +408,7 @@ class SignalGenerator:
                     self._pending_signals[symbol].append(enriched)
 
                     # Update rate limit
-                    self._last_signal_time[symbol] = datetime.now(timezone.utc)
+                    self._last_signal_time[symbol] = signal.timestamp
 
                     # Invoke callbacks
                     self._dispatch_signal(enriched)
@@ -435,7 +437,7 @@ class SignalGenerator:
             if symbol and sym != symbol:
                 continue
             for sig in sym_signals:
-                if sig.is_actionable:
+                if self._is_actionable(sig):
                     if direction is None or sig.signal.direction == direction:
                         signals.append(sig)
         return signals
@@ -549,7 +551,7 @@ class SignalGenerator:
             priority = SignalPriority.NORMAL
 
         # Set expiration
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.config.default_signal_ttl)
+        expires_at = signal.timestamp + timedelta(seconds=self.config.default_signal_ttl)
 
         metadata = SignalMetadata(
             priority=priority,
@@ -579,6 +581,9 @@ class SignalGenerator:
             return False
         if abs(signal.strength) < filter_criteria.min_strength:
             return False
+        signal_age = (self._clock_time - signal.timestamp).total_seconds()
+        if signal_age > filter_criteria.max_age_seconds:
+            return False
         if filter_criteria.symbols and signal.symbol not in filter_criteria.symbols:
             return False
         if filter_criteria.directions and signal.direction not in filter_criteria.directions:
@@ -600,24 +605,30 @@ class SignalGenerator:
         seen: dict[tuple, TradeSignal] = {}
 
         for signal in signals:
-            # Key by symbol + direction + source
-            key = (signal.symbol, signal.direction, signal.model_source)
+            # Key by symbol + direction + source + dedup time bucket.
+            window = max(1, self.config.dedup_window_seconds)
+            bucket = int(signal.timestamp.timestamp() // window)
+            key = (signal.symbol, signal.direction, signal.model_source, bucket)
 
             if key in seen:
                 # Keep the stronger/more confident one
                 existing = seen[key]
-                if signal.confidence > existing.confidence:
+                if (signal.confidence, abs(signal.strength)) > (
+                    existing.confidence,
+                    abs(existing.strength),
+                ):
                     seen[key] = signal
             else:
                 seen[key] = signal
 
         return list(seen.values())
 
-    def _check_rate_limit(self, symbol: str) -> bool:
+    def _check_rate_limit(self, symbol: str, signal_time: datetime) -> bool:
         """Check if signal generation is rate limited for symbol.
 
         Args:
             symbol: Stock symbol.
+            signal_time: Timestamp for the candidate signal.
 
         Returns:
             True if can generate signal.
@@ -626,7 +637,7 @@ class SignalGenerator:
         if last_time is None:
             return True
 
-        elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
+        elapsed = (signal_time - last_time).total_seconds()
         return elapsed >= self.config.min_signal_interval
 
     def _cleanup_expired(self) -> None:
@@ -634,7 +645,7 @@ class SignalGenerator:
         for symbol in list(self._pending_signals.keys()):
             active = []
             for signal in self._pending_signals[symbol]:
-                if signal.is_expired:
+                if self._is_expired(signal):
                     self._publish_signal_event(
                         signal.signal,
                         EventType.SIGNAL_EXPIRED,
@@ -646,6 +657,17 @@ class SignalGenerator:
                 self._pending_signals[symbol] = active
             else:
                 del self._pending_signals[symbol]
+
+    def _is_expired(self, signal: EnrichedSignal) -> bool:
+        """Clock-aware expiry check using market/event time."""
+        expires_at = signal.metadata.expires_at
+        if expires_at is None:
+            return False
+        return self._clock_time > expires_at
+
+    def _is_actionable(self, signal: EnrichedSignal) -> bool:
+        """Clock-aware actionable check."""
+        return not self._is_expired(signal) and not signal.processed
 
     def _dispatch_signal(self, signal: EnrichedSignal) -> None:
         """Dispatch signal to callbacks and event bus."""

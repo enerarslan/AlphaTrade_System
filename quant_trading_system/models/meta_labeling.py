@@ -463,21 +463,40 @@ class MetaLabeler:
 
         logger.info(f"Training on {len(X_train)} samples ({y_train.sum()} positive)")
 
-        # Train model
+        # Time-ordered holdout for unbiased fit metrics.
+        val_size = max(1, int(len(X_train) * 0.2))
+        gap = min(self.config.max_holding_period, max(0, len(X_train) // 10))
+        split_idx = len(X_train) - val_size - gap
+
         self._model = self._create_model()
-        self._model.fit(X_train, y_train)
+
+        if split_idx >= 20:
+            X_fit = X_train[:split_idx]
+            y_fit = y_train[:split_idx]
+            X_val = X_train[split_idx + gap :]
+            y_val = y_train[split_idx + gap :]
+
+            self._model.fit(X_fit, y_fit)
+            y_pred = self._model.predict(X_val)
+            y_proba = self._model.predict_proba(X_val)[:, 1]
+
+            # Refit on all data after unbiased metric estimation.
+            self._model.fit(X_train, y_train)
+        else:
+            # Fallback for very small samples.
+            self._model.fit(X_train, y_train)
+            y_pred = self._model.predict(X_train)
+            y_proba = self._model.predict_proba(X_train)[:, 1]
+            y_val = y_train
+
         self._is_fitted = True
 
-        # Calculate fit metrics
-        y_pred = self._model.predict(X_train)
-        y_proba = self._model.predict_proba(X_train)[:, 1]
-
         self._fit_metrics = MetaLabelMetrics(
-            precision=precision_score(y_train, y_pred),
-            recall=recall_score(y_train, y_pred),
-            f1=f1_score(y_train, y_pred),
-            auc_roc=roc_auc_score(y_train, y_proba),
-            signals_passed=len(y_train),
+            precision=precision_score(y_val, y_pred),
+            recall=recall_score(y_val, y_pred),
+            f1=f1_score(y_val, y_pred),
+            auc_roc=roc_auc_score(y_val, y_proba),
+            signals_passed=len(y_val),
             signals_filtered=0,
             filter_rate=0.0,
             precision_improvement=0.0,

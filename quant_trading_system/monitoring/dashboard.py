@@ -45,6 +45,9 @@ from .alerting import AlertSeverity, AlertStatus, get_alert_manager
 from .metrics import get_metrics_collector
 from .logger import get_logger, LogCategory
 from ..config.settings import get_settings
+from ..core.events import EventBus, Event, EventType, create_system_event
+from ..core.redis_bridge import RedisEventBridge
+from .health import SystemHealthChecker, HealthStatus, HealthCheckResult
 
 
 logger = get_logger("dashboard", LogCategory.SYSTEM)
@@ -645,6 +648,38 @@ class LogEntryResponse(BaseModel):
     extra: dict[str, Any] | None
 
 
+class TCAResponse(BaseModel):
+    """Transaction Cost Analysis response."""
+    
+    timestamp: str
+    slippage_bps: float
+    market_impact_bps: float
+    execution_speed_ms: float
+    fill_probability: float
+    venue_breakdown: dict[str, float]
+    cost_savings_vs_vwap: float
+
+
+class VaRResponse(BaseModel):
+    """Value at Risk & Stress Test response."""
+    
+    timestamp: str
+    var_95: float
+    var_99: float
+    cvar_95: float
+    stress_scenarios: dict[str, float]  # e.g., "2008_crash": -25.4%
+    distribution_curve: list[dict[str, float]]  # x: pnl, y: probability
+
+
+class FeatureImportanceResponse(BaseModel):
+    """AI Feature Importance response."""
+    
+    timestamp: str
+    model_name: str
+    global_importance: dict[str, float]  # feature: score
+    recent_shift: dict[str, float]  # feature: change_pct
+
+
 # =============================================================================
 # State Management (placeholder - would be injected in real implementation)
 # =============================================================================
@@ -678,13 +713,37 @@ class DashboardState:
         """Get uptime in seconds."""
         return (datetime.now(timezone.utc) - self.start_time).total_seconds()
 
+    async def handle_event(self, event: Event) -> None:
+        """Handle incoming system event."""
+        # Route event to appropriate handler
+        if event.event_type == EventType.PORTFOLIO_UPDATE:
+            self.update_portfolio(event.data)
+            await broadcast_portfolio_update(event.data)
+        elif event.event_type == EventType.ORDER_UPDATE:
+            self.update_order(event.data)
+            await broadcast_order_update(event.data)
+        elif event.event_type == EventType.SIGNAL_GENERATED:
+            self.add_signal(event.data)
+            await broadcast_signal(event.data)
+        elif event.event_type == EventType.RISK_ALERT:
+            # Trigger alert broadcast via alert manager if needed, or direct
+            pass
+
     def update_portfolio(self, data: dict[str, Any]) -> None:
         """Update portfolio data."""
-        self._portfolio_data = data
+        self._portfolio_data.update(data)
+        self._last_update = datetime.now(timezone.utc)
 
-    def update_position(self, symbol: str, data: dict[str, Any]) -> None:
-        """Update position data."""
-        self._positions[symbol] = data
+    def update_position(self, symbol: str, position: dict[str, Any]) -> None:
+        """Update a position."""
+        if position.get("quantity", 0) == 0:
+            if symbol in self._positions:
+                del self._positions[symbol]
+        else:
+            self._positions[symbol] = position
+            
+        # Update last update time
+        self._last_update = datetime.now(timezone.utc)
 
     def remove_position(self, symbol: str) -> None:
         """Remove a position."""
@@ -832,8 +891,13 @@ async def get_health() -> HealthResponse:
     This endpoint is public by default (configurable via ALLOW_PUBLIC_HEALTH env var).
     """
     state = get_dashboard_state()
+    
+    # Use real component health if available
+    checker = SystemHealthChecker()
+    # Note: We run a quick check here or rely on cached background checks
+    # For now, let's use the state which should be updated by background task
+    
     components = {k: "healthy" if v else "unhealthy" for k, v in state._components_healthy.items()}
-
     overall_status = "healthy" if all(state._components_healthy.values()) else "degraded"
 
     return HealthResponse(
@@ -842,6 +906,24 @@ async def get_health() -> HealthResponse:
         uptime_seconds=state.get_uptime(),
         components=components,
     )
+
+
+@app.get("/health/detailed", tags=["System"])
+async def get_health_detailed() -> dict[str, Any]:
+    """Get detailed system health report.
+    
+    This runs actual diagnostics on all components.
+    Public endpoint for easy monitoring.
+    """
+    checker = SystemHealthChecker()
+    results = await checker.run_all_checks()
+    overall = checker.get_overall_status(results)
+    
+    return {
+        "status": overall.value,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": [r.to_dict() for r in results]
+    }
 
 
 @app.get("/metrics", tags=["System"])
@@ -1140,6 +1222,70 @@ async def get_logs(
     ]
 
 
+@app.get("/execution/tca", response_model=TCAResponse, tags=["Execution"])
+async def get_tca_metrics(current_user: AuthenticatedUser) -> TCAResponse:
+    """Get Transaction Cost Analysis metrics. Requires authentication."""
+    # MOCKED for Phase 1
+    return TCAResponse(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        slippage_bps=2.4,
+        market_impact_bps=1.1,
+        execution_speed_ms=145.0,
+        fill_probability=0.98,
+        venue_breakdown={"IEX": 0.45, "NYSE": 0.30, "DARK": 0.25},
+        cost_savings_vs_vwap=12.5
+    )
+
+
+@app.get("/risk/var", response_model=VaRResponse, tags=["Risk"])
+async def get_var_metrics(current_user: AuthenticatedUser) -> VaRResponse:
+    """Get Value at Risk simulations. Requires authentication."""
+    # MOCKED for Phase 1
+    import numpy as np
+    
+    # Generate a mock normal distribution for VaR
+    x = np.linspace(-5000, 5000, 50)
+    y = (1 / (np.sqrt(2 * np.pi) * 1000)) * np.exp(-0.5 * ((x / 1000) ** 2))
+    
+    distribution = [{"pnl": float(xi), "probability": float(yi)} for xi, yi in zip(x, y)]
+
+    return VaRResponse(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        var_95=12400.0,
+        var_99=18500.0,
+        cvar_95=15600.0,
+        stress_scenarios={
+            "Black Monday": -22.4,
+            "DotCom Burst": -15.8,
+            "Covid Crash": -18.2,
+            "Rate Hike": -5.4
+        },
+        distribution_curve=distribution
+    )
+
+
+@app.get("/models/explainability", response_model=FeatureImportanceResponse, tags=["Models"])
+async def get_model_explainability(current_user: AuthenticatedUser) -> FeatureImportanceResponse:
+    """Get AI feature importance (SHAP values). Requires authentication."""
+    # MOCKED for Phase 1
+    return FeatureImportanceResponse(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        model_name="Ensemble_v4",
+        global_importance={
+            "momentum_rsi": 0.35,
+            "volatility_atr": 0.25,
+            "order_flow_imbalance": 0.20,
+            "sector_correlation": 0.15,
+            "macro_sentiment": 0.05
+        },
+        recent_shift={
+            "momentum_rsi": -0.05,
+            "volatility_atr": 0.12,  # Volatility becoming more important
+            "order_flow_imbalance": 0.01
+        }
+    )
+
+
 # =============================================================================
 # WebSocket Endpoints
 # =============================================================================
@@ -1269,3 +1415,57 @@ def get_dashboard_app() -> FastAPI:
         FastAPI application instance.
     """
     return app
+
+
+# =============================================================================
+# Startup & Shutdown Events
+# =============================================================================
+
+
+_redis_bridge: RedisEventBridge | None = None
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Initialize dashboard services on startup."""
+    global _redis_bridge
+    logger.info("Starting dashboard services...")
+
+    try:
+        # Initialize EventBus
+        event_bus = EventBus()
+
+        # Initialize and start Redis Bridge
+        # We subscribe to "events.dashboard" (trading engine publishes here)
+        # And we publish control events to "events.control"
+        _redis_bridge = RedisEventBridge(
+            event_bus, 
+            publish_channels=["events.control"],
+            subscribe_channels=["events.dashboard"]
+        )
+        await _redis_bridge.start()
+
+        # Subscribe DashboardState to EventBus
+        # The RedisBridge receives "events.dashboard" -> republishes to local EventBus
+        # DashboardState listens to local EventBus -> updates state & WebSocket
+        state = get_dashboard_state()
+        event_bus.subscribe_all(state.handle_event, "dashboard_state_updater")
+        
+        logger.info("Dashboard services started successfully")
+
+    except Exception as e:
+        logger.error(f"Failed to start dashboard services: {e}")
+        # We don't raise here to allow the API to start even if Redis is down,
+        # but health checks will show it.
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    """Clean up resources on shutdown."""
+    global _redis_bridge
+    logger.info("Stopping dashboard services...")
+
+    if _redis_bridge:
+        await _redis_bridge.stop()
+
+    logger.info("Dashboard services stopped")

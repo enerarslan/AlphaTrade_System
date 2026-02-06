@@ -60,6 +60,39 @@ class CrossSectionalFeature(ABC):
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
 
+    def align_series(
+        self,
+        base_df: pl.DataFrame,
+        base_col: str,
+        other_df: pl.DataFrame,
+        other_col: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Align two series by timestamp when available, else by common prefix length."""
+        base = base_df[base_col].to_numpy().astype(np.float64)
+        other = other_df[other_col].to_numpy().astype(np.float64)
+
+        if "timestamp" in base_df.columns and "timestamp" in other_df.columns:
+            try:
+                left = base_df.select([
+                    pl.col("timestamp"),
+                    pl.col(base_col).alias("_base"),
+                ])
+                right = other_df.select([
+                    pl.col("timestamp"),
+                    pl.col(other_col).alias("_other"),
+                ])
+                joined = left.join(right, on="timestamp", how="inner").sort("timestamp")
+                if len(joined) > 0:
+                    return (
+                        joined["_base"].to_numpy().astype(np.float64),
+                        joined["_other"].to_numpy().astype(np.float64),
+                    )
+            except Exception:
+                pass
+
+        min_len = min(len(base), len(other))
+        return base[:min_len], other[:min_len]
+
 
 # =============================================================================
 # RELATIVE METRICS
@@ -89,11 +122,7 @@ class RelativeStrength(CrossSectionalFeature):
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
             if "close" in spy_df.columns:
-                benchmark = spy_df["close"].to_numpy().astype(np.float64)
-                # Align lengths
-                min_len = min(len(close), len(benchmark))
-                close = close[:min_len]
-                benchmark = benchmark[:min_len]
+                close, benchmark = self.align_series(df, "close", spy_df, "close")
             else:
                 benchmark = None
         else:
@@ -145,10 +174,7 @@ class BetaToMarket(CrossSectionalFeature):
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
             if "close" in spy_df.columns:
-                benchmark = spy_df["close"].to_numpy().astype(np.float64)
-                min_len = min(len(close), len(benchmark))
-                close = close[:min_len]
-                benchmark = benchmark[:min_len]
+                close, benchmark = self.align_series(df, "close", spy_df, "close")
             else:
                 benchmark = None
         else:
@@ -204,10 +230,7 @@ class RelativeVolume(CrossSectionalFeature):
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
             if "volume" in spy_df.columns:
-                bench_vol = spy_df["volume"].to_numpy().astype(np.float64)
-                min_len = min(len(volume), len(bench_vol))
-                volume = volume[:min_len]
-                bench_vol = bench_vol[:min_len]
+                volume, bench_vol = self.align_series(df, "volume", spy_df, "volume")
             else:
                 bench_vol = None
         else:

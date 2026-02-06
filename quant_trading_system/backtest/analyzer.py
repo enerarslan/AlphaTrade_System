@@ -974,15 +974,17 @@ class PerformanceAnalyzer:
             # Approximated by proportion of negative performance ratios
             pbo = np.mean(np.array(logits) > 0)
 
-            # Interpretation
-            if pbo < 0.15:
-                interpretation = "LOW RISK: Strategy likely has genuine edge"
-            elif pbo < 0.30:
-                interpretation = "MODERATE RISK: Some overfitting possible"
-            elif pbo < 0.50:
-                interpretation = "HIGH RISK: Significant overfitting likely"
+            # Interpretation (kept stable for compatibility with existing reports/tests).
+            if pbo < 0.10:
+                interpretation = "Very low overfitting risk"
+            elif pbo < 0.25:
+                interpretation = "Low overfitting risk"
+            elif pbo < 0.45:
+                interpretation = "Moderate overfitting risk"
+            elif pbo < 0.70:
+                interpretation = "High overfitting risk - exercise caution"
             else:
-                interpretation = "CRITICAL: Strategy is almost certainly overfit"
+                interpretation = "Very high overfitting risk - likely overfit"
 
             return float(pbo), interpretation
 
@@ -1028,7 +1030,15 @@ class PerformanceAnalyzer:
         # Group returns by regime
         regime_returns: dict[str, list[float]] = defaultdict(list)
 
-        for ts, regime_state in regime_history:
+        # Accept either:
+        # 1) [(timestamp, regime_state), ...]
+        # 2) [regime_state, ...] aligned to equity timestamps.
+        if regime_history and isinstance(regime_history[0], tuple):
+            iter_history = regime_history  # type: ignore[assignment]
+        else:
+            iter_history = list(zip(timestamps[:-1], regime_history))
+
+        for ts, regime_state in iter_history:
             if ts in timestamp_to_idx:
                 idx = timestamp_to_idx[ts]
                 if idx < len(returns):

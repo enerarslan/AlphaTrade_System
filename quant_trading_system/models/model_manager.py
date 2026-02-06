@@ -18,6 +18,7 @@ from typing import Any, Callable
 import numpy as np
 
 from quant_trading_system.models.base import ModelType, TradingModel
+from quant_trading_system.models.purged_cv import create_purged_cv
 
 
 class SplitMethod(str, Enum):
@@ -806,7 +807,7 @@ class HyperparameterOptimizer:
         params: dict[str, Any],
         X: np.ndarray,
         y: np.ndarray,
-        cv_splitter: TimeSeriesSplitter,
+        cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
     ) -> float:
         """Evaluate a parameter combination using cross-validation."""
@@ -826,18 +827,62 @@ class HyperparameterOptimizer:
             if scoring_func is not None:
                 score = scoring_func(y_test, predictions)
             else:
-                # Default: negative MSE (higher is better)
-                score = -np.mean((y_test - predictions) ** 2)
+                score = self._default_score(y_test, predictions)
 
             scores.append(score)
 
         return np.mean(scores)
 
+    def _default_score(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+    ) -> float:
+        """Default optimization score aligned with selected metric."""
+        metric = self.metric.lower()
+
+        if metric in ("mse", "neg_mse"):
+            return -float(np.mean((y_true - y_pred) ** 2))
+        if metric == "mae":
+            return -float(np.mean(np.abs(y_true - y_pred)))
+        if metric == "r2":
+            y_var = np.var(y_true)
+            if y_var <= 1e-12:
+                return 0.0
+            return float(1 - np.mean((y_true - y_pred) ** 2) / y_var)
+
+        # Trading metrics: simulate directional strategy returns.
+        if len(y_true) < 2:
+            return float("-inf")
+
+        simulated_returns = np.sign(y_pred[:-1]) * y_true[1:]
+        if len(simulated_returns) == 0:
+            return float("-inf")
+
+        if metric in ("sharpe", "sharpe_ratio"):
+            std = np.std(simulated_returns)
+            if std <= 1e-12:
+                return float("-inf")
+            return float(np.mean(simulated_returns) / std * np.sqrt(252))
+
+        if metric == "win_rate":
+            return float(np.mean(simulated_returns > 0))
+
+        if metric == "profit_factor":
+            gross_profit = np.sum(simulated_returns[simulated_returns > 0])
+            gross_loss = abs(np.sum(simulated_returns[simulated_returns < 0]))
+            if gross_loss <= 1e-12:
+                return float("inf")
+            return float(gross_profit / gross_loss)
+
+        # Conservative fallback.
+        return -float(np.mean((y_true - y_pred) ** 2))
+
     def _random_search(
         self,
         X: np.ndarray,
         y: np.ndarray,
-        cv_splitter: TimeSeriesSplitter,
+        cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
     ) -> dict[str, Any]:
         """Random search optimization."""
@@ -880,7 +925,7 @@ class HyperparameterOptimizer:
         self,
         X: np.ndarray,
         y: np.ndarray,
-        cv_splitter: TimeSeriesSplitter,
+        cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
     ) -> dict[str, Any]:
         """Grid search optimization."""
@@ -924,7 +969,7 @@ class HyperparameterOptimizer:
         self,
         X: np.ndarray,
         y: np.ndarray,
-        cv_splitter: TimeSeriesSplitter,
+        cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
     ) -> dict[str, Any]:
         """Bayesian optimization using optuna."""
@@ -1089,6 +1134,9 @@ class ModelManager:
         cv_method: SplitMethod = SplitMethod.WALK_FORWARD,
         n_splits: int = 5,
         metrics: list[str] | None = None,
+        gap: int = 5,
+        embargo_pct: float = 0.01,
+        prediction_horizon: int = 1,
     ) -> dict[str, Any]:
         """
         Perform cross-validation.
@@ -1104,11 +1152,33 @@ class ModelManager:
         Returns:
             Dictionary of metric results
         """
-        splitter = TimeSeriesSplitter(method=cv_method, n_splits=n_splits)
-        splits = splitter.split(X, y)
+        if cv_method == SplitMethod.PURGED_KFOLD:
+            splitter = create_purged_cv(
+                cv_type="purged_kfold",
+                n_splits=n_splits,
+                purge_gap=gap,
+                embargo_pct=embargo_pct,
+                prediction_horizon=prediction_horizon,
+            )
+            splits = list(splitter.split(X, y))
+        elif cv_method == SplitMethod.WALK_FORWARD:
+            splitter = create_purged_cv(
+                cv_type="walk_forward",
+                n_splits=n_splits,
+                purge_gap=gap,
+                embargo_pct=embargo_pct,
+                prediction_horizon=prediction_horizon,
+            )
+            splits = list(splitter.split(X, y))
+        else:
+            splitter = TimeSeriesSplitter(method=cv_method, n_splits=n_splits, gap=gap)
+            splits = splitter.split(X, y)
 
         if metrics is None:
-            metrics = ["mse", "mae", "r2"] if model.model_type == ModelType.REGRESSOR else ["accuracy", "f1"]
+            if model.model_type == ModelType.REGRESSOR:
+                metrics = ["sharpe", "max_drawdown", "win_rate", "mse"]
+            else:
+                metrics = ["accuracy", "f1"]
 
         results: dict[str, list[float]] = {metric: [] for metric in metrics}
 
@@ -1151,6 +1221,10 @@ class ModelManager:
         )
 
         results = {}
+        trading_returns: np.ndarray | None = None
+        if model_type == ModelType.REGRESSOR and len(y_true) > 1:
+            trading_returns = np.sign(y_pred[:-1]) * y_true[1:]
+
         for metric in metrics:
             if metric == "mse":
                 results[metric] = mean_squared_error(y_true, y_pred)
@@ -1163,9 +1237,35 @@ class ModelManager:
             elif metric == "f1":
                 results[metric] = f1_score(y_true, y_pred, average="weighted", zero_division=0)
             elif metric == "sharpe":
-                # Simple Sharpe approximation
-                returns = y_pred - y_true  # Assuming returns
-                results[metric] = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+                if trading_returns is None or len(trading_returns) == 0:
+                    results[metric] = 0.0
+                else:
+                    std = np.std(trading_returns)
+                    results[metric] = (
+                        float(np.mean(trading_returns) / std * np.sqrt(252))
+                        if std > 1e-8
+                        else 0.0
+                    )
+            elif metric == "max_drawdown":
+                if trading_returns is None or len(trading_returns) == 0:
+                    results[metric] = 0.0
+                else:
+                    cumulative = np.cumprod(1 + trading_returns)
+                    running_max = np.maximum.accumulate(cumulative)
+                    drawdown = (running_max - cumulative) / np.maximum(running_max, 1e-12)
+                    results[metric] = float(np.max(drawdown))
+            elif metric == "win_rate":
+                if trading_returns is None or len(trading_returns) == 0:
+                    results[metric] = 0.0
+                else:
+                    results[metric] = float(np.mean(trading_returns > 0))
+            elif metric == "profit_factor":
+                if trading_returns is None or len(trading_returns) == 0:
+                    results[metric] = 0.0
+                else:
+                    gross_profit = np.sum(trading_returns[trading_returns > 0])
+                    gross_loss = abs(np.sum(trading_returns[trading_returns < 0]))
+                    results[metric] = float(gross_profit / gross_loss) if gross_loss > 1e-12 else float("inf")
 
         return results
 
@@ -1178,6 +1278,7 @@ class ModelManager:
         n_trials: int = 50,
         optimization_method: str = "random",
         cv_method: SplitMethod = SplitMethod.WALK_FORWARD,
+        optimization_metric: str = "sharpe_ratio",
         register: bool = True,
         holdout_fraction: float = 0.15,
         gap: int = 5,
@@ -1249,11 +1350,29 @@ class ModelManager:
         optimizer = HyperparameterOptimizer(
             model_class=model_class,
             param_space=param_space,
+            metric=optimization_metric,
             n_trials=n_trials,
             method=optimization_method,
         )
 
-        cv_splitter = TimeSeriesSplitter(method=cv_method, n_splits=5, gap=gap)
+        if cv_method == SplitMethod.PURGED_KFOLD:
+            cv_splitter = create_purged_cv(
+                cv_type="purged_kfold",
+                n_splits=5,
+                purge_gap=gap,
+                embargo_pct=0.01,
+                prediction_horizon=1,
+            )
+        elif cv_method == SplitMethod.WALK_FORWARD:
+            cv_splitter = create_purged_cv(
+                cv_type="walk_forward",
+                n_splits=5,
+                purge_gap=gap,
+                embargo_pct=0.01,
+                prediction_horizon=1,
+            )
+        else:
+            cv_splitter = TimeSeriesSplitter(method=cv_method, n_splits=5, gap=gap)
         best_params = optimizer.optimize(X_train_val, y_train_val, cv_splitter)
 
         logger.info(f"Best hyperparameters: {best_params}")
@@ -1326,6 +1445,7 @@ class ModelManager:
         y_true: np.ndarray,
         y_pred: np.ndarray,
         model_type: "ModelType",
+        assumed_cost_bps: float = 5.0,
     ) -> dict[str, float]:
         """
         JPMORGAN FIX: Calculate comprehensive metrics on holdout test set.
@@ -1359,7 +1479,11 @@ class ModelManager:
             # Simulated returns based on predictions
             if len(y_true) > 1:
                 # Assume y_pred is return prediction, trade in direction of prediction
-                simulated_returns = np.sign(y_pred[:-1]) * y_true[1:]
+                signals = np.sign(y_pred[:-1])
+                gross_returns = signals * y_true[1:]
+                turnover = np.abs(np.diff(np.concatenate([[0.0], signals])))
+                costs = turnover * (assumed_cost_bps / 10000)
+                simulated_returns = gross_returns - costs
 
                 if len(simulated_returns) > 0 and np.std(simulated_returns) > 1e-10:
                     # Sharpe ratio (annualized assuming 15-min bars, ~26 bars/day, 252 days/year)

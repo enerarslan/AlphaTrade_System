@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Iterator
 
 import numpy as np
-from scipy import optimize
 from scipy.stats import uniform
 
 from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
@@ -368,6 +367,16 @@ class BayesianOptimizer(BaseOptimizer):
                 new_x = best_x + noise * (np.array([s.high - s.low for s in self._continuous_params]))
                 new_x = np.clip(new_x, [s.low for s in self._continuous_params], [s.high for s in self._continuous_params])
                 params = {s.name: new_x[i] for i, s in enumerate(self._continuous_params)}
+
+                # Keep non-continuous parameters present and explicit.
+                for space in self.param_spaces:
+                    if space.param_type == "continuous":
+                        continue
+
+                    if best_params and space.name in best_params:
+                        params[space.name] = best_params[space.name]
+                    else:
+                        params[space.name] = space.sample()
 
             metric = self._evaluate(params)
 

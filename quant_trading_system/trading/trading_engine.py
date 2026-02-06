@@ -657,24 +657,23 @@ class TradingEngine:
                 except Exception as e:
                     logger.error(f"Signal callback error: {e}")
 
-            # 4. Build target portfolio
-            if signals:
-                target = self.portfolio_manager.build_target_portfolio(
-                    signals=signals,
-                    portfolio=portfolio,
-                    prices=self._prices,
-                )
+            # 4. Build target portfolio (including empty-signal case)
+            target = self.portfolio_manager.build_target_portfolio(
+                signals=signals,
+                portfolio=portfolio,
+                prices=self._prices,
+            )
 
-                # 5. Check if rebalancing needed
-                needs_rebalance, reason = self.portfolio_manager.check_rebalance_needed(
-                    target=target,
-                    portfolio=portfolio,
-                    prices=self._prices,
-                )
+            # 5. Check if rebalancing needed
+            needs_rebalance, reason = self.portfolio_manager.check_rebalance_needed(
+                target=target,
+                portfolio=portfolio,
+                prices=self._prices,
+            )
 
-                # 6. Generate and execute trades
-                if needs_rebalance:
-                    await self._execute_rebalance(target, portfolio)
+            # 6. Generate and execute trades
+            if needs_rebalance:
+                await self._execute_rebalance(target, portfolio)
 
             # Update metrics
             self._metrics.bars_processed += len(self._latest_bars)
@@ -727,18 +726,22 @@ class TradingEngine:
             return
 
         # P0 FIX: Also check local kill switch flag for redundancy
-        if self._session and self._session.kill_switch_triggered:
-            logger.warning("Local kill switch triggered - blocking order submission")
-            return
+        # P0-7 FIX: Acquire lock when reading session state
+        with self._state_lock:
+            if self._session and self._session.kill_switch_triggered:
+                logger.warning("Local kill switch triggered - blocking order submission")
+                return
 
         if self.config.mode == TradingMode.DRY_RUN:
             logger.info("DRY RUN: Would execute rebalance trades")
             return
 
         # Check trade limits
-        if self._session and self._session.trades_today >= self.config.max_daily_trades:
-            logger.warning("Daily trade limit reached")
-            return
+        # P0-7 FIX: Acquire lock when reading session state
+        with self._state_lock:
+            if self._session and self._session.trades_today >= self.config.max_daily_trades:
+                logger.warning("Daily trade limit reached")
+                return
 
         # Generate trades
         trades = self.portfolio_manager.generate_rebalance_trades(
@@ -778,7 +781,9 @@ class TradingEngine:
                     # Check if any risk check failed
                     failed_checks = [r for r in risk_results if not r.passed]
                     if failed_checks:
-                        reasons = "; ".join(r.reason for r in failed_checks if r.reason)
+                        # P0 FIX (January 2026 Audit): Use 'message' attribute instead of 'reason'
+                        # RiskCheckResult dataclass has 'message' field, not 'reason'
+                        reasons = "; ".join(r.message for r in failed_checks if r.message)
                         logger.warning(
                             f"Order rejected by PreTradeRiskChecker: {request.symbol} "
                             f"- {reasons}"
@@ -790,8 +795,10 @@ class TradingEngine:
                         current_price=current_price,
                     )
 
-                if self._session:
-                    self._session.orders_submitted += 1
+                # P0-7 FIX: Acquire lock when modifying session state
+                with self._state_lock:
+                    if self._session:
+                        self._session.orders_submitted += 1
                 self._metrics.orders_submitted += 1
 
             except Exception as e:
@@ -880,28 +887,37 @@ class TradingEngine:
 
         Returns:
             True if trading can continue.
+
+        P0-7 FIX (January 2026 Audit): Added lock to prevent race condition
+        with websocket callbacks that also modify session state.
         """
         if not self._session:
             return True
 
         portfolio = self.position_tracker.get_portfolio()
-        self._session.current_equity = portfolio.equity
 
-        # Calculate current P&L
-        self._session.daily_pnl = portfolio.equity - self._session.start_equity
-        if self._session.start_equity > 0:
-            self._session.daily_pnl_pct = float(
-                self._session.daily_pnl / self._session.start_equity
-            )
+        # P0-7 FIX: Acquire lock before modifying session state
+        with self._state_lock:
+            self._session.current_equity = portfolio.equity
+
+            # Calculate current P&L
+            self._session.daily_pnl = portfolio.equity - self._session.start_equity
+            if self._session.start_equity > 0:
+                self._session.daily_pnl_pct = float(
+                    self._session.daily_pnl / self._session.start_equity
+                )
+
+            # Capture values we need outside the lock
+            daily_pnl_pct = self._session.daily_pnl_pct
 
         # UPDATE DRAWDOWN METRICS (Critical fix: max_drawdown was never calculated before)
         # This must be called BEFORE checking drawdown limit
         self._update_drawdown(portfolio.equity)
 
         # Check daily loss limit
-        if self._session.daily_pnl_pct < -self.config.max_daily_loss_pct:
+        if daily_pnl_pct < -self.config.max_daily_loss_pct:
             self.trigger_kill_switch(
-                f"Daily loss limit exceeded: {self._session.daily_pnl_pct:.2%}"
+                f"Daily loss limit exceeded: {daily_pnl_pct:.2%}"
             )
             return False
 

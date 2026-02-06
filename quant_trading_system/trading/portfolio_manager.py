@@ -235,7 +235,7 @@ class PositionSizer:
         elif self.config.method == PositionSizingMethod.KELLY:
             # Simplified Kelly criterion
             # f = (p * b - q) / b where p=win_prob, q=1-p, b=win/loss ratio
-            win_prob = (signal.signal.confidence + 1) / 2  # Map confidence to prob
+            win_prob = max(0.0, min(1.0, signal.signal.confidence))
             win_loss_ratio = abs(signal.signal.strength) * 2  # Estimate
 
             if win_loss_ratio > 0:
@@ -415,6 +415,13 @@ class PortfolioManager:
             price = prices.get(symbol, Decimal("0"))
             if price <= 0:
                 continue
+
+            if self.rebalance_config.consider_transaction_costs:
+                cost_drag = self.rebalance_config.transaction_cost_bps / 10000
+                sign = -1.0 if weight < 0 else 1.0
+                weight = sign * max(0.0, abs(weight) - cost_drag)
+                if weight == 0.0:
+                    continue
 
             # For shorts, weight is negative - use absolute value for target_value
             is_short = weight < 0
@@ -618,11 +625,12 @@ class PortfolioManager:
             # Determine stop loss and take profit if signal available
             stop_loss = None
             take_profit = None
+            signal_id = None
 
             if trade.target_position and trade.target_position.signal:
                 signal = trade.target_position.signal
                 # Could add stop/take profit based on signal metadata
-                pass
+                signal_id = signal.signal.signal_id
 
             request = OrderRequest(
                 symbol=trade.symbol,
@@ -632,6 +640,7 @@ class PortfolioManager:
                 limit_price=trade.limit_price,
                 priority=trade.priority,
                 strategy_id=strategy_id or "",
+                signal_id=signal_id,
                 notes=trade.reason,
                 stop_loss_price=stop_loss,
                 take_profit_price=take_profit,
@@ -692,7 +701,8 @@ class PortfolioManager:
         for symbol, position in portfolio.positions.items():
             target_pos = target.target_positions.get(symbol)
             target_value = target_pos.target_value if target_pos else Decimal("0")
-            change = abs(target_value - position.market_value)
+            current_abs_value = abs(position.market_value)
+            change = abs(target_value - current_abs_value)
             total_change += change
 
         # New positions
@@ -721,13 +731,21 @@ class PortfolioManager:
 
         for trade in trades:
             trade_value = float(trade.notional_value)
-            if total_value + trade_value <= max_turnover_value:
+            if self.rebalance_config.consider_transaction_costs:
+                estimated_cost = trade_value * (
+                    self.rebalance_config.transaction_cost_bps / 10000
+                )
+            else:
+                estimated_cost = 0.0
+            effective_trade_value = trade_value + estimated_cost
+
+            if total_value + effective_trade_value <= max_turnover_value:
                 filtered_trades.append(trade)
-                total_value += trade_value
+                total_value += effective_trade_value
             else:
                 logger.warning(
                     f"Skipping trade {trade.symbol} due to turnover limit "
-                    f"({total_value + trade_value:.0f} > {max_turnover_value:.0f})"
+                    f"({total_value + effective_trade_value:.0f} > {max_turnover_value:.0f})"
                 )
 
         return filtered_trades

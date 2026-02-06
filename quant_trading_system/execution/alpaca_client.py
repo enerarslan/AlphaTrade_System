@@ -510,23 +510,33 @@ class AlpacaClient:
         params: dict[str, Any] | None,
         json_data: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Make synchronous HTTP request (fallback when aiohttp unavailable)."""
+        """Make synchronous HTTP request (fallback when aiohttp unavailable).
+
+        P0-3 FIX (January 2026 Audit): Wrap blocking urllib call in asyncio.to_thread()
+        to prevent blocking the event loop. Previously this blocked the entire event
+        loop which could cause timeouts and missed updates in live trading.
+        """
         import json
         import urllib.request
 
-        req_url = url
-        if params:
-            query = "&".join(f"{k}={v}" for k, v in params.items())
-            req_url = f"{url}?{query}"
+        def _blocking_request() -> dict[str, Any]:
+            """Execute blocking HTTP request in thread pool."""
+            req_url = url
+            if params:
+                query = "&".join(f"{k}={v}" for k, v in params.items())
+                req_url = f"{url}?{query}"
 
-        data = json.dumps(json_data).encode() if json_data else None
-        request = urllib.request.Request(req_url, data=data, method=method)
+            data = json.dumps(json_data).encode() if json_data else None
+            request = urllib.request.Request(req_url, data=data, method=method)
 
-        for key, value in self.headers.items():
-            request.add_header(key, value)
+            for key, value in self.headers.items():
+                request.add_header(key, value)
 
-        with urllib.request.urlopen(request) as response:
-            return json.loads(response.read().decode())
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode())
+
+        # Run blocking code in thread pool to avoid blocking event loop
+        return await asyncio.to_thread(_blocking_request)
 
     # Account Methods
 

@@ -404,10 +404,17 @@ class PolarsDataHandler(DataHandler):
 
             row = self._data_indexed[symbol].get(current_date)
             if row is not None:
+                if isinstance(current_date, datetime):
+                    timestamp = current_date
+                else:
+                    timestamp = pd.Timestamp(current_date).to_pydatetime()
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=timezone.utc)
+
                 # Create OHLCVBar from Polars row
                 bar = OHLCVBar(
                     symbol=symbol,
-                    timestamp=current_date if isinstance(current_date, datetime) else datetime.now(timezone.utc),
+                    timestamp=timestamp,
                     open=Decimal(str(round(row.get("open", row.get("Open", 0)), 8))),
                     high=Decimal(str(round(row.get("high", row.get("High", 0)), 8))),
                     low=Decimal(str(round(row.get("low", row.get("Low", 0)), 8))),
@@ -728,10 +735,13 @@ class BacktestEngine:
         if execution_price is None:
             return None
 
+        spread_bps = Decimal(str(conditions.spread_bps / 10000))
+        half_spread = execution_price * spread_bps / Decimal("2")
+
         conditions = MarketConditions(
             price=execution_price,
-            bid=conditions.bid,
-            ask=conditions.ask,
+            bid=execution_price - half_spread,
+            ask=execution_price + half_spread,
             volume=bar.volume,
             avg_daily_volume=conditions.avg_daily_volume,
             volatility=conditions.volatility,
@@ -771,13 +781,29 @@ class BacktestEngine:
         trade_value = fill_quantity * fill_price
 
         if order.side == OrderSide.BUY:
-            return self._state.cash >= trade_value + commission
+            if self._state.cash < trade_value + commission:
+                return False
+        else:
+            # For sells, check position
+            position = self._state.positions.get(order.symbol)
+            if position is None and not self.config.allow_short:
+                return False
+            if position is not None and position.quantity < fill_quantity and not self.config.allow_short:
+                return False
 
-        # For sells, check position
-        position = self._state.positions.get(order.symbol)
-        if position is None:
-            return self.config.allow_short
-        return position.quantity >= fill_quantity or self.config.allow_short
+        if self._state.equity <= 0:
+            return False
+
+        # Enforce gross leverage cap.
+        current_gross = sum(abs(p.market_value) for p in self._state.positions.values())
+        max_gross = self._state.equity * Decimal(str(self.config.max_leverage))
+        additional_exposure = self._estimate_additional_exposure(
+            symbol=order.symbol,
+            side=order.side,
+            quantity=fill_quantity,
+            price=fill_price,
+        )
+        return current_gross + additional_exposure <= max_gross
 
     def _fill_order_with_result(
         self,
@@ -789,101 +815,141 @@ class BacktestEngine:
         fill_price = fill_result.fill_price
         fill_quantity = fill_result.fill_quantity
         commission = fill_result.commission
+        slippage = fill_result.slippage
+        if fill_quantity <= 0:
+            return
+
         trade_value = fill_quantity * fill_price
 
-        # Update position
         position = self._state.positions.get(order.symbol)
+        current_qty = position.quantity if position else Decimal("0")
+        open_pos = self._open_positions.get(order.symbol)
 
         if order.side == OrderSide.BUY:
             self._state.cash -= trade_value + commission
+            new_qty = current_qty + fill_quantity
+            closing_qty = min(abs(current_qty), fill_quantity) if current_qty < 0 else Decimal("0")
+            opening_qty = fill_quantity - closing_qty
+            closing_side = OrderSide.SELL
+            entry_side = OrderSide.BUY
+        else:
+            self._state.cash += trade_value - commission
+            new_qty = current_qty - fill_quantity
+            closing_qty = min(current_qty, fill_quantity) if current_qty > 0 else Decimal("0")
+            opening_qty = fill_quantity - closing_qty
+            closing_side = OrderSide.BUY
+            entry_side = OrderSide.SELL
 
-            if position is None:
-                # New position
-                self._state.positions[order.symbol] = Position(
-                    symbol=order.symbol,
-                    quantity=fill_quantity,
-                    avg_entry_price=fill_price,
-                    current_price=fill_price,
-                    cost_basis=trade_value,
-                    market_value=trade_value,
+        # Realized PnL from the closing leg of this fill.
+        if closing_qty > 0 and open_pos is not None:
+            tracked_qty = Decimal(str(open_pos.get("quantity", abs(current_qty))))
+            tracked_qty = max(tracked_qty, closing_qty)
+            close_ratio = closing_qty / tracked_qty if tracked_qty > 0 else Decimal("1")
+            exit_ratio = closing_qty / fill_quantity if fill_quantity > 0 else Decimal("0")
+
+            entry_commission = Decimal(str(open_pos.get("total_commission", Decimal("0")))) * close_ratio
+            entry_slippage = Decimal(str(open_pos.get("total_slippage", Decimal("0")))) * close_ratio
+            exit_commission = commission * exit_ratio
+            exit_slippage = slippage * exit_ratio
+            total_commission = entry_commission + exit_commission
+            total_slippage = entry_slippage + exit_slippage
+
+            entry_price = Decimal(str(open_pos.get("entry_price", fill_price)))
+            entry_direction = open_pos.get("entry_side", closing_side)
+
+            if entry_direction == OrderSide.BUY:
+                gross_pnl = (fill_price - entry_price) * closing_qty
+            else:
+                gross_pnl = (entry_price - fill_price) * closing_qty
+
+            pnl = gross_pnl - total_commission - total_slippage
+            notional = abs(entry_price * closing_qty)
+            pnl_pct = float(pnl / notional) if notional > 0 else 0.0
+
+            trade = Trade(
+                symbol=order.symbol,
+                entry_time=open_pos["entry_time"],
+                exit_time=fill_time,
+                side=entry_direction,
+                quantity=closing_qty,
+                entry_price=entry_price,
+                exit_price=fill_price,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                commission=total_commission,
+                slippage=total_slippage,
+                holding_period_bars=open_pos.get("bars_held", 0),
+                metadata={
+                    "fill_type": fill_result.fill_type.value,
+                    "latency_ms": fill_result.latency_ms,
+                    "market_impact": float(fill_result.market_impact),
+                },
+            )
+            self._state.trades.append(trade)
+
+            remaining_tracked_qty = tracked_qty - closing_qty
+            if remaining_tracked_qty > 0:
+                open_pos["quantity"] = remaining_tracked_qty
+                open_pos["total_commission"] = max(
+                    Decimal("0"),
+                    Decimal(str(open_pos.get("total_commission", Decimal("0")))) - entry_commission,
                 )
+                open_pos["total_slippage"] = max(
+                    Decimal("0"),
+                    Decimal(str(open_pos.get("total_slippage", Decimal("0")))) - entry_slippage,
+                )
+                self._open_positions[order.symbol] = open_pos
+            else:
+                self._open_positions.pop(order.symbol, None)
+
+        # Open/increase the new leg (same-side add or reversal remainder).
+        if opening_qty > 0:
+            open_ratio = opening_qty / fill_quantity if fill_quantity > 0 else Decimal("0")
+            open_commission = commission * open_ratio
+            open_slippage = slippage * open_ratio
+            tracked = self._open_positions.get(order.symbol)
+
+            if (
+                tracked is not None
+                and tracked.get("entry_side") == entry_side
+                and Decimal(str(tracked.get("quantity", Decimal("0")))) > 0
+            ):
+                prev_qty = Decimal(str(tracked.get("quantity", Decimal("0"))))
+                prev_entry = Decimal(str(tracked.get("entry_price", fill_price)))
+                total_qty = prev_qty + opening_qty
+                weighted_entry = (
+                    (prev_entry * prev_qty) + (fill_price * opening_qty)
+                ) / total_qty
+                tracked["entry_price"] = weighted_entry
+                tracked["quantity"] = total_qty
+                tracked["total_commission"] = Decimal(str(tracked.get("total_commission", Decimal("0")))) + open_commission
+                tracked["total_slippage"] = Decimal(str(tracked.get("total_slippage", Decimal("0")))) + open_slippage
+                self._open_positions[order.symbol] = tracked
+            else:
                 self._open_positions[order.symbol] = {
                     "entry_time": fill_time,
                     "entry_price": fill_price,
-                    "quantity": fill_quantity,
+                    "quantity": opening_qty,
                     "bars_held": 0,
-                    "entry_side": order.side,
-                    "total_slippage": fill_result.slippage,
-                    "total_commission": commission,
+                    "entry_side": entry_side,
+                    "total_slippage": open_slippage,
+                    "total_commission": open_commission,
                 }
-            else:
-                # Add to position
-                new_qty = position.quantity + fill_quantity
-                new_cost = position.cost_basis + trade_value
-                new_avg = new_cost / new_qty
-                self._state.positions[order.symbol] = Position(
-                    symbol=order.symbol,
-                    quantity=new_qty,
-                    avg_entry_price=new_avg,
-                    current_price=fill_price,
-                    cost_basis=new_cost,
-                    market_value=new_qty * fill_price,
-                )
-                # Update open position tracking
-                if order.symbol in self._open_positions:
-                    self._open_positions[order.symbol]["total_slippage"] += fill_result.slippage
-                    self._open_positions[order.symbol]["total_commission"] += commission
+
+        if new_qty == 0:
+            self._state.positions.pop(order.symbol, None)
+            self._open_positions.pop(order.symbol, None)
         else:
-            # Sell
-            self._state.cash += trade_value - commission
-
-            if position is not None:
-                # Record trade
-                if order.symbol in self._open_positions:
-                    open_pos = self._open_positions[order.symbol]
-                    entry_side = open_pos.get("entry_side", OrderSide.BUY)
-
-                    if entry_side == OrderSide.BUY:
-                        pnl = (fill_price - open_pos["entry_price"]) * fill_quantity - commission
-                    else:
-                        pnl = (open_pos["entry_price"] - fill_price) * fill_quantity - commission
-
-                    pnl_pct = float(pnl / (open_pos["entry_price"] * fill_quantity))
-
-                    trade = Trade(
-                        symbol=order.symbol,
-                        entry_time=open_pos["entry_time"],
-                        exit_time=fill_time,
-                        side=entry_side,
-                        quantity=fill_quantity,
-                        entry_price=open_pos["entry_price"],
-                        exit_price=fill_price,
-                        pnl=pnl,
-                        pnl_pct=pnl_pct,
-                        commission=commission + open_pos.get("total_commission", Decimal("0")),
-                        slippage=fill_result.slippage + open_pos.get("total_slippage", Decimal("0")),
-                        holding_period_bars=open_pos["bars_held"],
-                        metadata={
-                            "fill_type": fill_result.fill_type.value,
-                            "latency_ms": fill_result.latency_ms,
-                            "market_impact": float(fill_result.market_impact),
-                        },
-                    )
-                    self._state.trades.append(trade)
-
-                new_qty = position.quantity - fill_quantity
-                if new_qty <= 0:
-                    del self._state.positions[order.symbol]
-                    self._open_positions.pop(order.symbol, None)
-                else:
-                    self._state.positions[order.symbol] = Position(
-                        symbol=order.symbol,
-                        quantity=new_qty,
-                        avg_entry_price=position.avg_entry_price,
-                        current_price=fill_price,
-                        cost_basis=position.avg_entry_price * new_qty,
-                        market_value=new_qty * fill_price,
-                    )
+            tracked = self._open_positions.get(order.symbol)
+            avg_entry = Decimal(str(tracked.get("entry_price", fill_price))) if tracked else fill_price
+            self._state.positions[order.symbol] = Position(
+                symbol=order.symbol,
+                quantity=new_qty,
+                avg_entry_price=avg_entry,
+                current_price=fill_price,
+                cost_basis=avg_entry * new_qty,
+                market_value=new_qty * fill_price,
+            )
 
         # Handle partial fills - re-queue remaining
         if fill_result.fill_type == FillType.PARTIAL and fill_result.partial_remaining > 0:
@@ -967,17 +1033,13 @@ class BacktestEngine:
 
     def _can_fill_order(self, order: Order, fill_price: Decimal) -> bool:
         """Check if order can be filled."""
-        trade_value = order.quantity * fill_price
         commission = self._calculate_commission(order, fill_price)
-
-        if order.side == OrderSide.BUY:
-            return self._state.cash >= trade_value + commission
-
-        # For sells, check position
-        position = self._state.positions.get(order.symbol)
-        if position is None:
-            return self.config.allow_short
-        return position.quantity >= order.quantity or self.config.allow_short
+        return self._can_fill_order_amount(
+            order=order,
+            fill_price=fill_price,
+            fill_quantity=order.quantity,
+            commission=commission,
+        )
 
     def _fill_order(
         self,
@@ -985,103 +1047,19 @@ class BacktestEngine:
         fill_price: Decimal,
         fill_time: datetime,
     ) -> None:
-        """Fill an order and update state."""
+        """Fallback fill path (without market simulator)."""
         commission = self._calculate_commission(order, fill_price)
-        trade_value = order.quantity * fill_price
-
-        # Update position
-        position = self._state.positions.get(order.symbol)
-
-        if order.side == OrderSide.BUY:
-            self._state.cash -= trade_value + commission
-
-            if position is None:
-                # New position
-                self._state.positions[order.symbol] = Position(
-                    symbol=order.symbol,
-                    quantity=order.quantity,
-                    avg_entry_price=fill_price,
-                    current_price=fill_price,
-                    cost_basis=trade_value,
-                    market_value=trade_value,
-                )
-                self._open_positions[order.symbol] = {
-                    "entry_time": fill_time,
-                    "entry_price": fill_price,
-                    "quantity": order.quantity,
-                    "bars_held": 0,
-                    "entry_side": order.side,  # Track entry side for correct P&L calculation
-                }
-            else:
-                # Add to position
-                new_qty = position.quantity + order.quantity
-                new_cost = position.cost_basis + trade_value
-                new_avg = new_cost / new_qty
-                self._state.positions[order.symbol] = Position(
-                    symbol=order.symbol,
-                    quantity=new_qty,
-                    avg_entry_price=new_avg,
-                    current_price=fill_price,
-                    cost_basis=new_cost,
-                    market_value=new_qty * fill_price,
-                )
-        else:
-            # Sell
-            self._state.cash += trade_value - commission
-
-            if position is not None:
-                # Record trade
-                if order.symbol in self._open_positions:
-                    open_pos = self._open_positions[order.symbol]
-
-                    # CRITICAL FIX: Calculate P&L correctly based on entry side
-                    # Long position (entry_side=BUY): pnl = (exit - entry) * qty
-                    # Short position (entry_side=SELL): pnl = (entry - exit) * qty
-                    entry_side = open_pos.get("entry_side", OrderSide.BUY)
-                    if entry_side == OrderSide.BUY:
-                        # Closing a long position
-                        pnl = (fill_price - open_pos["entry_price"]) * order.quantity - commission
-                    else:
-                        # Closing a short position
-                        pnl = (open_pos["entry_price"] - fill_price) * order.quantity - commission
-
-                    pnl_pct = float(pnl / (open_pos["entry_price"] * order.quantity))
-
-                    trade = Trade(
-                        symbol=order.symbol,
-                        entry_time=open_pos["entry_time"],
-                        exit_time=fill_time,
-                        side=entry_side,  # Original entry side (BUY for long, SELL for short)
-                        quantity=order.quantity,
-                        entry_price=open_pos["entry_price"],
-                        exit_price=fill_price,
-                        pnl=pnl,
-                        pnl_pct=pnl_pct,
-                        commission=commission,
-                        slippage=Decimal("0"),  # Already applied to fill_price
-                        holding_period_bars=open_pos["bars_held"],
-                    )
-                    self._state.trades.append(trade)
-
-                new_qty = position.quantity - order.quantity
-                if new_qty <= 0:
-                    del self._state.positions[order.symbol]
-                    self._open_positions.pop(order.symbol, None)
-                else:
-                    self._state.positions[order.symbol] = Position(
-                        symbol=order.symbol,
-                        quantity=new_qty,
-                        avg_entry_price=position.avg_entry_price,
-                        current_price=fill_price,
-                        cost_basis=position.avg_entry_price * new_qty,
-                        market_value=new_qty * fill_price,
-                    )
-
-        self._state.orders_filled += 1
-        self.strategy.on_fill(order)
-
-        for callback in self._on_fill_callbacks:
-            callback(order, fill_price)
+        fill_result = FillResult(
+            fill_type=FillType.FULL,
+            fill_price=fill_price,
+            fill_quantity=order.quantity,
+            slippage=Decimal("0"),
+            market_impact=Decimal("0"),
+            commission=commission,
+            latency_ms=0.0,
+            timestamp=fill_time,
+        )
+        self._fill_order_with_result(order, fill_result, fill_time)
 
     def _process_signal(self, signal: TradeSignal) -> None:
         """Process a trading signal and create order."""
@@ -1104,6 +1082,14 @@ class BacktestEngine:
         if not self.config.allow_fractional:
             quantity = Decimal(int(quantity))
 
+        # Enforce gross leverage cap before submitting order.
+        quantity = self._cap_quantity_to_leverage(
+            symbol=signal.symbol,
+            side=side,
+            requested_qty=quantity,
+            price=bar.close,
+        )
+
         if quantity <= 0:
             return
 
@@ -1117,6 +1103,65 @@ class BacktestEngine:
         )
 
         self._state.pending_orders.append(order)
+
+    def _estimate_additional_exposure(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: Decimal,
+        price: Decimal,
+    ) -> Decimal:
+        """Estimate gross exposure increase from an order."""
+        position = self._state.positions.get(symbol)
+        current_qty = position.quantity if position else Decimal("0")
+        new_qty = current_qty + quantity if side == OrderSide.BUY else current_qty - quantity
+        abs_increase = max(Decimal("0"), abs(new_qty) - abs(current_qty))
+        return abs_increase * price
+
+    def _cap_quantity_to_leverage(
+        self,
+        symbol: str,
+        side: OrderSide,
+        requested_qty: Decimal,
+        price: Decimal,
+    ) -> Decimal:
+        """Cap order quantity so max gross leverage is not breached."""
+        if requested_qty <= 0 or price <= 0 or self._state.equity <= 0:
+            return Decimal("0")
+
+        current_gross = sum(abs(p.market_value) for p in self._state.positions.values())
+        max_gross = self._state.equity * Decimal(str(self.config.max_leverage))
+        allowed_additional = max_gross - current_gross
+        if allowed_additional <= 0:
+            return Decimal("0")
+
+        requested_additional = self._estimate_additional_exposure(
+            symbol=symbol,
+            side=side,
+            quantity=requested_qty,
+            price=price,
+        )
+        if requested_additional <= allowed_additional:
+            return requested_qty
+
+        low = Decimal("0")
+        high = requested_qty
+        for _ in range(24):
+            mid = (low + high) / Decimal("2")
+            additional = self._estimate_additional_exposure(
+                symbol=symbol,
+                side=side,
+                quantity=mid,
+                price=price,
+            )
+            if additional <= allowed_additional:
+                low = mid
+            else:
+                high = mid
+
+        if not self.config.allow_fractional:
+            return Decimal(int(low))
+        return low
 
     def _update_equity(self) -> None:
         """Update equity and equity curve."""

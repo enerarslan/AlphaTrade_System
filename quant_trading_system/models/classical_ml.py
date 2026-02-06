@@ -7,11 +7,15 @@ with trading-specific optimizations and hyperparameters.
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from quant_trading_system.models.base import ModelType, TradingModel
+
+logger = logging.getLogger(__name__)
 
 
 class XGBoostModel(TradingModel):

@@ -697,26 +697,33 @@ class FeaturePipeline:
         if self.config.fill_method == "ffill":
             # Forward fill
             mask = np.isnan(values)
-            idx = np.where(~mask, np.arange(len(values)), 0)
+            idx = np.where(~mask, np.arange(len(values)), -1)
             np.maximum.accumulate(idx, out=idx)
-            values = values[idx]
-            # Handle leading NaNs
-            first_valid = np.argmax(~np.isnan(values))
-            values[:first_valid] = values[first_valid]
+            valid = idx >= 0
+            values[valid] = values[idx[valid]]
 
         elif self.config.fill_method == "bfill":
-            # Backward fill
+            # Causal-safe fallback: avoid backward-looking fill in training paths.
             mask = np.isnan(values)
-            idx = np.where(~mask, np.arange(len(values)), len(values) - 1)
-            idx = np.minimum.accumulate(idx[::-1])[::-1]
-            values = values[idx]
+            idx = np.where(~mask, np.arange(len(values)), -1)
+            np.maximum.accumulate(idx, out=idx)
+            valid = idx >= 0
+            values[valid] = values[idx[valid]]
 
         elif self.config.fill_method == "zero":
             values = np.nan_to_num(values, nan=0.0)
 
         elif self.config.fill_method == "mean":
-            mean_val = np.nanmean(values)
-            values = np.nan_to_num(values, nan=mean_val)
+            # Causal mean: use historical mean up to t-1, never future samples.
+            running_sum = 0.0
+            running_count = 0
+            for i, value in enumerate(values):
+                if np.isnan(value):
+                    if running_count > 0:
+                        values[i] = running_sum / running_count
+                else:
+                    running_sum += float(value)
+                    running_count += 1
 
         return values
 

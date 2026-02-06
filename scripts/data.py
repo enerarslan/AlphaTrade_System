@@ -953,20 +953,42 @@ class DataManager:
             Lineage record ID.
         """
         try:
-            from quant_trading_system.data.data_lineage import DataLineageTracker
-
-            tracker = DataLineageTracker()
-            record_id = tracker.register(
-                source=source,
-                transformation=transformation,
-                output=output,
-                metadata=metadata or {},
+            from quant_trading_system.data.lineage import (
+                LineageEventType,
+                get_lineage_tracker,
             )
+
+            tracker = get_lineage_tracker()
+            source_node = tracker.create_node(
+                data_type="data_source_ref",
+                metadata={"name": source},
+            )
+            target_node = tracker.create_node(
+                data_type="data_output_ref",
+                metadata={"name": output},
+            )
+            tracker.record_transformation(
+                source_node=source_node,
+                target_node=target_node,
+                operation=transformation,
+                event_type=LineageEventType.DATA_TRANSFORMATION,
+                parameters=metadata or {},
+            )
+            event = tracker.record_event(
+                event_type=LineageEventType.DATA_TRANSFORMATION,
+                operation=transformation,
+                source_nodes=[source_node.node_id],
+                target_nodes=[target_node.node_id],
+                parameters={"source": source, "output": output, **(metadata or {})},
+                status="success",
+            )
+            record_id = event.event_id
 
             self.logger.info(f"Registered lineage: {record_id}")
             return record_id
 
-        except ImportError:
+        except Exception as exc:
+            self.logger.warning(f"Lineage registration failed, using fallback logging: {exc}")
             # Fallback: Simple logging
             record_id = f"lineage_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
             self.logger.info(f"Lineage (fallback): {source} -> {transformation} -> {output}")

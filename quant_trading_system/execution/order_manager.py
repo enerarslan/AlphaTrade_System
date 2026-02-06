@@ -44,6 +44,7 @@ from quant_trading_system.core.exceptions import (
     OrderCancellationError,
     OrderSubmissionError,
 )
+from quant_trading_system.risk.limits import KillSwitch
 from quant_trading_system.execution.alpaca_client import (
     AlpacaClient,
     AlpacaOrder,
@@ -622,9 +623,11 @@ class OrderManager:
         self._broker_id_map: dict[str, UUID] = {}
 
         # Thread safety - protect shared state from race conditions
-        # Use asyncio.Lock for async methods and threading.RLock for sync callbacks
-        self._async_lock = asyncio.Lock()
-        self._sync_lock = threading.RLock()  # RLock for sync WebSocket callbacks
+        # P0-8 FIX (January 2026 Audit): Use single lock for all shared state access.
+        # Previously had separate _async_lock and _sync_lock which caused race conditions
+        # when async code updated _broker_id_map while sync callbacks read it.
+        # Using threading.RLock works in both sync and async contexts.
+        self._sync_lock = threading.RLock()  # RLock for all shared state access
 
         # Callbacks
         self._fill_callbacks: list[Callable[[ManagedOrder], None]] = []
@@ -791,6 +794,20 @@ class OrderManager:
                 take_profit = {"limit_price": str(managed.request.take_profit_price)}
                 stop_loss = {"stop_price": str(managed.request.stop_loss_price)}
 
+            # P0-1 FIX (January 2026 Audit): Atomic kill switch check immediately before
+            # broker submission to prevent TOCTOU vulnerability. Without this check,
+            # orders validated before kill switch activation could still be submitted.
+            kill_switch = KillSwitch()
+            if kill_switch.is_active():
+                managed.state = OrderState.REJECTED
+                managed.error_message = f"Kill switch active: {kill_switch._reason}"
+                self._publish_order_event(EventType.ORDER_REJECTED, managed)
+                raise OrderSubmissionError(
+                    f"Order rejected: Kill switch is active ({kill_switch._reason})",
+                    order_id=str(managed.order.order_id),
+                    symbol=managed.order.symbol,
+                )
+
             # Submit to broker
             managed.state = OrderState.SUBMITTED
             managed.submission_time = datetime.now(timezone.utc)
@@ -822,7 +839,8 @@ class OrderManager:
             managed.last_update = datetime.now(timezone.utc)
 
             # Track by broker ID with lock protection
-            async with self._async_lock:
+            # P0-8 FIX: Use unified _sync_lock instead of separate _async_lock
+            with self._sync_lock:
                 self._broker_id_map[broker_order.order_id] = managed.order.order_id
 
             # Publish event
@@ -957,6 +975,34 @@ class OrderManager:
         if not managed.broker_order:
             raise ExecutionError("Order not yet submitted to broker")
 
+        # P0-2 FIX (January 2026 Audit): Add safety checks that were completely missing.
+        # Without these checks, modify_order() could bypass kill switch and risk limits.
+
+        # Check 1: Kill switch must not be active
+        kill_switch = KillSwitch()
+        if kill_switch.is_active():
+            raise ExecutionError(
+                f"Cannot modify order: Kill switch is active ({kill_switch._reason})"
+            )
+
+        # Check 2: Validate new quantity if provided
+        if quantity is not None:
+            if quantity <= 0:
+                raise ExecutionError(
+                    f"Invalid quantity: {quantity}. Must be positive."
+                )
+
+            # Check 3: If increasing quantity, this could exceed position limits
+            # For now, log a warning - full PreTradeRiskChecker integration would
+            # require portfolio state which modify_order doesn't have access to.
+            # This is a defensive check for obviously bad values.
+            original_qty = managed.order.quantity
+            if quantity > original_qty * Decimal("2"):
+                logger.warning(
+                    f"Large quantity increase on modify: {original_qty} -> {quantity} "
+                    f"for order {order_id}. Consider canceling and submitting new order."
+                )
+
         try:
             new_broker_order = await self.client.replace_order(
                 order_id=managed.broker_order.order_id,
@@ -971,7 +1017,8 @@ class OrderManager:
             managed.last_update = datetime.now(timezone.utc)
 
             # Update broker ID map with lock protection
-            async with self._async_lock:
+            # P0-8 FIX: Use unified _sync_lock instead of separate _async_lock
+            with self._sync_lock:
                 self._broker_id_map[new_broker_order.order_id] = managed.order.order_id
 
             logger.info(f"Modified order {order_id}")

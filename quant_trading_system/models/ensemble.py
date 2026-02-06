@@ -337,10 +337,8 @@ class StackingEnsemble(EnsembleModel):
         Returns:
             self for method chaining
         """
-        # CRITICAL FIX: Use TimeSeriesSplit instead of KFold to prevent data leakage
-        # KFold can shuffle data and use future data to predict past values
-        # TimeSeriesSplit ensures chronological ordering is preserved
-        from sklearn.model_selection import TimeSeriesSplit
+        # Use purged walk-forward folds to reduce temporal leakage.
+        from quant_trading_system.models.purged_cv import create_purged_cv
 
         n_samples = X.shape[0]
         n_models = len(self._base_models)
@@ -357,7 +355,13 @@ class StackingEnsemble(EnsembleModel):
         # Generate OOF predictions using TIME-SERIES SPLIT
         # This ensures we never use future data to make predictions
         oof_predictions = np.zeros((n_samples, n_models))
-        tscv = TimeSeriesSplit(n_splits=self._params["n_folds"])
+        tscv = create_purged_cv(
+            cv_type="walk_forward",
+            n_splits=self._params["n_folds"],
+            purge_gap=1,
+            embargo_pct=0.01,
+            prediction_horizon=1,
+        )
 
         for model_idx, model in enumerate(self._base_models):
             for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X)):

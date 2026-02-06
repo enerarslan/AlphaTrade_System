@@ -1119,8 +1119,10 @@ class OpeningRangeMetrics(MicrostructureFeature):
         or_breakout = np.full(n, np.nan)
 
         current_date = None
-        day_bars = []
-        day_indices = []
+        day_bar_index = 0
+        opening_high = np.nan
+        opening_low = np.nan
+        opening_range_ready = False
 
         for i, ts in enumerate(timestamps):
             if isinstance(ts, datetime):
@@ -1132,42 +1134,30 @@ class OpeningRangeMetrics(MicrostructureFeature):
                     continue
 
             if date != current_date:
-                # New day - calculate OR for previous day's remaining bars
-                if day_bars and len(day_bars) >= self.opening_bars:
-                    or_h = max(h for h, _, _ in day_bars[: self.opening_bars])
-                    or_l = min(l for _, l, _ in day_bars[: self.opening_bars])
-
-                    for idx, (_, _, c) in zip(day_indices, day_bars):
-                        or_high[idx] = or_h
-                        or_low[idx] = or_l
-                        if c > or_h:
-                            or_breakout[idx] = 1
-                        elif c < or_l:
-                            or_breakout[idx] = -1
-                        else:
-                            or_breakout[idx] = 0
-
                 current_date = date
-                day_bars = []
-                day_indices = []
+                day_bar_index = 0
+                opening_high = np.nan
+                opening_low = np.nan
+                opening_range_ready = False
 
-            day_bars.append((high[i], low[i], close[i]))
-            day_indices.append(i)
+            # Build opening range incrementally from the first N bars only.
+            if day_bar_index < self.opening_bars:
+                opening_high = high[i] if np.isnan(opening_high) else max(opening_high, high[i])
+                opening_low = low[i] if np.isnan(opening_low) else min(opening_low, low[i])
+                if day_bar_index == self.opening_bars - 1:
+                    opening_range_ready = True
 
-        # Handle last day
-        if day_bars and len(day_bars) >= self.opening_bars:
-            or_h = max(h for h, _, _ in day_bars[: self.opening_bars])
-            or_l = min(l for _, l, _ in day_bars[: self.opening_bars])
-
-            for idx, (_, _, c) in zip(day_indices, day_bars):
-                or_high[idx] = or_h
-                or_low[idx] = or_l
-                if c > or_h:
-                    or_breakout[idx] = 1
-                elif c < or_l:
-                    or_breakout[idx] = -1
+            if opening_range_ready:
+                or_high[i] = opening_high
+                or_low[i] = opening_low
+                if close[i] > opening_high:
+                    or_breakout[i] = 1
+                elif close[i] < opening_low:
+                    or_breakout[i] = -1
                 else:
-                    or_breakout[idx] = 0
+                    or_breakout[i] = 0
+
+            day_bar_index += 1
 
         # Distance from opening range
         or_dist_high = (close - or_high) / np.where(or_high == 0, 1, or_high)

@@ -102,7 +102,8 @@ class DPO(TechnicalIndicator):
         sma = SMA._rolling_mean(close, self.period)
 
         dpo = np.full(len(close), np.nan)
-        dpo[offset:] = close[offset:] - sma[:-offset]
+        # Causal alignment: value at t is computed with data available at t.
+        dpo[offset:] = close[:-offset] - sma[offset:]
 
         return {f"dpo_{self.period}": dpo}
 

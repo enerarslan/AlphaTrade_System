@@ -139,6 +139,9 @@ def cmd_trade(args: argparse.Namespace) -> int:
       - Transaction cost analysis (TCA)
       - A/B testing for strategy variants
     """
+    if getattr(args, "dry_run", False):
+        args.mode = "dry-run"
+
     from scripts.trade import run_trading
     return run_trading(args)
 
@@ -162,6 +165,14 @@ def cmd_backtest(args: argparse.Namespace) -> int:
       - Performance attribution (Brinson-Fachler)
       - Monte Carlo simulation for confidence intervals
     """
+    # Backward-compatible aliases used by older scripts/tests.
+    if hasattr(args, "start_date"):
+        args.start = args.start_date
+    if hasattr(args, "end_date"):
+        args.end = args.end_date
+    if hasattr(args, "initial_capital"):
+        args.capital = args.initial_capital
+
     from scripts.backtest import run_backtest
     return run_backtest(args)
 
@@ -306,6 +317,35 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     return run_deployment(args)
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """
+    Run the monitoring dashboard.
+    
+    @infra: Starts the FastAPI dashboard and WebSocket server.
+    """
+    import uvicorn
+    from quant_trading_system.config.settings import get_settings
+    
+    settings = get_settings()
+    
+    # Allow command line override of port/host
+    host = args.host or "0.0.0.0"
+    port = args.port or 8000
+    
+    # Configure logging
+    setup_logging(log_level=args.log_level)
+    get_logger("dashboard").info(f"Starting dashboard on http://{host}:{port}")
+    
+    uvicorn.run(
+        "quant_trading_system.monitoring.dashboard:app",
+        host=host,
+        port=port,
+        reload=args.reload,
+        log_level=args.log_level.lower(),
+    )
+    return 0
+
+
 # ==============================================================================
 # CLI ARGUMENT PARSER
 # ==============================================================================
@@ -337,6 +377,12 @@ Examples:
   # Run full system health check
   python main.py health check --full
 
+  # Run full system health check
+  python main.py health check --full
+
+  # Start dashboard
+  python main.py dashboard --port 8000
+
   # Deploy to production
   python main.py deploy setup --env production
 
@@ -363,8 +409,9 @@ For more information, visit: https://github.com/alphatrade/docs
     )
     parser.add_argument(
         "--log-format",
-        choices=["CONSOLE", "JSON", "STRUCTURED"],
-        default="CONSOLE",
+        type=str.lower,
+        choices=["console", "json", "structured", "text"],
+        default="console",
         help="Log output format (default: CONSOLE)",
     )
     parser.add_argument(
@@ -393,6 +440,11 @@ For more information, visit: https://github.com/alphatrade/docs
         choices=["live", "paper", "dry-run"],
         default="paper",
         help="Trading mode (default: paper)",
+    )
+    trade_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Alias for --mode dry-run",
     )
     trade_parser.add_argument(
         "--symbols", "-s",
@@ -450,13 +502,15 @@ For more information, visit: https://github.com/alphatrade/docs
         description="Backtest trading strategies on historical data.",
     )
     backtest_parser.add_argument(
-        "--start", "-s",
+        "--start", "--start-date", "-s",
+        dest="start_date",
         type=str,
         required=True,
         help="Start date (YYYY-MM-DD)",
     )
     backtest_parser.add_argument(
-        "--end", "-e",
+        "--end", "--end-date", "-e",
+        dest="end_date",
         type=str,
         required=True,
         help="End date (YYYY-MM-DD)",
@@ -468,7 +522,8 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Symbols to backtest",
     )
     backtest_parser.add_argument(
-        "--capital",
+        "--capital", "--initial-capital",
+        dest="initial_capital",
         type=float,
         default=100000.0,
         help="Initial capital (default: 100000)",
@@ -928,13 +983,38 @@ For more information, visit: https://github.com/alphatrade/docs
         choices=["build", "up", "down", "logs", "status"],
         help="Docker action",
     )
-    deploy_docker.add_argument(
-        "--service",
-        type=str,
-        help="Specific service (default: all)",
+    deploy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate deployment actions",
     )
-
     deploy_parser.set_defaults(func=cmd_deploy)
+
+    # --------------------------------------------------------------------------
+    # DASHBOARD COMMAND
+    # --------------------------------------------------------------------------
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="Run monitoring dashboard",
+        description="Start the real-time monitoring dashboard.",
+    )
+    dashboard_parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host to bind to (default: 0.0.0.0)",
+    )
+    dashboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind to (default: 8000)",
+    )
+    dashboard_parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable auto-reload (dev mode)",
+    )
+    dashboard_parser.set_defaults(func=cmd_dashboard)
 
     return parser
 
@@ -966,6 +1046,56 @@ def setup_signal_handlers() -> None:
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ==============================================================================
+# COMPATIBILITY API
+# ==============================================================================
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments (compatibility wrapper used by tests)."""
+    parser = create_parser()
+    return parser.parse_args(argv)
+
+
+class TradingSystemApp:
+    """Lightweight async app wrapper used by unit tests and orchestration."""
+
+    def __init__(self, settings: Any):
+        self.settings = settings
+        self._running = False
+        self._metrics: dict[str, Any] = {}
+        self._logger = get_logger("trading_app", "SYSTEM")
+
+    async def start(self, mode: str = "paper") -> None:
+        """Start app loop until stop() is called."""
+        self._running = True
+        self._logger.info(f"TradingSystemApp started in {mode} mode")
+
+        while self._running:
+            self._update_system_metrics()
+            await asyncio.sleep(1.0)
+
+    async def stop(self) -> None:
+        """Stop app loop."""
+        self._running = False
+        self._logger.info("TradingSystemApp stopped")
+
+    def _update_system_metrics(self) -> None:
+        """Best-effort system metric update (never raises)."""
+        try:
+            import psutil
+
+            process = psutil.Process()
+            self._metrics = {
+                "memory_mb": process.memory_info().rss / (1024 * 1024),
+                "cpu_percent": process.cpu_percent(interval=None),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception:
+            self._metrics = {
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
 
 # ==============================================================================

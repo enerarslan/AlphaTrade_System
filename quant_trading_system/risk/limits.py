@@ -717,22 +717,31 @@ class PreTradeRiskChecker:
         portfolio: Portfolio,
         current_price: Decimal,
     ) -> RiskCheckResult:
-        """Check daily trading limits."""
+        """Check daily trading limits.
+
+        P1-1 FIX (January 2026 Audit): Added lock protection when reading
+        daily counters to prevent race condition at midnight reset.
+        """
+        # P1-1 FIX: Read counters atomically with lock protection
+        with self._lock:
+            daily_trades = self._daily_trades
+            daily_turnover = self._daily_turnover
+
         # Check trade count
-        if self._daily_trades >= self.config.max_daily_trades:
+        if daily_trades >= self.config.max_daily_trades:
             return RiskCheckResult(
                 check_name="daily_limits",
                 result=CheckResult.FAILED,
                 message="Daily trade limit reached",
                 details={
-                    "trades_today": self._daily_trades,
+                    "trades_today": daily_trades,
                     "max_trades": self.config.max_daily_trades,
                 },
             )
 
         # Check turnover
         order_value = order.quantity * current_price
-        new_turnover = self._daily_turnover + order_value
+        new_turnover = daily_turnover + order_value
         max_turnover = portfolio.equity * Decimal(str(self.config.max_daily_turnover_pct))
 
         if new_turnover > max_turnover:
@@ -741,7 +750,7 @@ class PreTradeRiskChecker:
                 result=CheckResult.FAILED,
                 message="Daily turnover limit would be exceeded",
                 details={
-                    "current_turnover": float(self._daily_turnover),
+                    "current_turnover": float(daily_turnover),
                     "order_value": float(order_value),
                     "max_turnover": float(max_turnover),
                 },
