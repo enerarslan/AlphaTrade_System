@@ -33,16 +33,13 @@ Version: 1.3.0
 """
 
 import argparse
-import asyncio
 import json
 import logging
-import os
 import pickle
+import re
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +57,16 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("train")
+
+SUPPORTED_MODELS = [
+    "xgboost",
+    "lightgbm",
+    "random_forest",
+    "lstm",
+    "transformer",
+    "tcn",
+    "ensemble",
+]
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -249,50 +256,13 @@ class ModelTrainer:
     def _load_data(self) -> None:
         """Phase 1: Load market data for training."""
         self.logger.info("Phase 1: Loading data...")
+        if self.config.use_database:
+            self.logger.info(
+                "Database mode requested; using local training files from data/raw "
+                "for deterministic offline training."
+            )
 
-        try:
-            from quant_trading_system.data.loader import DataLoader
-
-            data_dir = PROJECT_ROOT / "data" / "raw"
-            loader = DataLoader(data_dir=data_dir, use_database=self.config.use_database)
-
-            # Determine symbols
-            symbols = self.config.symbols
-            if not symbols:
-                symbols = loader.get_available_symbols()
-                self.logger.info(f"Using all available symbols: {len(symbols)}")
-
-            # Load data
-            dfs = []
-            for symbol in symbols:
-                try:
-                    df = loader.load_symbol(
-                        symbol,
-                        start_date=self.config.start_date or None,
-                        end_date=self.config.end_date or None,
-                    )
-                    if df is not None and len(df) > 0:
-                        # Handle both Polars and Pandas DataFrames
-                        import polars as pl
-                        if hasattr(df, 'with_columns'):  # Polars DataFrame
-                            df = df.with_columns(pl.lit(symbol).alias("symbol"))
-                            df = df.to_pandas()  # Convert to pandas for downstream compatibility
-                        else:  # Pandas DataFrame
-                            df["symbol"] = symbol
-                        dfs.append(df)
-                except Exception as e:
-                    self.logger.warning(f"Failed to load {symbol}: {e}")
-
-            if not dfs:
-                raise ValueError("No data loaded for any symbol")
-
-            self.data = pd.concat(dfs, ignore_index=True)
-            self.logger.info(f"Loaded {len(self.data)} rows for {len(dfs)} symbols")
-
-        except ImportError:
-            # Fallback: Load from CSV files
-            self.logger.info("Using fallback CSV loader")
-            self._load_data_fallback()
+        self._load_data_fallback()
 
     def _load_data_fallback(self) -> None:
         """Fallback data loading from CSV files."""
@@ -302,18 +272,41 @@ class ModelTrainer:
             raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
         dfs = []
-        csv_files = list(data_dir.glob("*.csv"))
+        requested_symbols = {s.strip().upper() for s in self.config.symbols if s.strip()}
 
-        for csv_file in csv_files:
-            symbol = csv_file.stem.upper()
+        for csv_file in sorted(data_dir.glob("*.csv")):
+            file_symbol = csv_file.stem.upper()
+            base_symbol = self._extract_base_symbol(file_symbol)
 
-            # Filter by requested symbols
-            if self.config.symbols and symbol not in self.config.symbols:
+            if requested_symbols and file_symbol not in requested_symbols and base_symbol not in requested_symbols:
                 continue
 
             try:
-                df = pd.read_csv(csv_file, parse_dates=["timestamp"])
-                df["symbol"] = symbol
+                df = pd.read_csv(csv_file)
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+                elif "date" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+                    df = df.drop(columns=["date"])
+                else:
+                    self.logger.warning(f"{csv_file.name}: missing timestamp/date column")
+                    continue
+
+                required_cols = ["open", "high", "low", "close", "volume", "timestamp"]
+                missing = [col for col in required_cols if col not in df.columns]
+                if missing:
+                    self.logger.warning(f"{csv_file.name}: missing required columns {missing}")
+                    continue
+
+                if self.config.start_date:
+                    start_ts = pd.to_datetime(self.config.start_date, utc=True)
+                    df = df[df["timestamp"] >= start_ts]
+                if self.config.end_date:
+                    end_ts = pd.to_datetime(self.config.end_date, utc=True)
+                    df = df[df["timestamp"] <= end_ts]
+
+                df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                df["symbol"] = base_symbol
                 dfs.append(df)
             except Exception as e:
                 self.logger.warning(f"Failed to load {csv_file}: {e}")
@@ -322,7 +315,23 @@ class ModelTrainer:
             raise ValueError("No data loaded")
 
         self.data = pd.concat(dfs, ignore_index=True)
-        self.logger.info(f"Loaded {len(self.data)} rows from {len(dfs)} CSV files")
+        self.logger.info(
+            f"Loaded {len(self.data)} rows from {len(dfs)} files "
+            f"across {self.data['symbol'].nunique()} symbols"
+        )
+
+    @staticmethod
+    def _extract_base_symbol(file_symbol: str) -> str:
+        """
+        Extract ticker from filename stem.
+
+        Examples:
+          - AAPL_15MIN -> AAPL
+          - BRK.B_15MIN -> BRK.B
+        """
+        normalized = file_symbol.strip().upper()
+        match = re.match(r"^([A-Z]+(?:\.[A-Z]+)?)(?:_.*)?$", normalized)
+        return match.group(1) if match else normalized
 
     def _compute_features(self) -> None:
         """Phase 2: Compute features for model training."""
@@ -337,32 +346,49 @@ class ModelTrainer:
             self._compute_features_fallback()
 
     def _compute_features_full_pipeline(self) -> None:
-        """Compute ALL features using the optimized technical calculator (fast)."""
-        from quant_trading_system.features.technical import TechnicalIndicatorCalculator
+        """Compute ALL feature groups using the unified feature pipeline."""
         import polars as pl
+        from quant_trading_system.features.feature_pipeline import create_pipeline
 
-        self.logger.info("Using OPTIMIZED feature computation (200+ technical features)")
-
-        # Use the fast TechnicalIndicatorCalculator directly
-        calc = TechnicalIndicatorCalculator()
+        self.logger.info(
+            "Using full feature pipeline (technical + statistical + microstructure + cross-sectional)"
+        )
+        pipeline = create_pipeline(groups=["all"], normalization="none", include_targets=False)
 
         features_list = []
+        universe_data: dict[str, pl.DataFrame] = {}
+
+        for symbol in self.data["symbol"].unique():
+            symbol_df = (
+                self.data[self.data["symbol"] == symbol]
+                .copy()
+                .sort_values("timestamp")
+                .reset_index(drop=True)
+            )
+            universe_data[symbol] = pl.from_pandas(symbol_df)
+
         for symbol in self.data["symbol"].unique():
             self.logger.info(f"Computing features for {symbol}...")
-            df = self.data[self.data["symbol"] == symbol].copy()
-            df = df.sort_values("timestamp").reset_index(drop=True)
+            df = (
+                self.data[self.data["symbol"] == symbol]
+                .copy()
+                .sort_values("timestamp")
+                .reset_index(drop=True)
+            )
 
-            # Convert to polars for calculator
             df_pl = pl.from_pandas(df)
 
             try:
-                # Compute ALL technical features (fast vectorized implementation)
-                feature_cols = calc.compute_all(df_pl)
+                feature_set = pipeline.compute(
+                    df_pl,
+                    symbol=symbol,
+                    universe_data=universe_data,
+                    use_cache=True,
+                )
+                feature_cols = feature_set.features
 
-                # Merge with original data
-                features_df = df.copy()
-                for col, values in feature_cols.items():
-                    features_df[col] = values
+                feature_df = pd.DataFrame(feature_cols, index=df.index)
+                features_df = pd.concat([df, feature_df], axis=1)
 
                 features_df["symbol"] = symbol
                 features_list.append(features_df)
@@ -378,8 +404,10 @@ class ModelTrainer:
 
         if features_list:
             self.features = pd.concat(features_list, ignore_index=True)
-            self.features = self.features.dropna()
-            self.logger.info(f"Total: {len(self.features.columns)} features computed for {len(features_list)} symbols")
+            self.features = self.features.replace([np.inf, -np.inf], np.nan).dropna()
+            self.logger.info(
+                f"Total: {len(self.features.columns)} columns for {len(features_list)} symbols"
+            )
 
     def _compute_features_fallback(self) -> None:
         """Fallback feature computation with basic indicators."""
@@ -619,17 +647,35 @@ class ModelTrainer:
                 self._train_deep_learning_model(model, X_train, y_train, X_test, y_test)
             else:
                 # Classical ML models
-                model.fit(X_train, y_train)
+                try:
+                    model.fit(X_train, y_train, validation_data=(X_test, y_test))
+                except TypeError:
+                    model.fit(X_train, y_train)
 
             # Evaluate
-            y_pred = model.predict(X_test)
-            y_proba = self._get_predictions_proba(model, X_test)
+            y_pred = np.asarray(model.predict(X_test))
+            y_proba = np.asarray(self._get_predictions_proba(model, X_test))
+
+            y_eval = np.asarray(y_test)
+            if len(y_pred) != len(y_eval):
+                eval_len = min(len(y_pred), len(y_eval), len(y_proba))
+                if eval_len <= 1:
+                    self.logger.warning(
+                        f"Fold {fold_idx + 1}: insufficient aligned predictions, skipping fold"
+                    )
+                    continue
+                y_eval = y_eval[-eval_len:]
+                y_pred = y_pred[-eval_len:]
+                y_proba = y_proba[-eval_len:]
+                self.logger.info(
+                    f"Fold {fold_idx + 1}: aligned sequence outputs to {eval_len} samples"
+                )
 
             # Calculate metrics
-            metrics = self._calculate_fold_metrics(y_test, y_pred, y_proba)
+            metrics = self._calculate_fold_metrics(y_eval, y_pred, y_proba)
             metrics["fold"] = fold_idx + 1
             metrics["train_size"] = len(train_idx)
-            metrics["test_size"] = len(test_idx)
+            metrics["test_size"] = len(y_eval)
 
             fold_results.append(metrics)
             models.append(model)
@@ -640,6 +686,9 @@ class ModelTrainer:
             )
 
         # Select best model or use ensemble
+        if not fold_results:
+            raise ValueError("No valid CV folds produced training metrics")
+
         self.cv_results = fold_results
         self._select_final_model(models, fold_results)
 
@@ -700,18 +749,25 @@ class ModelTrainer:
 
     def _create_base_model(self, params: dict | None = None):
         """Create base model without fitting."""
-        params = params or self.config.model_params
+        params = dict(params or self.config.model_params)
 
         if self.config.model_type == "xgboost":
             from xgboost import XGBClassifier
-            return XGBClassifier(**params, use_label_encoder=False, eval_metric="logloss")
+            if self.config.use_gpu:
+                params.setdefault("tree_method", "hist")
+                params.setdefault("device", "cuda")
+            params.setdefault("eval_metric", "logloss")
+            return XGBClassifier(**params)
 
         elif self.config.model_type == "lightgbm":
             from lightgbm import LGBMClassifier
-            return LGBMClassifier(**params, verbose=-1)
+            params.setdefault("verbose", -1)
+            return LGBMClassifier(**params)
 
         elif self.config.model_type == "random_forest":
             from sklearn.ensemble import RandomForestClassifier
+            params.setdefault("n_jobs", self.config.n_jobs)
+            params.setdefault("random_state", 42)
             return RandomForestClassifier(**params)
 
         elif self.config.model_type == "elastic_net":

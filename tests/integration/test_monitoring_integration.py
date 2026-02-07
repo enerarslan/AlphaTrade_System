@@ -238,6 +238,12 @@ class TestDashboardAPIIntegration:
         response = client.get("/logs")
         assert response.status_code == 200
 
+        # 10.1 Project coverage surfaces
+        response = client.get("/system/coverage")
+        assert response.status_code == 200
+        response = client.get("/control/jobs/catalog")
+        assert response.status_code == 200
+
         # 11. Advanced model governance
         response = client.get("/models/registry")
         assert response.status_code == 200

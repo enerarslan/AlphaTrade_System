@@ -57,5 +57,53 @@
   .panel-surface {
     @apply rounded-2xl border border-slate-200 bg-white/90 shadow-sm backdrop-blur;
   }
+
+  .mission-gradient {
+    background:
+      radial-gradient(circle at 12% 18%, rgba(15, 118, 110, 0.2), transparent 38%),
+      radial-gradient(circle at 85% 14%, rgba(251, 146, 60, 0.2), transparent 40%),
+      linear-gradient(140deg, #f4f9ff 0%, #f9f7f2 45%, #eef6f4 100%);
+  }
+
+  .mission-grid {
+    background-image:
+      linear-gradient(rgba(148, 163, 184, 0.16) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148, 163, 184, 0.16) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+
+  .status-ping::before {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: 9999px;
+    background: radial-gradient(circle, rgba(16, 185, 129, 0.35), transparent 65%);
+    animation: statusPulse 2.2s ease-in-out infinite;
+    z-index: -1;
+  }
 }
 
+@keyframes signalTape {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes statusPulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.06);
+  }
+}
+
+.animate-signal-tape {
+  animation: signalTape 28s linear infinite;
+}

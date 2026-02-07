@@ -55,6 +55,39 @@ type Order = {
   updated_at: string;
 };
 
+type Performance = {
+  daily_pnl: number;
+  total_pnl: number;
+  sharpe_ratio_30d: number | null;
+  sortino_ratio_30d: number | null;
+  max_drawdown_30d: number | null;
+  current_drawdown: number | null;
+  win_rate_30d: number | null;
+  profit_factor: number | null;
+  avg_trade_pnl: number | null;
+};
+
+type Signal = {
+  signal_id: string;
+  timestamp: string;
+  symbol: string;
+  direction: string;
+  strength: number;
+  confidence: number;
+  model_source: string;
+};
+
+type ModelStatus = {
+  model_name: string;
+  status: string;
+  accuracy: number | null;
+  auc: number | null;
+  sharpe: number | null;
+  last_prediction_time: string | null;
+  prediction_count: number;
+  error_count: number;
+};
+
 type RiskMetrics = {
   portfolio_var_95: number;
   portfolio_var_99: number | null;
@@ -322,6 +355,50 @@ type CommandJob = {
   output: string;
 };
 
+type CommandCatalogEntry = {
+  command: string;
+  summary: string;
+  script_path: string;
+  script_exists: boolean;
+  sample_args: string[];
+  risk_level: string;
+};
+
+type ScriptInventoryEntry = {
+  script_name: string;
+  path: string;
+  exists: boolean;
+  linked_command: string | null;
+  entrypoint: string | null;
+};
+
+type DomainCoverageEntry = {
+  domain: string;
+  path: string;
+  module_count: number;
+  subpackage_count: number;
+};
+
+type DataCoverage = {
+  root: string;
+  exists: boolean;
+  total_files: number;
+  csv_files: number;
+  parquet_files: number;
+  json_files: number;
+  other_files: number;
+};
+
+type SystemCoverage = {
+  timestamp: string;
+  main_entrypoint: string;
+  main_entrypoint_exists: boolean;
+  command_catalog: CommandCatalogEntry[];
+  scripts: ScriptInventoryEntry[];
+  domains: DomainCoverageEntry[];
+  data_assets: DataCoverage;
+};
+
 type LoginResponse = {
   access_token: string;
   token_type: string;
@@ -412,8 +489,11 @@ type DashboardState = {
 
   health: SystemHealth | null;
   portfolio: Portfolio | null;
+  performance: Performance | null;
   positions: Position[];
   orders: Order[];
+  signals: Signal[];
+  modelStatuses: ModelStatus[];
   riskMetrics: RiskMetrics | null;
   tca: TCAResponse | null;
   executionQuality: ExecutionQualityResponse | null;
@@ -442,6 +522,8 @@ type DashboardState = {
   runbooks: RunbookRecord[];
   tradingStatus: TradingStatus | null;
   jobs: CommandJob[];
+  jobCatalog: CommandCatalogEntry[];
+  systemCoverage: SystemCoverage | null;
   ws: WsState;
   error: string | null;
 
@@ -455,8 +537,11 @@ type DashboardState = {
   fetchSnapshot: () => Promise<void>;
   fetchHealth: () => Promise<void>;
   fetchPortfolio: () => Promise<void>;
+  fetchPerformance: () => Promise<void>;
   fetchPositions: () => Promise<void>;
   fetchOrders: () => Promise<void>;
+  fetchSignals: () => Promise<void>;
+  fetchModelStatuses: () => Promise<void>;
   fetchRiskMetrics: () => Promise<void>;
   fetchTCA: () => Promise<void>;
   fetchExecutionQuality: () => Promise<void>;
@@ -492,6 +577,8 @@ type DashboardState = {
   fetchRunbooks: () => Promise<void>;
   fetchTradingStatus: () => Promise<void>;
   fetchJobs: () => Promise<void>;
+  fetchJobCatalog: () => Promise<void>;
+  fetchSystemCoverage: () => Promise<void>;
   promoteChampion: (modelName: string, versionId: string, reason?: string, mfaCode?: string) => Promise<void>;
   startTrading: (payload: StartTradingPayload) => Promise<void>;
   stopTrading: () => Promise<void>;
@@ -539,6 +626,7 @@ function isStatus(error: unknown, status: number) {
   return maybeResponse?.status === status;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function connectSocket(channel: keyof WsState, onMessage: (payload: any) => void, setWs: (connected: boolean) => void) {
   const ws = new WebSocket(`${websocketBaseUrl}/ws/${channel}`);
   sockets[channel] = ws;
@@ -567,8 +655,11 @@ export const useStore = create<DashboardState>((set, get) => ({
 
   health: null,
   portfolio: null,
+  performance: null,
   positions: [],
   orders: [],
+  signals: [],
+  modelStatuses: [],
   riskMetrics: null,
   tca: null,
   executionQuality: null,
@@ -597,6 +688,8 @@ export const useStore = create<DashboardState>((set, get) => ({
   runbooks: [],
   tradingStatus: null,
   jobs: [],
+  jobCatalog: [],
+  systemCoverage: null,
   ws: { portfolio: false, orders: false, signals: false, alerts: false },
   error: null,
 
@@ -709,8 +802,11 @@ export const useStore = create<DashboardState>((set, get) => ({
       role: "viewer",
       health: null,
       portfolio: null,
+      performance: null,
       positions: [],
       orders: [],
+      signals: [],
+      modelStatuses: [],
       riskMetrics: null,
       tca: null,
       executionQuality: null,
@@ -739,6 +835,8 @@ export const useStore = create<DashboardState>((set, get) => ({
       runbooks: [],
       jobs: [],
       tradingStatus: null,
+      jobCatalog: [],
+      systemCoverage: null,
       authError: null,
       error: null,
     });
@@ -750,9 +848,16 @@ export const useStore = create<DashboardState>((set, get) => ({
       const tasks: Array<Promise<void>> = [
         get().fetchHealth(),
         get().fetchPortfolio(),
+        get().fetchPerformance(),
         get().fetchPositions(),
         get().fetchOrders(),
+        get().fetchSignals(),
+        get().fetchModelStatuses(),
         get().fetchRiskMetrics(),
+        get().fetchRiskConcentration(),
+        get().fetchRiskCorrelation(),
+        get().fetchRiskStress(),
+        get().fetchRiskAttribution(),
         get().fetchTCA(),
         get().fetchExecutionQuality(),
         get().fetchVar(),
@@ -767,6 +872,7 @@ export const useStore = create<DashboardState>((set, get) => ({
         get().fetchAdminUsers(),
         get().fetchAlerts(),
         get().fetchLogs(),
+        get().fetchAuditTrail(),
         get().fetchSloStatus(),
         get().fetchIncidents(),
         get().fetchIncidentTimeline(),
@@ -793,6 +899,11 @@ export const useStore = create<DashboardState>((set, get) => ({
     set({ portfolio: response.data });
   },
 
+  fetchPerformance: async () => {
+    const response = await api.get<Performance>("/performance");
+    set({ performance: response.data });
+  },
+
   fetchPositions: async () => {
     const response = await api.get<Position[]>("/positions");
     set({ positions: response.data });
@@ -801,6 +912,16 @@ export const useStore = create<DashboardState>((set, get) => ({
   fetchOrders: async () => {
     const response = await api.get<Order[]>("/orders?limit=250");
     set({ orders: response.data });
+  },
+
+  fetchSignals: async () => {
+    const response = await api.get<Signal[]>("/signals?limit=200");
+    set({ signals: response.data });
+  },
+
+  fetchModelStatuses: async () => {
+    const response = await api.get<ModelStatus[]>("/models");
+    set({ modelStatuses: response.data });
   },
 
   fetchRiskMetrics: async () => {
@@ -824,23 +945,71 @@ export const useStore = create<DashboardState>((set, get) => ({
   },
 
   fetchRiskConcentration: async () => {
-    const response = await api.get<RiskConcentrationResponse>("/risk/concentration");
-    set({ riskConcentration: response.data });
+    if (!get().hasPermission("risk.advanced.read")) {
+      set({ riskConcentration: null });
+      return;
+    }
+    try {
+      const response = await api.get<RiskConcentrationResponse>("/risk/concentration");
+      set({ riskConcentration: response.data });
+    } catch (error) {
+      if (isStatus(error, 403)) {
+        set({ riskConcentration: null });
+        return;
+      }
+      throw error;
+    }
   },
 
   fetchRiskCorrelation: async () => {
-    const response = await api.get<RiskCorrelationResponse>("/risk/correlation");
-    set({ riskCorrelation: response.data });
+    if (!get().hasPermission("risk.advanced.read")) {
+      set({ riskCorrelation: null });
+      return;
+    }
+    try {
+      const response = await api.get<RiskCorrelationResponse>("/risk/correlation");
+      set({ riskCorrelation: response.data });
+    } catch (error) {
+      if (isStatus(error, 403)) {
+        set({ riskCorrelation: null });
+        return;
+      }
+      throw error;
+    }
   },
 
   fetchRiskStress: async () => {
-    const response = await api.get<RiskStressResponse>("/risk/stress");
-    set({ riskStress: response.data });
+    if (!get().hasPermission("risk.advanced.read")) {
+      set({ riskStress: null });
+      return;
+    }
+    try {
+      const response = await api.get<RiskStressResponse>("/risk/stress");
+      set({ riskStress: response.data });
+    } catch (error) {
+      if (isStatus(error, 403)) {
+        set({ riskStress: null });
+        return;
+      }
+      throw error;
+    }
   },
 
   fetchRiskAttribution: async () => {
-    const response = await api.get<RiskAttributionResponse>("/risk/attribution");
-    set({ riskAttribution: response.data });
+    if (!get().hasPermission("risk.advanced.read")) {
+      set({ riskAttribution: null });
+      return;
+    }
+    try {
+      const response = await api.get<RiskAttributionResponse>("/risk/attribution");
+      set({ riskAttribution: response.data });
+    } catch (error) {
+      if (isStatus(error, 403)) {
+        set({ riskAttribution: null });
+        return;
+      }
+      throw error;
+    }
   },
 
   fetchExplainability: async () => {
@@ -1223,6 +1392,36 @@ export const useStore = create<DashboardState>((set, get) => ({
     }
   },
 
+  fetchJobCatalog: async () => {
+    if (!get().hasPermission("control.jobs.read")) {
+      set({ jobCatalog: [] });
+      return;
+    }
+    try {
+      const response = await api.get<CommandCatalogEntry[]>("/control/jobs/catalog");
+      set({ jobCatalog: response.data });
+    } catch (error) {
+      if (isStatus(error, 403)) {
+        set({ jobCatalog: [] });
+        return;
+      }
+      throw error;
+    }
+  },
+
+  fetchSystemCoverage: async () => {
+    try {
+      const response = await api.get<SystemCoverage>("/system/coverage");
+      set({ systemCoverage: response.data });
+    } catch (error) {
+      if (isStatus(error, 403)) {
+        set({ systemCoverage: null });
+        return;
+      }
+      throw error;
+    }
+  },
+
   promoteChampion: async (modelName: string, versionId: string, reason = "manual_promotion", mfaCode?: string) => {
     await api.post(
       "/models/champion/promote",
@@ -1395,8 +1594,14 @@ export const useStore = create<DashboardState>((set, get) => ({
     connectSocket(
       "signals",
       (payload) => {
+        if (payload?.type === "snapshot" && Array.isArray(payload.data)) {
+          set({ signals: payload.data });
+          return;
+        }
         if (payload?.type === "signal" && payload.data) {
-          // signals are shown on overview via explainability and alerts; no-op for now
+          set((state) => ({
+            signals: [payload.data, ...state.signals].slice(0, 200),
+          }));
           return;
         }
       },

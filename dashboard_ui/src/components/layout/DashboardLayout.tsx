@@ -4,6 +4,7 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
+  Boxes,
   Bot,
   BriefcaseBusiness,
   Gauge,
@@ -29,6 +30,7 @@ type NavItem = {
 const navItems: NavItem[] = [
   { icon: Gauge, label: "Command Center", href: "/" },
   { icon: BriefcaseBusiness, label: "Execution", href: "/trading", permission: "control.trading.status" },
+  { icon: Boxes, label: "Platform", href: "/platform", permission: "read.basic" },
   { icon: ShieldAlert, label: "Risk", href: "/risk", permission: "risk.advanced.read" },
   { icon: Bot, label: "Models", href: "/models", permission: "models.governance.read" },
   { icon: Workflow, label: "Operations", href: "/operations", permission: "operations.sre.read" },
@@ -59,7 +61,9 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <div className="min-h-screen w-full bg-[radial-gradient(circle_at_20%_10%,#dce9ff_0,#f5f8ff_40%,#f8f7f3_100%)] text-slate-900">
+    <div className="mission-gradient min-h-screen w-full text-slate-900">
+      <div className="pointer-events-none fixed left-[-120px] top-[-140px] h-72 w-72 rounded-full bg-teal-300/20 blur-3xl" />
+      <div className="pointer-events-none fixed bottom-[-130px] right-[-90px] h-80 w-80 rounded-full bg-amber-300/20 blur-3xl" />
       <div className="mx-auto flex max-w-[1800px]">
         <aside
           className={cn(

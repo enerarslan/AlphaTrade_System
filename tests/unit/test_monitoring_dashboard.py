@@ -312,6 +312,26 @@ class TestDashboardEndpoints:
         data = response.json()
         assert data.get("status") == "flushed"
 
+    def test_control_jobs_catalog_endpoint(self, client):
+        """Test /control/jobs/catalog endpoint."""
+        response = client.get("/control/jobs/catalog")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+        assert any(item.get("command") == "health" for item in data)
+        assert all("script_path" in item for item in data)
+
+    def test_system_coverage_endpoint(self, client):
+        """Test /system/coverage endpoint."""
+        response = client.get("/system/coverage")
+        assert response.status_code == 200
+        data = response.json()
+        assert "main_entrypoint" in data
+        assert "command_catalog" in data
+        assert "scripts" in data
+        assert "domains" in data
+        assert "data_assets" in data
+
     def test_model_governance_endpoints(self, client):
         """Test model governance endpoints."""
         response = client.get("/models/registry")

@@ -6,6 +6,7 @@ import "./App.css";
 
 const OverviewPage = lazy(() => import("@/pages/overview"));
 const TradingTerminalPage = lazy(() => import("@/pages/trading"));
+const PlatformPage = lazy(() => import("@/pages/platform"));
 const RiskWarRoomPage = lazy(() => import("@/pages/risk"));
 const OperationsPage = lazy(() => import("@/pages/system-status"));
 const ModelsPage = lazy(() => import("@/pages/models"));
@@ -50,6 +51,14 @@ function ProtectedApp() {
             element={
               <GuardedRoute permission="control.trading.status">
                 <TradingTerminalPage />
+              </GuardedRoute>
+            }
+          />
+          <Route
+            path="/platform"
+            element={
+              <GuardedRoute permission="read.basic">
+                <PlatformPage />
               </GuardedRoute>
             }
           />

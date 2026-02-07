@@ -26,6 +26,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import ssl
 import subprocess
@@ -2091,6 +2092,17 @@ class CommandJobResponse(BaseModel):
     output: str
 
 
+class CommandCatalogEntryResponse(BaseModel):
+    """Allowlisted dashboard job command metadata."""
+
+    command: str
+    summary: str
+    script_path: str
+    script_exists: bool
+    sample_args: list[str]
+    risk_level: str
+
+
 class KillSwitchActivateRequest(BaseModel):
     """Request for kill-switch activation."""
 
@@ -2234,6 +2246,49 @@ class RunbookExecutionRequest(BaseModel):
 
     action: str = Field(..., pattern="^(health_check|validate_env|gpu_check|data_feed_check|broker_reconnect_dryrun)$")
     mfa_code: str | None = None
+
+
+class ScriptInventoryEntryResponse(BaseModel):
+    """Inventory record for one scripts/* module."""
+
+    script_name: str
+    path: str
+    exists: bool
+    linked_command: str | None
+    entrypoint: str | None
+
+
+class DomainCoverageEntryResponse(BaseModel):
+    """Coverage summary for one quant_trading_system domain package."""
+
+    domain: str
+    path: str
+    module_count: int
+    subpackage_count: int
+
+
+class DataCoverageResponse(BaseModel):
+    """Dataset inventory summary used by dashboard system coverage."""
+
+    root: str
+    exists: bool
+    total_files: int
+    csv_files: int
+    parquet_files: int
+    json_files: int
+    other_files: int
+
+
+class SystemCoverageResponse(BaseModel):
+    """Project-wide coverage snapshot for control-plane visibility."""
+
+    timestamp: str
+    main_entrypoint: str
+    main_entrypoint_exists: bool
+    command_catalog: list[CommandCatalogEntryResponse]
+    scripts: list[ScriptInventoryEntryResponse]
+    domains: list[DomainCoverageEntryResponse]
+    data_assets: DataCoverageResponse
 
 
 # =============================================================================
@@ -3248,10 +3303,180 @@ def _store_idempotent_response(
     )
 
 
+JOB_COMMAND_CATALOG: dict[str, dict[str, Any]] = {
+    "backtest": {
+        "summary": "Historical simulation and attribution run.",
+        "script_path": "scripts/backtest.py",
+        "sample_args": ["--start", "2025-01-01", "--end", "2025-12-31", "--symbols", "AAPL", "MSFT"],
+        "risk_level": "medium",
+    },
+    "train": {
+        "summary": "Model training with validation gates.",
+        "script_path": "scripts/train.py",
+        "sample_args": ["--model", "xgboost", "--symbols", "AAPL", "MSFT"],
+        "risk_level": "medium",
+    },
+    "data": {
+        "summary": "Data loading, validation, and export workflows.",
+        "script_path": "scripts/data.py",
+        "sample_args": ["validate", "--symbols", "AAPL", "MSFT"],
+        "risk_level": "low",
+    },
+    "features": {
+        "summary": "Feature pipeline computation and diagnostics.",
+        "script_path": "scripts/features.py",
+        "sample_args": ["compute", "--symbols", "AAPL", "MSFT"],
+        "risk_level": "low",
+    },
+    "health": {
+        "summary": "Operational health and dependency diagnostics.",
+        "script_path": "scripts/health.py",
+        "sample_args": ["check", "--full"],
+        "risk_level": "low",
+    },
+    "deploy": {
+        "summary": "Environment, docker, and deployment checks.",
+        "script_path": "scripts/deploy.py",
+        "sample_args": ["env", "check"],
+        "risk_level": "high",
+    },
+}
+
+
+def _build_command_catalog() -> list[CommandCatalogEntryResponse]:
+    """Build sorted command catalog from allowlisted job definitions."""
+    records: list[CommandCatalogEntryResponse] = []
+    for command, metadata in sorted(JOB_COMMAND_CATALOG.items(), key=lambda x: x[0]):
+        rel_path = str(metadata.get("script_path", "")).replace("\\", "/")
+        script_exists = bool(rel_path) and (PROJECT_ROOT / rel_path).exists()
+        records.append(
+            CommandCatalogEntryResponse(
+                command=command,
+                summary=str(metadata.get("summary", "")),
+                script_path=rel_path,
+                script_exists=script_exists,
+                sample_args=[str(x) for x in metadata.get("sample_args", [])],
+                risk_level=str(metadata.get("risk_level", "low")),
+            )
+        )
+    return records
+
+
+def _extract_script_entrypoint(script_path: Path) -> str | None:
+    """Best-effort detection of `run_*` entrypoint in scripts file."""
+    try:
+        source = script_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    match = re.search(r"def\s+(run_[A-Za-z0-9_]+)\s*\(", source)
+    return match.group(1) if match else None
+
+
+def _build_script_inventory() -> list[ScriptInventoryEntryResponse]:
+    """Build scripts directory inventory for dashboard coverage view."""
+    scripts_root = PROJECT_ROOT / "scripts"
+    if not scripts_root.exists():
+        return []
+
+    command_by_script = {
+        str(metadata.get("script_path", "")).replace("\\", "/"): command
+        for command, metadata in JOB_COMMAND_CATALOG.items()
+    }
+
+    records: list[ScriptInventoryEntryResponse] = []
+    for script_path in sorted(scripts_root.glob("*.py")):
+        if script_path.name.startswith("__"):
+            continue
+        rel_path = script_path.relative_to(PROJECT_ROOT).as_posix()
+        records.append(
+            ScriptInventoryEntryResponse(
+                script_name=script_path.stem,
+                path=rel_path,
+                exists=script_path.exists(),
+                linked_command=command_by_script.get(rel_path),
+                entrypoint=_extract_script_entrypoint(script_path),
+            )
+        )
+    return records
+
+
+def _build_domain_coverage() -> list[DomainCoverageEntryResponse]:
+    """Summarize quant_trading_system package/domain module coverage."""
+    package_root = PROJECT_ROOT / "quant_trading_system"
+    if not package_root.exists():
+        return []
+
+    records: list[DomainCoverageEntryResponse] = []
+    for domain_path in sorted(package_root.iterdir(), key=lambda x: x.name):
+        if not domain_path.is_dir() or domain_path.name.startswith("_"):
+            continue
+        if not (domain_path / "__init__.py").exists():
+            continue
+
+        module_count = len([p for p in domain_path.rglob("*.py") if p.name != "__init__.py"])
+        subpackage_count = len(
+            [p for p in domain_path.iterdir() if p.is_dir() and (p / "__init__.py").exists()]
+        )
+        records.append(
+            DomainCoverageEntryResponse(
+                domain=domain_path.name,
+                path=domain_path.relative_to(PROJECT_ROOT).as_posix(),
+                module_count=module_count,
+                subpackage_count=subpackage_count,
+            )
+        )
+    return records
+
+
+def _build_data_coverage() -> DataCoverageResponse:
+    """Summarize local data assets for operator situational awareness."""
+    data_root = PROJECT_ROOT / "data"
+    if not data_root.exists():
+        return DataCoverageResponse(
+            root="data",
+            exists=False,
+            total_files=0,
+            csv_files=0,
+            parquet_files=0,
+            json_files=0,
+            other_files=0,
+        )
+
+    counts = {
+        "total_files": 0,
+        "csv_files": 0,
+        "parquet_files": 0,
+        "json_files": 0,
+        "other_files": 0,
+    }
+    for candidate in data_root.rglob("*"):
+        if not candidate.is_file():
+            continue
+        counts["total_files"] += 1
+        suffix = candidate.suffix.lower()
+        if suffix in {".csv", ".tsv"}:
+            counts["csv_files"] += 1
+        elif suffix in {".parquet", ".pq", ".feather"}:
+            counts["parquet_files"] += 1
+        elif suffix in {".json", ".jsonl", ".ndjson"}:
+            counts["json_files"] += 1
+        else:
+            counts["other_files"] += 1
+
+    return DataCoverageResponse(
+        root=data_root.relative_to(PROJECT_ROOT).as_posix(),
+        exists=True,
+        total_files=counts["total_files"],
+        csv_files=counts["csv_files"],
+        parquet_files=counts["parquet_files"],
+        json_files=counts["json_files"],
+        other_files=counts["other_files"],
+    )
+
+
 def _build_main_command(command: str, args: list[str]) -> list[str]:
     """Build executable CLI command with safety allowlist."""
-    allowed = {"backtest", "train", "data", "features", "health", "deploy"}
-    if command not in allowed:
+    if command not in JOB_COMMAND_CATALOG:
         raise HTTPException(status_code=400, detail=f"Unsupported command: {command}")
     return [sys.executable, "main.py", command, *args]
 
@@ -4291,6 +4516,21 @@ async def get_metrics() -> Response:
     )
 
 
+@app.get("/system/coverage", response_model=SystemCoverageResponse, tags=["System"])
+async def get_system_coverage(current_user: AuthenticatedUser) -> SystemCoverageResponse:
+    """Return project-wide dashboard coverage for main/scripts/domains/data."""
+    _require_permission(current_user, "read.basic")
+    return SystemCoverageResponse(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        main_entrypoint="main.py",
+        main_entrypoint_exists=(PROJECT_ROOT / "main.py").exists(),
+        command_catalog=_build_command_catalog(),
+        scripts=_build_script_inventory(),
+        domains=_build_domain_coverage(),
+        data_assets=_build_data_coverage(),
+    )
+
+
 @app.get("/portfolio", response_model=PortfolioResponse, tags=["Portfolio"])
 async def get_portfolio(current_user: AuthenticatedUser) -> PortfolioResponse:
     """Get current portfolio state. Requires authentication."""
@@ -5004,6 +5244,13 @@ async def reset_kill_switch(
         idempotency_key=idempotency_key,
     )
     return response
+
+
+@app.get("/control/jobs/catalog", response_model=list[CommandCatalogEntryResponse], tags=["Control"])
+async def get_command_job_catalog(current_user: AuthenticatedUser) -> list[CommandCatalogEntryResponse]:
+    """List allowlisted async command jobs exposed to dashboard operators."""
+    _require_permission(current_user, "control.jobs.read")
+    return _build_command_catalog()
 
 
 @app.post("/control/jobs", response_model=CommandJobResponse, tags=["Control"])
