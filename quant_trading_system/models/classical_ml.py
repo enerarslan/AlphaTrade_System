@@ -8,6 +8,7 @@ with trading-specific optimizations and hyperparameters.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -121,10 +122,36 @@ class XGBoostModel(TradingModel):
             "verbosity": 0,
         }
 
+        extra_param_keys = {
+            "objective",
+            "eval_metric",
+            "gamma",
+            "max_delta_step",
+            "scale_pos_weight",
+            "max_bin",
+            "grow_policy",
+            "monotone_constraints",
+            "interaction_constraints",
+        }
+        for key in extra_param_keys:
+            if key in self._params:
+                params[key] = self._params[key]
+
         # GPU support
         if self._params.get("use_gpu"):
             params["tree_method"] = "hist"
             params["device"] = "cuda"
+        params.setdefault(
+            "objective",
+            "binary:logistic" if self._model_type == ModelType.CLASSIFIER else "reg:squarederror",
+        )
+        params.setdefault(
+            "eval_metric",
+            "auc" if self._model_type == ModelType.CLASSIFIER else "rmse",
+        )
+        early_stopping_rounds = int(max(0, self._params.get("early_stopping_rounds", 0)))
+        if early_stopping_rounds > 0 and validation_data is not None:
+            params.setdefault("early_stopping_rounds", early_stopping_rounds)
 
         # Create model based on type
         if self._model_type == ModelType.CLASSIFIER:
@@ -133,17 +160,15 @@ class XGBoostModel(TradingModel):
             self._model = xgb.XGBRegressor(**params)
 
         # Fit with early stopping if validation data provided
-        fit_params: dict[str, Any] = {"sample_weight": sample_weights}
+        fit_params: dict[str, Any] = {}
+        if sample_weights is not None:
+            fit_params["sample_weight"] = sample_weights
 
         if validation_data is not None:
             X_val, y_val = validation_data
-            self._model.fit(
-                X,
-                y,
-                eval_set=[(X_val, y_val)],
-                verbose=False,
-                **fit_params,
-            )
+            fit_params["eval_set"] = [(X_val, y_val)]
+            fit_params["verbose"] = False
+            self._model.fit(X, y, **fit_params)
         else:
             self._model.fit(X, y, **fit_params)
 
@@ -295,26 +320,49 @@ class LightGBMModel(TradingModel):
             "verbose": -1,
         }
 
+        extra_param_keys = {
+            "objective",
+            "metric",
+            "class_weight",
+            "is_unbalance",
+            "scale_pos_weight",
+            "min_gain_to_split",
+            "max_bin",
+        }
+        for key in extra_param_keys:
+            if key in self._params:
+                params[key] = self._params[key]
+
         if self._params.get("use_gpu"):
             params["device_type"] = "gpu"
+        params.setdefault(
+            "objective",
+            "binary" if self._model_type == ModelType.CLASSIFIER else "regression",
+        )
+        params.setdefault(
+            "metric",
+            "auc" if self._model_type == ModelType.CLASSIFIER else "rmse",
+        )
 
         if self._model_type == ModelType.CLASSIFIER:
             self._model = lgb.LGBMClassifier(**params)
         else:
             self._model = lgb.LGBMRegressor(**params)
 
-        fit_params: dict[str, Any] = {"sample_weight": sample_weights}
+        fit_params: dict[str, Any] = {}
+        if sample_weights is not None:
+            fit_params["sample_weight"] = sample_weights
         if categorical_features:
             fit_params["categorical_feature"] = categorical_features
 
         if validation_data is not None:
             X_val, y_val = validation_data
-            self._model.fit(
-                X,
-                y,
-                eval_set=[(X_val, y_val)],
-                **fit_params,
-            )
+            fit_params["eval_set"] = [(X_val, y_val)]
+            fit_params["eval_metric"] = params.get("metric")
+            early_stopping_rounds = int(max(0, self._params.get("early_stopping_rounds", 0)))
+            if early_stopping_rounds > 0:
+                fit_params["callbacks"] = [lgb.early_stopping(early_stopping_rounds, verbose=False)]
+            self._model.fit(X, y, **fit_params)
         else:
             self._model.fit(X, y, **fit_params)
 
@@ -548,6 +596,9 @@ class RandomForestModel(TradingModel):
         """
         super().__init__(name, version, model_type, **kwargs)
 
+        if os.name == "nt" and n_jobs != 1:
+            n_jobs = 1
+
         self._params.update({
             "n_estimators": n_estimators,
             "max_depth": max_depth,
@@ -596,6 +647,17 @@ class RandomForestModel(TradingModel):
             "random_state": self._params["random_state"],
             "n_jobs": self._params["n_jobs"],
         }
+        for key in (
+            "class_weight",
+            "criterion",
+            "ccp_alpha",
+            "max_samples",
+            "min_impurity_decrease",
+            "min_weight_fraction_leaf",
+            "max_leaf_nodes",
+        ):
+            if key in self._params:
+                params[key] = self._params[key]
 
         if self._model_type == ModelType.CLASSIFIER:
             self._model = RandomForestClassifier(**params)

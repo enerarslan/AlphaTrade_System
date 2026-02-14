@@ -127,6 +127,49 @@ class TestParseArgs:
             assert args.nested_inner_splits == 3
             assert args.seed == 7
 
+    def test_parse_train_advanced_risk_and_execution_flags(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "train",
+                "--objective-weight-cvar",
+                "0.6",
+                "--objective-weight-skew",
+                "0.2",
+                "--holdout-pct",
+                "0.2",
+                "--min-holdout-sharpe",
+                "0.1",
+                "--max-holdout-drawdown",
+                "0.25",
+                "--max-regime-shift",
+                "0.3",
+                "--label-edge-cost-buffer-bps",
+                "3.0",
+                "--disable-dynamic-no-trade-band",
+                "--execution-vol-target-daily",
+                "0.01",
+                "--execution-turnover-cap",
+                "0.7",
+                "--execution-cooldown-bars",
+                "4",
+            ],
+        ):
+            args = parse_args()
+            assert args.objective_weight_cvar == pytest.approx(0.6)
+            assert args.objective_weight_skew == pytest.approx(0.2)
+            assert args.holdout_pct == pytest.approx(0.2)
+            assert args.min_holdout_sharpe == pytest.approx(0.1)
+            assert args.max_holdout_drawdown == pytest.approx(0.25)
+            assert args.max_regime_shift == pytest.approx(0.3)
+            assert args.label_edge_cost_buffer_bps == pytest.approx(3.0)
+            assert args.disable_dynamic_no_trade_band is True
+            assert args.execution_vol_target_daily == pytest.approx(0.01)
+            assert args.execution_turnover_cap == pytest.approx(0.7)
+            assert args.execution_cooldown_bars == 4
+
     def test_parse_data_download_alias_and_sync_flags(self):
         with patch.object(
             sys,

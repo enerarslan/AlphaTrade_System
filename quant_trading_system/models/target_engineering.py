@@ -25,6 +25,11 @@ class TargetEngineeringConfig:
     spread_bps: float = 1.0
     slippage_bps: float = 3.0
     impact_bps: float = 2.0
+    min_signal_abs_return_bps: float = 8.0
+    neutral_buffer_bps: float = 4.0
+    edge_cost_buffer_bps: float = 2.0
+    max_abs_forward_return: float = 0.35
+    signal_volatility_floor_mult: float = 0.50
     regime_lookback: int = 30
     temporal_weight_decay: float = 0.999
 
@@ -37,6 +42,16 @@ class TargetEngineeringConfig:
             raise ValueError("max_holding_period must be positive")
         if not 0.0 < self.temporal_weight_decay <= 1.0:
             raise ValueError("temporal_weight_decay must be in (0, 1]")
+        if self.min_signal_abs_return_bps < 0.0:
+            raise ValueError("min_signal_abs_return_bps must be non-negative")
+        if self.neutral_buffer_bps < 0.0:
+            raise ValueError("neutral_buffer_bps must be non-negative")
+        if self.edge_cost_buffer_bps < 0.0:
+            raise ValueError("edge_cost_buffer_bps must be non-negative")
+        if self.max_abs_forward_return <= 0.0:
+            raise ValueError("max_abs_forward_return must be positive")
+        if self.signal_volatility_floor_mult < 0.0:
+            raise ValueError("signal_volatility_floor_mult must be non-negative")
 
 
 @dataclass
@@ -121,28 +136,65 @@ def generate_targets(
     )
 
     by_symbol: list[pd.DataFrame] = []
+    total_signal_candidates = 0
+    total_active_signals = 0
+    total_neutral_filtered = 0
+    total_forward_outlier_filtered = 0
     for symbol, sdf in work.groupby("symbol", sort=True):
         sdf = sdf.sort_values("timestamp").reset_index(drop=True)
         close = sdf["close"].astype(float)
+        returns = close.pct_change()
+        rolling_vol = returns.rolling(max(5, config.volatility_lookback)).std()
 
         # Multi-horizon forward returns.
         for horizon in config.horizons:
             sdf[f"forward_return_h{horizon}"] = close.pct_change(horizon).shift(-horizon)
 
         primary_forward = sdf[f"forward_return_h{config.primary_horizon}"]
+        total_cost = (config.spread_bps + config.slippage_bps + config.impact_bps) / 10000.0
+        min_signal_abs_return = max(
+            config.min_signal_abs_return_bps / 10000.0,
+            total_cost * 1.25,
+        )
+        vol_floor = (
+            np.nan_to_num(rolling_vol.to_numpy(dtype=float), nan=0.0)
+            * float(config.signal_volatility_floor_mult)
+        )
+        signal_floor = np.maximum(min_signal_abs_return, vol_floor)
+        primary_forward_values = pd.to_numeric(primary_forward, errors="coerce").to_numpy(dtype=float)
+        abs_primary_forward = np.abs(primary_forward_values)
+        forward_outlier_mask = abs_primary_forward > float(config.max_abs_forward_return)
+        active_signal_mask = (
+            np.isfinite(primary_forward_values)
+            & (abs_primary_forward >= signal_floor)
+            & (~forward_outlier_mask)
+        )
+        primary_signal_values = np.where(active_signal_mask, np.sign(primary_forward_values), 0.0)
         primary_signals = pd.Series(
-            np.where(primary_forward > 0, 1.0, np.where(primary_forward < 0, -1.0, 0.0)),
+            primary_signal_values,
             index=sdf.index,
             dtype=float,
         )
         tb = labeler.generate_labels(prices=close, signals=primary_signals)
 
-        total_cost = (config.spread_bps + config.slippage_bps + config.impact_bps) / 10000.0
         gross_ret = pd.to_numeric(tb["return"], errors="coerce")
         net_ret = gross_ret - total_cost * primary_signals.abs()
-        cost_label = np.where(primary_signals != 0, (net_ret > 0).astype(float), np.nan)
+        neutral_buffer = float(config.neutral_buffer_bps + config.edge_cost_buffer_bps) / 10000.0
+        signal_active = primary_signals != 0
+        neutral_mask = signal_active & (net_ret.abs() <= neutral_buffer)
+        cost_label = np.where(
+            signal_active,
+            np.where(
+                net_ret > neutral_buffer,
+                1.0,
+                np.where(net_ret < -neutral_buffer, 0.0, np.nan),
+            ),
+            np.nan,
+        )
 
         sdf["primary_signal"] = primary_signals
+        sdf["trade_side_label"] = np.where(primary_signals > 0.0, 1, np.where(primary_signals < 0.0, -1, 0))
+        sdf["binary_trade_label"] = (primary_signals != 0.0).astype(int)
         sdf["triple_barrier_label"] = pd.to_numeric(tb["label"], errors="coerce")
         sdf["triple_barrier_event_return"] = gross_ret
         sdf["triple_barrier_net_return"] = net_ret
@@ -150,12 +202,18 @@ def generate_targets(
         sdf["holding_period"] = pd.to_numeric(tb["holding_period"], errors="coerce")
         # Final binary label for model training.
         sdf["label"] = np.where(~np.isnan(sdf["triple_barrier_label"]), cost_label, np.nan)
+        # Forward-return outliers are excluded from label set for robustness.
+        sdf.loc[forward_outlier_mask, "label"] = np.nan
         sdf["regime"] = _classify_regime(
             close=close,
             lookback=config.regime_lookback,
             vol_lookback=config.volatility_lookback,
         ).values
 
+        total_signal_candidates += int(np.isfinite(primary_forward_values).sum())
+        total_active_signals += int(signal_active.sum())
+        total_neutral_filtered += int(neutral_mask.sum())
+        total_forward_outlier_filtered += int(forward_outlier_mask.sum())
         by_symbol.append(sdf)
 
     labeled = pd.concat(by_symbol, ignore_index=True)
@@ -185,7 +243,12 @@ def generate_targets(
         "normal_range": 1.00,
     }
     regime_weight_values = labeled["regime"].map(regime_boost).fillna(1.0).to_numpy(dtype=float)
-    sample_weights = temporal_weight * class_weight_values * regime_weight_values
+    neutral_buffer = max(float(config.neutral_buffer_bps + config.edge_cost_buffer_bps) / 10000.0, 1e-6)
+    net_return_abs = np.abs(
+        pd.to_numeric(labeled["triple_barrier_net_return"], errors="coerce").to_numpy(dtype=float)
+    )
+    edge_weight_values = 1.0 + np.clip(net_return_abs / neutral_buffer, 0.0, 2.0)
+    sample_weights = temporal_weight * class_weight_values * regime_weight_values * edge_weight_values
     sample_weights = np.nan_to_num(sample_weights, nan=1.0, posinf=1.0, neginf=1.0)
     mean_w = float(np.mean(sample_weights)) if len(sample_weights) else 1.0
     if mean_w > 1e-12:
@@ -215,10 +278,18 @@ def generate_targets(
         "positive_rate_second_half": second_half_rate,
         "label_drift_abs": float(drift_abs),
         "regime_distribution": {str(k): float(v) for k, v in regime_distribution.items()},
+        "signal_candidate_count": int(total_signal_candidates),
+        "signal_active_count": int(total_active_signals),
+        "signal_active_rate": (
+            float(total_active_signals / total_signal_candidates) if total_signal_candidates > 0 else 0.0
+        ),
+        "neutral_filtered_count": int(total_neutral_filtered),
+        "forward_outlier_filtered_count": int(total_forward_outlier_filtered),
         "cost_assumptions_bps": {
             "spread": float(config.spread_bps),
             "slippage": float(config.slippage_bps),
             "impact": float(config.impact_bps),
+            "edge_cost_buffer": float(config.edge_cost_buffer_bps),
         },
         "horizons": [int(h) for h in config.horizons],
         "primary_horizon": int(config.primary_horizon),

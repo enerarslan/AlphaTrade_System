@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from quant_trading_system.models.training_lineage import register_training_model_version
 from scripts import train as train_script
 
 
@@ -160,6 +161,43 @@ def test_run_training_all_dispatch(monkeypatch):
     ]
 
 
+def test_run_training_all_continues_when_one_model_fails(monkeypatch):
+    trained = []
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            self.config = config
+            trained.append(config.model_type)
+
+        def run(self):
+            if self.config.model_type == "lightgbm":
+                raise RuntimeError("intentional failure")
+            return {"success": True, "training_metrics": {}}
+
+    class DummyEnsembleTrainer:
+        def __init__(self, config):
+            self.config = config
+            trained.append(config.model_type)
+
+        def train(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "EnsembleTrainer", DummyEnsembleTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+
+    args = _base_args(model="all")
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 1
+    assert trained[0] == "xgboost"
+    assert "lightgbm" in trained
+    assert "random_forest" in trained
+    assert "ensemble" in trained
+    assert trained[-1] == "ensemble"
+
+
 def test_run_training_rejects_optional_disable_flags():
     args = _base_args(no_database=True)
     exit_code = train_script.run_training(args)
@@ -207,6 +245,60 @@ def test_validate_model_uses_min_accuracy_gate():
     assert passed is False
     assert trainer.validation_results["gates"]["min_accuracy"][0] is False
     assert trainer.validation_results["gates"]["min_win_rate"][0] is True
+
+
+def test_effective_trade_target_scales_with_fold_size():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="xgboost", min_trades=100)
+    )
+
+    assert trainer._effective_trade_target(None) == 100
+    assert trainer._effective_trade_target(50) == 3
+    assert trainer._effective_trade_target(400) == 10
+
+
+def test_validate_model_uses_dynamic_min_trades_threshold():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            min_trades=100,
+            use_meta_labeling=False,
+            require_nested_trace_for_promotion=False,
+            require_objective_breakdown_for_promotion=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 20.0,
+        "mean_test_size": 50.0,
+        "mean_risk_adjusted_score": 0.25,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.20,
+    }
+
+    passed = trainer._validate_model()
+
+    assert passed is True
+    assert trainer.training_metrics["effective_min_trades_gate"] == pytest.approx(3.0)
+    assert trainer.validation_results["gates"]["min_trades"][2] == pytest.approx(3.0)
+
+
+def test_load_model_defaults_random_forest_windows_forces_single_job(monkeypatch):
+    monkeypatch.setattr(train_script.os, "name", "nt", raising=False)
+    defaults = train_script._load_model_defaults("random_forest", use_gpu=True)
+    assert defaults.get("n_jobs") == 1
+
+
+def test_augment_params_random_forest_windows_forces_single_job(monkeypatch):
+    monkeypatch.setattr(train_script.os, "name", "nt", raising=False)
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="random_forest"))
+    params = trainer._augment_params_for_train_labels({}, np.array([0, 1, 1, 0], dtype=float))
+    assert params.get("class_weight") == "balanced_subsample"
+    assert params.get("n_jobs") == 1
 
 
 def test_compute_shap_values_sequence_model_handles_single_row_kernel_calls(monkeypatch):
@@ -257,6 +349,98 @@ def test_compute_shap_values_sequence_model_handles_single_row_kernel_calls(monk
     assert "shap_importance" in trainer.training_metrics
     assert trainer.model.call_sizes
     assert min(trainer.model.call_sizes) >= trainer.model.lookback_window
+
+
+def test_calculate_fold_metrics_uses_active_trade_returns():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    metrics = trainer._calculate_fold_metrics(
+        y_true=np.array([1, 1, 0, 0], dtype=float),
+        y_pred=np.array([1, 0, 0, 0], dtype=float),
+        y_proba=np.array([0.70, 0.50, 0.50, 0.50], dtype=float),
+        long_threshold=0.55,
+        short_threshold=0.45,
+        realized_forward_returns=np.array([0.01, 0.01, 0.01, 0.01], dtype=float),
+    )
+
+    assert metrics["trade_count"] == pytest.approx(1.0)
+    assert metrics["trade_return_observations"] == pytest.approx(1.0)
+    assert metrics["win_rate"] == pytest.approx(1.0)
+
+
+def test_build_execution_profile_relaxes_band_when_activity_too_low():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            min_trades=20,
+            dynamic_no_trade_band=True,
+        )
+    )
+    y_proba = np.full(120, 0.565, dtype=float)
+    realized = np.full(120, 0.001, dtype=float)
+
+    profile = trainer._build_execution_profile(
+        y_proba=y_proba,
+        long_threshold=0.55,
+        short_threshold=0.45,
+        realized_returns=realized,
+    )
+
+    assert np.count_nonzero(profile["raw_signals"]) > 0
+    assert float(np.mean(profile["long_threshold_series"])) < 0.58
+
+
+def test_derive_signal_thresholds_with_labels_boosts_activity():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="xgboost", min_trades=40)
+    )
+    rng = np.random.default_rng(17)
+    train_proba = np.clip(rng.normal(loc=0.68, scale=0.08, size=240), 0.01, 0.99)
+    train_labels = (rng.random(240) < 0.52).astype(float)
+
+    long_unlabeled, short_unlabeled = trainer._derive_signal_thresholds(train_proba)
+    long_labeled, short_labeled = trainer._derive_signal_thresholds(
+        train_proba,
+        train_labels=train_labels,
+    )
+
+    signals_unlabeled = np.where(
+        train_proba >= long_unlabeled,
+        1.0,
+        np.where(train_proba <= short_unlabeled, -1.0, 0.0),
+    )
+    signals_labeled = np.where(
+        train_proba >= long_labeled,
+        1.0,
+        np.where(train_proba <= short_labeled, -1.0, 0.0),
+    )
+    assert float(np.mean(signals_labeled != 0.0)) >= float(np.mean(signals_unlabeled != 0.0))
+
+
+def test_validate_model_normalizes_gate_bool_types():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            use_meta_labeling=False,
+            require_nested_trace_for_promotion=False,
+            require_objective_breakdown_for_promotion=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": np.float64(0.6),
+        "mean_accuracy": np.float64(0.7),
+        "mean_max_drawdown": np.float64(0.1),
+        "mean_win_rate": np.float64(0.6),
+        "mean_trade_count": np.float64(150.0),
+        "mean_risk_adjusted_score": np.float64(0.2),
+        "mean_test_size": np.float64(500.0),
+        "deflated_sharpe": np.float64(0.3),
+        "deflated_sharpe_p_value": np.float64(0.05),
+        "pbo": np.float64(0.2),
+    }
+
+    trainer._validate_model()
+    gate_flag = trainer.validation_results["gates"]["min_accuracy"][0]
+    assert isinstance(gate_flag, bool)
 
 
 def test_save_model_uses_model_native_save_when_available(tmp_path):
@@ -336,6 +520,163 @@ def test_build_parser_supports_feature_pipeline_flags():
     assert args.feature_reuse_min_coverage == 0.3
 
 
+def test_build_parser_supports_advanced_risk_and_execution_flags():
+    parser = train_script.build_parser()
+    args = parser.parse_args(
+        [
+            "--objective-weight-cvar",
+            "0.55",
+            "--objective-weight-skew",
+            "0.15",
+            "--holdout-pct",
+            "0.2",
+            "--min-holdout-sharpe",
+            "0.1",
+            "--max-holdout-drawdown",
+            "0.3",
+            "--max-regime-shift",
+            "0.25",
+            "--label-edge-cost-buffer-bps",
+            "2.5",
+            "--disable-dynamic-no-trade-band",
+            "--execution-vol-target-daily",
+            "0.01",
+            "--execution-turnover-cap",
+            "0.8",
+            "--execution-cooldown-bars",
+            "5",
+        ]
+    )
+    assert args.objective_weight_cvar == pytest.approx(0.55)
+    assert args.objective_weight_skew == pytest.approx(0.15)
+    assert args.holdout_pct == pytest.approx(0.2)
+    assert args.min_holdout_sharpe == pytest.approx(0.1)
+    assert args.max_holdout_drawdown == pytest.approx(0.3)
+    assert args.max_regime_shift == pytest.approx(0.25)
+    assert args.label_edge_cost_buffer_bps == pytest.approx(2.5)
+    assert args.disable_dynamic_no_trade_band is True
+    assert args.execution_vol_target_daily == pytest.approx(0.01)
+    assert args.execution_turnover_cap == pytest.approx(0.8)
+    assert args.execution_cooldown_bars == 5
+
+
+def test_build_training_matrix_ranks_by_governance_score():
+    rows = train_script._build_training_matrix(
+        [
+            (
+                "xgboost",
+                {
+                    "success": True,
+                    "model_name": "xgb_a",
+                    "training_metrics": {
+                        "mean_risk_adjusted_score": 0.40,
+                        "holdout_sharpe": 0.30,
+                        "deflated_sharpe": 0.20,
+                        "holdout_max_drawdown": 0.10,
+                        "pbo": 0.15,
+                    },
+                },
+            ),
+            (
+                "lightgbm",
+                {
+                    "success": True,
+                    "model_name": "lgb_b",
+                    "training_metrics": {
+                        "mean_risk_adjusted_score": 0.10,
+                        "holdout_sharpe": 0.05,
+                        "deflated_sharpe": 0.00,
+                        "holdout_max_drawdown": 0.20,
+                        "pbo": 0.30,
+                    },
+                },
+            ),
+        ]
+    )
+
+    assert rows[0]["model_type"] == "xgboost"
+    assert rows[0]["rank"] == 1
+    assert rows[0]["governance_score"] > rows[1]["governance_score"]
+
+
+def test_auto_select_champion_and_challenger_promotes_best(tmp_path):
+    first = register_training_model_version(
+        registry_root=tmp_path / "registry",
+        model_name="xgboost",
+        model_version="xgb_a",
+        model_type="xgboost",
+        model_path=str(tmp_path / "xgb_a.pkl"),
+        metrics={"mean_risk_adjusted_score": 0.2},
+        is_active=False,
+    )
+    second = register_training_model_version(
+        registry_root=tmp_path / "registry",
+        model_name="lightgbm",
+        model_version="lgb_b",
+        model_type="lightgbm",
+        model_path=str(tmp_path / "lgb_b.pkl"),
+        metrics={"mean_risk_adjusted_score": 0.4},
+        is_active=False,
+    )
+
+    rows = [
+        {
+            "model_type": "lightgbm",
+            "success": True,
+            "governance_score": 0.8,
+            "registry_version_id": second["version_id"],
+            "promotion_package_path": "models/promotion_packages/lgb_b.json",
+            "deployment_plan": {
+                "ready_for_production": True,
+                "canary_rollout": [{"phase": 1, "capital_fraction": 0.05}],
+            },
+        },
+        {
+            "model_type": "xgboost",
+            "success": True,
+            "governance_score": 0.5,
+            "registry_version_id": first["version_id"],
+            "promotion_package_path": "models/promotion_packages/xgb_a.json",
+            "deployment_plan": {"ready_for_production": True},
+        },
+    ]
+
+    snapshot = train_script._auto_select_champion_and_challenger(tmp_path, rows)
+
+    assert snapshot["promoted"] is True
+    assert snapshot["champion"]["model_type"] == "lightgbm"
+    assert (tmp_path / "active_model.json").exists()
+    assert (tmp_path / "champion_challenger_snapshot.json").exists()
+    assert (tmp_path / "canary_rollout_plan.json").exists()
+
+
+def test_auto_select_champion_requires_ready_plan_and_promotion_package(tmp_path):
+    entry = register_training_model_version(
+        registry_root=tmp_path / "registry",
+        model_name="ensemble",
+        model_version="ens_a",
+        model_type="ensemble",
+        model_path=str(tmp_path / "ens_a.pkl"),
+        metrics={"mean_accuracy": 0.6},
+        is_active=False,
+    )
+    rows = [
+        {
+            "model_type": "ensemble",
+            "success": True,
+            "governance_score": 0.9,
+            "registry_version_id": entry["version_id"],
+            "promotion_package_path": "",
+            "deployment_plan": {},
+        }
+    ]
+
+    snapshot = train_script._auto_select_champion_and_challenger(tmp_path, rows)
+    assert snapshot["promoted"] is False
+    assert snapshot["champion"] is None
+    assert not (tmp_path / "active_model.json").exists()
+
+
 def test_multiple_testing_correction_adds_deflated_sharpe_and_pbo_metrics():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -359,6 +700,27 @@ def test_multiple_testing_correction_adds_deflated_sharpe_and_pbo_metrics():
     assert "pbo_interpretation" in trainer.training_metrics
 
 
+def test_multiple_testing_correction_sets_effective_pbo_gate_and_source():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            correction_method="deflated_sharpe",
+            n_trials=12,
+            max_pbo=0.45,
+        )
+    )
+    trainer.training_metrics = {"mean_sharpe": 0.4}
+    trainer.cv_results = [{"fold": 1}, {"fold": 2}]
+    trainer.cv_return_series = [np.array([0.0, 0.0, 0.0, 0.0], dtype=float)]
+    trainer.cv_active_return_series = [np.array([0.001, -0.001], dtype=float)]
+
+    trainer._apply_multiple_testing_correction()
+
+    assert trainer.training_metrics["multiple_testing_return_source"] == "all_returns"
+    assert trainer.training_metrics["multiple_testing_return_observations"] == pytest.approx(4.0)
+    assert float(trainer.training_metrics["effective_max_pbo_gate"]) >= 0.45
+
+
 def test_validate_model_fails_when_pbo_gate_breaches():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -380,6 +742,38 @@ def test_validate_model_fails_when_pbo_gate_breaches():
     passed = trainer._validate_model()
     assert passed is False
     assert trainer.validation_results["gates"]["max_pbo"][0] is False
+
+
+def test_validate_model_uses_effective_pbo_gate_override():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            max_pbo=0.45,
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 20.0,
+        "mean_test_size": 50.0,
+        "mean_risk_adjusted_score": 0.25,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.50,
+        "effective_max_pbo_gate": 0.55,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is True
+    assert trainer.validation_results["gates"]["max_pbo"][0] is True
+    assert trainer.validation_results["gates"]["max_pbo"][2] == pytest.approx(0.55)
 
 
 def test_fit_model_falls_back_to_sample_weight_keyword():

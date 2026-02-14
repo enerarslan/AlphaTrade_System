@@ -10,8 +10,11 @@ from quant_trading_system.models.training_lineage import (
     build_data_quality_report,
     build_snapshot_manifest,
     compute_data_quality_hash,
+    load_registry_entries,
+    persist_active_model_pointer,
     persist_snapshot_bundle,
     register_training_model_version,
+    set_registry_active_version,
 )
 
 
@@ -117,3 +120,50 @@ def test_register_training_model_version_writes_dashboard_compatible_registry(tm
     assert payload["xgboost"][0]["metrics"]["mean_accuracy"] == 0.61
     assert "ignored" not in payload["xgboost"][0]["metrics"]
     assert payload["xgboost"][0]["lineage"]["snapshot_id"] == manifest["snapshot_id"]
+
+
+def test_set_registry_active_version_and_persist_active_model_pointer(tmp_path) -> None:
+    first = register_training_model_version(
+        registry_root=tmp_path / "registry",
+        model_name="xgboost",
+        model_version="xgb_a",
+        model_type="xgboost",
+        model_path=str(tmp_path / "xgb_a.pkl"),
+        metrics={"mean_accuracy": 0.55},
+        is_active=False,
+    )
+    second = register_training_model_version(
+        registry_root=tmp_path / "registry",
+        model_name="lightgbm",
+        model_version="lgb_b",
+        model_type="lightgbm",
+        model_path=str(tmp_path / "lgb_b.pkl"),
+        metrics={"mean_accuracy": 0.60},
+        is_active=False,
+    )
+
+    promoted = set_registry_active_version(
+        registry_root=tmp_path / "registry",
+        model_name="lightgbm",
+        version_id=second["version_id"],
+    )
+    assert promoted is True
+
+    entries = load_registry_entries(tmp_path / "registry")
+    active_entries = [row for row in entries if bool(row.get("is_active", False))]
+    assert len(active_entries) == 1
+    assert active_entries[0]["version_id"] == second["version_id"]
+    assert active_entries[0]["version_id"] != first["version_id"]
+
+    pointer_path = persist_active_model_pointer(
+        models_root=tmp_path,
+        model_name="lightgbm",
+        version_id=second["version_id"],
+        updated_by="unit_test",
+        reason="auto_benchmark_promotion",
+    )
+    assert pointer_path.exists()
+    payload = json.loads(pointer_path.read_text(encoding="utf-8"))
+    assert payload["model_name"] == "lightgbm"
+    assert payload["version_id"] == second["version_id"]
+    assert payload["updated_by"] == "unit_test"

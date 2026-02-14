@@ -102,9 +102,16 @@ def build_data_quality_report(
             if not positive_diffs.empty:
                 inferred_bar_seconds = float(np.median(positive_diffs.to_numpy()))
                 if inferred_bar_seconds > 0:
-                    span_seconds = float((timestamps.iloc[-1] - timestamps.iloc[0]).total_seconds())
-                    expected_points = int(np.floor(span_seconds / inferred_bar_seconds)) + 1
-                    symbol_missing = max(expected_points - len(timestamps), 0)
+                    regular_gap_limit = inferred_bar_seconds * 1.5
+                    # Treat long gaps (overnight/weekend/session breaks) as non-missing.
+                    # Missing bars are counted only inside regular trading segments.
+                    session_break_limit = max(inferred_bar_seconds * 24.0, 6.0 * 3600.0)
+                    missing_from_gaps = np.where(
+                        (positive_diffs > regular_gap_limit) & (positive_diffs <= session_break_limit),
+                        np.floor(positive_diffs / inferred_bar_seconds) - 1.0,
+                        0.0,
+                    )
+                    symbol_missing = int(np.maximum(missing_from_gaps, 0.0).sum())
 
         returns = group["close"].pct_change()
         returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -341,6 +348,8 @@ def register_training_model_version(
     snapshot_manifest: dict[str, Any] | None = None,
     training_config: dict[str, Any] | None = None,
     project_root: Path | None = None,
+    model_card: dict[str, Any] | None = None,
+    deployment_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Append one model version record to dashboard-compatible registry."""
     registry_root = Path(registry_root)
@@ -392,6 +401,15 @@ def register_training_model_version(
         "embargo_pct",
         "n_trials",
         "use_gpu",
+        "holdout_pct",
+        "min_holdout_sharpe",
+        "max_holdout_drawdown",
+        "max_regime_shift",
+        "execution_vol_target_daily",
+        "execution_turnover_cap",
+        "execution_cooldown_bars",
+        "objective_weight_cvar",
+        "objective_weight_skew",
     ]
     config_summary: dict[str, Any] = {}
     if isinstance(training_config, dict):
@@ -413,6 +431,8 @@ def register_training_model_version(
         "registry_schema_version": MODEL_REGISTRY_SCHEMA_VERSION,
         "lineage": lineage,
         "training_config": config_summary,
+        "model_card": model_card if isinstance(model_card, dict) else {},
+        "deployment_plan": deployment_plan if isinstance(deployment_plan, dict) else {},
     }
 
     versions.append(entry)
@@ -421,3 +441,96 @@ def register_training_model_version(
         json.dump(payload, f, indent=2, ensure_ascii=True, sort_keys=True, default=str)
 
     return entry
+
+
+def load_registry_entries(registry_root: Path) -> list[dict[str, Any]]:
+    """Load flattened registry entries sorted by recency."""
+    registry_file = Path(registry_root) / "registry.json"
+    if not registry_file.exists():
+        return []
+
+    try:
+        with registry_file.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+
+    if not isinstance(payload, dict):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for _, versions in payload.items():
+        if not isinstance(versions, list):
+            continue
+        for entry in versions:
+            if isinstance(entry, dict):
+                rows.append(entry)
+
+    def _sort_key(entry: dict[str, Any]) -> str:
+        return str(entry.get("registered_at", ""))
+
+    rows.sort(key=_sort_key, reverse=True)
+    return rows
+
+
+def set_registry_active_version(
+    registry_root: Path,
+    model_name: str,
+    version_id: str,
+) -> bool:
+    """Set exactly one active version across registry entries."""
+    registry_file = Path(registry_root) / "registry.json"
+    if not registry_file.exists():
+        return False
+
+    try:
+        with registry_file.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    matched = False
+    for _, versions in payload.items():
+        if not isinstance(versions, list):
+            continue
+        for entry in versions:
+            if not isinstance(entry, dict):
+                continue
+            is_match = (
+                str(entry.get("model_name", "")) == str(model_name)
+                and str(entry.get("version_id", "")) == str(version_id)
+            )
+            entry["is_active"] = bool(is_match)
+            if is_match:
+                matched = True
+
+    if not matched:
+        return False
+
+    with registry_file.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=True, sort_keys=True, default=str)
+    return True
+
+
+def persist_active_model_pointer(
+    models_root: Path,
+    model_name: str,
+    version_id: str,
+    updated_by: str = "training_pipeline",
+    reason: str = "auto_promotion",
+) -> Path:
+    """Persist champion pointer compatible with dashboard expectations."""
+    pointer_path = Path(models_root) / "active_model.json"
+    pointer_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_name": str(model_name),
+        "version_id": str(version_id),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_by": str(updated_by),
+        "reason": str(reason),
+    }
+    with pointer_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True, default=str)
+    return pointer_path

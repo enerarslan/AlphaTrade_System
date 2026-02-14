@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import quant_trading_system.models.classical_ml as classical_ml_models
 from quant_trading_system.models.base import ModelType, TimeSeriesModel, TradingModel
 from quant_trading_system.models.classical_ml import (
     CatBoostModel,
@@ -336,6 +337,11 @@ class TestRandomForestModel:
         model.fit(X, y)
 
         assert "oob_score" in model.training_metrics
+
+    def test_windows_forces_single_job(self, monkeypatch):
+        monkeypatch.setattr(classical_ml_models.os, "name", "nt", raising=False)
+        model = RandomForestModel(n_estimators=10, n_jobs=-1)
+        assert model.get_params()["n_jobs"] == 1
 
 
 class TestElasticNetModel:

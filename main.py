@@ -702,6 +702,24 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Multi-objective calibration penalty weight (default: 0.25)",
     )
     train_parser.add_argument(
+        "--objective-weight-trade-activity",
+        type=float,
+        default=1.0,
+        help="Penalty weight for low-trade activity in risk objective (default: 1.0)",
+    )
+    train_parser.add_argument(
+        "--objective-weight-cvar",
+        type=float,
+        default=0.4,
+        help="CVaR/expected shortfall penalty weight in objective (default: 0.4)",
+    )
+    train_parser.add_argument(
+        "--objective-weight-skew",
+        type=float,
+        default=0.1,
+        help="Negative return skew penalty weight in objective (default: 0.1)",
+    )
+    train_parser.add_argument(
         "--replay-manifest",
         type=Path,
         default=None,
@@ -757,6 +775,36 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Validation gate threshold for mean accuracy (default: 0.45)",
     )
     train_parser.add_argument(
+        "--min-trades",
+        type=int,
+        default=100,
+        help="Validation gate threshold for minimum mean trade count per fold (default: 100)",
+    )
+    train_parser.add_argument(
+        "--holdout-pct",
+        type=float,
+        default=0.15,
+        help="Terminal untouched holdout split ratio by timestamp (default: 0.15)",
+    )
+    train_parser.add_argument(
+        "--min-holdout-sharpe",
+        type=float,
+        default=0.0,
+        help="Validation gate threshold for holdout Sharpe ratio (default: 0.0)",
+    )
+    train_parser.add_argument(
+        "--max-holdout-drawdown",
+        type=float,
+        default=0.35,
+        help="Validation gate threshold for holdout max drawdown (default: 0.35)",
+    )
+    train_parser.add_argument(
+        "--max-regime-shift",
+        type=float,
+        default=0.35,
+        help="Maximum allowed regime distribution shift across train/test/holdout (default: 0.35)",
+    )
+    train_parser.add_argument(
         "--label-horizons",
         nargs="+",
         type=int,
@@ -804,6 +852,36 @@ For more information, visit: https://github.com/alphatrade/docs
         type=float,
         default=2.0,
         help="Cost-aware labeling impact assumption in bps (default: 2.0)",
+    )
+    train_parser.add_argument(
+        "--label-min-signal-abs-return-bps",
+        type=float,
+        default=8.0,
+        help="Minimum absolute forward return for signal candidacy in bps (default: 8.0)",
+    )
+    train_parser.add_argument(
+        "--label-neutral-buffer-bps",
+        type=float,
+        default=4.0,
+        help="Neutral edge buffer around zero net return in bps (default: 4.0)",
+    )
+    train_parser.add_argument(
+        "--label-edge-cost-buffer-bps",
+        type=float,
+        default=2.0,
+        help="Additional edge-over-cost buffer in bps for durable labels (default: 2.0)",
+    )
+    train_parser.add_argument(
+        "--label-max-abs-forward-return",
+        type=float,
+        default=0.35,
+        help="Absolute forward-return outlier cap for labeling robustness (default: 0.35)",
+    )
+    train_parser.add_argument(
+        "--label-signal-volatility-floor-mult",
+        type=float,
+        default=0.50,
+        help="Signal floor volatility multiplier for adaptive label filtering (default: 0.50)",
     )
     train_parser.add_argument(
         "--label-volatility-lookback",
@@ -870,6 +948,29 @@ For more information, visit: https://github.com/alphatrade/docs
         "--skip-feature-persist",
         action="store_true",
         help="Skip writing computed features back to PostgreSQL for this training run",
+    )
+    train_parser.add_argument(
+        "--disable-dynamic-no-trade-band",
+        action="store_true",
+        help="Disable adaptive no-trade thresholding in execution-aware evaluation",
+    )
+    train_parser.add_argument(
+        "--execution-vol-target-daily",
+        type=float,
+        default=0.012,
+        help="Daily volatility target used for position scaling during evaluation (default: 0.012)",
+    )
+    train_parser.add_argument(
+        "--execution-turnover-cap",
+        type=float,
+        default=0.90,
+        help="Maximum average turnover cap used in execution-aware evaluation (default: 0.90)",
+    )
+    train_parser.add_argument(
+        "--execution-cooldown-bars",
+        type=int,
+        default=2,
+        help="Cooldown bars before direction flips in execution-aware evaluation (default: 2)",
     )
     train_parser.add_argument(
         "--min-deflated-sharpe",
