@@ -26,6 +26,7 @@ from scipy import stats
 from quant_trading_system.core.data_types import Portfolio, Position, RiskMetrics
 from quant_trading_system.core.events import Event, EventBus, EventType, create_risk_event
 from quant_trading_system.core.exceptions import RiskError
+from quant_trading_system.risk.sector_rebalancer import GICSSector, SectorClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,8 @@ class RiskMonitor:
         event_bus: EventBus | None = None,
         var_calculator: VaRCalculator | None = None,
         alert_callback: Callable[[RiskAlert], None] | None = None,
+        sector_map: dict[str, str] | None = None,
+        sector_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         """Initialize risk monitor.
 
@@ -272,6 +275,10 @@ class RiskMonitor:
         self.event_bus = event_bus
         self.var_calculator = var_calculator or VaRCalculator()
         self.alert_callback = alert_callback
+        self._sector_classifier = self._build_sector_classifier(
+            sector_map=sector_map,
+            sector_resolver=sector_resolver,
+        )
 
         # State tracking
         self._drawdown_state: DrawdownState | None = None
@@ -290,6 +297,55 @@ class RiskMonitor:
             "position_concentration": (0.15, AlertSeverity.WARNING),
             "sector_concentration": (0.30, AlertSeverity.WARNING),
         }
+
+    def _build_sector_classifier(
+        self,
+        sector_map: dict[str, str] | None = None,
+        sector_resolver: Callable[[str], str | None] | None = None,
+    ) -> SectorClassifier:
+        """Build sector classifier with optional custom mappings/resolver."""
+        normalized_map: dict[str, GICSSector] = {}
+        if sector_map:
+            for symbol, raw_sector in sector_map.items():
+                sector_key = str(raw_sector).strip().lower()
+                try:
+                    sector_enum = GICSSector(sector_key)
+                except ValueError:
+                    try:
+                        sector_enum = GICSSector[str(raw_sector).strip().upper()]
+                    except KeyError:
+                        sector_enum = GICSSector.UNKNOWN
+                normalized_map[str(symbol).upper()] = sector_enum
+
+        fetch_callback: Callable[[str], GICSSector | None] | None = None
+        if sector_resolver is not None:
+            def _fetch(symbol: str) -> GICSSector | None:
+                resolved = sector_resolver(symbol)
+                if resolved is None:
+                    return None
+                key = str(resolved).strip().lower()
+                try:
+                    return GICSSector(key)
+                except ValueError:
+                    try:
+                        return GICSSector[str(resolved).strip().upper()]
+                    except KeyError:
+                        return GICSSector.UNKNOWN
+
+            fetch_callback = _fetch
+
+        return SectorClassifier(
+            sector_map=normalized_map if normalized_map else None,
+            fetch_callback=fetch_callback,
+        )
+
+    def _resolve_sector(self, symbol: str) -> str:
+        """Resolve symbol sector via classifier with UNKNOWN fallback."""
+        try:
+            return self._sector_classifier.get_sector(symbol).value.upper()
+        except Exception as exc:
+            logger.warning(f"Failed to resolve sector for {symbol}: {exc}")
+            return "UNKNOWN"
 
     def set_threshold(
         self,
@@ -386,12 +442,10 @@ class RiskMonitor:
 
     def _calculate_sector_exposures(self, portfolio: Portfolio) -> dict[str, Decimal]:
         """Calculate sector exposures from portfolio positions."""
-        # This is a placeholder - in production, we'd lookup sector from symbol
         exposures: dict[str, Decimal] = {}
         if portfolio.equity > 0:
             for symbol, position in portfolio.positions.items():
-                # Placeholder: assign all to "UNKNOWN" sector
-                sector = "UNKNOWN"
+                sector = self._resolve_sector(symbol)
                 if sector not in exposures:
                     exposures[sector] = Decimal("0")
                 exposures[sector] += abs(position.market_value) / portfolio.equity
@@ -422,6 +476,24 @@ class RiskMonitor:
                         severity=severity,
                         symbol=symbol,
                         message=f"Position concentration for {symbol} ({concentration:.1%}) exceeds limit ({threshold:.1%})",
+                    )
+
+        # Check sector concentration
+        if "sector_concentration" in self._thresholds:
+            threshold, severity = self._thresholds["sector_concentration"]
+            for sector, exposure in metrics.sector_exposures.items():
+                exposure_pct = float(exposure)
+                if exposure_pct > threshold:
+                    self._generate_alert(
+                        alert_type="sector_concentration",
+                        metric_name="sector_concentration",
+                        current_value=exposure_pct,
+                        threshold_value=threshold,
+                        severity=severity,
+                        message=(
+                            f"Sector concentration for {sector} ({exposure_pct:.1%}) "
+                            f"exceeds limit ({threshold:.1%})"
+                        ),
                     )
 
         # Check portfolio-level thresholds

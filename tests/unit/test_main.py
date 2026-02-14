@@ -83,6 +83,73 @@ class TestParseArgs:
             assert args.port == 9000
             assert args.reload is True
 
+    def test_parse_train_command_with_new_flags(self):
+        """Train parser should accept institutional fail-fast flags."""
+        with patch.object(sys, "argv", [
+            "main.py",
+            "train",
+            "--model",
+            "elastic_net",
+            "--name",
+            "elastic_v1",
+            "--no-redis-cache",
+            "--min-accuracy",
+            "0.55",
+        ]):
+            args = parse_args()
+            assert args.command == "train"
+            assert args.model == "elastic_net"
+            assert args.name == "elastic_v1"
+            assert args.no_redis_cache is True
+            assert args.min_accuracy == pytest.approx(0.55)
+
+    def test_parse_train_replay_and_nested_flags(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "train",
+                "--replay-manifest",
+                "models/replays/example.replay_manifest.json",
+                "--nested-outer-splits",
+                "5",
+                "--nested-inner-splits",
+                "3",
+                "--seed",
+                "7",
+            ],
+        ):
+            args = parse_args()
+            assert args.command == "train"
+            assert str(args.replay_manifest).endswith("example.replay_manifest.json")
+            assert args.nested_outer_splits == 5
+            assert args.nested_inner_splits == 3
+            assert args.seed == 7
+
+    def test_parse_data_download_alias_and_sync_flags(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "data",
+                "download",
+                "--symbols",
+                "AAPL",
+                "--sync-db",
+                "--incremental",
+                "--batch-size",
+                "2500",
+            ],
+        ):
+            args = parse_args()
+            assert args.command == "data"
+            assert args.data_command == "download"
+            assert args.sync_db is True
+            assert args.incremental is True
+            assert args.batch_size == 2500
+
     def test_parse_log_level(self):
         """Test parsing log level option."""
         with patch.object(sys, 'argv', [

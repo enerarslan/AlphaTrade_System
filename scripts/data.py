@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -596,11 +597,147 @@ class DataManager:
     # DATA DOWNLOAD
     # ========================================================================
 
+    @staticmethod
+    def _parse_datetime_utc(
+        value: str | datetime | None,
+        *,
+        end_of_day: bool = False,
+    ) -> datetime | None:
+        """Parse string/datetime input to timezone-aware UTC datetime."""
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+
+        if isinstance(value, datetime):
+            parsed = value
+            original_text = ""
+        else:
+            original_text = value.strip()
+            parsed_ts = pd.to_datetime(original_text, utc=True, errors="raise")
+            if isinstance(parsed_ts, pd.Timestamp):
+                parsed = parsed_ts.to_pydatetime()
+            else:
+                raise ValueError(f"Unsupported datetime value: {value}")
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+
+        if (
+            end_of_day
+            and original_text
+            and len(original_text) <= 10
+            and "T" not in original_text
+            and " " not in original_text
+        ):
+            parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        return parsed
+
+    @staticmethod
+    def _timeframe_to_timedelta(timeframe: str) -> timedelta:
+        """Convert Alpaca timeframe string (e.g. 15Min, 1Hour) to timedelta."""
+        tf = (timeframe or "15Min").strip().lower()
+        aliases = {
+            "1min": timedelta(minutes=1),
+            "5min": timedelta(minutes=5),
+            "15min": timedelta(minutes=15),
+            "30min": timedelta(minutes=30),
+            "1hour": timedelta(hours=1),
+            "1day": timedelta(days=1),
+        }
+        if tf in aliases:
+            return aliases[tf]
+
+        match = re.match(r"^(?P<num>\d+)\s*(?P<unit>[a-z]+)$", tf)
+        if not match:
+            return timedelta(minutes=15)
+
+        amount = int(match.group("num"))
+        unit = match.group("unit")
+        if unit.startswith("min"):
+            return timedelta(minutes=amount)
+        if unit.startswith("hour") or unit == "h":
+            return timedelta(hours=amount)
+        if unit.startswith("day") or unit == "d":
+            return timedelta(days=amount)
+        return timedelta(minutes=15)
+
+    def _normalize_alpaca_bars(
+        self,
+        symbol: str,
+        bars: list[dict[str, Any]] | pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Normalize Alpaca bars payload into canonical OHLCV frame."""
+        if isinstance(bars, pd.DataFrame):
+            frame = bars.copy()
+        else:
+            frame = pd.DataFrame(bars or [])
+
+        if frame.empty:
+            return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+
+        rename_map = {
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
+            "vw": "vwap",
+            "n": "trade_count",
+        }
+        frame = frame.rename(columns=rename_map)
+        if "timestamp" not in frame.columns:
+            return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["timestamp"])
+
+        for col in ["open", "high", "low", "close", "volume", "vwap", "trade_count"]:
+            if col in frame.columns:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+        required = ["open", "high", "low", "close", "volume"]
+        for col in required:
+            if col not in frame.columns:
+                frame[col] = np.nan
+
+        frame = frame.dropna(subset=required)
+        frame = frame.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        frame["symbol"] = symbol.upper()
+
+        ordered_cols = ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+        optional_cols = [c for c in ["vwap", "trade_count"] if c in frame.columns]
+        return frame[ordered_cols + optional_cols].reset_index(drop=True)
+
+    def get_latest_database_timestamp(self, symbol: str) -> datetime | None:
+        """Get latest timestamp in PostgreSQL for a symbol."""
+        if not self.config.use_database:
+            return None
+        try:
+            from quant_trading_system.data.db_loader import get_db_loader
+
+            db_loader = get_db_loader()
+            date_range = db_loader.get_date_range(symbol.upper())
+            if not date_range:
+                return None
+
+            latest = date_range[1]
+            if latest.tzinfo is None:
+                return latest.replace(tzinfo=timezone.utc)
+            return latest.astimezone(timezone.utc)
+        except Exception as exc:
+            self.logger.warning(f"Could not read latest DB timestamp for {symbol}: {exc}")
+            return None
+
     async def download_data(
         self,
         symbols: list[str],
-        start_date: str,
-        end_date: str,
+        start_date: str | datetime,
+        end_date: str | datetime,
     ) -> dict[str, pd.DataFrame]:
         """
         Download market data from Alpaca.
@@ -609,16 +746,25 @@ class DataManager:
 
         Args:
             symbols: List of ticker symbols.
-            start_date: Start date (YYYY-MM-DD).
-            end_date: End date (YYYY-MM-DD).
+            start_date: Start datetime/date.
+            end_date: End datetime/date.
 
         Returns:
             Dictionary of DataFrames by symbol.
         """
         self.logger.info(f"Downloading data for {len(symbols)} symbols")
-        self.logger.info(f"Date range: {start_date} to {end_date}")
+        start_dt = self._parse_datetime_utc(start_date)
+        end_dt = self._parse_datetime_utc(end_date, end_of_day=True)
+        if start_dt is None or end_dt is None:
+            raise ValueError("Both start_date and end_date are required for Alpaca download")
+        if start_dt >= end_dt:
+            raise ValueError(f"start_date must be before end_date ({start_dt.isoformat()} >= {end_dt.isoformat()})")
+
+        self.logger.info(f"Date range (UTC): {start_dt.isoformat()} to {end_dt.isoformat()}")
 
         downloaded = {}
+        # Alpaca responses are paginated via `next_page_token` and effectively capped per page.
+        page_limit = 1_000
 
         try:
             from quant_trading_system.execution.alpaca_client import AlpacaClient
@@ -627,16 +773,37 @@ class DataManager:
 
             for symbol in symbols:
                 try:
-                    bars = await client.get_bars(
-                        symbol=symbol,
-                        start=start_date,
-                        end=end_date,
-                        timeframe=self.config.timeframe,
-                    )
+                    chunks: list[pd.DataFrame] = []
+                    page_token: str | None = None
 
-                    if bars is not None and len(bars) > 0:
-                        downloaded[symbol] = bars
-                        self.logger.info(f"Downloaded {symbol}: {len(bars)} bars")
+                    while True:
+                        page = await client.get_bars_page(
+                            symbol=symbol,
+                            start=start_dt,
+                            end=end_dt,
+                            timeframe=self.config.timeframe,
+                            limit=page_limit,
+                            page_token=page_token,
+                        )
+                        bars = page.get("bars", []) if isinstance(page, dict) else []
+                        normalized = self._normalize_alpaca_bars(symbol, bars)
+                        if normalized.empty:
+                            break
+
+                        chunks.append(normalized)
+                        page_token = page.get("next_page_token") if isinstance(page, dict) else None
+                        if not page_token:
+                            break
+
+                    if chunks:
+                        symbol_df = pd.concat(chunks, ignore_index=True)
+                        symbol_df = (
+                            symbol_df.sort_values("timestamp")
+                            .drop_duplicates(subset=["timestamp"], keep="last")
+                            .reset_index(drop=True)
+                        )
+                        downloaded[symbol] = symbol_df
+                        self.logger.info(f"Downloaded {symbol}: {len(symbol_df)} bars")
                     else:
                         self.logger.warning(f"No data for {symbol}")
 
@@ -998,7 +1165,11 @@ class DataManager:
     # DATABASE OPERATIONS
     # ========================================================================
 
-    async def sync_to_database(self, data: dict[str, pd.DataFrame]) -> int:
+    async def sync_to_database(
+        self,
+        data: dict[str, pd.DataFrame],
+        batch_size: int = 5000,
+    ) -> int:
         """
         Sync data to PostgreSQL/TimescaleDB.
 
@@ -1018,14 +1189,21 @@ class DataManager:
             return 0
 
         try:
-            from quant_trading_system.database.repository import OHLCVRepository
+            from quant_trading_system.data.db_loader import get_db_loader
 
-            repo = OHLCVRepository()
+            db_loader = get_db_loader()
             total_rows = 0
 
             for symbol, df in data.items():
+                if df is None or df.empty:
+                    continue
                 try:
-                    rows = await repo.upsert_bars(symbol, df)
+                    rows = db_loader.upsert_dataframe(
+                        df=df,
+                        symbol=symbol,
+                        batch_size=max(100, int(batch_size)),
+                        source_timezone="UTC",
+                    )
                     total_rows += rows
                     self.logger.info(f"Synced {symbol}: {rows} rows")
                 except Exception as e:
@@ -1049,28 +1227,73 @@ def cmd_download(args: argparse.Namespace) -> int:
     logger.info("DATA DOWNLOAD")
     logger.info("=" * 80)
 
+    source = getattr(args, "source", "alpaca")
+    if source != "alpaca":
+        logger.error(f"Unsupported data source for `data load`: {source}. Use --source alpaca.")
+        return 1
+
+    start_arg = getattr(args, "start", None) or getattr(args, "start_date", None) or ""
+    end_arg = getattr(args, "end", None) or getattr(args, "end_date", None) or ""
+
     config = DataConfig(
         symbols=getattr(args, "symbols", []),
-        start_date=getattr(args, "start_date", ""),
-        end_date=getattr(args, "end_date", ""),
+        start_date=start_arg,
+        end_date=end_arg,
         timeframe=getattr(args, "timeframe", "15Min"),
+        raw_data_dir=str(getattr(args, "output_dir", "data/raw")),
+        use_database=bool(getattr(args, "sync_db", False)),
     )
 
     manager = DataManager(config)
 
     async def _download():
-        symbols = config.symbols
+        symbols = []
+        for raw_symbol in config.symbols:
+            normalized = str(raw_symbol).strip().upper()
+            if "_" in normalized:
+                normalized = normalized.split("_", 1)[0]
+            if normalized and normalized not in symbols:
+                symbols.append(normalized)
         if not symbols:
             logger.error("No symbols specified. Use --symbols AAPL MSFT ...")
             return 1
 
-        start = config.start_date or (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
-        end = config.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        end_dt = manager._parse_datetime_utc(config.end_date, end_of_day=True) or datetime.now(timezone.utc)
+        base_start_dt = manager._parse_datetime_utc(config.start_date) or (end_dt - timedelta(days=365))
+        incremental = bool(getattr(args, "incremental", False))
+        sync_db = bool(getattr(args, "sync_db", False))
+        batch_size = int(getattr(args, "batch_size", 5000))
 
-        data = await manager.download_data(symbols, start, end)
+        data: dict[str, pd.DataFrame] = {}
+        if sync_db and incremental:
+            bar_delta = manager._timeframe_to_timedelta(config.timeframe)
+            for symbol in symbols:
+                symbol_start = base_start_dt
+                latest_db_ts = manager.get_latest_database_timestamp(symbol)
+                if latest_db_ts is not None:
+                    symbol_start = max(symbol_start, latest_db_ts + bar_delta)
+
+                if symbol_start >= end_dt:
+                    logger.info(
+                        f"Skipping {symbol}: database already up to date "
+                        f"(latest={latest_db_ts.isoformat() if latest_db_ts else 'n/a'})"
+                    )
+                    continue
+
+                symbol_data = await manager.download_data([symbol], symbol_start, end_dt)
+                data.update(symbol_data)
+        else:
+            data = await manager.download_data(symbols, base_start_dt, end_dt)
 
         if data:
-            manager.save_data(data, format="csv")
+            manager.save_data(
+                data,
+                output_dir=str(getattr(args, "output_dir", config.raw_data_dir)),
+                format="csv",
+            )
+            if sync_db:
+                synced_rows = await manager.sync_to_database(data, batch_size=batch_size)
+                logger.info(f"Database sync complete: {synced_rows} rows upserted")
             logger.info(f"Downloaded data for {len(data)} symbols")
             return 0
         else:
@@ -1323,12 +1546,16 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         symbols = getattr(args, "symbols", None)
         batch_size = getattr(args, "batch_size", 50000)
         verify = getattr(args, "verify", False)
+        source_timezone = getattr(args, "source_timezone", "America/New_York")
+        resume = not bool(getattr(args, "no_resume", False))
 
         results = migrate_csv_to_postgres(
             source_dir,
             symbols=symbols,
             batch_size=batch_size,
             verify=verify,
+            source_timezone=source_timezone,
+            resume=resume,
         )
 
         successful = sum(1 for v in results.values() if v > 0)
@@ -1400,11 +1627,14 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     logger.info("Checking database status...")
 
     try:
-        from sqlalchemy import text, func, select
+        from sqlalchemy import text
         from quant_trading_system.database.connection import get_db_manager
 
         db = get_db_manager()
         with db.session() as session:
+            session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
+            session.execute(text("SET LOCAL statement_timeout = '5000ms'"))
+
             # Check basic connection
             result = session.execute(text("SELECT 1"))
             logger.info("Database connection: OK")
@@ -1428,28 +1658,41 @@ def cmd_db_status(args: argparse.Namespace) -> int:
             except Exception:
                 logger.warning("Could not query hypertables (may not exist yet)")
 
-            # Check row counts
-            from quant_trading_system.database.models import OHLCVBar, Feature
-
-            ohlcv_count = session.scalar(select(func.count()).select_from(OHLCVBar))
-            feature_count = session.scalar(select(func.count()).select_from(Feature))
-
-            logger.info(f"OHLCV rows: {ohlcv_count or 0}")
-            logger.info(f"Feature rows: {feature_count or 0}")
-
-            # Check available symbols
-            result = session.execute(
-                text("SELECT DISTINCT symbol FROM ohlcv_bars ORDER BY symbol")
+            # Fast row count estimates (avoids lock-heavy full table counts)
+            estimate_query = text(
+                """
+                SELECT
+                    COALESCE((SELECT reltuples::BIGINT FROM pg_class WHERE relname = 'ohlcv_bars'), 0) AS ohlcv_estimate,
+                    COALESCE((SELECT reltuples::BIGINT FROM pg_class WHERE relname = 'features'), 0) AS feature_estimate
+                """
             )
-            symbols = [row[0] for row in result]
-            if symbols:
-                logger.info(f"Symbols in database: {len(symbols)}")
-                for sym in symbols[:10]:  # Show first 10
-                    logger.info(f"  - {sym}")
-                if len(symbols) > 10:
-                    logger.info(f"  ... and {len(symbols) - 10} more")
-            else:
-                logger.info("No symbols in database yet")
+            estimate = session.execute(estimate_query).mappings().first() or {}
+            ohlcv_estimate = max(0, int(estimate.get("ohlcv_estimate", 0)))
+            feature_estimate = max(0, int(estimate.get("feature_estimate", 0)))
+            logger.info(f"OHLCV rows (estimate): {ohlcv_estimate}")
+            logger.info(f"Feature rows (estimate): {feature_estimate}")
+            if getattr(args, "verbose", False):
+                logger.info(
+                    "Exact row counts are skipped by default to avoid lock pressure; "
+                    "use table-specific maintenance windows for full COUNT(*)."
+                )
+
+            # Check available symbols (best-effort only)
+            try:
+                result = session.execute(
+                    text("SELECT symbol FROM ohlcv_bars GROUP BY symbol ORDER BY symbol LIMIT 500")
+                )
+                symbols = [row[0] for row in result]
+                if symbols:
+                    logger.info(f"Symbols in database: {len(symbols)}")
+                    for sym in symbols[:10]:  # Show first 10
+                        logger.info(f"  - {sym}")
+                    if len(symbols) > 10:
+                        logger.info(f"  ... and {len(symbols) - 10} more")
+                else:
+                    logger.info("No symbols in database yet")
+            except Exception as sym_exc:
+                logger.warning(f"Symbol listing skipped due to DB limits: {sym_exc}")
 
         return 0
 
@@ -1473,6 +1716,7 @@ def run_data_command(args: argparse.Namespace) -> int:
     command = getattr(args, "data_command", "list")
 
     commands = {
+        "load": cmd_download,
         "download": cmd_download,
         "validate": cmd_validate,
         "preprocess": cmd_preprocess,

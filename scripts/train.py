@@ -8,7 +8,7 @@ Institutional-grade model training with full ML pipeline support.
 @mlquant: This script implements all ML/Quant requirements including:
   - Purged K-Fold Cross-Validation (P2-B) with embargo periods
   - Model Validation Gates for production deployment
-  - Hyperparameter optimization (Optuna, Grid, Random, Bayesian)
+  - Mandatory hyperparameter optimization (Optuna + pruning)
   - Meta-labeling for signal filtering (P2-3.5)
   - Multiple testing correction (P1-3.1: Bonferroni, BH, Deflated Sharpe)
   - GPU acceleration for deep learning models
@@ -17,15 +17,15 @@ Institutional-grade model training with full ML pipeline support.
 
 Model Types Supported:
   - Classical ML: XGBoost, LightGBM, RandomForest, ElasticNet
-  - Deep Learning: LSTM, GRU, Transformer, TCN
+  - Deep Learning: LSTM, Transformer, TCN
   - Ensemble: Voting, Stacking, IC-Weighted, Adaptive
   - Reinforcement Learning: PPO Agent
 
 Usage:
     python main.py train --model xgboost --symbols AAPL MSFT
-    python main.py train --model ensemble --optimize optuna --n-trials 100
+    python main.py train --model ensemble --n-trials 100
     python main.py train --model lstm --use-gpu --epochs 100
-    python main.py train --validate-only --model-path models/xgboost_v1.pkl
+    python main.py train --model all --n-trials 50
 
 Author: AlphaTrade System
 Version: 1.3.0
@@ -33,9 +33,13 @@ Version: 1.3.0
 """
 
 import argparse
+import gc
+import hashlib
 import json
 import logging
+import os
 import pickle
+import random
 import re
 import sys
 from dataclasses import dataclass, field
@@ -45,10 +49,27 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from quant_trading_system.models.training_lineage import (
+    build_data_quality_report,
+    build_snapshot_manifest,
+    compute_data_quality_hash,
+    persist_snapshot_bundle,
+    register_training_model_version,
+)
+from quant_trading_system.models.statistical_validation import (
+    calculate_deflated_sharpe_ratio,
+    calculate_probability_of_backtest_overfitting,
+)
+from quant_trading_system.models.target_engineering import (
+    TargetEngineeringConfig,
+    generate_targets,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -62,11 +83,223 @@ SUPPORTED_MODELS = [
     "xgboost",
     "lightgbm",
     "random_forest",
+    "elastic_net",
     "lstm",
     "transformer",
     "tcn",
     "ensemble",
 ]
+
+MANDATORY_MODEL_TECH_STACK = {
+    "postgresql_data": True,
+    "redis_cache": True,
+    "gpu_acceleration": True,
+    "hyperopt_optuna": True,
+    "meta_labeling": True,
+    "multiple_testing_correction": True,
+    "shap_explainability": True,
+    "future_leak_validation": True,
+}
+
+BASE_MARKET_COLUMNS = {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
+FORBIDDEN_FEATURE_COLUMNS = {
+    "label",
+    "primary_signal",
+    "barrier_touched",
+    "triple_barrier_label",
+    "triple_barrier_event_return",
+    "triple_barrier_net_return",
+    "holding_period",
+    "regime",
+}
+FORBIDDEN_FEATURE_PREFIXES = ("forward_return_h",)
+REPLAY_MANIFEST_SCHEMA_VERSION = "1.0.0"
+PROMOTION_PACKAGE_SCHEMA_VERSION = "1.0.0"
+
+
+def _compute_feature_pipeline_fingerprint() -> str:
+    """Create deterministic fingerprint for feature-engineering code."""
+    fingerprint = hashlib.sha256()
+    candidate_files = [
+        PROJECT_ROOT / "quant_trading_system" / "features" / "feature_pipeline.py",
+        PROJECT_ROOT / "quant_trading_system" / "features" / "optimized_pipeline.py",
+        PROJECT_ROOT / "quant_trading_system" / "features" / "cross_sectional.py",
+    ]
+    for file_path in candidate_files:
+        if not file_path.exists():
+            continue
+        fingerprint.update(file_path.name.encode("utf-8"))
+        fingerprint.update(file_path.read_bytes())
+    return fingerprint.hexdigest()[:16]
+
+
+def set_global_seed(seed: int) -> None:
+    """Set deterministic random seeds for reproducible training runs."""
+    normalized_seed = int(seed)
+    random.seed(normalized_seed)
+    np.random.seed(normalized_seed)
+    os.environ["PYTHONHASHSEED"] = str(normalized_seed)
+
+    try:
+        import torch
+
+        torch.manual_seed(normalized_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(normalized_seed)
+    except Exception:
+        pass
+
+
+def _load_replay_manifest(replay_manifest_path: Path) -> dict[str, Any]:
+    """Load replay manifest payload and return normalized structure."""
+    path = Path(replay_manifest_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Replay manifest not found: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError("Replay manifest must be a JSON object.")
+
+    manifest = payload.get("replay_manifest") if isinstance(payload.get("replay_manifest"), dict) else payload
+    if not isinstance(manifest, dict):
+        raise ValueError("Replay manifest payload is invalid.")
+
+    training_config = manifest.get("training_config")
+    if training_config is None and isinstance(manifest.get("config"), dict):
+        training_config = manifest.get("config")
+    if not isinstance(training_config, dict):
+        raise ValueError("Replay manifest missing `training_config` object.")
+
+    return {
+        "manifest_path": str(path),
+        "manifest": manifest,
+        "training_config": training_config,
+    }
+
+
+def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, Any]:
+    """Load model defaults from YAML config."""
+    config_path = PROJECT_ROOT / "quant_trading_system" / "config" / "model_configs.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            all_cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+    if model_type in {"xgboost", "lightgbm", "random_forest", "elastic_net"}:
+        section = all_cfg.get(model_type, {})
+        params = dict(section.get("classifier", {}))
+    elif model_type in {"lstm", "transformer", "tcn"}:
+        params = dict(all_cfg.get(model_type, {}))
+    else:
+        params = {}
+
+    # Remove training-script-owned knobs from model constructor params.
+    for key in (
+        "early_stopping_rounds",
+        "batch_size",
+        "learning_rate",
+        "max_epochs",
+        "early_stopping_patience",
+        "scheduler",
+    ):
+        params.pop(key, None)
+
+    if model_type == "xgboost" and use_gpu:
+        params["tree_method"] = "hist"
+        params["device"] = "cuda"
+    elif model_type == "lightgbm" and use_gpu:
+        params["device_type"] = "gpu"
+
+    # Harmonize YAML keys with model constructor names.
+    if model_type == "lstm":
+        if "sequence_length" in params:
+            params["lookback_window"] = params.pop("sequence_length")
+    elif model_type == "transformer":
+        if "sequence_length" in params:
+            params["lookback_window"] = params.pop("sequence_length")
+        if "num_encoder_layers" in params:
+            params["num_layers"] = params.pop("num_encoder_layers")
+        if "dim_feedforward" in params:
+            params["d_ff"] = params.pop("dim_feedforward")
+    elif model_type == "tcn":
+        if "sequence_length" in params:
+            params["lookback_window"] = params.pop("sequence_length")
+
+    return params
+
+
+def _verify_institutional_infra() -> None:
+    """Fail-fast infrastructure check for institutional training mode."""
+    from quant_trading_system.database.connection import get_db_manager, get_redis_manager
+
+    db_manager = get_db_manager()
+    if not db_manager.health_check():
+        raise RuntimeError("PostgreSQL health check failed. Institutional training requires PostgreSQL.")
+
+    redis_manager = get_redis_manager()
+    if not redis_manager.health_check():
+        raise RuntimeError("Redis health check failed. Institutional training requires Redis.")
+
+
+def _verify_gpu_stack(model_list: list[str]) -> None:
+    """Fail-fast GPU validation for institutional training mode."""
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("PyTorch is required for GPU preflight checks in institutional mode.") from exc
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU not detected. Institutional training requires NVIDIA CUDA GPU.")
+
+    gpu_name = torch.cuda.get_device_name(0)
+    logger.info(f"CUDA GPU detected: {gpu_name}")
+
+    deep_models = {"lstm", "transformer", "tcn"}
+    if deep_models.intersection(model_list):
+        # Validate tensor ops on device for deep learning stack.
+        _ = torch.randn((16, 8), device="cuda")
+
+    if {"xgboost", "ensemble"}.intersection(model_list):
+        try:
+            import xgboost as xgb
+
+            X = np.random.rand(64, 8)
+            y = np.random.randint(0, 2, 64)
+            probe = xgb.XGBClassifier(
+                n_estimators=2,
+                max_depth=2,
+                tree_method="hist",
+                device="cuda",
+                eval_metric="logloss",
+            )
+            probe.fit(X, y)
+        except Exception as exc:
+            raise RuntimeError(
+                "XGBoost GPU backend validation failed. Verify CUDA-enabled XGBoost installation."
+            ) from exc
+
+    if {"lightgbm", "ensemble"}.intersection(model_list):
+        try:
+            import lightgbm as lgb
+
+            X = np.random.rand(128, 8)
+            y = np.random.randint(0, 2, 128)
+            probe = lgb.LGBMClassifier(
+                n_estimators=2,
+                max_depth=3,
+                device_type="gpu",
+                verbosity=-1,
+            )
+            probe.fit(X, y)
+        except Exception as exc:
+            raise RuntimeError(
+                "LightGBM GPU backend validation failed. Install a GPU-enabled LightGBM build."
+            ) from exc
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -78,7 +311,7 @@ class TrainingConfig:
     """Complete training configuration."""
 
     # Model selection
-    model_type: str = "xgboost"  # xgboost, lightgbm, lstm, transformer, ensemble
+    model_type: str = "xgboost"  # xgboost, lightgbm, random_forest, elastic_net, lstm, transformer, tcn, ensemble
     model_name: str = ""  # Custom name for the model
 
     # Data configuration
@@ -96,10 +329,20 @@ class TrainingConfig:
     purge_pct: float = 0.02
 
     # Hyperparameter optimization
-    optimize: bool = False
+    optimize: bool = True
     optimizer: str = "optuna"  # optuna, grid, random, bayesian
     n_trials: int = 100
     n_jobs: int = -1
+    seed: int = 42
+    use_nested_walk_forward: bool = True
+    nested_outer_splits: int = 4
+    nested_inner_splits: int = 3
+    require_nested_trace_for_promotion: bool = True
+    require_objective_breakdown_for_promotion: bool = True
+    objective_weight_sharpe: float = 1.0
+    objective_weight_drawdown: float = 0.5
+    objective_weight_turnover: float = 0.1
+    objective_weight_calibration: float = 0.25
 
     # Model-specific parameters
     model_params: dict = field(default_factory=dict)
@@ -114,12 +357,29 @@ class TrainingConfig:
     min_sharpe_ratio: float = 0.5
     max_drawdown: float = 0.20
     min_win_rate: float = 0.45
+    min_accuracy: float = 0.45
     min_trades: int = 100
     max_is_oos_ratio: float = 2.0
     min_ic: float = 0.02
+    min_deflated_sharpe: float = 0.10
+    max_deflated_sharpe_pvalue: float = 0.10
+    max_pbo: float = 0.45
+
+    # Target engineering (Workstream B)
+    label_horizons: list[int] = field(default_factory=lambda: [1, 5, 20])
+    primary_label_horizon: int = 5
+    label_profit_taking_threshold: float = 0.015
+    label_stop_loss_threshold: float = 0.010
+    label_max_holding_period: int = 20
+    label_spread_bps: float = 1.0
+    label_slippage_bps: float = 3.0
+    label_impact_bps: float = 2.0
+    label_volatility_lookback: int = 20
+    label_regime_lookback: int = 30
+    label_temporal_weight_decay: float = 0.999
 
     # Meta-labeling (P2-3.5)
-    use_meta_labeling: bool = False
+    use_meta_labeling: bool = True
     meta_model_type: str = "xgboost"
 
     # Multiple testing correction (P1-3.1)
@@ -127,11 +387,12 @@ class TrainingConfig:
     correction_method: str = "deflated_sharpe"  # bonferroni, bh, deflated_sharpe
 
     # GPU acceleration
-    use_gpu: bool = False
+    use_gpu: bool = True
     gpu_device: int = 0
 
     # Database integration
     use_database: bool = True  # Load data from PostgreSQL + TimescaleDB
+    use_redis_cache: bool = True  # Use Redis for lightweight metadata caching
 
     # Explainability
     compute_shap: bool = True
@@ -140,11 +401,32 @@ class TrainingConfig:
     # Output
     output_dir: str = "models"
     save_artifacts: bool = True
+    quality_missing_bars_threshold: float = 0.01
+    quality_duplicate_bars_threshold: float = 0.001
+    quality_extreme_move_threshold: float = 0.01
+    quality_corporate_action_jump_threshold: float = 0.001
+    feature_groups: list[str] = field(
+        default_factory=lambda: ["technical", "statistical", "microstructure", "cross_sectional"]
+    )
+    enable_cross_sectional: bool = True
+    max_cross_sectional_symbols: int = 20
+    max_cross_sectional_rows: int = 250000
+    allow_feature_group_fallback: bool = True
+    feature_materialization_batch_rows: int = 5000
+    feature_reuse_min_coverage: float = 0.20
+    persist_features_to_postgres: bool = True
 
     def __post_init__(self):
         if not self.model_name:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             self.model_name = f"{self.model_type}_{timestamp}"
+        self.feature_materialization_batch_rows = max(250, int(self.feature_materialization_batch_rows))
+        self.max_cross_sectional_symbols = max(2, int(self.max_cross_sectional_symbols))
+        self.max_cross_sectional_rows = max(10_000, int(self.max_cross_sectional_rows))
+        self.feature_reuse_min_coverage = min(max(float(self.feature_reuse_min_coverage), 0.01), 0.95)
+        self.feature_groups = [str(g).strip().lower() for g in self.feature_groups if str(g).strip()]
+        if not self.feature_groups:
+            self.feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
 
 
 # ============================================================================
@@ -173,15 +455,34 @@ class ModelTrainer:
         self.data: pd.DataFrame | None = None
         self.features: pd.DataFrame | None = None
         self.labels: pd.Series | None = None
+        self.feature_names: list[str] = []
+        self.timestamps: np.ndarray | None = None
+        self.row_symbols: np.ndarray | None = None
+        self.close_prices: pd.Series | None = None
+        self.primary_forward_returns: np.ndarray | None = None
+        self.cost_aware_event_returns: np.ndarray | None = None
         self.model: Any = None
         self.cv_results: list[dict] = []
         self.validation_results: dict = {}
         self.shap_values: np.ndarray | None = None
         self.meta_model: Any = None
+        self.oof_primary_proba: np.ndarray | None = None
+        self.cv_return_series: list[np.ndarray] = []
+        self.sample_weights: np.ndarray | None = None
+        self.label_diagnostics: dict[str, Any] = {}
+        self.data_quality_report: dict[str, Any] | None = None
+        self.data_quality_report_hash: str | None = None
+        self.snapshot_manifest: dict[str, Any] | None = None
+        self.snapshot_manifest_path: Path | None = None
+        self.data_quality_report_path: Path | None = None
+        self.nested_cv_trace: list[dict[str, Any]] = []
+        self.replay_manifest_path: Path | None = None
+        self.promotion_package_path: Path | None = None
 
         # Metrics
         self.training_metrics: dict = {}
         self.start_time: datetime | None = None
+        self.feature_pipeline_fingerprint = _compute_feature_pipeline_fingerprint()
 
     def run(self) -> dict:
         """
@@ -193,6 +494,7 @@ class ModelTrainer:
         self.start_time = datetime.now(timezone.utc)
         self.logger.info(f"Starting training pipeline for {self.config.model_type}")
         self.logger.info(f"Model name: {self.config.model_name}")
+        set_global_seed(self.config.seed)
 
         try:
             # Phase 1: Load Data
@@ -204,6 +506,9 @@ class ModelTrainer:
             # Phase 3: Create Labels
             self._create_labels()
 
+            # Phase 3.5: Enforce future-leak validation gates
+            self._validate_no_future_leakage()
+
             # Phase 4: Hyperparameter Optimization (if enabled)
             if self.config.optimize:
                 self._optimize_hyperparameters()
@@ -211,16 +516,16 @@ class ModelTrainer:
             # Phase 5: Cross-Validation Training
             self._train_with_cv()
 
-            # Phase 6: Validation Gates
-            passed_gates = self._validate_model()
-
-            # Phase 7: Meta-Labeling (if enabled)
-            if self.config.use_meta_labeling:
-                self._train_meta_labeler()
-
-            # Phase 8: Multiple Testing Correction
+            # Phase 6: Multiple testing / overfitting diagnostics before gating.
             if self.config.apply_multiple_testing:
                 self._apply_multiple_testing_correction()
+
+            # Phase 7: Validation Gates (includes DSR/PBO hard checks)
+            passed_gates = self._validate_model()
+
+            # Phase 8: Meta-Labeling (if enabled)
+            if self.config.use_meta_labeling:
+                self._train_meta_labeler()
 
             # Phase 9: SHAP Explainability
             if self.config.compute_shap:
@@ -242,6 +547,39 @@ class ModelTrainer:
                 "validation_results": self.validation_results,
                 "training_metrics": self.training_metrics,
                 "passed_validation_gates": passed_gates,
+                "snapshot_id": (
+                    str(self.snapshot_manifest.get("snapshot_id"))
+                    if isinstance(self.snapshot_manifest, dict)
+                    else None
+                ),
+                "snapshot_manifest_path": (
+                    str(self.snapshot_manifest_path)
+                    if self.snapshot_manifest_path is not None
+                    else None
+                ),
+                "data_quality_report_path": (
+                    str(self.data_quality_report_path)
+                    if self.data_quality_report_path is not None
+                    else None
+                ),
+                "data_quality_report_hash": self.data_quality_report_hash,
+                "feature_schema_version": (
+                    str(self.snapshot_manifest.get("feature_schema_version"))
+                    if isinstance(self.snapshot_manifest, dict)
+                    else None
+                ),
+                "label_diagnostics": self.label_diagnostics,
+                "nested_cv_trace": self.nested_cv_trace,
+                "replay_manifest_path": (
+                    str(self.replay_manifest_path)
+                    if self.replay_manifest_path is not None
+                    else None
+                ),
+                "promotion_package_path": (
+                    str(self.promotion_package_path)
+                    if self.promotion_package_path is not None
+                    else None
+                ),
             }
 
             self.logger.info(f"Training completed in {duration:.1f}s")
@@ -256,13 +594,110 @@ class ModelTrainer:
     def _load_data(self) -> None:
         """Phase 1: Load market data for training."""
         self.logger.info("Phase 1: Loading data...")
-        if self.config.use_database:
-            self.logger.info(
-                "Database mode requested; using local training files from data/raw "
-                "for deterministic offline training."
+        if not self.config.use_database:
+            raise RuntimeError(
+                "Institutional training mode requires PostgreSQL data source. "
+                "Disable is not allowed."
+            )
+        self._load_data_from_postgres()
+        self._capture_data_quality_report()
+
+    def _load_data_from_postgres(self) -> None:
+        """Load OHLCV data from PostgreSQL/TimescaleDB."""
+        from sqlalchemy import text
+        from quant_trading_system.database.connection import get_db_manager, get_redis_manager
+
+        db_manager = get_db_manager()
+        symbols = [s.strip().upper() for s in self.config.symbols if s.strip()]
+        if not self.config.use_redis_cache:
+            raise RuntimeError(
+                "Institutional training mode requires Redis cache layer. "
+                "Disable is not allowed."
             )
 
-        self._load_data_fallback()
+        redis_mgr = get_redis_manager()
+        if not redis_mgr.health_check():
+            raise RuntimeError("Redis cache unavailable. Institutional mode requires Redis.")
+
+        with db_manager.session() as session:
+            session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
+            session.execute(text("SET LOCAL statement_timeout = '120000ms'"))
+            if not symbols:
+                cache_key = "train:ohlcv_symbols"
+                cached_symbols: list[str] = []
+                if redis_mgr is not None:
+                    cached_raw = redis_mgr.get(cache_key)
+                    if cached_raw:
+                        try:
+                            cached_symbols = json.loads(cached_raw)
+                        except json.JSONDecodeError:
+                            cached_symbols = []
+
+                if cached_symbols:
+                    symbols = cached_symbols
+                else:
+                    result = session.execute(text("SELECT DISTINCT symbol FROM ohlcv_bars ORDER BY symbol"))
+                    symbols = [row[0] for row in result.fetchall()]
+                    if redis_mgr is not None and symbols:
+                        redis_mgr.set(cache_key, json.dumps(symbols), expire_seconds=300)
+
+            if not symbols:
+                raise ValueError("No symbols found in ohlcv_bars")
+
+            self.logger.info(f"Loading {len(symbols)} symbols from PostgreSQL")
+
+            query = text(
+                """
+                SELECT
+                    symbol,
+                    timestamp,
+                    CAST(open AS DOUBLE PRECISION) AS open,
+                    CAST(high AS DOUBLE PRECISION) AS high,
+                    CAST(low AS DOUBLE PRECISION) AS low,
+                    CAST(close AS DOUBLE PRECISION) AS close,
+                    CAST(volume AS BIGINT) AS volume
+                FROM ohlcv_bars
+                WHERE symbol = :symbol
+                  AND (:start_date IS NULL OR timestamp >= :start_date)
+                  AND (:end_date IS NULL OR timestamp <= :end_date)
+                ORDER BY timestamp
+                """
+            )
+
+            dfs: list[pd.DataFrame] = []
+            start_date = pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
+            end_date = pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
+
+            for symbol in symbols:
+                try:
+                    result = session.execute(
+                        query,
+                        {
+                            "symbol": symbol,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                        },
+                    )
+                    rows = result.fetchall()
+                    if not rows:
+                        self.logger.warning(f"No PostgreSQL rows for {symbol}")
+                        continue
+
+                    df = pd.DataFrame(rows, columns=result.keys())
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+                    df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
+                    dfs.append(df)
+                except Exception as e:
+                    self.logger.warning(f"Failed to load {symbol} from PostgreSQL: {e}")
+
+            if not dfs:
+                raise ValueError("No training data loaded from PostgreSQL")
+
+            self.data = pd.concat(dfs, ignore_index=True)
+            self.logger.info(
+                f"Loaded {len(self.data)} rows from PostgreSQL for "
+                f"{self.data['symbol'].nunique()} symbols"
+            )
 
     def _load_data_fallback(self) -> None:
         """Fallback data loading from CSV files."""
@@ -333,41 +768,245 @@ class ModelTrainer:
         match = re.match(r"^([A-Z]+(?:\.[A-Z]+)?)(?:_.*)?$", normalized)
         return match.group(1) if match else normalized
 
+    def _capture_data_quality_report(self) -> None:
+        """Build and cache quality report for the active training dataset."""
+        if self.data is None or self.data.empty:
+            raise ValueError("Training data is empty; cannot compute data quality report.")
+
+        thresholds = {
+            "missing_bars_ratio_max": self.config.quality_missing_bars_threshold,
+            "duplicate_bars_ratio_max": self.config.quality_duplicate_bars_threshold,
+            "extreme_move_ratio_max": self.config.quality_extreme_move_threshold,
+            "corporate_action_jump_ratio_max": self.config.quality_corporate_action_jump_threshold,
+        }
+
+        self.data_quality_report = build_data_quality_report(
+            self.data,
+            thresholds=thresholds,
+        )
+        self.data_quality_report_hash = compute_data_quality_hash(self.data_quality_report)
+
+        summary = self.data_quality_report.get("summary", {})
+        self.logger.info(
+            "Data quality report prepared: "
+            f"rows={summary.get('rows_total', 0)}, "
+            f"symbols={summary.get('symbol_count', 0)}, "
+            f"passed={self.data_quality_report.get('passed', False)}, "
+            f"hash={self.data_quality_report_hash[:12] if self.data_quality_report_hash else 'n/a'}"
+        )
+        if not bool(self.data_quality_report.get("passed", False)):
+            self.logger.warning(
+                "Data quality SLA breaches detected in training dataset. "
+                "Review quality report before model promotion."
+            )
+
+    def _build_training_snapshot_manifest(self) -> None:
+        """Create deterministic snapshot manifest after features are finalized."""
+        if self.data is None or self.data.empty:
+            raise ValueError("Training data is empty; cannot build snapshot manifest.")
+        if self.data_quality_report_hash is None:
+            raise ValueError("Data quality hash missing; cannot build snapshot manifest.")
+        if not self.feature_names:
+            raise ValueError("Feature names missing; cannot build snapshot manifest.")
+
+        self.snapshot_manifest = build_snapshot_manifest(
+            ohlcv_data=self.data,
+            feature_names=self.feature_names,
+            data_quality_report_hash=self.data_quality_report_hash,
+            requested_start_date=self.config.start_date or None,
+            requested_end_date=self.config.end_date or None,
+            source_system="postgresql_timescaledb",
+        )
+        self.logger.info(
+            "Snapshot manifest created: "
+            f"{self.snapshot_manifest.get('snapshot_id')} "
+            f"({self.snapshot_manifest.get('row_count', 0)} rows)"
+        )
+
     def _compute_features(self) -> None:
         """Phase 2: Compute features for model training."""
         self.logger.info("Phase 2: Computing features...")
+        # 1) Reuse previously computed features from PostgreSQL when available.
+        cached = self._load_features_from_postgres()
+        if cached is not None and not cached.empty:
+            self.features = cached
+            self.logger.info("Using feature matrix loaded from PostgreSQL features table")
+            return
 
-        # Use FULL feature pipeline for JPMorgan-level training
-        # This includes ALL feature groups: technical, statistical, microstructure
-        try:
-            self._compute_features_full_pipeline()
-        except Exception as e:
-            self.logger.warning(f"Full pipeline failed ({e}), falling back to basic features")
+        # Windows-specific stability guard:
+        # The institutional full feature pipeline can stall on large panel datasets
+        # under native Windows runtime. Fallback path remains deterministic and
+        # keeps the end-to-end training pipeline operational.
+        if os.name == "nt":
+            self.logger.warning(
+                "Using fallback feature computation on Windows for training stability."
+            )
             self._compute_features_fallback()
+            return
+
+        # 2) Compute full institutional feature set.
+        self._compute_features_full_pipeline()
+
+        # 3) Persist computed features to PostgreSQL for deterministic reuse.
+        if self.config.persist_features_to_postgres:
+            self._store_features_to_postgres()
+        else:
+            self.logger.info("Skipping feature persistence to PostgreSQL for this run")
+
+    def _resolve_feature_groups(self) -> list[Any]:
+        """Resolve configured feature groups into FeatureGroup enum values."""
+        from quant_trading_system.features.feature_pipeline import FeatureGroup
+
+        group_map = {
+            "technical": FeatureGroup.TECHNICAL,
+            "statistical": FeatureGroup.STATISTICAL,
+            "microstructure": FeatureGroup.MICROSTRUCTURE,
+            "cross_sectional": FeatureGroup.CROSS_SECTIONAL,
+            "cross-sectional": FeatureGroup.CROSS_SECTIONAL,
+            "cross": FeatureGroup.CROSS_SECTIONAL,
+            "all": FeatureGroup.ALL,
+        }
+
+        requested = [str(g).strip().lower() for g in self.config.feature_groups if str(g).strip()]
+        if not requested:
+            requested = ["all"]
+
+        resolved: list[Any] = []
+        for name in requested:
+            group = group_map.get(name)
+            if group is None:
+                self.logger.warning(f"Ignoring unknown feature group: {name}")
+                continue
+            if group == FeatureGroup.ALL:
+                return [
+                    FeatureGroup.TECHNICAL,
+                    FeatureGroup.STATISTICAL,
+                    FeatureGroup.MICROSTRUCTURE,
+                    FeatureGroup.CROSS_SECTIONAL,
+                ]
+            if group not in resolved:
+                resolved.append(group)
+
+        if not resolved:
+            return [
+                FeatureGroup.TECHNICAL,
+                FeatureGroup.STATISTICAL,
+                FeatureGroup.MICROSTRUCTURE,
+                FeatureGroup.CROSS_SECTIONAL,
+            ]
+        return resolved
+
+    def _prediction_horizon(self) -> int:
+        """Return effective prediction horizon for purging/leakage controls."""
+        horizons = [int(h) for h in self.config.label_horizons if int(h) > 0]
+        if not horizons:
+            horizons = [int(self.config.primary_label_horizon)]
+        return max(1, max(horizons))
+
+    @staticmethod
+    def _sanitize_feature_columns(columns: list[str]) -> list[str]:
+        """Remove columns that should never be part of model feature matrix."""
+        cleaned: list[str] = []
+        for col in columns:
+            if col in BASE_MARKET_COLUMNS:
+                continue
+            if col in FORBIDDEN_FEATURE_COLUMNS:
+                continue
+            if any(col.startswith(prefix) for prefix in FORBIDDEN_FEATURE_PREFIXES):
+                continue
+            cleaned.append(col)
+        return cleaned
+
+    def _feature_schema_cache_key(
+        self,
+        symbols: list[str],
+        start_date: pd.Timestamp | None,
+        end_date: pd.Timestamp | None,
+    ) -> str:
+        """Build deterministic cache key for reusable PostgreSQL feature matrices."""
+        symbol_part = ",".join(sorted(symbols))
+        groups_part = ",".join(sorted(self.config.feature_groups))
+        cross_sectional_part = "1" if self.config.enable_cross_sectional else "0"
+        start_part = start_date.isoformat() if start_date is not None else "none"
+        end_part = end_date.isoformat() if end_date is not None else "none"
+        return (
+            "train:features:schema:v1:"
+            f"{symbol_part}:{start_part}:{end_part}:"
+            f"{groups_part}:{cross_sectional_part}:{self.feature_pipeline_fingerprint}"
+        )
+
+    def _build_feature_schema_metadata(
+        self,
+        feature_names: list[str],
+    ) -> dict[str, Any]:
+        """Serialize feature schema metadata used for deterministic cache reuse."""
+        return {
+            "pipeline_fingerprint": self.feature_pipeline_fingerprint,
+            "feature_names": sorted(str(name) for name in feature_names),
+            "feature_groups": sorted(str(name) for name in self.config.feature_groups),
+            "enable_cross_sectional": bool(self.config.enable_cross_sectional),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     def _compute_features_full_pipeline(self) -> None:
-        """Compute ALL feature groups using the unified feature pipeline."""
+        """Compute institutional features with adaptive memory-safe fallback behavior."""
         import polars as pl
-        from quant_trading_system.features.feature_pipeline import create_pipeline
-
-        self.logger.info(
-            "Using full feature pipeline (technical + statistical + microstructure + cross-sectional)"
+        from quant_trading_system.features.feature_pipeline import (
+            FeatureConfig,
+            FeatureGroup,
+            FeaturePipeline,
+            NormalizationMethod,
         )
-        pipeline = create_pipeline(groups=["all"], normalization="none", include_targets=False)
 
         features_list = []
-        universe_data: dict[str, pl.DataFrame] = {}
+        symbols = sorted(self.data["symbol"].dropna().unique().tolist())
+        total_rows = len(self.data)
+        groups_to_compute = self._resolve_feature_groups()
 
-        for symbol in self.data["symbol"].unique():
-            symbol_df = (
-                self.data[self.data["symbol"] == symbol]
-                .copy()
-                .sort_values("timestamp")
-                .reset_index(drop=True)
+        if not self.config.enable_cross_sectional:
+            groups_to_compute = [g for g in groups_to_compute if g != FeatureGroup.CROSS_SECTIONAL]
+
+        if FeatureGroup.CROSS_SECTIONAL in groups_to_compute:
+            exceeds_symbols = len(symbols) > int(self.config.max_cross_sectional_symbols)
+            exceeds_rows = total_rows > int(self.config.max_cross_sectional_rows)
+            if exceeds_symbols or exceeds_rows:
+                message = (
+                    "Cross-sectional feature group disabled adaptively due to dataset scale: "
+                    f"symbols={len(symbols)}/{self.config.max_cross_sectional_symbols}, "
+                    f"rows={total_rows}/{self.config.max_cross_sectional_rows}."
+                )
+                if self.config.allow_feature_group_fallback:
+                    self.logger.warning(message)
+                    groups_to_compute = [
+                        g for g in groups_to_compute if g != FeatureGroup.CROSS_SECTIONAL
+                    ]
+                else:
+                    raise RuntimeError(message)
+
+        group_names = [g.value for g in groups_to_compute]
+        self.logger.info(f"Feature groups for this run: {group_names}")
+        if not groups_to_compute:
+            raise RuntimeError("No feature groups enabled for computation.")
+        disable_optimized_technical = os.name == "nt"
+        if disable_optimized_technical:
+            self.logger.warning(
+                "Disabling optimized technical feature pipeline on Windows; "
+                "using standard deterministic calculators to avoid runtime stalls."
             )
-            universe_data[symbol] = pl.from_pandas(symbol_df)
 
-        for symbol in self.data["symbol"].unique():
+        universe_data: dict[str, pl.DataFrame] | None = None
+        if FeatureGroup.CROSS_SECTIONAL in groups_to_compute:
+            universe_data = {}
+            for symbol in symbols:
+                symbol_df = (
+                    self.data[self.data["symbol"] == symbol]
+                    .copy()
+                    .sort_values("timestamp")
+                    .reset_index(drop=True)
+                )
+                universe_data[symbol] = pl.from_pandas(symbol_df)
+
+        for symbol in symbols:
             self.logger.info(f"Computing features for {symbol}...")
             df = (
                 self.data[self.data["symbol"] == symbol]
@@ -378,29 +1017,52 @@ class ModelTrainer:
 
             df_pl = pl.from_pandas(df)
 
-            try:
-                feature_set = pipeline.compute(
-                    df_pl,
-                    symbol=symbol,
-                    universe_data=universe_data,
-                    use_cache=True,
+            combined_features: dict[str, np.ndarray] = {}
+            for group in groups_to_compute:
+                feature_config = FeatureConfig(
+                    groups=[group],
+                    normalization=NormalizationMethod.NONE,
+                    include_targets=False,
+                    use_gpu=self.config.use_gpu and group == FeatureGroup.TECHNICAL,
+                    use_cache=self.config.use_redis_cache and group == FeatureGroup.TECHNICAL,
+                    use_optimized_pipeline=(
+                        group == FeatureGroup.TECHNICAL and not disable_optimized_technical
+                    ),
                 )
-                feature_cols = feature_set.features
+                pipeline = FeaturePipeline(feature_config)
+                try:
+                    feature_set = pipeline.compute(
+                        df_pl,
+                        symbol=symbol,
+                        universe_data=universe_data if group == FeatureGroup.CROSS_SECTIONAL else None,
+                        use_cache=feature_config.use_cache,
+                    )
+                    combined_features.update(feature_set.features)
+                except Exception as e:
+                    if self.config.allow_feature_group_fallback and group == FeatureGroup.CROSS_SECTIONAL:
+                        self.logger.warning(
+                            f"{symbol}: cross-sectional features skipped due to runtime error: {e}"
+                        )
+                        continue
+                    raise RuntimeError(
+                        f"Feature pipeline failed for {symbol} group={group.value}; "
+                        "institutional mode requires deterministic feature materialization."
+                    ) from e
+                finally:
+                    del pipeline
+                    gc.collect()
 
-                feature_df = pd.DataFrame(feature_cols, index=df.index)
-                features_df = pd.concat([df, feature_df], axis=1)
+            if not combined_features:
+                raise RuntimeError(f"No features computed for symbol {symbol}")
 
-                features_df["symbol"] = symbol
-                features_list.append(features_df)
-                self.logger.info(f"  {symbol}: {len(feature_cols)} features computed")
+            feature_df = pd.DataFrame(combined_features, index=df.index)
+            features_df = pd.concat([df, feature_df], axis=1)
+            features_df["symbol"] = symbol
+            features_list.append(features_df)
+            self.logger.info(f"  {symbol}: {len(combined_features)} features computed")
 
-            except Exception as e:
-                self.logger.error(f"Failed to compute features for {symbol}: {e}")
-                # Add basic features as fallback for this symbol
-                df["returns"] = df["close"].pct_change()
-                df["volatility"] = df["returns"].rolling(20).std()
-                df["symbol"] = symbol
-                features_list.append(df)
+            del df_pl
+            gc.collect()
 
         if features_list:
             self.features = pd.concat(features_list, ignore_index=True)
@@ -408,6 +1070,302 @@ class ModelTrainer:
             self.logger.info(
                 f"Total: {len(self.features.columns)} columns for {len(features_list)} symbols"
             )
+
+    def _load_features_from_postgres(self) -> pd.DataFrame | None:
+        """Load precomputed features from PostgreSQL and merge with OHLCV data."""
+        from sqlalchemy import text
+        from quant_trading_system.database.connection import get_db_manager, get_redis_manager
+
+        if self.data is None or self.data.empty:
+            return None
+
+        symbols = sorted(self.data["symbol"].dropna().unique().tolist())
+        if not symbols:
+            return None
+
+        db_manager = get_db_manager()
+        redis_mgr = get_redis_manager()
+
+        start_date = pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
+        end_date = pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
+
+        cache_key = (
+            f"train:features:coverage:v3:{','.join(symbols)}:"
+            f"{start_date.isoformat() if start_date is not None else 'none'}:"
+            f"{end_date.isoformat() if end_date is not None else 'none'}"
+        )
+        schema_key = self._feature_schema_cache_key(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        cached_coverage = redis_mgr.get(cache_key)
+        if cached_coverage == "empty":
+            self.logger.info("Feature cache marked empty previously; revalidating PostgreSQL coverage.")
+
+        schema_payload_raw = redis_mgr.get(schema_key)
+        if not schema_payload_raw:
+            self.logger.info(
+                "Feature schema metadata not found for cache reuse; recomputing features for determinism."
+            )
+            return None
+        try:
+            schema_payload = json.loads(schema_payload_raw)
+        except Exception:
+            self.logger.warning("Invalid feature schema metadata in Redis; recomputing features.")
+            return None
+        expected_feature_names = [
+            str(name)
+            for name in schema_payload.get("feature_names", [])
+            if isinstance(name, str) and name.strip()
+        ]
+        if not expected_feature_names:
+            self.logger.info("Feature schema metadata missing feature names; recomputing features.")
+            return None
+        if schema_payload.get("pipeline_fingerprint") != self.feature_pipeline_fingerprint:
+            self.logger.info(
+                "Feature pipeline fingerprint changed since cache write; recomputing features."
+            )
+            return None
+
+        query = text(
+            """
+            SELECT
+                symbol,
+                timestamp,
+                feature_name,
+                value
+            FROM features
+            WHERE symbol = :symbol
+              AND (:start_date IS NULL OR timestamp >= :start_date)
+              AND (:end_date IS NULL OR timestamp <= :end_date)
+            ORDER BY timestamp, feature_name
+            """
+        )
+
+        feature_frames: list[pd.DataFrame] = []
+        with db_manager.session() as session:
+            session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
+            session.execute(text("SET LOCAL statement_timeout = '60000ms'"))
+            for symbol in symbols:
+                result = session.execute(
+                    query,
+                    {"symbol": symbol, "start_date": start_date, "end_date": end_date},
+                )
+                rows = result.fetchall()
+                if not rows:
+                    continue
+                feature_frames.append(pd.DataFrame(rows, columns=result.keys()))
+
+        if not feature_frames:
+            redis_mgr.set(cache_key, "empty", expire_seconds=300)
+            return None
+
+        long_df = pd.concat(feature_frames, ignore_index=True)
+        long_df["timestamp"] = pd.to_datetime(long_df["timestamp"], utc=True, errors="coerce")
+        long_df = long_df.dropna(subset=["timestamp", "feature_name", "value"])
+
+        wide_df = (
+            long_df.pivot_table(
+                index=["symbol", "timestamp"],
+                columns="feature_name",
+                values="value",
+                aggfunc="last",
+            )
+            .reset_index()
+        )
+        wide_df.columns.name = None
+
+        merged = self.data.merge(wide_df, on=["symbol", "timestamp"], how="left")
+        feature_cols = [c for c in merged.columns if c not in BASE_MARKET_COLUMNS]
+        feature_cols = self._sanitize_feature_columns(feature_cols)
+        if not feature_cols:
+            redis_mgr.set(cache_key, "empty", expire_seconds=300)
+            return None
+
+        missing_features = sorted(set(expected_feature_names).difference(feature_cols))
+        if missing_features:
+            self.logger.info(
+                f"Cached PostgreSQL features missing {len(missing_features)} expected columns; recomputing."
+            )
+            redis_mgr.set(cache_key, "empty", expire_seconds=300)
+            return None
+
+        selected_feature_cols = [name for name in expected_feature_names if name in feature_cols]
+        if not selected_feature_cols:
+            redis_mgr.set(cache_key, "empty", expire_seconds=300)
+            return None
+        merged = merged[["symbol", "timestamp", "open", "high", "low", "close", "volume", *selected_feature_cols]]
+        feature_cols = selected_feature_cols
+
+        clean_merged = merged.replace([np.inf, -np.inf], np.nan).dropna()
+        usable_rows = len(clean_merged)
+        reuse_floor = min(max(float(self.config.feature_reuse_min_coverage), 0.01), 0.95)
+        min_required_rows = max(50, int(reuse_floor * len(merged)))
+        cell_coverage = float(merged[feature_cols].notna().mean().mean())
+        self.logger.info(
+            "PostgreSQL feature coverage: "
+            f"cells={cell_coverage:.2%}, usable_rows={usable_rows}/{len(merged)} "
+            f"(min_required={min_required_rows})"
+        )
+        # Rolling windows naturally reduce usable rows; gate by absolute usable sample count.
+        if usable_rows < min_required_rows:
+            redis_mgr.set(cache_key, "empty", expire_seconds=300)
+            return None
+
+        redis_mgr.set(cache_key, f"{usable_rows}", expire_seconds=300)
+        return clean_merged
+
+    def _store_features_to_postgres(self) -> None:
+        """Persist computed features to PostgreSQL `features` table (upsert)."""
+        from sqlalchemy import text
+        from quant_trading_system.database.connection import get_db_manager, get_redis_manager
+
+        if self.features is None or self.features.empty:
+            return
+
+        feature_cols = [c for c in self.features.columns if c not in BASE_MARKET_COLUMNS]
+        feature_cols = self._sanitize_feature_columns(feature_cols)
+        if not feature_cols:
+            return
+
+        export_df = self.features[["symbol", "timestamp", *feature_cols]].copy()
+        export_df["timestamp"] = pd.to_datetime(export_df["timestamp"], utc=True, errors="coerce")
+        export_df = export_df.dropna(subset=["timestamp"])
+        if export_df.empty:
+            return
+
+        upsert = text(
+            """
+            INSERT INTO features (symbol, timestamp, feature_name, value)
+            VALUES (:symbol, :timestamp, :feature_name, :value)
+            ON CONFLICT (symbol, timestamp, feature_name)
+            DO UPDATE SET value = EXCLUDED.value
+            """
+        )
+
+        db_manager = get_db_manager()
+        checkpoint_file = self._feature_materialization_checkpoint_path()
+        total_source_rows = len(export_df)
+        resume_offset = min(self._read_materialization_offset(checkpoint_file), total_source_rows)
+        if resume_offset > 0:
+            self.logger.info(
+                f"Resuming feature materialization from source row offset "
+                f"{resume_offset}/{total_source_rows}"
+            )
+
+        total_upserted_rows = 0
+        requested_source_batch_rows = max(250, int(self.config.feature_materialization_batch_rows))
+        source_batch_rows = min(requested_source_batch_rows, 1000)
+        if source_batch_rows < requested_source_batch_rows:
+            self.logger.info(
+                "Capping feature materialization source batch rows "
+                f"from {requested_source_batch_rows} to {source_batch_rows} for DB lock safety"
+            )
+        with db_manager.session() as session:
+            session.execute(text("SET max_parallel_workers_per_gather = 0"))
+            session.execute(text("SET statement_timeout = '120000ms'"))
+
+            for i in range(resume_offset, total_source_rows, source_batch_rows):
+                source_batch = export_df.iloc[i:i + source_batch_rows]
+                long_batch = source_batch.melt(
+                    id_vars=["symbol", "timestamp"],
+                    value_vars=feature_cols,
+                    var_name="feature_name",
+                    value_name="value",
+                ).dropna(subset=["value"])
+
+                if not long_batch.empty:
+                    write_batch_size = min(2000, max(500, source_batch_rows * 2))
+                    for offset in range(0, len(long_batch), write_batch_size):
+                        chunk_df = long_batch.iloc[offset:offset + write_batch_size]
+                        write_chunk = [
+                            {
+                                "symbol": row.symbol,
+                                "timestamp": (
+                                    row.timestamp.to_pydatetime()
+                                    if hasattr(row.timestamp, "to_pydatetime")
+                                    else row.timestamp
+                                ),
+                                "feature_name": row.feature_name,
+                                "value": float(row.value),
+                            }
+                            for row in chunk_df.itertuples(index=False)
+                        ]
+                        if not write_chunk:
+                            continue
+                        session.execute(upsert, write_chunk)
+                        session.commit()
+                        total_upserted_rows += len(write_chunk)
+
+                self._write_materialization_offset(
+                    checkpoint_file=checkpoint_file,
+                    next_offset=i + len(source_batch),
+                    total_rows=total_source_rows,
+                )
+
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
+
+        redis_mgr = get_redis_manager()
+        redis_mgr.delete("train:ohlcv_symbols")
+        symbols = sorted(export_df["symbol"].dropna().unique().tolist())
+        start_date = pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
+        end_date = pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
+        schema_key = self._feature_schema_cache_key(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        schema_metadata = self._build_feature_schema_metadata(feature_cols)
+        redis_mgr.set(schema_key, json.dumps(schema_metadata, ensure_ascii=True), expire_seconds=604800)
+        self.logger.info(f"Persisted {total_upserted_rows} feature rows to PostgreSQL")
+
+    def _feature_materialization_checkpoint_path(self) -> Path:
+        """Checkpoint path for resumable feature materialization."""
+        state_dir = Path(self.config.output_dir) / "materialization_state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_id = (
+            str(self.snapshot_manifest.get("snapshot_id"))
+            if isinstance(self.snapshot_manifest, dict)
+            else "unknown"
+        )
+        fingerprint = hashlib.sha256(
+            f"{snapshot_id}:{self.config.model_name}:{self.config.model_type}".encode("utf-8")
+        ).hexdigest()[:12]
+        return state_dir / f"features_{snapshot_id}_{fingerprint}.json"
+
+    @staticmethod
+    def _read_materialization_offset(checkpoint_file: Path) -> int:
+        if not checkpoint_file.exists():
+            return 0
+        try:
+            payload = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+            return max(0, int(payload.get("next_offset", 0)))
+        except Exception:
+            return 0
+
+    def _write_materialization_offset(
+        self,
+        checkpoint_file: Path,
+        next_offset: int,
+        total_rows: int,
+    ) -> None:
+        payload = {
+            "snapshot_id": (
+                self.snapshot_manifest.get("snapshot_id")
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "model_name": self.config.model_name,
+            "next_offset": int(next_offset),
+            "total_rows": int(total_rows),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        checkpoint_file.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
 
     def _compute_features_fallback(self) -> None:
         """Fallback feature computation with basic indicators."""
@@ -466,90 +1424,788 @@ class ModelTrainer:
     def _create_labels(self) -> None:
         """Phase 3: Create labels for supervised learning."""
         self.logger.info("Phase 3: Creating labels...")
+        label_horizons = sorted(
+            {
+                int(h)
+                for h in self.config.label_horizons
+                if isinstance(h, (int, np.integer, float, np.floating)) and int(h) > 0
+            }
+        )
+        if not label_horizons:
+            label_horizons = [1, 5, 20]
+        primary_horizon = int(self.config.primary_label_horizon)
+        if primary_horizon not in label_horizons:
+            label_horizons.append(primary_horizon)
+            label_horizons = sorted(set(label_horizons))
 
-        # Forward returns as labels (predict next-bar direction)
-        horizon = 1  # 1-bar ahead prediction
+        target_config = TargetEngineeringConfig(
+            horizons=tuple(label_horizons),
+            primary_horizon=primary_horizon,
+            profit_taking_threshold=float(self.config.label_profit_taking_threshold),
+            stop_loss_threshold=float(self.config.label_stop_loss_threshold),
+            max_holding_period=int(self.config.label_max_holding_period),
+            use_volatility_barriers=True,
+            volatility_lookback=int(self.config.label_volatility_lookback),
+            spread_bps=float(self.config.label_spread_bps),
+            slippage_bps=float(self.config.label_slippage_bps),
+            impact_bps=float(self.config.label_impact_bps),
+            regime_lookback=int(self.config.label_regime_lookback),
+            temporal_weight_decay=float(self.config.label_temporal_weight_decay),
+        )
+        target_result = generate_targets(self.features, target_config)
+        labeled_frame = target_result.frame.dropna(subset=["label"]).copy()
+        if labeled_frame.empty:
+            raise ValueError("Target engineering produced zero valid labels.")
+        labeled_frame["label"] = pd.to_numeric(labeled_frame["label"], errors="coerce").astype(int)
+        labeled_frame = labeled_frame.dropna(subset=["timestamp"]).reset_index(drop=True)
 
-        labels_list = []
-        for symbol in self.features["symbol"].unique():
-            df = self.features[self.features["symbol"] == symbol].copy()
+        weight_series = target_result.sample_weights
+        weight_series = weight_series.reindex(target_result.frame.index).fillna(1.0)
+        filtered_weights = weight_series.loc[target_result.frame["label"].notna()].reset_index(drop=True)
+        sample_weights = np.asarray(filtered_weights, dtype=float)
+        sample_weights = np.nan_to_num(sample_weights, nan=1.0, posinf=1.0, neginf=1.0)
+        if len(sample_weights) != len(labeled_frame):
+            sample_weights = np.ones(len(labeled_frame), dtype=float)
 
-            # Forward returns
-            df["forward_return"] = df["close"].pct_change(horizon).shift(-horizon)
+        self.label_diagnostics = target_result.diagnostics
+        self.training_metrics["label_positive_rate"] = float(self.label_diagnostics.get("positive_rate", 0.0))
+        self.training_metrics["label_class_balance_ratio"] = float(
+            self.label_diagnostics.get("class_balance_ratio", 0.0)
+        )
+        self.training_metrics["label_drift_abs"] = float(self.label_diagnostics.get("label_drift_abs", 0.0))
+        self.training_metrics["label_count"] = float(self.label_diagnostics.get("label_count", 0))
 
-            # Binary classification: 1 = up, 0 = down
-            df["label"] = (df["forward_return"] > 0).astype(int)
-
-            labels_list.append(df)
-
-        self.features = pd.concat(labels_list, ignore_index=True)
-        self.features = self.features.dropna(subset=["label"])
-
-        self.labels = self.features["label"]
+        self.labels = labeled_frame["label"]
+        self.timestamps = labeled_frame["timestamp"].to_numpy()
+        self.row_symbols = labeled_frame["symbol"].astype(str).to_numpy()
+        self.close_prices = labeled_frame["close"].reset_index(drop=True)
+        primary_forward_col = f"forward_return_h{primary_horizon}"
+        if primary_forward_col in labeled_frame.columns:
+            self.primary_forward_returns = np.nan_to_num(
+                pd.to_numeric(labeled_frame[primary_forward_col], errors="coerce").to_numpy(dtype=float),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        else:
+            self.primary_forward_returns = np.zeros(len(labeled_frame), dtype=float)
+        if "triple_barrier_net_return" in labeled_frame.columns:
+            self.cost_aware_event_returns = np.nan_to_num(
+                pd.to_numeric(labeled_frame["triple_barrier_net_return"], errors="coerce").to_numpy(dtype=float),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        else:
+            self.cost_aware_event_returns = np.zeros(len(labeled_frame), dtype=float)
+        self.sample_weights = sample_weights
 
         # Remove non-feature columns
-        exclude_cols = ["timestamp", "symbol", "label", "forward_return",
-                       "open", "high", "low", "close", "volume"]
-        feature_cols = [c for c in self.features.columns if c not in exclude_cols]
-        self.features = self.features[feature_cols]
+        exclude_cols = [
+            "timestamp",
+            "symbol",
+            "label",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "primary_signal",
+            "barrier_touched",
+            "triple_barrier_label",
+            "triple_barrier_event_return",
+            "triple_barrier_net_return",
+            "holding_period",
+            "regime",
+        ]
+        exclude_cols.extend([f"forward_return_h{h}" for h in label_horizons])
+        feature_cols = [c for c in labeled_frame.columns if c not in exclude_cols]
+        if not feature_cols:
+            raise ValueError("No model features remain after target engineering exclusion list.")
+        self.features = labeled_frame[feature_cols]
+        self.feature_names = feature_cols
 
-        self.logger.info(f"Created {len(self.labels)} labels (pos: {self.labels.sum()}, neg: {len(self.labels) - self.labels.sum()})")
+        self.logger.info(
+            f"Created {len(self.labels)} labels "
+            f"(pos: {int(self.labels.sum())}, neg: {int(len(self.labels) - self.labels.sum())}) "
+            f"| pos_rate={self.training_metrics['label_positive_rate']:.2%} "
+            f"| drift_abs={self.training_metrics['label_drift_abs']:.2%}"
+        )
+        self._build_training_snapshot_manifest()
+
+    def _validate_symbol_timestamp_ordering(self) -> None:
+        """Ensure timestamps are strictly increasing within each symbol stream."""
+        if self.timestamps is None:
+            raise ValueError("Timestamp array missing for leakage validation")
+        ts_series = pd.Series(pd.to_datetime(self.timestamps, utc=True, errors="coerce"))
+        if ts_series.isna().any():
+            raise ValueError("Timestamp array contains invalid entries after conversion")
+
+        if self.row_symbols is None or len(self.row_symbols) != len(ts_series):
+            diffs = np.diff(ts_series.astype("int64", copy=False).to_numpy())
+            if np.any(diffs <= 0):
+                raise ValueError("Timestamp ordering violation detected in training data.")
+            return
+
+        symbol_series = pd.Series(self.row_symbols.astype(str))
+        for symbol, idx in symbol_series.groupby(symbol_series).groups.items():
+            symbol_ts = ts_series.iloc[idx].astype("int64", copy=False).to_numpy()
+            if np.any(np.diff(symbol_ts) <= 0):
+                raise ValueError(
+                    f"Timestamp ordering violation for symbol {symbol}. "
+                    "Ensure per-symbol bars are strictly increasing."
+                )
+
+    def _panelize_timestamp_splits(
+        self,
+        splitter: Any,
+        timestamps: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Split by unique timestamps then map folds back to row indices."""
+        ts_series = pd.Series(pd.to_datetime(timestamps, utc=True, errors="coerce"))
+        if ts_series.isna().any():
+            raise ValueError("Invalid timestamps detected during panel split mapping.")
+
+        ts_ns = ts_series.astype("int64", copy=False).to_numpy()
+        unique_ts_ns = np.sort(np.unique(ts_ns))
+        if len(unique_ts_ns) < 3:
+            raise ValueError("Insufficient unique timestamps for panel-aware cross-validation.")
+
+        unique_dummy = np.zeros((len(unique_ts_ns), 1), dtype=float)
+        splits: list[tuple[np.ndarray, np.ndarray]] = []
+        for train_ts_idx, test_ts_idx in splitter.split(unique_dummy, unique_dummy[:, 0]):
+            train_ts_ns = unique_ts_ns[np.asarray(train_ts_idx, dtype=int)]
+            test_ts_ns = unique_ts_ns[np.asarray(test_ts_idx, dtype=int)]
+
+            train_idx = np.flatnonzero(np.isin(ts_ns, train_ts_ns)).astype(int)
+            test_idx = np.flatnonzero(np.isin(ts_ns, test_ts_ns)).astype(int)
+            if len(train_idx) == 0 or len(test_idx) == 0:
+                continue
+            if np.intersect1d(train_idx, test_idx).size > 0:
+                raise ValueError("Panel CV mapping produced overlapping train/test indices.")
+            splits.append((train_idx, test_idx))
+
+        if not splits:
+            raise ValueError("Panel-aware cross-validation produced no valid splits.")
+        return splits
+
+    def _generate_cv_splits(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """
+        Generate CV splits.
+
+        For panel data (multi-symbol with repeated timestamps), split on unique
+        timestamps then map back to row indices to avoid symbol-block leakage.
+        """
+        if self.timestamps is None or len(self.timestamps) != len(X):
+            cv = self._get_cv_splitter(n_samples=len(X))
+            return [(np.asarray(tr, dtype=int), np.asarray(te, dtype=int)) for tr, te in cv.split(X, y)]
+
+        ts_series = pd.Series(pd.to_datetime(self.timestamps, utc=True, errors="coerce"))
+        if ts_series.isna().any():
+            raise ValueError("Invalid timestamps detected during CV split generation.")
+
+        has_duplicate_ts = bool(ts_series.duplicated().any())
+        has_panel_symbols = (
+            self.row_symbols is not None
+            and len(self.row_symbols) == len(ts_series)
+            and len(pd.unique(pd.Series(self.row_symbols.astype(str)))) > 1
+        )
+        if not has_duplicate_ts and not has_panel_symbols:
+            cv = self._get_cv_splitter(n_samples=len(X))
+            return [(np.asarray(tr, dtype=int), np.asarray(te, dtype=int)) for tr, te in cv.split(X, y)]
+
+        cv = self._get_cv_splitter(n_samples=int(ts_series.nunique()))
+        return self._panelize_timestamp_splits(cv, ts_series.to_numpy())
+
+    def _validate_no_future_leakage(self) -> None:
+        """Run strict future-leak checks on dataset and planned CV splits."""
+        from quant_trading_system.models.model_manager import FutureLeakValidator
+
+        if self.features is None or self.labels is None:
+            raise ValueError("Features/labels must be prepared before leakage validation")
+
+        validator = FutureLeakValidator(strict_mode=True)
+        is_valid, issues = validator.validate(
+            self.features.values,
+            self.labels.values,
+            feature_names=self.feature_names,
+            timestamps=None,
+        )
+        if not is_valid:
+            raise ValueError(f"Future-leak validation failed: {issues}")
+        self._validate_symbol_timestamp_ordering()
+
+        splits = self._generate_cv_splits(self.features.values, self.labels.values)
+        for fold_idx, (train_idx, test_idx) in enumerate(splits):
+            if self.config.cv_method == "walk_forward":
+                valid_split, split_issues = validator.validate_time_series_split(
+                    self.timestamps[train_idx],
+                    self.timestamps[test_idx],
+                    gap_bars=max(self._prediction_horizon(), int(self.config.purge_pct * 100)),
+                )
+                if not valid_split:
+                    raise ValueError(
+                        f"Leakage detected in CV split {fold_idx + 1}: {split_issues}"
+                    )
+                continue
+
+            # Purged/combinatorial CV can include both past and future observations by design.
+            # Validate leakage via disjoint indices and no training timestamps inside test window.
+            overlap_idx = np.intersect1d(train_idx, test_idx)
+            if overlap_idx.size > 0:
+                raise ValueError(
+                    f"Leakage detected in CV split {fold_idx + 1}: "
+                    f"{overlap_idx.size} overlapping train/test indices."
+                )
+
+            train_ts = np.asarray(self.timestamps[train_idx])
+            test_ts = np.asarray(self.timestamps[test_idx])
+            train_ts_ns = pd.Series(
+                pd.to_datetime(train_ts, utc=True, errors="coerce")
+            ).astype("int64", copy=False).to_numpy()
+            test_ts_ns = pd.Series(
+                pd.to_datetime(test_ts, utc=True, errors="coerce")
+            ).astype("int64", copy=False).to_numpy()
+            shared_ts = np.intersect1d(train_ts_ns, test_ts_ns)
+            if shared_ts.size > 0:
+                raise ValueError(
+                    f"Leakage detected in CV split {fold_idx + 1}: "
+                    "training timestamps overlap with test timestamps."
+                )
+            if self.config.cv_method != "combinatorial":
+                test_min = np.min(test_ts_ns)
+                test_max = np.max(test_ts_ns)
+                in_test_window = (train_ts_ns >= test_min) & (train_ts_ns <= test_max)
+                if np.any(in_test_window):
+                    raise ValueError(
+                        f"Leakage detected in CV split {fold_idx + 1}: "
+                        "training timestamps found inside test window."
+                    )
+
+        self.logger.info("Future-leak validation passed for data and CV splits")
 
     def _optimize_hyperparameters(self) -> None:
         """Phase 4: Hyperparameter optimization."""
-        self.logger.info(f"Phase 4: Hyperparameter optimization using {self.config.optimizer}...")
-
-        if self.config.optimizer == "optuna":
-            self._optimize_with_optuna()
-        elif self.config.optimizer == "grid":
-            self._optimize_with_grid_search()
-        elif self.config.optimizer == "random":
-            self._optimize_with_random_search()
-        else:
-            self.logger.warning(f"Unknown optimizer: {self.config.optimizer}")
+        self.logger.info("Phase 4: Hyperparameter optimization using Optuna (risk-adjusted objective)...")
+        if self.config.optimizer != "optuna":
+            raise ValueError(
+                f"Institutional mode requires optimizer=optuna, got '{self.config.optimizer}'"
+            )
+        if not self.config.use_nested_walk_forward:
+            raise ValueError(
+                "Institutional mode requires nested walk-forward optimization trace."
+            )
+        self._optimize_with_optuna()
 
     def _optimize_with_optuna(self) -> None:
-        """Optimize hyperparameters using Optuna."""
+        """Optimize hyperparameters using Optuna with pruning and risk-adjusted score."""
+        if self.config.use_nested_walk_forward:
+            self._optimize_with_nested_walk_forward()
+            return
+
         try:
             import optuna
+        except ImportError as exc:
+            raise RuntimeError("Optuna is mandatory in institutional mode") from exc
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-            def objective(trial):
-                if self.config.model_type == "xgboost":
-                    params = {
-                        "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
-                        "max_depth": trial.suggest_int("max_depth", 3, 10),
-                        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-                        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-                        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-                        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-                        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-                    }
-                elif self.config.model_type == "lightgbm":
-                    params = {
-                        "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
-                        "max_depth": trial.suggest_int("max_depth", 3, 15),
-                        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-                        "num_leaves": trial.suggest_int("num_leaves", 20, 150),
-                        "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
-                        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
-                        "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
-                    }
-                else:
-                    params = {}
+        X = self.features.values
+        y = self.labels.values
+        weights = self.sample_weights if self.sample_weights is not None else None
+        splits = self._generate_cv_splits(X, y)
+        if not splits:
+            self.logger.info("No CV splits available for Optuna; keeping configured defaults")
+            return
 
-                # Quick CV evaluation
-                score = self._quick_cv_score(params)
-                return score
+        min_train_size = min(len(train_idx) for train_idx, _ in splits)
+        search_space = self._get_optuna_search_space(min_train_size=min_train_size)
+        if not search_space:
+            self.logger.info("No Optuna search space for this model type, keeping configured defaults")
+            return
 
-            study = optuna.create_study(direction="maximize")
-            study.optimize(objective, n_trials=self.config.n_trials, n_jobs=self.config.n_jobs)
+        def objective(trial: "optuna.Trial") -> float:
+            params = search_space(trial)
+            fold_scores: list[float] = []
 
-            self.config.model_params = study.best_params
-            self.logger.info(f"Best params: {study.best_params}")
-            self.logger.info(f"Best score: {study.best_value:.4f}")
+            try:
+                for fold_idx, (train_idx, test_idx) in enumerate(splits):
+                    fold_params = self._prepare_params_for_train_size(params, len(train_idx))
+                    model = self._create_model(params=fold_params)
+                    X_train, X_test = X[train_idx], X[test_idx]
+                    y_train, y_test = y[train_idx], y[test_idx]
+                    w_train = weights[train_idx] if weights is not None else None
+                    self._fit_model(
+                        model=model,
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_test,
+                        y_val=y_test,
+                        sample_weights=w_train,
+                    )
 
-        except ImportError:
-            self.logger.warning("Optuna not installed, skipping optimization")
+                    y_pred = np.asarray(model.predict(X_test))
+                    y_proba = np.asarray(self._get_predictions_proba(model, X_test))
+                    y_eval = np.asarray(y_test)
+                    eval_len = min(len(y_eval), len(y_pred), len(y_proba))
+                    if eval_len <= 1:
+                        continue
+                    fold_forward_returns = (
+                        np.asarray(self.primary_forward_returns[test_idx], dtype=float)
+                        if isinstance(self.primary_forward_returns, np.ndarray)
+                        and len(self.primary_forward_returns) == len(y)
+                        else None
+                    )
+                    fold_event_returns = (
+                        np.asarray(self.cost_aware_event_returns[test_idx], dtype=float)
+                        if isinstance(self.cost_aware_event_returns, np.ndarray)
+                        and len(self.cost_aware_event_returns) == len(y)
+                        else None
+                    )
+
+                    metrics = self._calculate_fold_metrics(
+                        y_eval[-eval_len:],
+                        y_pred[-eval_len:],
+                        y_proba[-eval_len:],
+                        realized_forward_returns=(
+                            fold_forward_returns[-eval_len:] if fold_forward_returns is not None else None
+                        ),
+                        event_net_returns=(
+                            fold_event_returns[-eval_len:] if fold_event_returns is not None else None
+                        ),
+                    )
+                    fold_score = float(metrics["risk_adjusted_score"])
+                    if not np.isfinite(fold_score):
+                        return -1e9
+                    fold_scores.append(fold_score)
+
+                    trial.report(float(np.mean(fold_scores)), step=fold_idx)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+            except optuna.TrialPruned:
+                raise
+            except Exception as exc:
+                self.logger.warning(f"Optuna trial failed for {self.config.model_type}: {exc}")
+                return -1e9
+
+            if not fold_scores:
+                return -1e9
+            return float(np.mean(fold_scores))
+
+        sampler = optuna.samplers.TPESampler(seed=self.config.seed)
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=sampler,
+            pruner=pruner,
+            study_name=f"{self.config.model_type}_institutional_opt",
+        )
+        study.optimize(
+            objective,
+            n_trials=self.config.n_trials,
+            n_jobs=1,
+            gc_after_trial=True,
+            show_progress_bar=False,
+        )
+
+        completed_trials = [
+            t
+            for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+            and t.value is not None
+            and np.isfinite(float(t.value))
+        ]
+        self.training_metrics["optuna_trials"] = int(len(study.trials))
+        self.training_metrics["optuna_pruned_trials"] = int(
+            sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED)
+        )
+
+        if not completed_trials:
+            self.training_metrics["optuna_best_score"] = -1e9
+            self.logger.warning(
+                "Optuna completed no valid trials; keeping existing model parameters."
+            )
+            return
+
+        best_trial = max(completed_trials, key=lambda t: float(t.value))
+        self.config.model_params = {**self.config.model_params, **best_trial.params}
+        self.config.model_params = self._prepare_params_for_train_size(
+            self.config.model_params, min_train_size
+        )
+        self.training_metrics["optuna_best_score"] = float(best_trial.value)
+        self.logger.info(f"Best params: {best_trial.params}")
+        self.logger.info(f"Best risk-adjusted CV score: {best_trial.value:.6f}")
+
+    def _build_walk_forward_splitter(self, n_splits: int, train_pct: float = 0.6):
+        """Build deterministic walk-forward splitter for nested CV."""
+        from quant_trading_system.models.purged_cv import WalkForwardCV
+
+        embargo_pct = max(self.config.embargo_pct, 0.01)
+        purge_gap = max(1, int(self.config.purge_pct * 100))
+        min_train_size = max(50, int(0.10 * len(self.features)))
+        prediction_horizon = min(
+            self._prediction_horizon(),
+            max(1, int(max(10, len(self.features)) * 0.1)),
+        )
+        return WalkForwardCV(
+            n_splits=max(1, int(n_splits)),
+            train_pct=float(train_pct),
+            window_type="expanding",
+            min_train_size=min_train_size,
+            purge_gap=purge_gap,
+            embargo_pct=embargo_pct,
+            prediction_horizon=prediction_horizon,
+        )
+
+    def _optimize_with_nested_walk_forward(self) -> None:
+        """Nested walk-forward Optuna optimization with auditable objective breakdown."""
+        try:
+            import optuna
+        except ImportError as exc:
+            raise RuntimeError("Optuna is mandatory in institutional mode") from exc
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        X = self.features.values
+        y = self.labels.values
+        weights = self.sample_weights if self.sample_weights is not None else None
+        timestamps = self.timestamps if self.timestamps is not None and len(self.timestamps) == len(X) else None
+        outer_cv = self._build_walk_forward_splitter(
+            n_splits=self.config.nested_outer_splits,
+            train_pct=0.60,
+        )
+        if timestamps is not None and pd.Series(timestamps).duplicated().any():
+            try:
+                outer_splits = self._panelize_timestamp_splits(outer_cv, timestamps)
+            except ValueError as exc:
+                self.logger.warning(
+                    "Nested outer panel split mapping failed (%s); "
+                    "falling back to row-wise walk-forward outer splits.",
+                    exc,
+                )
+                outer_splits = list(outer_cv.split(X, y))
+        else:
+            outer_splits = list(outer_cv.split(X, y))
+        if not outer_splits:
+            raise ValueError("Nested walk-forward requires at least one outer split.")
+
+        min_train_size = min(len(train_idx) for train_idx, _ in outer_splits)
+        search_space = self._get_optuna_search_space(min_train_size=min_train_size)
+        if not search_space:
+            self.logger.info("No Optuna search space for this model type, keeping configured defaults")
+            return
+
+        total_trials = 0
+        total_pruned = 0
+        self.nested_cv_trace = []
+
+        outer_candidates: list[tuple[float, dict[str, Any], int]] = []
+
+        for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(outer_splits, start=1):
+            X_outer_train = X[outer_train_idx]
+            y_outer_train = y[outer_train_idx]
+            X_outer_test = X[outer_test_idx]
+            y_outer_test = y[outer_test_idx]
+            w_outer_train = weights[outer_train_idx] if weights is not None else None
+            ts_outer_train = timestamps[outer_train_idx] if timestamps is not None else None
+            forward_outer_train = (
+                np.asarray(self.primary_forward_returns[outer_train_idx], dtype=float)
+                if isinstance(self.primary_forward_returns, np.ndarray)
+                and len(self.primary_forward_returns) == len(y)
+                else None
+            )
+            event_outer_train = (
+                np.asarray(self.cost_aware_event_returns[outer_train_idx], dtype=float)
+                if isinstance(self.cost_aware_event_returns, np.ndarray)
+                and len(self.cost_aware_event_returns) == len(y)
+                else None
+            )
+            forward_outer_test = (
+                np.asarray(self.primary_forward_returns[outer_test_idx], dtype=float)
+                if isinstance(self.primary_forward_returns, np.ndarray)
+                and len(self.primary_forward_returns) == len(y)
+                else None
+            )
+            event_outer_test = (
+                np.asarray(self.cost_aware_event_returns[outer_test_idx], dtype=float)
+                if isinstance(self.cost_aware_event_returns, np.ndarray)
+                and len(self.cost_aware_event_returns) == len(y)
+                else None
+            )
+
+            inner_cv = self._build_walk_forward_splitter(
+                n_splits=self.config.nested_inner_splits,
+                train_pct=0.65,
+            )
+            if ts_outer_train is not None and pd.Series(ts_outer_train).duplicated().any():
+                try:
+                    inner_splits = self._panelize_timestamp_splits(inner_cv, ts_outer_train)
+                except ValueError as exc:
+                    self.logger.warning(
+                        "Outer fold %s: nested inner panel split mapping failed (%s); "
+                        "falling back to row-wise inner splits.",
+                        outer_fold,
+                        exc,
+                    )
+                    inner_splits = list(inner_cv.split(X_outer_train, y_outer_train))
+            else:
+                inner_splits = list(inner_cv.split(X_outer_train, y_outer_train))
+            if not inner_splits:
+                self.logger.warning(f"Outer fold {outer_fold}: no valid inner splits, skipping fold.")
+                continue
+
+            def objective(
+                trial: "optuna.Trial",
+                _inner_splits: list[tuple[np.ndarray, np.ndarray]] = inner_splits,
+                _X_outer_train: np.ndarray = X_outer_train,
+                _y_outer_train: np.ndarray = y_outer_train,
+                _w_outer_train: np.ndarray | None = w_outer_train,
+                _forward_outer_train: np.ndarray | None = forward_outer_train,
+                _event_outer_train: np.ndarray | None = event_outer_train,
+            ) -> float:
+                params = search_space(trial)
+                fold_scores: list[float] = []
+                component_samples: list[dict[str, float]] = []
+
+                try:
+                    for inner_idx, (inner_train_idx, inner_val_idx) in enumerate(_inner_splits):
+                        fold_params = self._prepare_params_for_train_size(
+                            params, len(inner_train_idx)
+                        )
+                        model = self._create_model(params=fold_params)
+                        X_train = _X_outer_train[inner_train_idx]
+                        X_val = _X_outer_train[inner_val_idx]
+                        y_train = _y_outer_train[inner_train_idx]
+                        y_val = _y_outer_train[inner_val_idx]
+                        w_train = (
+                            _w_outer_train[inner_train_idx]
+                            if _w_outer_train is not None
+                            else None
+                        )
+                        self._fit_model(
+                            model=model,
+                            X_train=X_train,
+                            y_train=y_train,
+                            X_val=X_val,
+                            y_val=y_val,
+                            sample_weights=w_train,
+                        )
+
+                        y_pred = np.asarray(model.predict(X_val))
+                        y_proba = np.asarray(self._get_predictions_proba(model, X_val))
+                        y_eval = np.asarray(y_val)
+                        eval_len = min(len(y_eval), len(y_pred), len(y_proba))
+                        if eval_len <= 1:
+                            continue
+
+                        metrics = self._calculate_fold_metrics(
+                            y_eval[-eval_len:],
+                            y_pred[-eval_len:],
+                            y_proba[-eval_len:],
+                            realized_forward_returns=(
+                                _forward_outer_train[inner_val_idx][-eval_len:]
+                                if _forward_outer_train is not None
+                                else None
+                            ),
+                            event_net_returns=(
+                                _event_outer_train[inner_val_idx][-eval_len:]
+                                if _event_outer_train is not None
+                                else None
+                            ),
+                        )
+                        fold_score = float(metrics["risk_adjusted_score"])
+                        if not np.isfinite(fold_score):
+                            return -1e9
+                        fold_scores.append(fold_score)
+                        component_samples.append(
+                            {
+                                "objective_sharpe_component": float(
+                                    metrics.get("objective_sharpe_component", 0.0)
+                                ),
+                                "objective_drawdown_penalty": float(
+                                    metrics.get("objective_drawdown_penalty", 0.0)
+                                ),
+                                "objective_turnover_penalty": float(
+                                    metrics.get("objective_turnover_penalty", 0.0)
+                                ),
+                                "objective_calibration_penalty": float(
+                                    metrics.get("objective_calibration_penalty", 0.0)
+                                ),
+                            }
+                        )
+
+                        trial.report(float(np.mean(fold_scores)), step=inner_idx)
+                        if trial.should_prune():
+                            raise optuna.TrialPruned()
+                except optuna.TrialPruned:
+                    raise
+                except Exception as exc:
+                    self.logger.warning(f"Optuna nested trial failed: {exc}")
+                    return -1e9
+
+                if not fold_scores:
+                    return -1e9
+
+                if component_samples:
+                    trial.set_user_attr(
+                        "objective_component_mean",
+                        {
+                            key: float(np.mean([s[key] for s in component_samples]))
+                            for key in component_samples[0]
+                        },
+                    )
+                return float(np.mean(fold_scores))
+
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=self.config.seed + outer_fold),
+                pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
+                study_name=f"{self.config.model_type}_nested_outer_{outer_fold}",
+            )
+            study.optimize(
+                objective,
+                n_trials=self.config.n_trials,
+                n_jobs=1,
+                gc_after_trial=True,
+                show_progress_bar=False,
+            )
+
+            total_trials += int(len(study.trials))
+            total_pruned += int(
+                sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED)
+            )
+
+            completed_trials = [
+                t
+                for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+                and t.value is not None
+                and np.isfinite(float(t.value))
+            ]
+            if not completed_trials:
+                self.logger.warning(
+                    f"Outer fold {outer_fold}: no valid Optuna trials, fold skipped."
+                )
+                continue
+
+            best_trial = max(completed_trials, key=lambda t: float(t.value))
+            best_params = dict(best_trial.params)
+            best_fold_params = self._prepare_params_for_train_size(
+                best_params, len(outer_train_idx)
+            )
+
+            model = self._create_model(params=best_fold_params)
+            self._fit_model(
+                model=model,
+                X_train=X_outer_train,
+                y_train=y_outer_train,
+                X_val=X_outer_test,
+                y_val=y_outer_test,
+                sample_weights=w_outer_train,
+            )
+
+            y_pred = np.asarray(model.predict(X_outer_test))
+            y_proba = np.asarray(self._get_predictions_proba(model, X_outer_test))
+            y_eval = np.asarray(y_outer_test)
+            eval_len = min(len(y_eval), len(y_pred), len(y_proba))
+            if eval_len <= 1:
+                self.logger.warning(
+                    f"Outer fold {outer_fold}: insufficient predictions for scoring."
+                )
+                continue
+
+            metrics = self._calculate_fold_metrics(
+                y_eval[-eval_len:],
+                y_pred[-eval_len:],
+                y_proba[-eval_len:],
+                realized_forward_returns=(
+                    forward_outer_test[-eval_len:] if forward_outer_test is not None else None
+                ),
+                event_net_returns=(
+                    event_outer_test[-eval_len:] if event_outer_test is not None else None
+                ),
+            )
+            outer_score = float(metrics.get("risk_adjusted_score", -1e9))
+            if not np.isfinite(outer_score):
+                continue
+
+            outer_candidates.append((outer_score, best_params, len(outer_train_idx)))
+            self.nested_cv_trace.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "outer_train_size": int(len(outer_train_idx)),
+                    "outer_test_size": int(eval_len),
+                    "inner_split_count": int(len(inner_splits)),
+                    "inner_best_score": float(best_trial.value),
+                    "outer_score": outer_score,
+                    "best_params": best_params,
+                    "objective_components": {
+                        "objective_sharpe_component": float(
+                            metrics.get("objective_sharpe_component", 0.0)
+                        ),
+                        "objective_drawdown_penalty": float(
+                            metrics.get("objective_drawdown_penalty", 0.0)
+                        ),
+                        "objective_turnover_penalty": float(
+                            metrics.get("objective_turnover_penalty", 0.0)
+                        ),
+                        "objective_calibration_penalty": float(
+                            metrics.get("objective_calibration_penalty", 0.0)
+                        ),
+                    },
+                }
+            )
+
+        if not outer_candidates:
+            raise ValueError(
+                "Nested walk-forward optimization produced no valid outer-fold candidates."
+            )
+
+        best_outer_score, best_outer_params, best_outer_train_size = max(
+            outer_candidates, key=lambda x: x[0]
+        )
+        self.config.model_params = {**self.config.model_params, **best_outer_params}
+        self.config.model_params = self._prepare_params_for_train_size(
+            self.config.model_params, best_outer_train_size
+        )
+
+        outer_scores = [score for score, _, _ in outer_candidates]
+        self.training_metrics["optuna_trials"] = int(total_trials)
+        self.training_metrics["optuna_pruned_trials"] = int(total_pruned)
+        self.training_metrics["optuna_best_score"] = float(best_outer_score)
+        self.training_metrics["nested_outer_folds"] = int(len(self.nested_cv_trace))
+        self.training_metrics["nested_inner_splits"] = int(self.config.nested_inner_splits)
+        self.training_metrics["nested_mean_outer_score"] = float(np.mean(outer_scores))
+        self.training_metrics["nested_best_outer_score"] = float(best_outer_score)
+        self.training_metrics["nested_cv_trace"] = self.nested_cv_trace
+
+        if self.nested_cv_trace:
+            component_keys = [
+                "objective_sharpe_component",
+                "objective_drawdown_penalty",
+                "objective_turnover_penalty",
+                "objective_calibration_penalty",
+            ]
+            nested_component_summary = {
+                key: float(
+                    np.mean(
+                        [
+                            trace["objective_components"].get(key, 0.0)
+                            for trace in self.nested_cv_trace
+                        ]
+                    )
+                )
+                for key in component_keys
+            }
+            self.training_metrics["nested_objective_component_mean"] = nested_component_summary
+
+        self.logger.info(
+            "Nested walk-forward optimization complete: "
+            f"outer_folds={len(self.nested_cv_trace)}, "
+            f"best_outer_score={best_outer_score:.6f}"
+        )
 
     def _optimize_with_grid_search(self) -> None:
         """Grid search optimization."""
@@ -605,13 +2261,171 @@ class ModelTrainer:
         self.config.model_params = random_search.best_params_
         self.logger.info(f"Best params: {random_search.best_params_}")
 
+    def _get_optuna_search_space(self, min_train_size: int | None = None):
+        """Return model-specific Optuna search space function."""
+        if self.config.model_type == "xgboost":
+            return lambda trial: {
+                "n_estimators": trial.suggest_int("n_estimators", 200, 1500),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 15),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+            }
+
+        if self.config.model_type == "lightgbm":
+            return lambda trial: {
+                "n_estimators": trial.suggest_int("n_estimators", 200, 1500),
+                "max_depth": trial.suggest_int("max_depth", 3, 15),
+                "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.2, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 20, 200),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
+                "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 10, 100),
+                "lambda_l1": trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
+                "lambda_l2": trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
+            }
+
+        if self.config.model_type == "random_forest":
+            return lambda trial: {
+                "n_estimators": trial.suggest_int("n_estimators", 200, 1200),
+                "max_depth": trial.suggest_int("max_depth", 4, 24),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
+                "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2"]),
+            }
+
+        if self.config.model_type == "lstm":
+            lookback_candidates = self._sequence_lookback_candidates(min_train_size)
+            return lambda trial: {
+                "hidden_size": trial.suggest_categorical("hidden_size", [64, 96, 128, 192]),
+                "num_layers": trial.suggest_int("num_layers", 1, 3),
+                "dropout": trial.suggest_float("dropout", 0.05, 0.5),
+                "lookback_window": trial.suggest_categorical("lookback_window", lookback_candidates),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
+            }
+
+        if self.config.model_type == "transformer":
+            lookback_candidates = self._sequence_lookback_candidates(min_train_size)
+            return lambda trial: {
+                "d_model": trial.suggest_categorical("d_model", [64, 128, 256]),
+                "nhead": trial.suggest_categorical("nhead", [2, 4, 8]),
+                "num_layers": trial.suggest_int("num_layers", 2, 5),
+                "d_ff": trial.suggest_categorical("d_ff", [128, 256, 512, 768]),
+                "dropout": trial.suggest_float("dropout", 0.05, 0.3),
+                "lookback_window": trial.suggest_categorical("lookback_window", lookback_candidates),
+                "learning_rate": trial.suggest_float("learning_rate", 5e-5, 5e-3, log=True),
+            }
+
+        if self.config.model_type == "tcn":
+            lookback_candidates = self._sequence_lookback_candidates(min_train_size)
+            return lambda trial: {
+                "num_channels": trial.suggest_categorical(
+                    "num_channels",
+                    [[64, 128, 128, 64], [32, 64, 64, 32], [64, 64, 64, 64]],
+                ),
+                "kernel_size": trial.suggest_categorical("kernel_size", [2, 3, 5]),
+                "dropout": trial.suggest_float("dropout", 0.05, 0.4),
+                "lookback_window": trial.suggest_categorical("lookback_window", lookback_candidates),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
+            }
+
+        return None
+
+    def _sequence_lookback_candidates(self, min_train_size: int | None) -> list[int]:
+        """Generate safe lookback candidates for sequence models."""
+        base_candidates = [20, 40, 60]
+        if min_train_size is None:
+            return base_candidates
+
+        max_lookback = max(2, min_train_size - 2)
+        candidates = [v for v in base_candidates if v <= max_lookback]
+        if not candidates:
+            candidates = [max_lookback]
+        return sorted(set(candidates))
+
+    def _prepare_params_for_train_size(self, params: dict, train_size: int) -> dict:
+        """Adjust sequence model params for current CV fold size."""
+        adjusted = dict(params)
+        if self.config.model_type not in {"lstm", "transformer", "tcn"}:
+            return adjusted
+
+        if train_size < 4:
+            raise ValueError(
+                f"Not enough samples ({train_size}) for sequence model training in CV fold"
+            )
+
+        max_lookback = max(2, train_size - 2)
+        lookback = int(adjusted.get("lookback_window", min(20, max_lookback)))
+        adjusted["lookback_window"] = min(lookback, max_lookback)
+        return adjusted
+
+    @staticmethod
+    def _max_drawdown(returns: np.ndarray) -> float:
+        """Compute max drawdown from return series."""
+        if len(returns) == 0:
+            return 0.0
+        equity = np.cumprod(1.0 + returns)
+        peak = np.maximum.accumulate(equity)
+        drawdown = (equity - peak) / np.clip(peak, 1e-12, None)
+        return float(abs(np.min(drawdown)))
+
     def _quick_cv_score(self, params: dict) -> float:
         """Quick cross-validation score for optimization."""
-        from sklearn.model_selection import cross_val_score
+        scores: list[float] = []
+        X = self.features.values
+        y = self.labels.values
+        weights = self.sample_weights if self.sample_weights is not None else None
 
-        model = self._create_base_model(params)
-        scores = cross_val_score(model, self.features, self.labels, cv=3, scoring="accuracy")
-        return scores.mean()
+        for train_idx, test_idx in self._generate_cv_splits(X, y):
+            fold_params = self._prepare_params_for_train_size(params, len(train_idx))
+            model = self._create_model(params=fold_params)
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            w_train = weights[train_idx] if weights is not None else None
+            self._fit_model(
+                model=model,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_test,
+                y_val=y_test,
+                sample_weights=w_train,
+            )
+
+            y_pred = np.asarray(model.predict(X_test))
+            y_proba = np.asarray(self._get_predictions_proba(model, X_test))
+            eval_len = min(len(y_test), len(y_pred), len(y_proba))
+            if eval_len <= 1:
+                continue
+            fold_forward_returns = (
+                np.asarray(self.primary_forward_returns[test_idx], dtype=float)
+                if isinstance(self.primary_forward_returns, np.ndarray)
+                and len(self.primary_forward_returns) == len(y)
+                else None
+            )
+            fold_event_returns = (
+                np.asarray(self.cost_aware_event_returns[test_idx], dtype=float)
+                if isinstance(self.cost_aware_event_returns, np.ndarray)
+                and len(self.cost_aware_event_returns) == len(y)
+                else None
+            )
+
+            metrics = self._calculate_fold_metrics(
+                np.asarray(y_test)[-eval_len:],
+                y_pred[-eval_len:],
+                y_proba[-eval_len:],
+                realized_forward_returns=(
+                    fold_forward_returns[-eval_len:] if fold_forward_returns is not None else None
+                ),
+                event_net_returns=(
+                    fold_event_returns[-eval_len:] if fold_event_returns is not None else None
+                ),
+            )
+            scores.append(float(metrics["risk_adjusted_score"]))
+
+        return float(np.mean(scores)) if scores else -1e9
 
     def _train_with_cv(self) -> None:
         """
@@ -622,43 +2436,46 @@ class ModelTrainer:
         """
         self.logger.info(f"Phase 5: Training with {self.config.cv_method}...")
 
-        # Get CV splitter
-        cv = self._get_cv_splitter()
-
         # Prepare feature matrix
         X = self.features.values
         y = self.labels.values
+        weights = self.sample_weights if self.sample_weights is not None else None
 
         # Train with CV
         fold_results = []
         models = []
+        self.cv_return_series = []
+        self.oof_primary_proba = np.full(len(y), np.nan, dtype=float)
+        splits = self._generate_cv_splits(X, y)
 
-        for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X, y)):
-            self.logger.info(f"Training fold {fold_idx + 1}/{self.config.n_splits}")
+        for fold_idx, (train_idx, test_idx) in enumerate(splits):
+            self.logger.info(f"Training fold {fold_idx + 1}/{len(splits)}")
 
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
+            w_train = weights[train_idx] if weights is not None else None
 
             # Create and train model
-            model = self._create_model()
-
-            if self.config.model_type in ["lstm", "transformer", "gru", "tcn"]:
-                # Deep learning models
-                self._train_deep_learning_model(model, X_train, y_train, X_test, y_test)
-            else:
-                # Classical ML models
-                try:
-                    model.fit(X_train, y_train, validation_data=(X_test, y_test))
-                except TypeError:
-                    model.fit(X_train, y_train)
+            fold_params = self._prepare_params_for_train_size(
+                self.config.model_params, len(train_idx)
+            )
+            model = self._create_model(params=fold_params)
+            self._fit_model(
+                model=model,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_test,
+                y_val=y_test,
+                sample_weights=w_train,
+            )
 
             # Evaluate
             y_pred = np.asarray(model.predict(X_test))
             y_proba = np.asarray(self._get_predictions_proba(model, X_test))
 
             y_eval = np.asarray(y_test)
-            if len(y_pred) != len(y_eval):
-                eval_len = min(len(y_pred), len(y_eval), len(y_proba))
+            eval_len = min(len(y_pred), len(y_eval), len(y_proba), len(test_idx))
+            if eval_len != len(y_eval):
                 if eval_len <= 1:
                     self.logger.warning(
                         f"Fold {fold_idx + 1}: insufficient aligned predictions, skipping fold"
@@ -670,32 +2487,66 @@ class ModelTrainer:
                 self.logger.info(
                     f"Fold {fold_idx + 1}: aligned sequence outputs to {eval_len} samples"
                 )
+            eval_indices = np.asarray(test_idx[-eval_len:], dtype=int)
+            self.oof_primary_proba[eval_indices] = y_proba
 
             # Calculate metrics
-            metrics = self._calculate_fold_metrics(y_eval, y_pred, y_proba)
+            fold_forward_returns = (
+                np.asarray(self.primary_forward_returns[eval_indices], dtype=float)
+                if isinstance(self.primary_forward_returns, np.ndarray)
+                and len(self.primary_forward_returns) == len(y)
+                else None
+            )
+            fold_event_returns = (
+                np.asarray(self.cost_aware_event_returns[eval_indices], dtype=float)
+                if isinstance(self.cost_aware_event_returns, np.ndarray)
+                and len(self.cost_aware_event_returns) == len(y)
+                else None
+            )
+            metrics = self._calculate_fold_metrics(
+                y_eval,
+                y_pred,
+                y_proba,
+                realized_forward_returns=fold_forward_returns,
+                event_net_returns=fold_event_returns,
+            )
             metrics["fold"] = fold_idx + 1
             metrics["train_size"] = len(train_idx)
             metrics["test_size"] = len(y_eval)
+            net_returns = self._compute_net_returns(
+                y_eval,
+                y_proba,
+                realized_forward_returns=fold_forward_returns,
+                event_net_returns=fold_event_returns,
+            )
+            metrics["net_return_observations"] = int(len(net_returns))
+            if len(net_returns) > 0:
+                self.cv_return_series.append(net_returns.astype(float))
 
             fold_results.append(metrics)
             models.append(model)
 
             self.logger.info(
                 f"Fold {fold_idx + 1}: Accuracy={metrics['accuracy']:.4f}, "
-                f"Sharpe={metrics.get('sharpe', 0):.4f}"
+                f"Sharpe={metrics.get('sharpe', 0):.4f}, "
+                f"RiskScore={metrics.get('risk_adjusted_score', 0):.4f}"
             )
 
         # Select best model or use ensemble
         if not fold_results:
             raise ValueError("No valid CV folds produced training metrics")
+        if self.oof_primary_proba is not None:
+            oof_coverage = float(np.mean(np.isfinite(self.oof_primary_proba)))
+            self.training_metrics["oof_prediction_coverage"] = oof_coverage
 
         self.cv_results = fold_results
         self._select_final_model(models, fold_results)
 
         # Calculate aggregate metrics
         self._calculate_aggregate_metrics()
+        self._fit_final_model_full_data()
 
-    def _get_cv_splitter(self):
+    def _get_cv_splitter(self, n_samples: int | None = None):
         """
         Get cross-validation splitter based on configuration.
 
@@ -716,36 +2567,69 @@ class ModelTrainer:
             # Typical 15-min data has ~26 bars/day, so 2% = ~5 bars
             purge_gap = max(1, int(self.config.purge_pct * 100))  # purge_gap as integer bars
 
+            prediction_horizon = self._prediction_horizon()
+            requested_splits = max(1, int(self.config.n_splits))
+            if n_samples is not None:
+                horizon_cap = max(1, n_samples // max(4, requested_splits + 1))
+                prediction_horizon = min(prediction_horizon, horizon_cap)
+            if n_samples is None:
+                effective_splits = requested_splits
+            elif self.config.cv_method == "walk_forward":
+                effective_splits = max(1, min(requested_splits, max(1, n_samples - 1)))
+            elif self.config.cv_method == "combinatorial":
+                effective_splits = max(3, min(requested_splits, max(3, n_samples - 1)))
+            else:
+                effective_splits = max(2, min(requested_splits, max(2, n_samples - 1)))
+
             if self.config.cv_method == "purged_kfold":
                 return PurgedKFold(
-                    n_splits=self.config.n_splits,
+                    n_splits=effective_splits,
                     purge_gap=purge_gap,
                     embargo_pct=embargo_pct,
+                    prediction_horizon=prediction_horizon,
                 )
             elif self.config.cv_method == "combinatorial":
+                if effective_splits < 3:
+                    self.logger.warning(
+                        "Insufficient samples for combinatorial purged CV; falling back to purged_kfold."
+                    )
+                    return PurgedKFold(
+                        n_splits=max(2, effective_splits),
+                        purge_gap=purge_gap,
+                        embargo_pct=embargo_pct,
+                        prediction_horizon=prediction_horizon,
+                    )
                 return CombinatorialPurgedKFold(
-                    n_splits=self.config.n_splits,
+                    n_splits=effective_splits,
                     purge_gap=purge_gap,
                     embargo_pct=embargo_pct,
+                    prediction_horizon=prediction_horizon,
                 )
             elif self.config.cv_method == "walk_forward":
+                min_train_size = (
+                    max(2, min(50, max(2, n_samples // 3)))
+                    if n_samples is not None
+                    else None
+                )
                 return WalkForwardCV(
-                    n_splits=self.config.n_splits,
+                    n_splits=effective_splits,
+                    purge_gap=purge_gap,
                     embargo_pct=embargo_pct,
+                    prediction_horizon=prediction_horizon,
+                    min_train_size=min_train_size,
                 )
             else:
                 return PurgedKFold(
-                    n_splits=self.config.n_splits,
+                    n_splits=max(2, effective_splits),
                     purge_gap=purge_gap,
                     embargo_pct=embargo_pct,
+                    prediction_horizon=prediction_horizon,
                 )
 
         except ImportError:
-            # Fallback to sklearn TimeSeriesSplit
-            from sklearn.model_selection import TimeSeriesSplit
-
-            self.logger.warning("Using TimeSeriesSplit fallback (no purging)")
-            return TimeSeriesSplit(n_splits=self.config.n_splits)
+            raise RuntimeError(
+                "Purged CV module unavailable. Institutional mode requires purged/walk-forward CV."
+            )
 
     def _create_base_model(self, params: dict | None = None):
         """Create base model without fitting."""
@@ -762,6 +2646,8 @@ class ModelTrainer:
         elif self.config.model_type == "lightgbm":
             from lightgbm import LGBMClassifier
             params.setdefault("verbose", -1)
+            if self.config.use_gpu:
+                params.setdefault("device_type", "gpu")
             return LGBMClassifier(**params)
 
         elif self.config.model_type == "random_forest":
@@ -772,36 +2658,79 @@ class ModelTrainer:
 
         elif self.config.model_type == "elastic_net":
             from sklearn.linear_model import LogisticRegression
+            params.setdefault("l1_ratio", 0.5)
+            params.setdefault("max_iter", 2000)
             return LogisticRegression(penalty="elasticnet", solver="saga", **params)
 
         else:
             from xgboost import XGBClassifier
             return XGBClassifier(**params, use_label_encoder=False, eval_metric="logloss")
 
-    def _create_model(self):
+    def _create_model(self, params: dict | None = None):
         """Create model instance for training."""
+        model_params = dict(params if params is not None else self.config.model_params)
         try:
             # Try to use our model classes
             if self.config.model_type == "xgboost":
                 from quant_trading_system.models.classical_ml import XGBoostModel
-                return XGBoostModel(params=self.config.model_params)
+                from quant_trading_system.models.base import ModelType
+                return XGBoostModel(
+                    model_type=ModelType.CLASSIFIER,
+                    use_gpu=self.config.use_gpu,
+                    **model_params,
+                )
 
             elif self.config.model_type == "lightgbm":
                 from quant_trading_system.models.classical_ml import LightGBMModel
-                return LightGBMModel(params=self.config.model_params)
+                from quant_trading_system.models.base import ModelType
+                return LightGBMModel(
+                    model_type=ModelType.CLASSIFIER,
+                    use_gpu=self.config.use_gpu,
+                    **model_params,
+                )
+
+            elif self.config.model_type == "random_forest":
+                from quant_trading_system.models.classical_ml import RandomForestModel
+                from quant_trading_system.models.base import ModelType
+                return RandomForestModel(
+                    model_type=ModelType.CLASSIFIER,
+                    **model_params,
+                )
 
             elif self.config.model_type == "lstm":
                 from quant_trading_system.models.deep_learning import LSTMModel
+                from quant_trading_system.models.base import ModelType
+                model_params.setdefault("batch_size", self.config.batch_size)
+                model_params.setdefault("epochs", self.config.epochs)
+                model_params.setdefault("learning_rate", self.config.learning_rate)
                 return LSTMModel(
-                    params=self.config.model_params,
-                    use_gpu=self.config.use_gpu,
+                    model_type=ModelType.CLASSIFIER,
+                    device="cuda" if self.config.use_gpu else "cpu",
+                    **model_params,
                 )
 
             elif self.config.model_type == "transformer":
                 from quant_trading_system.models.deep_learning import TransformerModel
+                from quant_trading_system.models.base import ModelType
+                model_params.setdefault("batch_size", self.config.batch_size)
+                model_params.setdefault("epochs", self.config.epochs)
+                model_params.setdefault("learning_rate", self.config.learning_rate)
                 return TransformerModel(
-                    params=self.config.model_params,
-                    use_gpu=self.config.use_gpu,
+                    model_type=ModelType.CLASSIFIER,
+                    device="cuda" if self.config.use_gpu else "cpu",
+                    **model_params,
+                )
+
+            elif self.config.model_type == "tcn":
+                from quant_trading_system.models.deep_learning import TCNModel
+                from quant_trading_system.models.base import ModelType
+                model_params.setdefault("batch_size", self.config.batch_size)
+                model_params.setdefault("epochs", self.config.epochs)
+                model_params.setdefault("learning_rate", self.config.learning_rate)
+                return TCNModel(
+                    model_type=ModelType.CLASSIFIER,
+                    device="cuda" if self.config.use_gpu else "cpu",
+                    **model_params,
                 )
 
             elif self.config.model_type == "ensemble":
@@ -814,31 +2743,67 @@ class ModelTrainer:
         # Fallback to sklearn/xgboost
         return self._create_base_model()
 
+    def _fit_model(
+        self,
+        model: Any,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        sample_weights: np.ndarray | None = None,
+    ) -> None:
+        """Fit model with best-effort support for sample weights and validation sets."""
+        if self.config.model_type in ["lstm", "transformer", "tcn"]:
+            self._train_deep_learning_model(model, X_train, y_train, X_val, y_val)
+            return
+
+        candidate_calls: list[tuple[dict[str, Any], ...]] = []
+        if sample_weights is not None:
+            candidate_calls.extend(
+                [
+                    ({"validation_data": (X_val, y_val), "sample_weights": sample_weights},),
+                    ({"validation_data": (X_val, y_val), "sample_weight": sample_weights},),
+                    ({"sample_weights": sample_weights},),
+                    ({"sample_weight": sample_weights},),
+                ]
+            )
+        candidate_calls.extend(
+            [
+                ({"validation_data": (X_val, y_val)},),
+                ({},),
+            ]
+        )
+
+        last_error: Exception | None = None
+        for (kwargs,) in candidate_calls:
+            try:
+                model.fit(X_train, y_train, **kwargs)
+                return
+            except TypeError as exc:
+                last_error = exc
+                continue
+            except ValueError as exc:
+                # Some estimators reject extra kwargs with ValueError.
+                last_error = exc
+                continue
+
+        if last_error is not None:
+            raise last_error
+        model.fit(X_train, y_train)
+
     def _train_deep_learning_model(
         self, model, X_train, y_train, X_val, y_val
     ) -> None:
         """Train deep learning model with early stopping."""
         try:
             import torch
-            from torch.utils.data import DataLoader, TensorDataset
 
             device = "cuda" if self.config.use_gpu and torch.cuda.is_available() else "cpu"
             self.logger.info(f"Training on device: {device}")
 
-            # Prepare data
-            X_train_t = torch.FloatTensor(X_train).to(device)
-            y_train_t = torch.LongTensor(y_train).to(device)
-            X_val_t = torch.FloatTensor(X_val).to(device)
-            y_val_t = torch.LongTensor(y_val).to(device)
-
-            train_dataset = TensorDataset(X_train_t, y_train_t)
-            train_loader = DataLoader(
-                train_dataset, batch_size=self.config.batch_size, shuffle=True
-            )
-
             # Training loop (simplified)
             if hasattr(model, "fit"):
-                model.fit(X_train, y_train)
+                model.fit(X_train, y_train, validation_data=(X_val, y_val))
             else:
                 self.logger.warning("Model doesn't have fit method, skipping training")
 
@@ -871,63 +2836,321 @@ class ModelTrainer:
         return np.zeros(len(X))
 
     def _calculate_fold_metrics(
-        self, y_true, y_pred, y_proba
+        self,
+        y_true,
+        y_pred,
+        y_proba,
+        realized_forward_returns: np.ndarray | None = None,
+        event_net_returns: np.ndarray | None = None,
     ) -> dict:
         """Calculate metrics for a single fold."""
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, mean_squared_error, r2_score
+        from sklearn.metrics import (
+            accuracy_score,
+            precision_score,
+            recall_score,
+            f1_score,
+            mean_squared_error,
+            r2_score,
+        )
 
-        # Convert continuous predictions to binary for classification metrics
-        # Use 0.5 as threshold (predictions are normalized to [0, 1])
-        y_pred_binary = (np.array(y_pred) >= 0.5).astype(int) if not np.array_equal(y_pred, y_pred.astype(int)) else y_pred
-        y_true_binary = (np.array(y_true) >= 0.5).astype(int) if not np.array_equal(y_true, y_true.astype(int)) else y_true
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+        y_proba = np.asarray(y_proba)
+        y_true = np.nan_to_num(y_true, nan=0.0, posinf=1.0, neginf=0.0)
+        y_pred = np.nan_to_num(y_pred, nan=0.5, posinf=1.0, neginf=0.0)
+        y_proba = np.nan_to_num(y_proba, nan=0.5, posinf=1.0, neginf=0.0)
+        y_proba = np.clip(y_proba, 0.0, 1.0)
+
+        y_pred_binary = (y_pred >= 0.5).astype(int) if not np.array_equal(y_pred, y_pred.astype(int)) else y_pred
+        y_true_binary = (y_true >= 0.5).astype(int) if not np.array_equal(y_true, y_true.astype(int)) else y_true
+        if realized_forward_returns is not None:
+            realized_forward_returns = self._align_probabilities(
+                np.asarray(realized_forward_returns, dtype=float),
+                target_len=len(y_proba),
+                fill_value=0.0,
+            )
+        if event_net_returns is not None:
+            event_net_returns = self._align_probabilities(
+                np.asarray(event_net_returns, dtype=float),
+                target_len=len(y_proba),
+                fill_value=0.0,
+            )
 
         metrics = {
-            "accuracy": accuracy_score(y_true_binary, y_pred_binary),
-            "precision": precision_score(y_true_binary, y_pred_binary, zero_division=0),
-            "recall": recall_score(y_true_binary, y_pred_binary, zero_division=0),
-            "f1": f1_score(y_true_binary, y_pred_binary, zero_division=0),
-            # Also include regression metrics
-            "mse": mean_squared_error(y_true, y_pred),
-            "r2": r2_score(y_true, y_pred) if len(set(y_true)) > 1 else 0.0,
+            "accuracy": float(accuracy_score(y_true_binary, y_pred_binary)),
+            "precision": float(precision_score(y_true_binary, y_pred_binary, zero_division=0)),
+            "recall": float(recall_score(y_true_binary, y_pred_binary, zero_division=0)),
+            "f1": float(f1_score(y_true_binary, y_pred_binary, zero_division=0)),
+            "mse": float(mean_squared_error(y_true, y_pred)),
+            "r2": float(r2_score(y_true, y_pred)) if len(set(y_true)) > 1 else 0.0,
+            "brier_score": float(np.mean((y_proba - y_true_binary) ** 2)),
         }
 
-        # Calculate pseudo-Sharpe from predictions
-        # This is a simplified version - real Sharpe requires returns
         if len(y_proba) > 1:
-            signal_returns = np.where(y_true == 1, y_proba - 0.5, 0.5 - y_proba)
-            if np.std(signal_returns) > 0:
-                metrics["sharpe"] = np.mean(signal_returns) / np.std(signal_returns) * np.sqrt(252)
-            else:
-                metrics["sharpe"] = 0.0
-        else:
-            metrics["sharpe"] = 0.0
+            net_returns = self._compute_net_returns(
+                y_true,
+                y_proba,
+                realized_forward_returns=realized_forward_returns,
+                event_net_returns=event_net_returns,
+            )
+            signals = np.where(y_proba >= 0.55, 1.0, np.where(y_proba <= 0.45, -1.0, 0.0))
+            turnover_series = np.abs(np.diff(np.concatenate([[0.0], signals])))
+            turnover = float(np.mean(turnover_series))
+            std = float(np.std(net_returns))
+            sharpe = float(np.mean(net_returns) / std * np.sqrt(252)) if std > 1e-12 else 0.0
+            max_dd = self._max_drawdown(net_returns)
+            win_rate = float(np.mean(net_returns > 0))
+            annual_return = float(np.mean(net_returns) * 252)
+            calmar = annual_return / max_dd if max_dd > 1e-9 else annual_return
+            objective_components = self._compute_objective_components(
+                sharpe=sharpe,
+                max_drawdown=max_dd,
+                turnover=turnover,
+                brier_score=float(metrics["brier_score"]),
+            )
 
-        return metrics
+            metrics.update(
+                {
+                    "sharpe": sharpe,
+                    "max_drawdown": max_dd,
+                    "win_rate": win_rate,
+                    "turnover": turnover,
+                    "annual_return": annual_return,
+                    "calmar": calmar,
+                    "objective_sharpe_component": float(
+                        objective_components["objective_sharpe_component"]
+                    ),
+                    "objective_drawdown_penalty": float(
+                        objective_components["objective_drawdown_penalty"]
+                    ),
+                    "objective_turnover_penalty": float(
+                        objective_components["objective_turnover_penalty"]
+                    ),
+                    "objective_calibration_penalty": float(
+                        objective_components["objective_calibration_penalty"]
+                    ),
+                    "risk_adjusted_score": float(objective_components["risk_adjusted_score"]),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "sharpe": 0.0,
+                    "max_drawdown": 0.0,
+                    "win_rate": 0.0,
+                    "turnover": 0.0,
+                    "annual_return": 0.0,
+                    "calmar": 0.0,
+                    "objective_sharpe_component": 0.0,
+                    "objective_drawdown_penalty": 0.0,
+                    "objective_turnover_penalty": 0.0,
+                    "objective_calibration_penalty": 0.0,
+                    "risk_adjusted_score": -1e9,
+                }
+            )
+
+        sanitized_metrics: dict[str, float] = {}
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.floating, np.integer)):
+                sanitized_metrics[key] = float(
+                    np.nan_to_num(float(value), nan=0.0, posinf=1e6, neginf=-1e6)
+                )
+            else:
+                sanitized_metrics[key] = float(0.0)
+
+        return sanitized_metrics
+
+    def _compute_objective_components(
+        self,
+        *,
+        sharpe: float,
+        max_drawdown: float,
+        turnover: float,
+        brier_score: float,
+    ) -> dict[str, float]:
+        """Compute auditable objective component breakdown for optimization and promotion."""
+        sharpe_component = float(self.config.objective_weight_sharpe * sharpe)
+        drawdown_penalty = float(-self.config.objective_weight_drawdown * max_drawdown)
+        turnover_penalty = float(-self.config.objective_weight_turnover * turnover)
+        calibration_penalty = float(-self.config.objective_weight_calibration * brier_score)
+        total = sharpe_component + drawdown_penalty + turnover_penalty + calibration_penalty
+        return {
+            "objective_sharpe_component": sharpe_component,
+            "objective_drawdown_penalty": drawdown_penalty,
+            "objective_turnover_penalty": turnover_penalty,
+            "objective_calibration_penalty": calibration_penalty,
+            "risk_adjusted_score": float(total),
+        }
+
+    def _compute_net_returns(
+        self,
+        y_true: np.ndarray,
+        y_proba: np.ndarray,
+        realized_forward_returns: np.ndarray | None = None,
+        event_net_returns: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Compute strategy net returns from model signals and realized returns."""
+        y_true = np.asarray(y_true)
+        y_proba = np.asarray(y_proba)
+        if len(y_proba) <= 1:
+            return np.array([], dtype=float)
+
+        signals = np.where(y_proba >= 0.55, 1.0, np.where(y_proba <= 0.45, -1.0, 0.0))
+        realized = None
+        if realized_forward_returns is not None:
+            realized = self._align_probabilities(
+                np.asarray(realized_forward_returns, dtype=float),
+                len(y_proba),
+                fill_value=0.0,
+            )
+        elif event_net_returns is not None:
+            realized = self._align_probabilities(
+                np.asarray(event_net_returns, dtype=float),
+                len(y_proba),
+                fill_value=0.0,
+            )
+
+        if realized is not None:
+            raw_alpha = signals * realized
+        else:
+            # Conservative fallback when realized returns are unavailable.
+            raw_alpha = np.where(y_true == 1, y_proba - 0.5, 0.5 - y_proba)
+        turnover_series = np.abs(np.diff(np.concatenate([[0.0], signals])))
+        trading_cost_rate = max(
+            0.0005,
+            float(self.config.label_spread_bps + self.config.label_slippage_bps + self.config.label_impact_bps)
+            / 10000.0,
+        )
+        trading_cost = turnover_series * trading_cost_rate
+        net_returns = raw_alpha - trading_cost
+        return np.nan_to_num(net_returns.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
 
     def _select_final_model(self, models: list, fold_results: list[dict]) -> None:
         """Select final model from CV folds."""
-        # Select model with best Sharpe ratio
-        best_idx = np.argmax([r.get("sharpe", 0) for r in fold_results])
+        # Select model with best risk-adjusted score.
+        best_idx = int(np.argmax([r.get("risk_adjusted_score", r.get("sharpe", 0)) for r in fold_results]))
         self.model = models[best_idx]
+        self.training_metrics["selected_cv_fold"] = float(best_idx + 1)
         self.logger.info(f"Selected model from fold {best_idx + 1}")
+
+    def _fit_model_full_dataset(
+        self,
+        model: Any,
+        X: np.ndarray,
+        y: np.ndarray,
+        sample_weights: np.ndarray | None,
+    ) -> None:
+        """Fit final production model on full dataset with robust kwargs handling."""
+        candidate_calls: list[dict[str, Any]] = []
+        if sample_weights is not None:
+            candidate_calls.extend(
+                [
+                    {"sample_weights": sample_weights},
+                    {"sample_weight": sample_weights},
+                ]
+            )
+        candidate_calls.append({})
+
+        last_error: Exception | None = None
+        for kwargs in candidate_calls:
+            try:
+                model.fit(X, y, **kwargs)
+                return
+            except (TypeError, ValueError) as exc:
+                last_error = exc
+                continue
+
+        if len(X) < 8:
+            if last_error is not None:
+                raise last_error
+            model.fit(X, y)
+            return
+
+        gap = max(1, int(self.config.purge_pct * 100))
+        val_size = max(2, min(int(0.15 * len(X)), 512))
+        split_idx = max(2, len(X) - val_size - gap)
+        if split_idx >= len(X) - 1:
+            split_idx = max(2, len(X) - 2)
+            gap = 0
+        train_weights = sample_weights[:split_idx] if sample_weights is not None else None
+        self._fit_model(
+            model=model,
+            X_train=X[:split_idx],
+            y_train=y[:split_idx],
+            X_val=X[split_idx + gap:],
+            y_val=y[split_idx + gap:],
+            sample_weights=train_weights,
+        )
+
+    def _fit_final_model_full_data(self) -> None:
+        """Refit final model artifact on full training dataset for production use."""
+        X = self.features.values
+        y = self.labels.values
+        if len(X) <= 4:
+            self.logger.warning("Dataset too small for final full-data refit; using selected fold model.")
+            return
+
+        weights = self.sample_weights if self.sample_weights is not None else None
+        final_params = self._prepare_params_for_train_size(self.config.model_params, len(X))
+        final_model = self._create_model(params=final_params)
+        self._fit_model_full_dataset(final_model, X, y, weights)
+        self.model = final_model
+        self.training_metrics["final_refit_samples"] = float(len(X))
+        self.logger.info(f"Final production model refit completed on {len(X)} samples")
 
     def _calculate_aggregate_metrics(self) -> None:
         """Calculate aggregate metrics across all folds."""
         if not self.cv_results:
             return
 
-        metrics_keys = ["accuracy", "precision", "recall", "f1", "sharpe"]
+        metrics_keys = [
+            "accuracy",
+            "precision",
+            "recall",
+            "f1",
+            "brier_score",
+            "sharpe",
+            "max_drawdown",
+            "win_rate",
+            "turnover",
+            "annual_return",
+            "calmar",
+            "objective_sharpe_component",
+            "objective_drawdown_penalty",
+            "objective_turnover_penalty",
+            "objective_calibration_penalty",
+            "risk_adjusted_score",
+        ]
 
         for key in metrics_keys:
             values = [r.get(key, 0) for r in self.cv_results]
             self.training_metrics[f"mean_{key}"] = np.mean(values)
             self.training_metrics[f"std_{key}"] = np.std(values)
 
+        objective_component_summary = {
+            "objective_sharpe_component": float(
+                self.training_metrics.get("mean_objective_sharpe_component", 0.0)
+            ),
+            "objective_drawdown_penalty": float(
+                self.training_metrics.get("mean_objective_drawdown_penalty", 0.0)
+            ),
+            "objective_turnover_penalty": float(
+                self.training_metrics.get("mean_objective_turnover_penalty", 0.0)
+            ),
+            "objective_calibration_penalty": float(
+                self.training_metrics.get("mean_objective_calibration_penalty", 0.0)
+            ),
+        }
+        self.training_metrics["objective_component_summary"] = objective_component_summary
+        if self.nested_cv_trace:
+            self.training_metrics["nested_cv_trace"] = self.nested_cv_trace
+
         self.logger.info(
             f"Aggregate metrics - Accuracy: {self.training_metrics['mean_accuracy']:.4f} "
-            f"(±{self.training_metrics['std_accuracy']:.4f}), "
+            f"(+/-{self.training_metrics['std_accuracy']:.4f}), "
             f"Sharpe: {self.training_metrics['mean_sharpe']:.4f} "
-            f"(±{self.training_metrics['std_sharpe']:.4f})"
+            f"(+/-{self.training_metrics['std_sharpe']:.4f}), "
+            f"RiskScore: {self.training_metrics.get('mean_risk_adjusted_score', 0.0):.4f}"
         )
 
     def _validate_model(self) -> bool:
@@ -946,9 +3169,87 @@ class ModelTrainer:
                 self.config.min_sharpe_ratio,
             ),
             "min_accuracy": (
-                self.training_metrics.get("mean_accuracy", 0) >= self.config.min_win_rate,
+                self.training_metrics.get("mean_accuracy", 0) >= self.config.min_accuracy,
                 self.training_metrics.get("mean_accuracy", 0),
+                self.config.min_accuracy,
+            ),
+            "max_drawdown": (
+                self.training_metrics.get("mean_max_drawdown", 1.0) <= self.config.max_drawdown,
+                self.training_metrics.get("mean_max_drawdown", 1.0),
+                self.config.max_drawdown,
+            ),
+            "min_win_rate": (
+                self.training_metrics.get("mean_win_rate", 0.0) >= self.config.min_win_rate,
+                self.training_metrics.get("mean_win_rate", 0.0),
                 self.config.min_win_rate,
+            ),
+            "risk_adjusted_positive": (
+                self.training_metrics.get("mean_risk_adjusted_score", -1.0) > 0.0,
+                self.training_metrics.get("mean_risk_adjusted_score", -1.0),
+                0.0,
+            ),
+            "oof_prediction_coverage": (
+                (
+                    self.training_metrics.get("oof_prediction_coverage", 0.0) >= 0.60
+                    if "oof_prediction_coverage" in self.training_metrics
+                    else (not self.config.use_meta_labeling)
+                ),
+                self.training_metrics.get("oof_prediction_coverage", 1.0 if not self.config.use_meta_labeling else 0.0),
+                0.60 if self.config.use_meta_labeling else 0.0,
+            ),
+            "min_deflated_sharpe": (
+                self.training_metrics.get(
+                    "deflated_sharpe",
+                    self.training_metrics.get("mean_sharpe", 0.0),
+                ) >= self.config.min_deflated_sharpe,
+                self.training_metrics.get(
+                    "deflated_sharpe",
+                    self.training_metrics.get("mean_sharpe", 0.0),
+                ),
+                self.config.min_deflated_sharpe,
+            ),
+            "max_deflated_sharpe_pvalue": (
+                self.training_metrics.get("deflated_sharpe_p_value", 1.0)
+                <= self.config.max_deflated_sharpe_pvalue,
+                self.training_metrics.get("deflated_sharpe_p_value", 1.0),
+                self.config.max_deflated_sharpe_pvalue,
+            ),
+            "max_pbo": (
+                self.training_metrics.get("pbo", 1.0) <= self.config.max_pbo,
+                self.training_metrics.get("pbo", 1.0),
+                self.config.max_pbo,
+            ),
+            "nested_walk_forward_trace": (
+                (
+                    (len(self.nested_cv_trace) > 0)
+                    or (
+                        isinstance(self.training_metrics.get("nested_cv_trace"), list)
+                        and len(self.training_metrics.get("nested_cv_trace", [])) > 0
+                    )
+                )
+                if self.config.require_nested_trace_for_promotion
+                else True,
+                float(
+                    len(self.nested_cv_trace)
+                    if self.nested_cv_trace
+                    else len(self.training_metrics.get("nested_cv_trace", []))
+                ),
+                1.0 if self.config.require_nested_trace_for_promotion else 0.0,
+            ),
+            "objective_breakdown_present": (
+                (
+                    isinstance(self.training_metrics.get("objective_component_summary"), dict)
+                    and len(self.training_metrics.get("objective_component_summary", {})) > 0
+                )
+                if self.config.require_objective_breakdown_for_promotion
+                else True,
+                float(
+                    1.0
+                    if isinstance(self.training_metrics.get("objective_component_summary"), dict)
+                    and len(self.training_metrics.get("objective_component_summary", {})) > 0
+                    else 0.0
+                ),
+                1.0 if self.config.require_objective_breakdown_for_promotion else 0.0,
             ),
         }
 
@@ -976,29 +3277,54 @@ class ModelTrainer:
         self.logger.info("Phase 7: Training meta-labeling model...")
 
         try:
-            from quant_trading_system.models.meta_labeling import MetaLabelingModel
+            from quant_trading_system.models.meta_labeling import MetaLabelConfig, MetaLabeler
 
-            # Get primary model predictions
-            X = self.features.values
-            primary_predictions = self._get_predictions_proba(self.model, X)
+            if self.close_prices is None:
+                raise RuntimeError("Close prices unavailable for meta-labeling.")
+            if self.oof_primary_proba is None:
+                raise RuntimeError(
+                    "OOF primary predictions unavailable for meta-labeling. "
+                    "Institutional mode requires out-of-fold meta labels."
+                )
+            if len(self.oof_primary_proba) != len(self.features):
+                raise RuntimeError("OOF prediction length mismatch for meta-labeling.")
 
-            # Create meta-features
-            meta_features = np.column_stack([
-                X,
-                primary_predictions,
-                np.abs(primary_predictions - 0.5),  # Confidence
-            ])
+            oof_mask = np.isfinite(self.oof_primary_proba)
+            usable_count = int(np.sum(oof_mask))
+            if usable_count <= 1:
+                raise RuntimeError("Insufficient OOF predictions for meta-labeling.")
+            coverage = float(usable_count / len(self.features))
+            if coverage < 0.60:
+                raise RuntimeError(
+                    f"OOF prediction coverage too low for meta-labeling ({coverage:.2%})."
+                )
+            self.training_metrics["meta_label_oof_coverage"] = coverage
 
-            # Train meta-model
-            self.meta_model = MetaLabelingModel(
-                model_type=self.config.meta_model_type
+            primary_predictions = np.asarray(self.oof_primary_proba[oof_mask], dtype=float).reshape(-1)
+            used_close = self.close_prices.iloc[oof_mask].reset_index(drop=True)
+            used_features = self.features.iloc[oof_mask].copy()
+            self.logger.info(
+                f"Meta-labeling uses OOF predictions: {usable_count}/{len(self.features)} samples"
             )
-            self.meta_model.fit(meta_features, self.labels.values)
+
+            meta_cfg = MetaLabelConfig(model_type=self.config.meta_model_type)
+            self.meta_model = MetaLabeler(config=meta_cfg)
+
+            signal_series = pd.Series(
+                np.where(primary_predictions >= 0.5, 1.0, -1.0),
+                index=used_close.index,
+            )
+            X_frame = pd.DataFrame(used_features.values, columns=self.feature_names)
+            self.meta_model.fit(
+                X_frame,
+                signal_series,
+                used_close,
+            )
 
             self.logger.info("Meta-labeling model trained successfully")
 
-        except ImportError:
-            self.logger.warning("Meta-labeling module not available")
+        except ImportError as exc:
+            raise RuntimeError("Meta-labeling module is mandatory in institutional mode") from exc
 
     def _apply_multiple_testing_correction(self) -> None:
         """
@@ -1010,28 +3336,41 @@ class ModelTrainer:
         """
         self.logger.info(f"Phase 8: Applying {self.config.correction_method} correction...")
 
-        sharpe = self.training_metrics.get("mean_sharpe", 0)
-        n_trials = len(self.cv_results) if self.cv_results else 1
+        sharpe = float(self.training_metrics.get("mean_sharpe", 0))
+        returns = (
+            np.concatenate(self.cv_return_series)
+            if self.cv_return_series
+            else np.array([], dtype=float)
+        )
+        n_trials = max(
+            int(getattr(self.config, "n_trials", 1)),
+            len(self.cv_results) if self.cv_results else 1,
+            1,
+        )
 
         if self.config.correction_method == "deflated_sharpe":
-            # Deflated Sharpe Ratio (Bailey and Lopez de Prado)
-            # Adjusts Sharpe ratio for multiple testing
-            from scipy.stats import norm
-
-            # Estimate expected maximum Sharpe under null
-            e_max_sharpe = norm.ppf(1 - 1 / (n_trials + 1))
-
-            # Deflation factor
-            deflation = 1 - e_max_sharpe / max(sharpe, 0.01)
-            deflated_sharpe = sharpe * max(deflation, 0)
-
+            deflated_sharpe, p_value = calculate_deflated_sharpe_ratio(
+                observed_sharpe=sharpe,
+                returns=returns,
+                n_trials=n_trials,
+            )
+            pbo, interpretation = calculate_probability_of_backtest_overfitting(returns)
+            deflation = (
+                deflated_sharpe / sharpe
+                if abs(sharpe) > 1e-12
+                else 0.0
+            )
             self.training_metrics["deflated_sharpe"] = deflated_sharpe
+            self.training_metrics["deflated_sharpe_p_value"] = p_value
             self.training_metrics["sharpe_deflation_factor"] = deflation
+            self.training_metrics["pbo"] = pbo
+            self.training_metrics["pbo_interpretation"] = interpretation
 
             self.logger.info(
                 f"Deflated Sharpe: {deflated_sharpe:.4f} "
-                f"(original: {sharpe:.4f}, deflation: {deflation:.4f})"
+                f"(original: {sharpe:.4f}, p-value: {p_value:.4f}, deflation: {deflation:.4f})"
             )
+            self.logger.info(f"PBO: {pbo:.2%} ({interpretation})")
 
         elif self.config.correction_method == "bonferroni":
             # Bonferroni correction (conservative)
@@ -1058,30 +3397,104 @@ class ModelTrainer:
         """
         self.logger.info("Phase 9: Computing SHAP values...")
 
+        restore_device: Any | None = None
+        restore_amp: bool | None = None
         try:
             import shap
 
+            # Create explainer based on model type
+            model_for_shap = getattr(self.model, "_model", self.model)
+            sequence_model_types = {"lstm", "transformer", "tcn"}
+            is_sequence_model = (
+                self.config.model_type in sequence_model_types
+                or hasattr(self.model, "lookback_window")
+            )
+            lookback_window = int(
+                getattr(
+                    self.model,
+                    "lookback_window",
+                    self.config.model_params.get("lookback_window", 20),
+                )
+            )
+            lookback_window = max(1, lookback_window)
+
             # Sample data for SHAP
-            n_samples = min(self.config.n_shap_samples, len(self.features))
-            sample_idx = np.random.choice(len(self.features), n_samples, replace=False)
+            max_samples = min(self.config.n_shap_samples, len(self.features))
+            if is_sequence_model:
+                # Kernel SHAP on deep sequence models is expensive; keep a safe cap.
+                max_samples = min(max_samples, 64)
+            sample_idx = np.random.choice(len(self.features), max_samples, replace=False)
             X_sample = self.features.values[sample_idx]
 
-            # Create explainer based on model type
+            if is_sequence_model and hasattr(self.model, "_network") and hasattr(self.model, "device"):
+                try:
+                    import torch
+
+                    current_device = getattr(self.model, "device", None)
+                    if current_device is not None and str(current_device).startswith("cuda"):
+                        restore_device = current_device
+                        restore_amp = getattr(self.model, "_use_amp", None)
+                        self.logger.info("Switching sequence model to CPU for SHAP stability")
+                        self.model._network.to("cpu")
+                        self.model.device = torch.device("cpu")
+                        if hasattr(self.model, "_use_amp"):
+                            self.model._use_amp = False
+                except Exception as exc:
+                    self.logger.warning(f"Could not switch model to CPU for SHAP: {exc}")
+
             if self.config.model_type in ["xgboost", "lightgbm", "random_forest"]:
-                explainer = shap.TreeExplainer(self.model)
+                explainer = shap.TreeExplainer(model_for_shap)
             else:
+                def _predict_for_shap(x: np.ndarray) -> np.ndarray:
+                    """Return SHAP-compatible probabilities with output length == input length."""
+                    x_arr = np.asarray(x, dtype=float)
+                    if x_arr.ndim == 1:
+                        x_arr = x_arr.reshape(1, -1)
+                    x_arr = np.nan_to_num(x_arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    target_len = int(x_arr.shape[0])
+                    model_input = x_arr
+                    if is_sequence_model and lookback_window > 1:
+                        # KernelExplainer may call with tiny batches (even a single row).
+                        # Prepend synthetic context to satisfy sequence lookback constraints.
+                        prefix = np.repeat(x_arr[:1], lookback_window - 1, axis=0)
+                        model_input = np.vstack([prefix, x_arr])
+
+                    if is_sequence_model:
+                        probs = self._predict_sequence_probs_batched(
+                            model_input=model_input,
+                            lookback_window=lookback_window,
+                            target_len=target_len,
+                        )
+                    else:
+                        raw_probs = np.asarray(
+                            self._get_predictions_proba(self.model, model_input), dtype=float
+                        )
+                        probs = self._align_probabilities(raw_probs, target_len)
+                    return np.clip(np.nan_to_num(probs, nan=0.5), 0.0, 1.0)
+
+                background = X_sample[:100]
+                if is_sequence_model and lookback_window > 1:
+                    prefix = np.repeat(background[:1], lookback_window - 1, axis=0)
+                    background = np.vstack([prefix, background])
+
                 explainer = shap.KernelExplainer(
-                    lambda x: self._get_predictions_proba(self.model, x),
-                    X_sample[:100]
+                    _predict_for_shap,
+                    background
                 )
 
-            self.shap_values = explainer.shap_values(X_sample)
+            if self.config.model_type in ["xgboost", "lightgbm", "random_forest"]:
+                self.shap_values = explainer.shap_values(X_sample)
+            else:
+                kernel_nsamples = min(256, max(64, X_sample.shape[1] * 2))
+                self.logger.info(f"Kernel SHAP nsamples={kernel_nsamples}")
+                self.shap_values = explainer.shap_values(
+                    X_sample,
+                    nsamples=kernel_nsamples,
+                )
 
             # Feature importance from SHAP
-            if isinstance(self.shap_values, list):
-                mean_shap = np.abs(self.shap_values[1]).mean(axis=0)
-            else:
-                mean_shap = np.abs(self.shap_values).mean(axis=0)
+            mean_shap = self._mean_abs_shap_importance(self.shap_values, X_sample.shape[1])
 
             feature_names = self.features.columns.tolist()
             importance = dict(zip(feature_names, mean_shap))
@@ -1096,13 +3509,205 @@ class ModelTrainer:
                 self.logger.info(f"  {fname}: {imp:.4f}")
 
         except ImportError:
-            self.logger.warning("SHAP not installed, skipping explainability")
+            raise RuntimeError("SHAP is mandatory in institutional mode but not installed")
         except (TypeError, ValueError) as e:
-            # FIX: More specific error handling for data issues
-            self.logger.warning(f"SHAP computation failed due to data issue: {e}")
+            raise RuntimeError(f"SHAP computation failed due to data issue: {e}") from e
         except Exception as e:
-            # FIX: Log full traceback for unexpected errors
-            self.logger.error(f"Unexpected SHAP error: {e}", exc_info=True)
+            raise RuntimeError(f"Unexpected SHAP error: {e}") from e
+        finally:
+            if restore_device is not None and hasattr(self.model, "_network"):
+                try:
+                    self.model._network.to(restore_device)
+                    self.model.device = restore_device
+                    if restore_amp is not None and hasattr(self.model, "_use_amp"):
+                        self.model._use_amp = restore_amp
+                except Exception as exc:
+                    self.logger.warning(f"Failed to restore model device after SHAP: {exc}")
+
+    @staticmethod
+    def _align_probabilities(
+        probs: np.ndarray,
+        target_len: int,
+        fill_value: float = 0.5,
+    ) -> np.ndarray:
+        """Align 1D vector to target length with configurable fill values."""
+        target_len = int(target_len)
+        if target_len <= 0:
+            return np.array([], dtype=float)
+
+        arr = np.asarray(probs, dtype=float).reshape(-1)
+        if arr.size == target_len:
+            return arr
+        if arr.size == 0:
+            return np.full(target_len, fill_value, dtype=float)
+        if arr.size < target_len:
+            pad = np.full(target_len - arr.size, fill_value, dtype=float)
+            return np.concatenate([pad, arr])
+        return arr[-target_len:]
+
+    def _predict_sequence_probs_batched(
+        self,
+        model_input: np.ndarray,
+        lookback_window: int,
+        target_len: int,
+        chunk_target_size: int = 2048,
+    ) -> np.ndarray:
+        """Predict sequence-model probabilities in bounded chunks to avoid OOM."""
+        lookback_window = max(1, int(lookback_window))
+        target_len = int(target_len)
+        if target_len <= 0:
+            return np.array([], dtype=float)
+
+        model_input = np.asarray(model_input, dtype=float)
+        n_rows = int(model_input.shape[0])
+        max_target_len = max(0, n_rows - lookback_window + 1)
+        if max_target_len <= 0:
+            return np.full(target_len, 0.5, dtype=float)
+
+        chunk_target_size = max(64, int(chunk_target_size))
+        effective_target_len = min(target_len, max_target_len)
+        outputs: list[np.ndarray] = []
+
+        for start in range(0, effective_target_len, chunk_target_size):
+            chunk_len = min(chunk_target_size, effective_target_len - start)
+            end = start + chunk_len + lookback_window - 1
+            x_chunk = model_input[start:end]
+            raw_chunk = self._get_predictions_proba(self.model, x_chunk)
+            outputs.append(self._align_probabilities(raw_chunk, chunk_len))
+
+        if not outputs:
+            return np.full(target_len, 0.5, dtype=float)
+
+        combined = np.concatenate(outputs)
+        return self._align_probabilities(combined, target_len)
+
+    @staticmethod
+    def _mean_abs_shap_importance(shap_values: Any, n_features: int) -> np.ndarray:
+        """Normalize SHAP outputs (list/2D/3D/Explanation) to 1D feature importance."""
+        values = shap_values.values if hasattr(shap_values, "values") else shap_values
+
+        if isinstance(values, list):
+            arrays = [np.asarray(v, dtype=float) for v in values if v is not None]
+            if not arrays:
+                raise ValueError("Empty SHAP value list")
+            arr = np.stack(arrays, axis=0)
+        else:
+            arr = np.asarray(values, dtype=float)
+
+        if arr.ndim == 1:
+            if arr.shape[0] != n_features:
+                raise ValueError(
+                    f"Unexpected 1D SHAP shape {arr.shape}; expected {n_features} features"
+                )
+            return np.abs(arr)
+
+        # Detect feature axis by matching feature count (prefer rightmost match).
+        feature_axis = None
+        for axis, size in enumerate(arr.shape):
+            if size == n_features:
+                feature_axis = axis
+
+        if feature_axis is None:
+            feature_axis = arr.ndim - 1
+
+        arr = np.moveaxis(arr, feature_axis, -1)
+        reduce_axes = tuple(range(arr.ndim - 1))
+        importance = np.abs(arr).mean(axis=reduce_axes)
+
+        if importance.shape[0] != n_features:
+            raise ValueError(
+                f"Computed SHAP importance has shape {importance.shape}, expected ({n_features},)"
+            )
+        return importance
+
+    def _write_replay_manifest(self, output_dir: Path, model_path: Path) -> Path:
+        """Persist replay manifest used to reconstruct the same training run."""
+        replay_dir = output_dir / "replays"
+        replay_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "schema_version": REPLAY_MANIFEST_SCHEMA_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "model_name": self.config.model_name,
+            "model_type": self.config.model_type,
+            "model_path": str(model_path),
+            "training_config": self.config.__dict__,
+            "snapshot_manifest": self.snapshot_manifest,
+            "snapshot_manifest_path": (
+                str(self.snapshot_manifest_path) if self.snapshot_manifest_path else None
+            ),
+            "data_quality_report_hash": self.data_quality_report_hash,
+            "data_quality_report_path": (
+                str(self.data_quality_report_path) if self.data_quality_report_path else None
+            ),
+            "label_diagnostics": self.label_diagnostics,
+        }
+        replay_path = replay_dir / f"{self.config.model_name}.replay_manifest.json"
+        with replay_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True, sort_keys=True, default=str)
+
+        self.logger.info(f"Replay manifest saved to: {replay_path}")
+        return replay_path
+
+    def _write_promotion_package(
+        self,
+        output_dir: Path,
+        model_path: Path,
+        replay_manifest_path: Path | None,
+    ) -> Path:
+        """Persist promotion gate package with nested CV and objective breakdown evidence."""
+        package_dir = output_dir / "promotion_packages"
+        package_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "schema_version": PROMOTION_PACKAGE_SCHEMA_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "model_name": self.config.model_name,
+            "model_type": self.config.model_type,
+            "model_path": str(model_path),
+            "training_config": self.config.__dict__,
+            "promotion_passed": bool(self.validation_results.get("all_passed", False)),
+            "snapshot_id": (
+                self.snapshot_manifest.get("snapshot_id")
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "snapshot_manifest_path": (
+                str(self.snapshot_manifest_path) if self.snapshot_manifest_path else None
+            ),
+            "data_quality_report_path": (
+                str(self.data_quality_report_path) if self.data_quality_report_path else None
+            ),
+            "data_quality_report_hash": self.data_quality_report_hash,
+            "validation_results": self.validation_results,
+            "objective_component_summary": self.training_metrics.get(
+                "objective_component_summary", {}
+            ),
+            "nested_cv_trace": self.training_metrics.get("nested_cv_trace", self.nested_cv_trace),
+            "statistical_validity": {
+                "deflated_sharpe": self.training_metrics.get("deflated_sharpe"),
+                "deflated_sharpe_p_value": self.training_metrics.get("deflated_sharpe_p_value"),
+                "pbo": self.training_metrics.get("pbo"),
+                "pbo_interpretation": self.training_metrics.get("pbo_interpretation"),
+            },
+            "promotion_thresholds": {
+                "min_sharpe_ratio": self.config.min_sharpe_ratio,
+                "min_accuracy": self.config.min_accuracy,
+                "max_drawdown": self.config.max_drawdown,
+                "min_win_rate": self.config.min_win_rate,
+                "min_deflated_sharpe": self.config.min_deflated_sharpe,
+                "max_deflated_sharpe_pvalue": self.config.max_deflated_sharpe_pvalue,
+                "max_pbo": self.config.max_pbo,
+            },
+            "replay_manifest_path": str(replay_manifest_path) if replay_manifest_path else None,
+        }
+
+        package_path = package_dir / f"{self.config.model_name}.promotion_package.json"
+        with package_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True, sort_keys=True, default=str)
+
+        self.logger.info(f"Promotion package saved to: {package_path}")
+        return package_path
 
     def _save_model(self) -> str:
         """Phase 10: Save trained model and artifacts."""
@@ -1112,14 +3717,52 @@ class ModelTrainer:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Model filename
-        model_filename = f"{self.config.model_name}.pkl"
-        model_path = output_dir / model_filename
+        model_stem = self.config.model_name
+        model_path = output_dir / f"{model_stem}.pkl"
 
-        # Save model
-        with open(model_path, "wb") as f:
-            pickle.dump(self.model, f)
+        # Prefer model-native serialization when available (deep models).
+        if hasattr(self.model, "save") and callable(getattr(self.model, "save")):
+            try:
+                self.model.save(output_dir / model_stem)
+            except Exception as exc:
+                self.logger.warning(
+                    f"Model-native save failed ({exc}); falling back to pickle serialization."
+                )
+                with open(model_path, "wb") as f:
+                    pickle.dump(self.model, f)
+        else:
+            with open(model_path, "wb") as f:
+                pickle.dump(self.model, f)
 
         self.logger.info(f"Model saved to: {model_path}")
+
+        if self.config.save_artifacts:
+            if self.snapshot_manifest is None:
+                raise RuntimeError(
+                    "Snapshot manifest missing at save stage. "
+                    "Institutional mode requires snapshot lineage."
+                )
+            if self.data_quality_report is None:
+                raise RuntimeError(
+                    "Data quality report missing at save stage. "
+                    "Institutional mode requires quality report archival."
+                )
+
+            manifest_path, quality_path = persist_snapshot_bundle(
+                output_dir=output_dir,
+                manifest=self.snapshot_manifest,
+                quality_report=self.data_quality_report,
+            )
+            self.snapshot_manifest_path = manifest_path
+            self.data_quality_report_path = quality_path
+            self.snapshot_manifest["manifest_path"] = str(manifest_path)
+            self.snapshot_manifest["quality_report_path"] = str(quality_path)
+            self.replay_manifest_path = self._write_replay_manifest(output_dir, model_path)
+            self.promotion_package_path = self._write_promotion_package(
+                output_dir=output_dir,
+                model_path=model_path,
+                replay_manifest_path=self.replay_manifest_path,
+            )
 
         # Save training artifacts
         if self.config.save_artifacts:
@@ -1132,6 +3775,19 @@ class ModelTrainer:
                     if not isinstance(v, np.ndarray)
                 },
                 "feature_names": self.features.columns.tolist(),
+                "snapshot_id": self.snapshot_manifest.get("snapshot_id"),
+                "snapshot_manifest": self.snapshot_manifest,
+                "snapshot_manifest_path": str(self.snapshot_manifest_path),
+                "data_quality_report_hash": self.data_quality_report_hash,
+                "data_quality_report_path": str(self.data_quality_report_path),
+                "label_diagnostics": self.label_diagnostics,
+                "nested_cv_trace": self.nested_cv_trace,
+                "replay_manifest_path": (
+                    str(self.replay_manifest_path) if self.replay_manifest_path else None
+                ),
+                "promotion_package_path": (
+                    str(self.promotion_package_path) if self.promotion_package_path else None
+                ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -1168,6 +3824,7 @@ class EnsembleTrainer:
         self.config = config
         self.logger = logging.getLogger("EnsembleTrainer")
         self.base_models: list[tuple[str, Any]] = []
+        self.ensemble_model: Any | None = None
 
     def train(self) -> dict:
         """Train ensemble model."""
@@ -1201,14 +3858,21 @@ class EnsembleTrainer:
 
             ensemble = ICBasedEnsemble()
             for name, model in self.base_models:
-                ensemble.add_model(name, model)
+                ensemble.add_model(model)
 
+            self.ensemble_model = ensemble
             self.logger.info(f"Created ensemble with {len(self.base_models)} base models")
+            model_path = self._save_ensemble()
+            base_sharpes = [m.training_metrics.get("sharpe", 0.0) for _, m in self.base_models]
 
             return {
                 "success": True,
+                "model_path": model_path,
                 "ensemble_type": "ic_weighted",
                 "base_models": [name for name, _ in self.base_models],
+                "training_metrics": {
+                    "mean_base_sharpe": float(np.mean(base_sharpes)) if base_sharpes else 0.0,
+                },
             }
 
         except ImportError:
@@ -1218,6 +3882,16 @@ class EnsembleTrainer:
                 "ensemble_type": "simple_average",
                 "base_models": [name for name, _ in self.base_models],
             }
+
+    def _save_ensemble(self) -> str:
+        """Persist ensemble artifact."""
+        output_dir = Path(self.config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model_name = self.config.model_name or f"ensemble_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        model_path = output_dir / f"{model_name}.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(self.ensemble_model, f)
+        return str(model_path)
 
 
 # ============================================================================
@@ -1237,73 +3911,423 @@ def run_training(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure).
     """
+    # SQL statement-level INFO logs materially slow long feature upsert phases.
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+
     logger.info("=" * 80)
     logger.info("ALPHATRADE MODEL TRAINING PIPELINE")
     logger.info("=" * 80)
 
-    # Build configuration from args
-    config = TrainingConfig(
-        model_type=args.model,
-        model_name=getattr(args, "name", ""),
-        symbols=getattr(args, "symbols", []),
-        start_date=getattr(args, "start_date", ""),
-        end_date=getattr(args, "end_date", ""),
-        cv_method=getattr(args, "cv_method", "purged_kfold"),
-        n_splits=getattr(args, "n_splits", 5),
-        embargo_pct=max(getattr(args, "embargo_pct", 0.01), 0.01),  # P1-H1: Min 1%
-        optimize=getattr(args, "optimize", False),
-        optimizer=getattr(args, "optimizer", "optuna"),
-        n_trials=getattr(args, "n_trials", 100),
-        epochs=getattr(args, "epochs", 100),
-        batch_size=getattr(args, "batch_size", 64),
-        learning_rate=getattr(args, "learning_rate", 0.001),
-        use_meta_labeling=getattr(args, "meta_labeling", False),
-        apply_multiple_testing=getattr(args, "multiple_testing", True),
-        correction_method=getattr(args, "correction_method", "deflated_sharpe"),
-        use_gpu=getattr(args, "gpu", False) or getattr(args, "use_gpu", False),
-        use_database=getattr(args, "use_database", True) and not getattr(args, "no_database", False),
-        compute_shap=getattr(args, "shap", True),
-        output_dir=getattr(args, "output_dir", "models"),
-    )
-
-    # Log configuration
-    logger.info(f"Model type: {config.model_type}")
-    logger.info(f"Symbols: {config.symbols or 'all available'}")
-    logger.info(f"CV method: {config.cv_method} ({config.n_splits} splits)")
-    logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
-    logger.info(f"GPU: {config.use_gpu}")
-
     try:
-        # Choose trainer based on model type
-        if config.model_type == "ensemble":
-            trainer = EnsembleTrainer(config)
-            result = trainer.train()
-        else:
-            trainer = ModelTrainer(config)
-            result = trainer.run()
+        if getattr(args, "gpu", False) or getattr(args, "use_gpu", False):
+            logger.warning("`--gpu/--use-gpu` is deprecated and ignored. Institutional mode always uses GPU.")
+        if getattr(args, "no_database", False) or getattr(args, "no_redis_cache", False):
+            raise ValueError(
+                "Institutional mode does not allow disabling PostgreSQL or Redis."
+            )
+        if getattr(args, "no_shap", False):
+            raise ValueError("Institutional mode requires SHAP explainability.")
+        if getattr(args, "disable_nested_walk_forward", False):
+            raise ValueError(
+                "Institutional mode requires nested walk-forward optimization trace."
+            )
+
+        replay_bundle: dict[str, Any] | None = None
+        replay_config: dict[str, Any] = {}
+        replay_manifest_arg = getattr(args, "replay_manifest", None)
+        if replay_manifest_arg:
+            replay_bundle = _load_replay_manifest(Path(replay_manifest_arg))
+            replay_config = replay_bundle["training_config"]
+            logger.info(f"Replay mode enabled from manifest: {replay_bundle['manifest_path']}")
+
+        requested_model = str(replay_config.get("model_type") or getattr(args, "model", "xgboost"))
+        model_list = [
+            "xgboost",
+            "lightgbm",
+            "random_forest",
+            "elastic_net",
+            "lstm",
+            "transformer",
+            "tcn",
+            "ensemble",
+        ] if requested_model == "all" else [requested_model]
+
+        global_seed = int(replay_config.get("seed", getattr(args, "seed", 42)))
+        set_global_seed(global_seed)
+
+        _verify_institutional_infra()
+        _verify_gpu_stack(model_list)
+
+        audit_logger = None
+        try:
+            from quant_trading_system.monitoring.audit import create_audit_logger
+
+            audit_storage_dir = Path(getattr(args, "output_dir", "models")) / "audit_logs"
+            audit_logger = create_audit_logger(
+                storage_dir=audit_storage_dir,
+                source="training_pipeline",
+            )
+        except Exception as exc:
+            logger.warning(f"Training audit logging disabled: {exc}")
+
+        overall_success = True
+        results: list[tuple[str, dict[str, Any]]] = []
+        replay_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+        def _cfg_value(key: str, fallback: Any) -> Any:
+            value = replay_config.get(key, fallback)
+            return fallback if value is None else value
+
+        for model_type in model_list:
+            model_params = _load_model_defaults(
+                model_type=model_type,
+                use_gpu=True,
+            )
+            replay_model_params = replay_config.get("model_params")
+            if isinstance(replay_model_params, dict):
+                model_params = {**model_params, **replay_model_params}
+
+            configured_name = str(getattr(args, "name", "") or "").strip()
+            if configured_name:
+                model_name = configured_name
+            elif replay_config:
+                replay_base_name = str(replay_config.get("model_name") or model_type).strip()
+                model_name = f"{replay_base_name}_replay_{replay_timestamp}"
+            else:
+                model_name = ""
+
+            raw_horizons = _cfg_value("label_horizons", getattr(args, "label_horizons", [1, 5, 20]))
+            if isinstance(raw_horizons, (list, tuple)):
+                label_horizons = [int(v) for v in raw_horizons]
+            else:
+                label_horizons = [1, 5, 20]
+
+            raw_symbols = _cfg_value("symbols", getattr(args, "symbols", []))
+            if isinstance(raw_symbols, (list, tuple, set)):
+                symbols = [str(s).strip().upper() for s in raw_symbols if str(s).strip()]
+            elif raw_symbols:
+                symbols = [str(raw_symbols).strip().upper()]
+            else:
+                symbols = []
+
+            raw_feature_groups = _cfg_value(
+                "feature_groups",
+                getattr(args, "feature_groups", ["technical", "statistical", "microstructure", "cross_sectional"]),
+            )
+            if isinstance(raw_feature_groups, (list, tuple, set)):
+                feature_groups = [str(g).strip().lower() for g in raw_feature_groups if str(g).strip()]
+            elif raw_feature_groups:
+                feature_groups = [str(raw_feature_groups).strip().lower()]
+            else:
+                feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
+
+            config = TrainingConfig(
+                model_type=model_type,
+                model_name=model_name,
+                symbols=symbols,
+                start_date=_cfg_value(
+                    "start_date",
+                    getattr(args, "start_date", "") or getattr(args, "start", ""),
+                ),
+                end_date=_cfg_value(
+                    "end_date",
+                    getattr(args, "end_date", "") or getattr(args, "end", ""),
+                ),
+                cv_method=_cfg_value("cv_method", getattr(args, "cv_method", "purged_kfold")),
+                n_splits=int(_cfg_value("n_splits", getattr(args, "n_splits", 5))),
+                embargo_pct=max(float(_cfg_value("embargo_pct", getattr(args, "embargo_pct", 0.01))), 0.01),  # P1-H1: Min 1%
+                optimize=True,
+                optimizer="optuna",
+                n_trials=int(_cfg_value("n_trials", getattr(args, "n_trials", 100))),
+                seed=int(_cfg_value("seed", getattr(args, "seed", global_seed))),
+                use_nested_walk_forward=True,
+                nested_outer_splits=int(
+                    _cfg_value(
+                        "nested_outer_splits",
+                        getattr(args, "nested_outer_splits", 4),
+                    )
+                ),
+                nested_inner_splits=int(
+                    _cfg_value(
+                        "nested_inner_splits",
+                        getattr(args, "nested_inner_splits", 3),
+                    )
+                ),
+                require_nested_trace_for_promotion=True,
+                require_objective_breakdown_for_promotion=True,
+                objective_weight_sharpe=float(
+                    _cfg_value(
+                        "objective_weight_sharpe",
+                        getattr(args, "objective_weight_sharpe", 1.0),
+                    )
+                ),
+                objective_weight_drawdown=float(
+                    _cfg_value(
+                        "objective_weight_drawdown",
+                        getattr(args, "objective_weight_drawdown", 0.5),
+                    )
+                ),
+                objective_weight_turnover=float(
+                    _cfg_value(
+                        "objective_weight_turnover",
+                        getattr(args, "objective_weight_turnover", 0.1),
+                    )
+                ),
+                objective_weight_calibration=float(
+                    _cfg_value(
+                        "objective_weight_calibration",
+                        getattr(args, "objective_weight_calibration", 0.25),
+                    )
+                ),
+                epochs=int(_cfg_value("epochs", getattr(args, "epochs", 100))),
+                batch_size=int(_cfg_value("batch_size", getattr(args, "batch_size", 64))),
+                learning_rate=float(
+                    _cfg_value("learning_rate", getattr(args, "learning_rate", 0.001))
+                ),
+                use_meta_labeling=True,
+                apply_multiple_testing=True,
+                correction_method="deflated_sharpe",
+                use_gpu=True,
+                use_database=True,
+                use_redis_cache=True,
+                compute_shap=True,
+                min_accuracy=float(
+                    _cfg_value(
+                        "min_accuracy",
+                        getattr(args, "min_accuracy", getattr(args, "min_win_rate", 0.45)),
+                    )
+                ),
+                min_deflated_sharpe=float(
+                    _cfg_value(
+                        "min_deflated_sharpe",
+                        getattr(args, "min_deflated_sharpe", 0.10),
+                    )
+                ),
+                max_deflated_sharpe_pvalue=float(
+                    _cfg_value(
+                        "max_deflated_sharpe_pvalue",
+                        getattr(args, "max_deflated_sharpe_pvalue", 0.10),
+                    )
+                ),
+                max_pbo=float(_cfg_value("max_pbo", getattr(args, "max_pbo", 0.45))),
+                label_horizons=label_horizons,
+                primary_label_horizon=int(
+                    _cfg_value("primary_label_horizon", getattr(args, "primary_horizon", 5))
+                ),
+                label_profit_taking_threshold=float(
+                    _cfg_value("label_profit_taking_threshold", getattr(args, "profit_taking", 0.015))
+                ),
+                label_stop_loss_threshold=float(
+                    _cfg_value("label_stop_loss_threshold", getattr(args, "stop_loss", 0.010))
+                ),
+                label_max_holding_period=int(
+                    _cfg_value("label_max_holding_period", getattr(args, "max_holding", 20))
+                ),
+                label_spread_bps=float(
+                    _cfg_value("label_spread_bps", getattr(args, "spread_bps", 1.0))
+                ),
+                label_slippage_bps=float(
+                    _cfg_value("label_slippage_bps", getattr(args, "slippage_bps", 3.0))
+                ),
+                label_impact_bps=float(
+                    _cfg_value("label_impact_bps", getattr(args, "impact_bps", 2.0))
+                ),
+                label_volatility_lookback=int(
+                    _cfg_value(
+                        "label_volatility_lookback",
+                        getattr(args, "label_volatility_lookback", 20),
+                    )
+                ),
+                label_regime_lookback=int(
+                    _cfg_value("label_regime_lookback", getattr(args, "label_regime_lookback", 30))
+                ),
+                label_temporal_weight_decay=float(
+                    _cfg_value(
+                        "label_temporal_weight_decay",
+                        getattr(args, "label_temporal_weight_decay", 0.999),
+                    )
+                ),
+                feature_groups=feature_groups,
+                enable_cross_sectional=bool(
+                    _cfg_value(
+                        "enable_cross_sectional",
+                        not bool(getattr(args, "disable_cross_sectional", False)),
+                    )
+                ),
+                max_cross_sectional_symbols=int(
+                    _cfg_value(
+                        "max_cross_sectional_symbols",
+                        getattr(args, "max_cross_sectional_symbols", 20),
+                    )
+                ),
+                max_cross_sectional_rows=int(
+                    _cfg_value(
+                        "max_cross_sectional_rows",
+                        getattr(args, "max_cross_sectional_rows", 250000),
+                    )
+                ),
+                allow_feature_group_fallback=bool(
+                    _cfg_value(
+                        "allow_feature_group_fallback",
+                        not bool(getattr(args, "strict_feature_groups", False)),
+                    )
+                ),
+                feature_materialization_batch_rows=int(
+                    _cfg_value(
+                        "feature_materialization_batch_rows",
+                        getattr(args, "feature_materialization_batch_rows", 5000),
+                    )
+                ),
+                feature_reuse_min_coverage=float(
+                    _cfg_value(
+                        "feature_reuse_min_coverage",
+                        getattr(args, "feature_reuse_min_coverage", 0.20),
+                    )
+                ),
+                persist_features_to_postgres=bool(
+                    _cfg_value(
+                        "persist_features_to_postgres",
+                        not bool(getattr(args, "skip_feature_persist", False)),
+                    )
+                ),
+                output_dir=str(getattr(args, "output_dir", "models")),
+                model_params=model_params,
+            )
+
+            logger.info("-" * 80)
+            logger.info(f"Model type: {config.model_type}")
+            logger.info(f"Symbols: {config.symbols or 'all available'}")
+            logger.info("Data source: PostgreSQL (mandatory)")
+            logger.info("Redis cache: enabled (mandatory)")
+            logger.info(f"CV method: {config.cv_method} ({config.n_splits} splits)")
+            logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
+            logger.info(f"GPU: {config.use_gpu} (mandatory)")
+            logger.info(
+                "Institutional stack: Nested Walk-Forward + Optuna + Meta-Labeling + "
+                "Multiple-Testing + SHAP + Leak-Validation"
+            )
+            logger.info(
+                f"Nested CV: outer={config.nested_outer_splits}, inner={config.nested_inner_splits}"
+            )
+            logger.info(
+                f"Feature groups: {config.feature_groups} "
+                f"(cross_sectional={'on' if config.enable_cross_sectional else 'off'})"
+            )
+            if replay_config:
+                logger.info("Replay source: manifest-driven configuration")
+
+            if audit_logger is not None:
+                audit_logger.log_model_training_started(
+                    model_name=config.model_type,
+                    model_version=config.model_name,
+                    config={
+                        "cv_method": config.cv_method,
+                        "n_splits": config.n_splits,
+                        "embargo_pct": config.embargo_pct,
+                        "n_trials": config.n_trials,
+                        "use_gpu": config.use_gpu,
+                    },
+                    symbols=config.symbols,
+                )
+
+            try:
+                if config.model_type == "ensemble":
+                    trainer = EnsembleTrainer(config)
+                    result = trainer.train()
+                else:
+                    trainer = ModelTrainer(config)
+                    result = trainer.run()
+            except Exception as model_exc:
+                if audit_logger is not None:
+                    audit_logger.log_model_training_completed(
+                        model_name=config.model_type,
+                        model_version=config.model_name,
+                        metrics={},
+                        model_path=None,
+                        duration_seconds=None,
+                        success=False,
+                        error=str(model_exc),
+                    )
+                raise
+
+            registry_entry: dict[str, Any] | None = None
+            model_path = result.get("model_path")
+            if isinstance(model_path, str) and model_path.strip():
+                tags = [
+                    "training_pipeline",
+                    "institutional_mode",
+                    f"cv:{config.cv_method}",
+                    "validation:passed" if bool(result.get("success", False)) else "validation:failed",
+                ]
+                registry_entry = register_training_model_version(
+                    registry_root=Path(config.output_dir) / "registry",
+                    model_name=config.model_type,
+                    model_version=config.model_name,
+                    model_type=config.model_type,
+                    model_path=model_path,
+                    metrics=result.get("training_metrics", {}),
+                    tags=tags,
+                    is_active=bool(result.get("success", False)),
+                    snapshot_manifest=(
+                        trainer.snapshot_manifest
+                        if isinstance(trainer, ModelTrainer)
+                        else None
+                    ),
+                    training_config=config.__dict__,
+                    project_root=PROJECT_ROOT,
+                )
+                result["registry_version_id"] = registry_entry.get("version_id")
+                result["registry_path"] = str(Path(config.output_dir) / "registry" / "registry.json")
+
+            if audit_logger is not None:
+                audit_logger.log_model_training_completed(
+                    model_name=config.model_type,
+                    model_version=config.model_name,
+                    metrics=result.get("training_metrics", {}),
+                    model_path=result.get("model_path"),
+                    duration_seconds=result.get("training_duration_seconds"),
+                    success=bool(result.get("success", False)),
+                    snapshot_id=result.get("snapshot_id"),
+                    snapshot_manifest_path=result.get("snapshot_manifest_path"),
+                    registry_version_id=result.get("registry_version_id"),
+                    registry_path=result.get("registry_path"),
+                )
+
+            results.append((model_type, result))
+            if not result.get("success", False):
+                overall_success = False
+
+            if requested_model != "all":
+                break
 
         # Report results
         logger.info("=" * 80)
         logger.info("TRAINING COMPLETE")
         logger.info("=" * 80)
-
-        if result.get("success"):
+        for model_type, result in results:
+            logger.info("-" * 80)
+            logger.info(f"{model_type.upper()} RESULT")
             logger.info(f"Model saved to: {result.get('model_path', 'N/A')}")
             logger.info(f"Training duration: {result.get('training_duration_seconds', 0):.1f}s")
-
-            if "training_metrics" in result:
-                metrics = result["training_metrics"]
+            metrics = result.get("training_metrics", {})
+            if metrics:
                 logger.info(f"Mean accuracy: {metrics.get('mean_accuracy', 0):.4f}")
                 logger.info(f"Mean Sharpe: {metrics.get('mean_sharpe', 0):.4f}")
                 if "deflated_sharpe" in metrics:
                     logger.info(f"Deflated Sharpe: {metrics['deflated_sharpe']:.4f}")
+            if result.get("promotion_package_path"):
+                logger.info(f"Promotion package: {result.get('promotion_package_path')}")
+            if result.get("replay_manifest_path"):
+                logger.info(f"Replay manifest: {result.get('replay_manifest_path')}")
 
+        if overall_success:
             logger.info("Validation gates: PASSED")
             return 0
-        else:
-            logger.warning("Validation gates: FAILED")
-            logger.warning("Model may not meet production requirements")
-            return 1
+
+        logger.warning("Validation gates: FAILED for one or more models")
+        logger.warning("Some models may not meet production requirements")
+        return 1
 
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
@@ -1372,12 +4396,127 @@ def build_parser() -> argparse.ArgumentParser:
     """Build CLI parser for training script."""
     parser = argparse.ArgumentParser(description="AlphaTrade Model Training")
     parser.add_argument("--model", type=str, default="xgboost",
-                       choices=["xgboost", "lightgbm", "random_forest", "lstm",
-                               "transformer", "ensemble"])
+                       choices=SUPPORTED_MODELS + ["all"])
+    parser.add_argument("--name", type=str, default="")
     parser.add_argument("--symbols", nargs="+", default=[])
-    parser.add_argument("--optimize", action="store_true")
-    parser.add_argument("--use-gpu", action="store_true")
-    parser.add_argument("--meta-labeling", action="store_true")
+    parser.add_argument("--start", "--start-date", dest="start_date", type=str, default="")
+    parser.add_argument("--end", "--end-date", dest="end_date", type=str, default="")
+    parser.add_argument("--cv-method", choices=["purged_kfold", "combinatorial", "walk_forward"], default="purged_kfold")
+    parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--embargo-pct", type=float, default=0.01)
+    parser.add_argument("--n-trials", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--nested-outer-splits", type=int, default=4)
+    parser.add_argument("--nested-inner-splits", type=int, default=3)
+    parser.add_argument(
+        "--disable-nested-walk-forward",
+        action="store_true",
+        help="Forbidden in institutional mode; nested walk-forward is mandatory.",
+    )
+    parser.add_argument("--objective-weight-sharpe", type=float, default=1.0)
+    parser.add_argument("--objective-weight-drawdown", type=float, default=0.5)
+    parser.add_argument("--objective-weight-turnover", type=float, default=0.1)
+    parser.add_argument("--objective-weight-calibration", type=float, default=0.25)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument(
+        "--replay-manifest",
+        type=Path,
+        default=None,
+        help="Replay a prior run from replay/promotion/artifact manifest JSON.",
+    )
+    parser.add_argument(
+        "--min-accuracy",
+        type=float,
+        default=0.45,
+        help="Validation gate threshold for mean accuracy (default: 0.45).",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="Deprecated: institutional mode enforces GPU automatically.",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Deprecated: institutional mode enforces GPU automatically.",
+    )
+    parser.add_argument(
+        "--no-database",
+        action="store_true",
+        help="Forbidden in institutional mode; kept for explicit fail-fast validation.",
+    )
+    parser.add_argument(
+        "--no-redis-cache",
+        action="store_true",
+        help="Forbidden in institutional mode; kept for explicit fail-fast validation.",
+    )
+    parser.add_argument(
+        "--no-shap",
+        action="store_true",
+        help="Forbidden in institutional mode; kept for explicit fail-fast validation.",
+    )
+    parser.add_argument("--label-horizons", nargs="+", type=int, default=[1, 5, 20])
+    parser.add_argument("--primary-horizon", type=int, default=5)
+    parser.add_argument("--profit-taking", type=float, default=0.015)
+    parser.add_argument("--stop-loss", type=float, default=0.010)
+    parser.add_argument("--max-holding", type=int, default=20)
+    parser.add_argument("--spread-bps", type=float, default=1.0)
+    parser.add_argument("--slippage-bps", type=float, default=3.0)
+    parser.add_argument("--impact-bps", type=float, default=2.0)
+    parser.add_argument("--label-volatility-lookback", type=int, default=20)
+    parser.add_argument("--label-regime-lookback", type=int, default=30)
+    parser.add_argument("--label-temporal-weight-decay", type=float, default=0.999)
+    parser.add_argument(
+        "--feature-groups",
+        nargs="+",
+        default=["technical", "statistical", "microstructure", "cross_sectional"],
+        help="Feature groups to compute (default: technical statistical microstructure cross_sectional)",
+    )
+    parser.add_argument(
+        "--disable-cross-sectional",
+        action="store_true",
+        help="Disable cross-sectional features explicitly.",
+    )
+    parser.add_argument(
+        "--strict-feature-groups",
+        action="store_true",
+        help="Fail run if any requested feature group cannot be materialized.",
+    )
+    parser.add_argument(
+        "--max-cross-sectional-symbols",
+        type=int,
+        default=20,
+        help="Adaptive guardrail: disable cross-sectional when symbol count exceeds this value.",
+    )
+    parser.add_argument(
+        "--max-cross-sectional-rows",
+        type=int,
+        default=250000,
+        help="Adaptive guardrail: disable cross-sectional when dataset rows exceed this value.",
+    )
+    parser.add_argument(
+        "--feature-materialization-batch-rows",
+        type=int,
+        default=5000,
+        help="Source-row chunk size used while writing features to PostgreSQL.",
+    )
+    parser.add_argument(
+        "--feature-reuse-min-coverage",
+        type=float,
+        default=0.20,
+        help="Minimum usable feature row ratio required to reuse PostgreSQL feature cache.",
+    )
+    parser.add_argument(
+        "--skip-feature-persist",
+        action="store_true",
+        help="Skip persisting computed features to PostgreSQL.",
+    )
+    parser.add_argument("--min-deflated-sharpe", type=float, default=0.10)
+    parser.add_argument("--max-deflated-sharpe-pvalue", type=float, default=0.10)
+    parser.add_argument("--max-pbo", type=float, default=0.45)
+    parser.add_argument("--output-dir", type=Path, default=Path("models"))
     return parser
 
 

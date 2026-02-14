@@ -600,6 +600,48 @@ class TestRiskMonitor:
         # Should have at least one warning
         assert len(alerts) > 0 or monitor._drawdown_state.current_drawdown < 0.01
 
+    def test_sector_concentration_alert_generation(self):
+        """Sector mapping should trigger sector concentration alerts."""
+        monitor = RiskMonitor(
+            sector_map={
+                "AAPL": "information_technology",
+                "MSFT": "INFORMATION_TECHNOLOGY",
+            }
+        )
+        monitor.initialize(Decimal("100000"))
+
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("10000"),
+            buying_power=Decimal("10000"),
+            positions={
+                "AAPL": Position(
+                    symbol="AAPL",
+                    quantity=Decimal("200"),
+                    avg_entry_price=Decimal("200"),
+                    current_price=Decimal("200"),
+                    cost_basis=Decimal("40000"),
+                    market_value=Decimal("40000"),
+                ),
+                "MSFT": Position(
+                    symbol="MSFT",
+                    quantity=Decimal("175"),
+                    avg_entry_price=Decimal("200"),
+                    current_price=Decimal("200"),
+                    cost_basis=Decimal("35000"),
+                    market_value=Decimal("35000"),
+                ),
+            },
+        )
+
+        monitor.update(portfolio, np.zeros(32))
+        alerts = [
+            alert for alert in monitor.get_active_alerts()
+            if alert.alert_type == "sector_concentration"
+        ]
+        assert alerts
+        assert any("INFORMATION_TECHNOLOGY" in alert.message for alert in alerts)
+
 
 # ============================================================================
 # Risk Limits Tests

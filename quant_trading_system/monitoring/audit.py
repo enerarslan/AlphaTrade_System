@@ -30,6 +30,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    and_,
+    create_engine,
+    select,
+)
+from sqlalchemy.engine import Engine
+
 logger = logging.getLogger(__name__)
 
 
@@ -493,27 +508,90 @@ class FileAuditStorage(AuditStorage):
 class DatabaseAuditStorage(AuditStorage):
     """
     Database-based audit storage.
-
-    FIX: Changed from silent placeholder to explicit NotImplementedError.
-    Use FileAuditStorage for production until database implementation is complete.
     """
 
     def __init__(self, connection_string: str):
-        """Initialize database storage.
+        """Initialize database-backed audit storage."""
+        if not connection_string or not connection_string.strip():
+            raise ValueError("Database connection string is required for DatabaseAuditStorage")
 
-        Raises:
-            NotImplementedError: Database audit storage is not yet implemented.
-        """
-        # FIX: Fail explicitly instead of silently doing nothing
-        raise NotImplementedError(
-            "DatabaseAuditStorage is not yet implemented. "
-            "Use FileAuditStorage for production audit logging. "
-            "Example: AuditLogger(FileAuditStorage('/var/log/alphatrade/audit'))"
+        self._engine: Engine = create_engine(
+            connection_string,
+            pool_pre_ping=True,
+            future=True,
         )
+        self._lock = threading.Lock()
+        self._last_hash: str | None = None
+
+        self._metadata = MetaData()
+        self._events = Table(
+            "audit_events",
+            self._metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("event_id", String(64), nullable=False, unique=True, index=True),
+            Column("event_type", String(64), nullable=False, index=True),
+            Column("timestamp", DateTime(timezone=True), nullable=False, index=True),
+            Column("severity", String(16), nullable=False, index=True),
+            Column("source", String(128), nullable=False, index=True),
+            Column("user_id", String(128), nullable=True),
+            Column("session_id", String(128), nullable=True),
+            Column("action", Text, nullable=False),
+            Column("details", JSON, nullable=False),
+            Column("outcome", String(32), nullable=False),
+            Column("previous_hash", String(128), nullable=True),
+            Column("event_hash", String(128), nullable=False, index=True),
+        )
+        self._metadata.create_all(self._engine)
+        self._load_last_hash()
+
+    def _load_last_hash(self) -> None:
+        """Load the last stored hash for chain continuity."""
+        with self._engine.connect() as conn:
+            stmt = (
+                select(self._events.c.event_hash)
+                .order_by(self._events.c.timestamp.desc(), self._events.c.id.desc())
+                .limit(1)
+            )
+            row = conn.execute(stmt).first()
+            self._last_hash = row[0] if row else None
 
     def store(self, event: AuditEvent) -> None:
         """Store an audit event."""
-        raise NotImplementedError("DatabaseAuditStorage not implemented")
+        with self._lock:
+            if event.previous_hash != self._last_hash:
+                event = AuditEvent(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    timestamp=event.timestamp,
+                    severity=event.severity,
+                    source=event.source,
+                    user_id=event.user_id,
+                    session_id=event.session_id,
+                    action=event.action,
+                    details=event.details,
+                    outcome=event.outcome,
+                    previous_hash=self._last_hash,
+                )
+
+            with self._engine.begin() as conn:
+                conn.execute(
+                    self._events.insert().values(
+                        event_id=event.event_id,
+                        event_type=event.event_type.value,
+                        timestamp=event.timestamp,
+                        severity=event.severity.value,
+                        source=event.source,
+                        user_id=event.user_id,
+                        session_id=event.session_id,
+                        action=event.action,
+                        details=event.details,
+                        outcome=event.outcome,
+                        previous_hash=event.previous_hash,
+                        event_hash=event.event_hash,
+                    )
+                )
+
+            self._last_hash = event.event_hash
 
     def retrieve(
         self,
@@ -523,11 +601,60 @@ class DatabaseAuditStorage(AuditStorage):
         limit: int = 1000,
     ) -> list[AuditEvent]:
         """Retrieve audit events."""
-        raise NotImplementedError("DatabaseAuditStorage not implemented")
+        stmt = select(self._events).order_by(
+            self._events.c.timestamp.asc(), self._events.c.id.asc()
+        )
+        filters = []
+        if start_time is not None:
+            filters.append(self._events.c.timestamp >= start_time)
+        if end_time is not None:
+            filters.append(self._events.c.timestamp <= end_time)
+        if event_types:
+            filters.append(self._events.c.event_type.in_([et.value for et in event_types]))
+        if filters:
+            stmt = stmt.where(and_(*filters))
+        stmt = stmt.limit(limit)
+
+        events: list[AuditEvent] = []
+        with self._engine.connect() as conn:
+            rows = conn.execute(stmt).mappings().all()
+
+        for row in rows:
+            details = row["details"]
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except json.JSONDecodeError:
+                    details = {"raw": details}
+
+            timestamp = row["timestamp"]
+            if isinstance(timestamp, str):
+                timestamp = datetime.fromisoformat(timestamp)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+            events.append(
+                AuditEvent(
+                    event_id=row["event_id"],
+                    event_type=AuditEventType(row["event_type"]),
+                    timestamp=timestamp,
+                    severity=AuditSeverity(row["severity"]),
+                    source=row["source"],
+                    user_id=row["user_id"],
+                    session_id=row["session_id"],
+                    action=row["action"],
+                    details=details if isinstance(details, dict) else {},
+                    outcome=row["outcome"],
+                    previous_hash=row["previous_hash"],
+                    event_hash=row["event_hash"],
+                )
+            )
+
+        return events
 
     def get_last_hash(self) -> str | None:
         """Get last hash."""
-        raise NotImplementedError("DatabaseAuditStorage not implemented")
+        return self._last_hash
 
 
 class AuditLogger:
@@ -812,6 +939,55 @@ class AuditLogger:
                 "confidence": confidence,
                 **kwargs,
             },
+            source=f"model:{model_name}",
+        )
+
+    def log_model_training_started(
+        self,
+        model_name: str,
+        model_version: str,
+        config: dict[str, Any] | None = None,
+        symbols: list[str] | None = None,
+        **kwargs: Any,
+    ) -> AuditEvent:
+        """Log model training start."""
+        return self._log_event(
+            event_type=AuditEventType.MODEL_TRAINING_STARTED,
+            action=f"Start model training: {model_name} v{model_version}",
+            details={
+                "model_name": model_name,
+                "model_version": model_version,
+                "config": config,
+                "symbols": symbols,
+                **kwargs,
+            },
+            source=f"model:{model_name}",
+        )
+
+    def log_model_training_completed(
+        self,
+        model_name: str,
+        model_version: str,
+        metrics: dict[str, float] | None = None,
+        model_path: str | None = None,
+        duration_seconds: float | None = None,
+        success: bool = True,
+        **kwargs: Any,
+    ) -> AuditEvent:
+        """Log model training completion."""
+        return self._log_event(
+            event_type=AuditEventType.MODEL_TRAINING_COMPLETED,
+            action=f"Complete model training: {model_name} v{model_version}",
+            details={
+                "model_name": model_name,
+                "model_version": model_version,
+                "metrics": metrics,
+                "model_path": model_path,
+                "duration_seconds": duration_seconds,
+                **kwargs,
+            },
+            severity=AuditSeverity.INFO if success else AuditSeverity.WARNING,
+            outcome="success" if success else "failure",
             source=f"model:{model_name}",
         )
 

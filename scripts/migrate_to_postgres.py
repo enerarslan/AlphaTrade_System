@@ -116,6 +116,8 @@ def migrate_csv_to_postgres(
     symbols: list[str] | None = None,
     batch_size: int = 50000,
     verify: bool = False,
+    source_timezone: str = "America/New_York",
+    resume: bool = True,
 ) -> dict[str, int]:
     """
     Migrate CSV files to PostgreSQL.
@@ -151,6 +153,8 @@ def migrate_csv_to_postgres(
                 symbol=symbol,
                 batch_size=batch_size,
                 validate=True,
+                source_timezone=source_timezone,
+                resume=resume,
             )
 
             results[symbol] = rows
@@ -229,6 +233,17 @@ def main():
         help="Verify migration after each symbol",
     )
     parser.add_argument(
+        "--source-timezone",
+        type=str,
+        default="America/New_York",
+        help="Timezone for naive source timestamps (default: America/New_York)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resumable chunk checkpoints",
+    )
+    parser.add_argument(
         "--check-only",
         action="store_true",
         help="Only check database connection and exit",
@@ -271,6 +286,8 @@ def main():
         args.symbols,
         args.batch_size,
         args.verify,
+        source_timezone=args.source_timezone,
+        resume=not args.no_resume,
     )
 
     # Summary

@@ -517,13 +517,14 @@ class AlpacaClient:
         loop which could cause timeouts and missed updates in live trading.
         """
         import json
+        from urllib.parse import urlencode
         import urllib.request
 
         def _blocking_request() -> dict[str, Any]:
             """Execute blocking HTTP request in thread pool."""
             req_url = url
             if params:
-                query = "&".join(f"{k}={v}" for k, v in params.items())
+                query = urlencode(params, doseq=True, safe=":")
                 req_url = f"{url}?{query}"
 
             data = json.dumps(json_data).encode() if json_data else None
@@ -994,6 +995,49 @@ class AlpacaClient:
 
     # Market Data Methods
 
+    @staticmethod
+    def _format_utc_param(dt: datetime) -> str:
+        """Format datetimes for Alpaca query params in UTC ISO-8601 (Z suffix)."""
+        utc_dt = dt.astimezone(timezone.utc)
+        return utc_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    async def get_bars_page(
+        self,
+        symbol: str,
+        timeframe: str = "1Day",
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+        adjustment: str = "raw",
+        feed: str | None = None,
+        page_token: str | None = None,
+        sort: str = "asc",
+    ) -> dict[str, Any]:
+        """Get one paginated historical bars response (bars + next_page_token)."""
+        params: dict[str, Any] = {
+            "timeframe": timeframe,
+            "limit": max(1, min(int(limit), 10_000)),
+            "adjustment": adjustment,
+            "sort": sort,
+        }
+        resolved_feed = (feed or os.getenv("ALPACA_DATA_FEED", "iex")).strip().lower()
+        if resolved_feed:
+            params["feed"] = resolved_feed
+        if start:
+            params["start"] = self._format_utc_param(start)
+        if end:
+            params["end"] = self._format_utc_param(end)
+        if page_token:
+            params["page_token"] = page_token
+
+        data = await self._request(
+            "GET",
+            f"/v2/stocks/{symbol.upper()}/bars",
+            params=params,
+            base_url=self.DATA_BASE_URL,
+        )
+        return data if isinstance(data, dict) else {}
+
     async def get_bars(
         self,
         symbol: str,
@@ -1002,6 +1046,7 @@ class AlpacaClient:
         end: datetime | None = None,
         limit: int = 1000,
         adjustment: str = "raw",
+        feed: str | None = None,
     ) -> list[dict[str, Any]]:
         """Get historical bars.
 
@@ -1012,25 +1057,19 @@ class AlpacaClient:
             end: End datetime.
             limit: Maximum bars to return.
             adjustment: Price adjustment (raw, split, dividend, all).
+            feed: Data feed (iex, sip, otc). Defaults to ALPACA_DATA_FEED or iex.
 
         Returns:
             List of bar data.
         """
-        params: dict[str, Any] = {
-            "timeframe": timeframe,
-            "limit": limit,
-            "adjustment": adjustment,
-        }
-        if start:
-            params["start"] = start.isoformat()
-        if end:
-            params["end"] = end.isoformat()
-
-        data = await self._request(
-            "GET",
-            f"/v2/stocks/{symbol.upper()}/bars",
-            params=params,
-            base_url=self.DATA_BASE_URL,
+        data = await self.get_bars_page(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            limit=limit,
+            adjustment=adjustment,
+            feed=feed,
         )
         return data.get("bars", [])
 

@@ -125,6 +125,77 @@ class TestAlpacaClient:
         assert headers["APCA-API-KEY-ID"] == "key123"
         assert headers["APCA-API-SECRET-KEY"] == "secret456"
 
+    @pytest.mark.asyncio
+    async def test_sync_request_urlencodes_datetime_query_params(self, monkeypatch):
+        """Timezone offsets in query params must be URL-encoded (+ -> %2B)."""
+        client = AlpacaClient(api_key="test_key", api_secret="test_secret")
+        captured = {}
+
+        async def _fake_to_thread(fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        class _DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            @staticmethod
+            def read():
+                return b"{}"
+
+        def _fake_urlopen(request, timeout=30):
+            captured["url"] = request.full_url
+            return _DummyResponse()
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            await client._sync_request(
+                method="GET",
+                url="https://example.test/v2/stocks/AAPL/bars",
+                params={
+                    "start": "2026-02-07T00:00:00+00:00",
+                    "end": "2026-02-07T23:59:59+00:00",
+                    "timeframe": "15Min",
+                },
+                json_data=None,
+            )
+
+        assert "%2B00:00" in captured["url"]
+
+    @pytest.mark.asyncio
+    async def test_get_bars_page_formats_utc_params_and_passes_page_token(self, monkeypatch):
+        """Paginated bar requests should use Z timestamps and forward page_token."""
+        client = AlpacaClient(api_key="test_key", api_secret="test_secret")
+        captured = {}
+
+        async def _fake_request(method, path, params=None, base_url=None, json_data=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["params"] = params
+            captured["base_url"] = base_url
+            return {"bars": [], "next_page_token": None}
+
+        monkeypatch.setattr(client, "_request", _fake_request)
+
+        await client.get_bars_page(
+            symbol="AAPL",
+            timeframe="15Min",
+            start=datetime(2026, 2, 7, 0, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 2, 7, 23, 59, tzinfo=timezone.utc),
+            page_token="tok_123",
+            limit=5000,
+            feed="iex",
+        )
+
+        assert captured["method"] == "GET"
+        assert captured["path"] == "/v2/stocks/AAPL/bars"
+        assert captured["params"]["start"].endswith("Z")
+        assert captured["params"]["end"].endswith("Z")
+        assert captured["params"]["page_token"] == "tok_123"
+        assert captured["params"]["limit"] == 5000
+
 
 class TestAccountInfo:
     """Tests for AccountInfo dataclass."""

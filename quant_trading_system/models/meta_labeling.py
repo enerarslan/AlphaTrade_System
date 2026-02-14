@@ -353,6 +353,40 @@ class MetaLabeler:
                 min_samples_leaf=self.config.min_samples_leaf,
                 random_state=42,
             )
+        elif self.config.model_type == "xgboost":
+            try:
+                import xgboost as xgb
+
+                use_cuda = False
+                try:
+                    import torch
+
+                    use_cuda = torch.cuda.is_available()
+                except Exception:
+                    use_cuda = False
+
+                return xgb.XGBClassifier(
+                    n_estimators=self.config.n_estimators,
+                    max_depth=self.config.max_depth,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    eval_metric="logloss",
+                    random_state=42,
+                    tree_method="hist",
+                    device="cuda" if use_cuda else "cpu",
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"XGBoost meta-labeler unavailable ({exc}), using random_forest"
+                )
+                return RandomForestClassifier(
+                    n_estimators=self.config.n_estimators,
+                    max_depth=self.config.max_depth,
+                    min_samples_leaf=self.config.min_samples_leaf,
+                    random_state=42,
+                    n_jobs=-1,
+                )
         else:
             # Default to random forest
             logger.warning(f"Unknown model type {self.config.model_type}, using random_forest")

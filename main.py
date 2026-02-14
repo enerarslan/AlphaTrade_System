@@ -186,9 +186,12 @@ def cmd_train(args: argparse.Namespace) -> int:
     Model Types:
       - xgboost    : Gradient boosting (fast, interpretable)
       - lightgbm   : Light gradient boosting (efficient)
+      - random_forest: Bagged tree ensemble baseline
       - lstm       : Long short-term memory (sequential patterns)
       - transformer: Attention-based (complex dependencies)
+      - tcn        : Temporal convolutional network
       - ensemble   : IC-weighted model combination
+      - all        : Train full model suite
 
     Validation:
       - Purged K-Fold with embargo (no look-ahead bias)
@@ -201,7 +204,8 @@ def cmd_train(args: argparse.Namespace) -> int:
       - Multiple testing correction (Bonferroni, BH, Deflated Sharpe)
       - Feature importance and SHAP explanations
       - Model staleness detection
-      - Hyperparameter optimization with Optuna
+      - Mandatory Optuna hyperparameter optimization
+      - Mandatory PostgreSQL + Redis + leak-validation institutional stack
     """
     from scripts.train import run_training
     return run_training(args)
@@ -590,15 +594,31 @@ For more information, visit: https://github.com/alphatrade/docs
     )
     train_parser.add_argument(
         "--model", "-m",
-        choices=["xgboost", "lightgbm", "lstm", "transformer", "ensemble", "all"],
+        choices=[
+            "xgboost",
+            "lightgbm",
+            "random_forest",
+            "elastic_net",
+            "lstm",
+            "transformer",
+            "tcn",
+            "ensemble",
+            "all",
+        ],
         default="xgboost",
         help="Model type to train (default: xgboost)",
     )
     train_parser.add_argument(
+        "--name",
+        type=str,
+        default="",
+        help="Optional model name/version suffix",
+    )
+    train_parser.add_argument(
         "--symbols",
         nargs="+",
-        default=["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"],
-        help="Symbols to train on",
+        default=[],
+        help="Symbols to train on (default: all available symbols)",
     )
     train_parser.add_argument(
         "--start",
@@ -629,31 +649,251 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Embargo percentage for purged CV (default: 0.01)",
     )
     train_parser.add_argument(
-        "--optimize",
+        "--n-trials",
+        type=int,
+        default=100,
+        help="Optuna hyperparameter optimization trials (mandatory, default: 100)",
+    )
+    train_parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Global deterministic seed for reproducible training (default: 42)",
+    )
+    train_parser.add_argument(
+        "--nested-outer-splits",
+        type=int,
+        default=4,
+        help="Outer splits for mandatory nested walk-forward optimization (default: 4)",
+    )
+    train_parser.add_argument(
+        "--nested-inner-splits",
+        type=int,
+        default=3,
+        help="Inner splits for mandatory nested walk-forward optimization (default: 3)",
+    )
+    train_parser.add_argument(
+        "--disable-nested-walk-forward",
         action="store_true",
-        help="Run hyperparameter optimization",
+        help="Forbidden in institutional mode; retained for explicit fail-fast validation",
+    )
+    train_parser.add_argument(
+        "--objective-weight-sharpe",
+        type=float,
+        default=1.0,
+        help="Multi-objective Sharpe weight (default: 1.0)",
+    )
+    train_parser.add_argument(
+        "--objective-weight-drawdown",
+        type=float,
+        default=0.5,
+        help="Multi-objective drawdown penalty weight (default: 0.5)",
+    )
+    train_parser.add_argument(
+        "--objective-weight-turnover",
+        type=float,
+        default=0.1,
+        help="Multi-objective turnover penalty weight (default: 0.1)",
+    )
+    train_parser.add_argument(
+        "--objective-weight-calibration",
+        type=float,
+        default=0.25,
+        help="Multi-objective calibration penalty weight (default: 0.25)",
+    )
+    train_parser.add_argument(
+        "--replay-manifest",
+        type=Path,
+        default=None,
+        help="Replay a prior training run from replay/promotion/artifact manifest JSON",
     )
     train_parser.add_argument(
         "--gpu",
         action="store_true",
-        help="Use GPU acceleration",
+        help="Deprecated: institutional mode enforces GPU automatically",
+    )
+    train_parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="Deprecated: institutional mode enforces GPU automatically",
+    )
+    train_parser.add_argument(
+        "--no-database",
+        action="store_true",
+        help="Forbidden in institutional mode; kept for explicit fail-fast validation",
+    )
+    train_parser.add_argument(
+        "--no-redis-cache",
+        action="store_true",
+        help="Forbidden in institutional mode; kept for explicit fail-fast validation",
+    )
+    train_parser.add_argument(
+        "--no-shap",
+        action="store_true",
+        help="Forbidden in institutional mode; kept for explicit fail-fast validation",
+    )
+    train_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+        help="Training epochs for deep learning models (default: 100)",
+    )
+    train_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Batch size for deep learning models (default: 64)",
+    )
+    train_parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=0.001,
+        help="Learning rate for deep learning models (default: 0.001)",
+    )
+    train_parser.add_argument(
+        "--min-accuracy",
+        type=float,
+        default=0.45,
+        help="Validation gate threshold for mean accuracy (default: 0.45)",
+    )
+    train_parser.add_argument(
+        "--label-horizons",
+        nargs="+",
+        type=int,
+        default=[1, 5, 20],
+        help="Target horizons in bars (default: 1 5 20)",
+    )
+    train_parser.add_argument(
+        "--primary-horizon",
+        type=int,
+        default=5,
+        help="Primary horizon used for cost-aware labeling (default: 5)",
+    )
+    train_parser.add_argument(
+        "--profit-taking",
+        type=float,
+        default=0.015,
+        help="Triple-barrier profit-taking threshold (default: 0.015)",
+    )
+    train_parser.add_argument(
+        "--stop-loss",
+        type=float,
+        default=0.010,
+        help="Triple-barrier stop-loss threshold (default: 0.010)",
+    )
+    train_parser.add_argument(
+        "--max-holding",
+        type=int,
+        default=20,
+        help="Triple-barrier max holding period in bars (default: 20)",
+    )
+    train_parser.add_argument(
+        "--spread-bps",
+        type=float,
+        default=1.0,
+        help="Cost-aware labeling spread assumption in bps (default: 1.0)",
+    )
+    train_parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=3.0,
+        help="Cost-aware labeling slippage assumption in bps (default: 3.0)",
+    )
+    train_parser.add_argument(
+        "--impact-bps",
+        type=float,
+        default=2.0,
+        help="Cost-aware labeling impact assumption in bps (default: 2.0)",
+    )
+    train_parser.add_argument(
+        "--label-volatility-lookback",
+        type=int,
+        default=20,
+        help="Lookback for volatility-adaptive barriers (default: 20)",
+    )
+    train_parser.add_argument(
+        "--label-regime-lookback",
+        type=int,
+        default=30,
+        help="Lookback for regime-aware labels (default: 30)",
+    )
+    train_parser.add_argument(
+        "--label-temporal-weight-decay",
+        type=float,
+        default=0.999,
+        help="Temporal sample weight decay (default: 0.999)",
+    )
+    train_parser.add_argument(
+        "--feature-groups",
+        nargs="+",
+        default=["technical", "statistical", "microstructure", "cross_sectional"],
+        help=(
+            "Feature groups to compute (default: technical statistical "
+            "microstructure cross_sectional)"
+        ),
+    )
+    train_parser.add_argument(
+        "--disable-cross-sectional",
+        action="store_true",
+        help="Disable cross-sectional features explicitly",
+    )
+    train_parser.add_argument(
+        "--strict-feature-groups",
+        action="store_true",
+        help="Fail training if any requested feature group cannot be materialized",
+    )
+    train_parser.add_argument(
+        "--max-cross-sectional-symbols",
+        type=int,
+        default=20,
+        help="Adaptive guardrail for cross-sectional features by symbol count",
+    )
+    train_parser.add_argument(
+        "--max-cross-sectional-rows",
+        type=int,
+        default=250000,
+        help="Adaptive guardrail for cross-sectional features by row count",
+    )
+    train_parser.add_argument(
+        "--feature-materialization-batch-rows",
+        type=int,
+        default=5000,
+        help="Source-row chunk size while writing features to PostgreSQL",
+    )
+    train_parser.add_argument(
+        "--feature-reuse-min-coverage",
+        type=float,
+        default=0.20,
+        help="Minimum usable feature-row ratio to reuse PostgreSQL feature cache",
+    )
+    train_parser.add_argument(
+        "--skip-feature-persist",
+        action="store_true",
+        help="Skip writing computed features back to PostgreSQL for this training run",
+    )
+    train_parser.add_argument(
+        "--min-deflated-sharpe",
+        type=float,
+        default=0.10,
+        help="Hard promotion gate for deflated Sharpe (default: 0.10)",
+    )
+    train_parser.add_argument(
+        "--max-deflated-sharpe-pvalue",
+        type=float,
+        default=0.10,
+        help="Hard promotion gate for deflated Sharpe p-value (default: 0.10)",
+    )
+    train_parser.add_argument(
+        "--max-pbo",
+        type=float,
+        default=0.45,
+        help="Hard promotion gate for probability of backtest overfitting (default: 0.45)",
     )
     train_parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("models"),
         help="Output directory for trained models",
-    )
-    train_parser.add_argument(
-        "--use-database",
-        action="store_true",
-        default=True,
-        help="Load data from PostgreSQL + TimescaleDB (default: True)",
-    )
-    train_parser.add_argument(
-        "--no-database",
-        action="store_true",
-        help="Load data from CSV files instead of database",
     )
     train_parser.set_defaults(func=cmd_train)
 
@@ -705,6 +945,77 @@ For more information, visit: https://github.com/alphatrade/docs
         type=Path,
         default=Path("data/raw"),
         help="Output directory (default: data/raw)",
+    )
+    data_load.add_argument(
+        "--sync-db",
+        action="store_true",
+        help="Upsert downloaded bars into PostgreSQL/TimescaleDB",
+    )
+    data_load.add_argument(
+        "--incremental",
+        action="store_true",
+        help="If --sync-db, fetch each symbol from latest DB bar to now",
+    )
+    data_load.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help="Batch size for database upserts (default: 5000)",
+    )
+
+    # data download (alias of load)
+    data_download = data_subparsers.add_parser(
+        "download",
+        help="Download historical data (alias for load)",
+    )
+    data_download.add_argument(
+        "--source",
+        choices=["alpaca", "csv", "database"],
+        default="alpaca",
+        help="Data source (default: alpaca)",
+    )
+    data_download.add_argument(
+        "--symbols",
+        nargs="+",
+        required=True,
+        help="Symbols to load",
+    )
+    data_download.add_argument(
+        "--start",
+        type=str,
+        help="Start date (YYYY-MM-DD)",
+    )
+    data_download.add_argument(
+        "--end",
+        type=str,
+        help="End date (YYYY-MM-DD)",
+    )
+    data_download.add_argument(
+        "--timeframe",
+        default="15Min",
+        help="Bar timeframe (default: 15Min)",
+    )
+    data_download.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data/raw"),
+        help="Output directory (default: data/raw)",
+    )
+    data_download.add_argument(
+        "--sync-db",
+        action="store_true",
+        help="Upsert downloaded bars into PostgreSQL/TimescaleDB",
+    )
+    data_download.add_argument(
+        "--incremental",
+        action="store_true",
+        help="If --sync-db, fetch each symbol from latest DB bar to now",
+    )
+    data_download.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help="Batch size for database upserts (default: 5000)",
     )
 
     # data validate
@@ -767,6 +1078,17 @@ For more information, visit: https://github.com/alphatrade/docs
         "--verify",
         action="store_true",
         help="Verify migration after each symbol",
+    )
+    data_migrate.add_argument(
+        "--source-timezone",
+        type=str,
+        default="America/New_York",
+        help="Timezone for naive source timestamps (default: America/New_York)",
+    )
+    data_migrate.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resumable chunk checkpoints during migration",
     )
     data_migrate.add_argument(
         "--export-after",

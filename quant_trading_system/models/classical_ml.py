@@ -208,6 +208,7 @@ class LightGBMModel(TradingModel):
         lambda_l2: float = 0.1,
         min_data_in_leaf: int = 20,
         early_stopping_rounds: int = 50,
+        use_gpu: bool = False,
         random_state: int = 42,
         **kwargs: Any,
     ):
@@ -229,6 +230,7 @@ class LightGBMModel(TradingModel):
             lambda_l2: L2 regularization
             min_data_in_leaf: Minimum samples in a leaf
             early_stopping_rounds: Early stopping patience
+            use_gpu: Whether to use GPU acceleration
             random_state: Random seed
             **kwargs: Additional parameters
         """
@@ -246,6 +248,7 @@ class LightGBMModel(TradingModel):
             "lambda_l2": lambda_l2,
             "min_data_in_leaf": min_data_in_leaf,
             "early_stopping_rounds": early_stopping_rounds,
+            "use_gpu": use_gpu,
             "random_state": random_state,
         })
 
@@ -291,6 +294,9 @@ class LightGBMModel(TradingModel):
             "n_jobs": -1,
             "verbose": -1,
         }
+
+        if self._params.get("use_gpu"):
+            params["device_type"] = "gpu"
 
         if self._model_type == ModelType.CLASSIFIER:
             self._model = lgb.LGBMClassifier(**params)

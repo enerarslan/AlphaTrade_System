@@ -68,6 +68,16 @@ services:
     image: timescale/timescaledb:latest-pg15
     container_name: trading_postgres
     restart: always
+    command:
+      - postgres
+      - -c
+      - max_locks_per_transaction=256
+      - -c
+      - max_parallel_workers_per_gather=0
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=32MB
     environment:
       - POSTGRES_DB=quant_trading
       - POSTGRES_USER=postgres
