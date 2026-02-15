@@ -87,11 +87,11 @@ Thumbs.db
 nul
 
 
-.gitignore
-.claude
-.vscode
-CLAUDE.md
-AGENTS.md
-alembic.ini
-dumb.rdb
+.gitignore/
+.claude/
+.vscode/
+CLAUDE.md/
+AGENTS.md/
+alembic.ini/
+dumb.rdb/
 
