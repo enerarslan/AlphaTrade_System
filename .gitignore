@@ -85,3 +85,13 @@ data/
 .DS_Store
 Thumbs.db
 nul
+
+
+.gitignore
+.claude
+.vscode
+CLAUDE.md
+AGENTS.md
+alembic.ini
+dumb.rdb
+
