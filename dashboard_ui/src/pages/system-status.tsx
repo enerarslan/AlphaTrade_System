@@ -1,320 +1,332 @@
-import { useEffect, useMemo, useState, type ElementType } from "react";
-import { Cpu, Database, HardDrive, Network, Server } from "lucide-react";
+import { useEffect, useMemo } from "react";
+import { motion } from "framer-motion";
+import {
+  AlertTriangle,
+  BookOpen,
+  FileText,
+  Gauge,
+  HeartPulse,
+  Play,
+  ScrollText,
+  Server,
+  ShieldCheck,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useStore } from "@/lib/store";
 
-const iconByComponent: Record<string, ElementType> = {
-  database: Database,
-  redis: HardDrive,
-  broker: Network,
-  gpu: Cpu,
+const stagger = {
+  hidden: { opacity: 0 },
+  show: { opacity: 1, transition: { staggerChildren: 0.08 } },
 };
+const fadeUp = {
+  hidden: { opacity: 0, y: 12 },
+  show: { opacity: 1, y: 0, transition: { duration: 0.4, ease: "easeOut" as const } },
+} as const;
 
-export default function OperationsPage() {
+function StatusDot({ ok }: { ok: boolean }) {
+  return (
+    <span className={`inline-block h-2.5 w-2.5 rounded-full ${ok ? "bg-emerald-400 shadow-[0_0_6px_rgba(16,185,129,0.5)]" : "bg-rose-400 shadow-[0_0_6px_rgba(244,63,94,0.5)]"}`} />
+  );
+}
+
+export default function SystemStatusPage() {
   const {
-    hasPermission,
-    mfaStatus,
     health,
+    sloStatus,
     jobs,
     logs,
     auditTrail,
     siemStatus,
-    sloStatus,
     incidents,
-    incidentTimeline,
     runbooks,
+    hasPermission,
     fetchHealth,
+    fetchSloStatus,
     fetchJobs,
     fetchLogs,
     fetchAuditTrail,
     fetchSiemStatus,
-    fetchSloStatus,
     fetchIncidents,
     fetchIncidentTimeline,
     fetchRunbooks,
-    createJob,
+    cancelJob,
     executeRunbookAction,
-    flushSiemQueue,
     exportAuditTrail,
   } = useStore();
-  const [mfaCode, setMfaCode] = useState("");
-  const canRunRunbooks = hasPermission("operations.runbooks.execute");
-  const canCreateJobs = hasPermission("control.jobs.create");
+
   const canReadAudit = hasPermission("control.audit.read");
   const canManageAudit = hasPermission("control.audit.manage");
-  const requiresMfa = Boolean(mfaStatus?.mfa_enabled);
+  const canRunbook = hasPermission("operations.runbook.execute");
 
   useEffect(() => {
-    void Promise.all([fetchHealth(), fetchJobs(), fetchLogs(), fetchAuditTrail(), fetchSiemStatus(), fetchSloStatus(), fetchIncidents(), fetchIncidentTimeline(), fetchRunbooks()]);
-    const timer = setInterval(
-      () => void Promise.all([fetchHealth(), fetchJobs(), fetchLogs(), fetchAuditTrail(), fetchSiemStatus(), fetchSloStatus(), fetchIncidents(), fetchIncidentTimeline(), fetchRunbooks()]),
-      10000,
-    );
+    void fetchHealth();
+    void fetchSloStatus();
+    void fetchJobs();
+    void fetchLogs();
+    void fetchIncidents();
+    void fetchIncidentTimeline();
+    void fetchRunbooks();
+    if (canReadAudit) {
+      void fetchAuditTrail();
+      void fetchSiemStatus();
+    }
+    const timer = setInterval(() => {
+      void fetchHealth();
+      void fetchJobs();
+      void fetchLogs();
+    }, 10000);
     return () => clearInterval(timer);
-  }, [fetchHealth, fetchJobs, fetchLogs, fetchAuditTrail, fetchSiemStatus, fetchSloStatus, fetchIncidents, fetchIncidentTimeline, fetchRunbooks]);
+  }, [fetchHealth, fetchSloStatus, fetchJobs, fetchLogs, fetchAuditTrail, fetchSiemStatus, fetchIncidents, fetchIncidentTimeline, fetchRunbooks, canReadAudit]);
 
-  const recentLogs = useMemo(() => logs.slice(0, 18), [logs]);
-  const recentJobs = useMemo(() => jobs.slice(0, 10), [jobs]);
+  const healthChecks = useMemo(() => {
+    if (!health) return [];
+    return (health.checks ?? []).map((c) => ({
+      name: c.component,
+      status: c.status,
+      ok: c.status === "HEALTHY",
+    }));
+  }, [health]);
+
+  const recentLogs = useMemo(() => logs.slice(0, 20), [logs]);
   const recentAudit = useMemo(() => auditTrail.slice(0, 10), [auditTrail]);
+  const recentJobs = useMemo(() => jobs.slice(0, 8), [jobs]);
   const recentIncidents = useMemo(() => incidents.slice(0, 8), [incidents]);
-  const recentTimeline = useMemo(() => incidentTimeline.slice(0, 12), [incidentTimeline]);
 
   return (
-    <div className="space-y-6">
-      <section className="rounded-2xl border border-slate-200 bg-white/90 p-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Infrastructure</p>
-            <h1 className="mt-2 text-3xl font-bold text-slate-900">Operations Console</h1>
-            <p className="mt-1 text-sm text-slate-600">Service health, command jobs, and runtime telemetry.</p>
-          </div>
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={() => void createJob("health", ["check", "--full"])} disabled={!canCreateJobs}>
-              Full Health Check
-            </Button>
-            <Button variant="outline" onClick={() => void createJob("deploy", ["env", "check"])} disabled={!canCreateJobs}>
-              Validate Env
-            </Button>
-            <Button variant="outline" onClick={() => void createJob("deploy", ["gpu", "check"])} disabled={!canCreateJobs}>
-              GPU Check
-            </Button>
-          </div>
+    <motion.div variants={stagger} initial="hidden" animate="show" className="space-y-6">
+      {/* Header */}
+      <motion.section variants={fadeUp} className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-6 backdrop-blur-sm">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-500/70">Site Reliability</p>
+        <h1 className="mt-2 text-3xl font-bold text-slate-100">Operations Console</h1>
+        <p className="mt-1 text-sm text-slate-400">Infrastructure health, SLOs, logs, audit, incidents, and runbook automation.</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Badge variant={health?.status === "healthy" ? "success" : "error"}>
+            <HeartPulse size={12} className="mr-1" />
+            {health?.status ?? "--"}
+          </Badge>
+          <Badge variant="outline">SLO: {sloStatus?.status ?? "--"}</Badge>
         </div>
-      </section>
+      </motion.section>
 
-      <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {health?.checks.map((check) => {
-          const Icon = iconByComponent[check.component] ?? Server;
-          return (
-            <Card key={check.component} className="border-slate-200 bg-white/90">
-              <CardHeader className="pb-2">
-                <CardDescription className="capitalize">{check.component.replaceAll("_", " ")}</CardDescription>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <Icon size={18} />
-                  {check.status}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="text-sm text-slate-600">
-                <p>{check.message}</p>
-                <p className="mt-1 text-xs">Latency: {check.latency_ms.toFixed(2)}ms</p>
-              </CardContent>
-            </Card>
-          );
-        })}
-      </section>
-
-      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader className="pb-2">
-            <CardDescription>SLO Status</CardDescription>
-            <CardTitle className="text-xl">{sloStatus?.status ?? "--"}</CardTitle>
-          </CardHeader>
-        </Card>
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader className="pb-2">
-            <CardDescription>Availability</CardDescription>
-            <CardTitle className="text-xl">{((sloStatus?.availability ?? 0) * 100).toFixed(2)}%</CardTitle>
-          </CardHeader>
-        </Card>
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader className="pb-2">
-            <CardDescription>Burn Rate 1h</CardDescription>
-            <CardTitle className="text-xl">{(sloStatus?.burn_rate_1h ?? 0).toFixed(2)}</CardTitle>
-          </CardHeader>
-        </Card>
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader className="pb-2">
-            <CardDescription>Error Budget Left</CardDescription>
-            <CardTitle className="text-xl">{(sloStatus?.error_budget_remaining_pct ?? 0).toFixed(2)}%</CardTitle>
-          </CardHeader>
-        </Card>
-      </section>
-
-      <section className="grid gap-4 lg:grid-cols-2">
-        <Card className="border-slate-200 bg-white/90">
+      {/* Health Checks */}
+      <motion.div variants={fadeUp}>
+        <Card>
           <CardHeader>
-            <CardTitle>Command Job Queue</CardTitle>
-            <CardDescription>Latest asynchronous operations launched from dashboard</CardDescription>
+            <CardTitle className="flex items-center gap-2">
+              <Server size={18} className="text-cyan-400" />
+              Health Checks
+            </CardTitle>
+            <CardDescription>Component-level health status.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              {healthChecks.length === 0 ? (
+                <p className="text-sm text-slate-500 col-span-full">No health data.</p>
+              ) : (
+                healthChecks.map((c) => (
+                  <div key={c.name} className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${c.ok ? "border-emerald-500/15 bg-emerald-500/[0.03]" : "border-rose-500/15 bg-rose-500/[0.03]"}`}>
+                    <StatusDot ok={c.ok} />
+                    <div>
+                      <p className="font-medium text-slate-200">{c.name}</p>
+                      <p className="text-xs text-slate-500">{String(c.status)}</p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* SLO + Jobs */}
+      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Gauge size={18} className="text-emerald-400" />
+              SLO Status
+            </CardTitle>
+            <CardDescription>Service-level objectives.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            {!sloStatus ? (
+              <p className="text-slate-500">No SLO data.</p>
+            ) : (
+              Object.entries(sloStatus).map(([key, val]) => (
+                <div key={key} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                  <span className="text-slate-400">{key.replaceAll("_", " ")}</span>
+                  <span className="font-mono text-slate-200">{typeof val === "number" ? val.toFixed(3) : String(val)}</span>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Play size={18} className="text-cyan-400" />
+              Command Jobs
+            </CardTitle>
+            <CardDescription>Orchestrated job queue.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
             {recentJobs.length === 0 ? (
-              <p className="text-sm text-slate-500">No jobs yet.</p>
+              <p className="text-sm text-slate-500">No jobs.</p>
             ) : (
               recentJobs.map((job) => (
-                <div key={job.job_id} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                  <div className="flex items-center justify-between">
-                    <p className="font-medium text-slate-800">{job.command}</p>
-                    <Badge variant={job.status === "succeeded" ? "success" : "outline"}>{job.status}</Badge>
+                <div key={job.job_id} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                  <div>
+                    <p className="font-medium text-slate-200">{job.command}</p>
+                    <p className="truncate font-mono text-xs text-slate-500">{job.args.join(" ")}</p>
                   </div>
-                  <p className="mt-1 truncate font-mono text-xs text-slate-600">{job.args.join(" ")}</p>
+                  <div className="flex items-center gap-2">
+                    <Badge variant={job.status === "succeeded" ? "success" : job.status === "failed" ? "error" : "warning"}>{job.status}</Badge>
+                    {(job.status === "queued" || job.status === "running") && (
+                      <Button variant="ghost" size="sm" onClick={() => void cancelJob(job.job_id)}>Cancel</Button>
+                    )}
+                  </div>
                 </div>
               ))
             )}
           </CardContent>
         </Card>
+      </motion.div>
 
-        <Card className="border-slate-200 bg-white/90">
+      {/* Logs + Audit */}
+      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
+        <Card>
           <CardHeader>
-            <CardTitle>System Logs</CardTitle>
-            <CardDescription>Recent logs streamed from backend state</CardDescription>
+            <CardTitle className="flex items-center gap-2">
+              <FileText size={18} className="text-amber-400" />
+              System Logs
+            </CardTitle>
+            <CardDescription>Recent system log entries.</CardDescription>
           </CardHeader>
-          <CardContent className="max-h-[360px] space-y-2 overflow-auto">
-            {recentLogs.length === 0 ? (
-              <p className="text-sm text-slate-500">No logs available.</p>
-            ) : (
-              recentLogs.map((entry, idx) => (
-                <div key={`${entry.timestamp}_${idx}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                  <div className="flex items-center justify-between text-xs">
-                    <Badge variant="outline">{entry.level}</Badge>
-                    <span className="font-mono text-slate-500">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+          <CardContent>
+            <div className="max-h-80 space-y-1 overflow-y-auto rounded-xl border border-white/[0.06] bg-slate-950/60 p-3 font-mono text-xs">
+              {recentLogs.length === 0 ? (
+                <p className="text-slate-500">No logs.</p>
+              ) : (
+                recentLogs.map((log, i) => (
+                  <div key={i} className="flex gap-2 leading-relaxed">
+                    <span className="shrink-0 text-slate-600">{new Date(log.timestamp).toLocaleTimeString()}</span>
+                    <span className={log.level === "ERROR" ? "text-rose-400" : log.level === "WARNING" ? "text-amber-400" : "text-slate-400"}>
+                      [{log.level}]
+                    </span>
+                    <span className="text-slate-300">{log.message}</span>
                   </div>
-                  <p className="mt-2 text-sm text-slate-700">{entry.message}</p>
-                </div>
-              ))
-            )}
+                ))
+              )}
+            </div>
           </CardContent>
         </Card>
-      </section>
 
-      <section className="grid gap-4 lg:grid-cols-2">
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader>
-            <CardTitle>Runbook Automation</CardTitle>
-            <CardDescription>Execute operator-safe runbook actions</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {requiresMfa ? (
-              <input
-                className="h-10 w-full rounded-lg border border-slate-300 bg-white px-3 font-mono"
-                value={mfaCode}
-                onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                placeholder="MFA code"
-              />
-            ) : null}
-            {runbooks.slice(0, 6).map((rb) => {
-              const action = rb.alert_type === "HIGH_LATENCY"
-                ? "health_check"
-                : rb.alert_type === "BROKER_CONNECTION_LOST"
-                  ? "broker_reconnect_dryrun"
-                  : rb.alert_type === "DATA_FEED_FAILURE"
-                    ? "data_feed_check"
-                    : "validate_env";
-              return (
-                <Button
-                  key={rb.alert_type}
-                  variant="outline"
-                  className="w-full justify-start"
-                  onClick={() => void executeRunbookAction(action, mfaCode || undefined)}
-                  disabled={!canRunRunbooks || (requiresMfa && mfaCode.length !== 6)}
-                >
-                  {rb.alert_type.replaceAll("_", " ")}
+        {canReadAudit && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ScrollText size={18} className="text-cyan-400" />
+                Audit Trail
+              </CardTitle>
+              <CardDescription>Immutable audit log with integrity hashes.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {recentAudit.length === 0 ? (
+                <p className="text-sm text-slate-500">No audit entries.</p>
+              ) : (
+                  recentAudit.map((a, i) => (
+                  <div key={i} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-slate-200">{a.action}</span>
+                      <span className="text-slate-500">{new Date(a.timestamp).toLocaleString()}</span>
+                    </div>
+                    <p className="text-slate-500">by {a.user} — {a.status}</p>
+                    {a.record_hash && <p className="font-mono text-slate-600 truncate">hash: {a.record_hash}</p>}
+                  </div>
+                ))
+              )}
+              {canManageAudit && (
+                <Button variant="outline" size="sm" onClick={() => void exportAuditTrail("json")}>
+                  Export Audit Trail
                 </Button>
-              );
-            })}
-            {!canRunRunbooks ? <p className="text-xs text-rose-700">Role lacks runbook execution permission.</p> : null}
-          </CardContent>
-        </Card>
+              )}
+            </CardContent>
+          </Card>
+        )}
+      </motion.div>
 
-        <Card className="border-slate-200 bg-white/90">
+      {/* Incidents + SIEM + Runbooks */}
+      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-3">
+        <Card>
           <CardHeader>
-            <CardTitle>Recent Incidents</CardTitle>
-            <CardDescription>High-severity alerts and active incidents</CardDescription>
+            <CardTitle className="flex items-center gap-2">
+              <AlertTriangle size={18} className="text-amber-400" />
+              Incidents
+            </CardTitle>
           </CardHeader>
           <CardContent className="space-y-2">
             {recentIncidents.length === 0 ? (
               <p className="text-sm text-slate-500">No incidents.</p>
             ) : (
-              recentIncidents.map((incident) => (
-                <div key={incident.incident_id} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              recentIncidents.map((inc) => (
+                <div key={inc.incident_id} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
                   <div className="flex items-center justify-between">
-                    <p className="text-sm font-medium text-slate-800">{incident.title}</p>
-                    <Badge variant={incident.severity === "CRITICAL" ? "error" : "warning"}>{incident.severity}</Badge>
+                    <span className="text-sm font-medium text-slate-200">{inc.title}</span>
+                    <Badge variant={inc.severity === "CRITICAL" ? "error" : "warning"}>{inc.severity}</Badge>
                   </div>
-                  <p className="mt-1 text-xs text-slate-500">{new Date(incident.created_at).toLocaleString()}</p>
+                  <p className="text-xs text-slate-500">{new Date(inc.created_at).toLocaleString()}</p>
                 </div>
               ))
             )}
           </CardContent>
         </Card>
-      </section>
 
-      <Card className="border-slate-200 bg-white/90">
-        <CardHeader>
-          <CardTitle>Signed Audit Trail</CardTitle>
-          <CardDescription>Tamper-evident privileged action records</CardDescription>
-        </CardHeader>
-        <CardContent className="max-h-[300px] space-y-2 overflow-auto">
-          {recentAudit.length === 0 ? (
-            <p className="text-sm text-slate-500">No audit records.</p>
-          ) : (
-            recentAudit.map((entry) => (
-              <div key={entry.record_hash} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="flex items-center justify-between text-xs">
-                  <Badge variant="outline">{entry.status}</Badge>
-                  <span className="font-mono text-slate-500">{new Date(entry.timestamp).toLocaleTimeString()}</span>
-                </div>
-                <p className="mt-2 text-sm font-medium text-slate-800">{entry.action}</p>
-                <p className="mt-1 text-xs font-mono text-slate-500">hash {entry.record_hash.slice(0, 14)}...</p>
-              </div>
-            ))
-          )}
-        </CardContent>
-      </Card>
-
-      {canReadAudit ? (
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader>
-            <CardTitle>SIEM Forwarding</CardTitle>
-            <CardDescription>Centralized audit export and downstream SIEM delivery status.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="grid gap-2 text-sm text-slate-700 sm:grid-cols-2">
+        {canReadAudit && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ShieldCheck size={18} className="text-emerald-400" />
+                SIEM Status
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm text-slate-300">
               <p>Enabled: <span className="font-semibold">{siemStatus?.enabled ? "yes" : "no"}</span></p>
-              <p>Queue depth: <span className="font-semibold">{siemStatus?.queue_depth ?? 0}</span></p>
-              <p>Delivered: <span className="font-semibold">{siemStatus?.total_delivered ?? 0}</span></p>
-              <p>Failed: <span className="font-semibold">{siemStatus?.total_failed ?? 0}</span></p>
-            </div>
-            {siemStatus?.last_error ? (
-              <p className="rounded-lg border border-rose-200 bg-rose-50 p-2 text-xs text-rose-700">{siemStatus.last_error}</p>
-            ) : null}
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={() => void exportAuditTrail("jsonl")}>
-                Export NDJSON
-              </Button>
-              <Button variant="outline" onClick={() => void exportAuditTrail("json")}>
-                Export JSON
-              </Button>
-              <Button variant="outline" onClick={() => void flushSiemQueue(5)} disabled={!canManageAudit}>
-                Flush SIEM Queue
-              </Button>
-            </div>
+              <p>Endpoint: <span className="font-mono text-xs text-slate-400">{siemStatus?.endpoint ?? "--"}</span></p>
+              <p>Queue: <span className="font-semibold">{siemStatus?.queue_depth ?? 0}</span></p>
+              {siemStatus?.last_error && <p className="text-xs text-rose-400">{siemStatus.last_error}</p>}
+            </CardContent>
+          </Card>
+        )}
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <BookOpen size={18} className="text-cyan-400" />
+              Runbooks
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {runbooks.length === 0 ? (
+              <p className="text-sm text-slate-500">No runbooks.</p>
+            ) : (
+              runbooks.map((rb) => (
+                <div key={rb.alert_type} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                  <div>
+                    <p className="text-sm font-medium text-slate-200">{rb.alert_type}</p>
+                    <p className="text-xs text-slate-500">{rb.suggested_action ?? "No action specified"}</p>
+                  </div>
+                  <Button variant="outline" size="sm" disabled={!canRunbook} onClick={() => void executeRunbookAction(rb.alert_type)}>
+                    Run
+                  </Button>
+                </div>
+              ))
+            )}
           </CardContent>
         </Card>
-      ) : null}
-
-      <Card className="border-slate-200 bg-white/90">
-        <CardHeader>
-          <CardTitle>Incident Timeline</CardTitle>
-          <CardDescription>Correlated stream: alerts, audit and runtime logs</CardDescription>
-        </CardHeader>
-        <CardContent className="max-h-[300px] space-y-2 overflow-auto">
-          {recentTimeline.length === 0 ? (
-            <p className="text-sm text-slate-500">No incident timeline records.</p>
-          ) : (
-            recentTimeline.map((event, idx) => (
-              <div key={`${event.timestamp}_${idx}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                <div className="flex items-center justify-between text-xs">
-                  <Badge variant="outline">{event.source}</Badge>
-                  <span className="font-mono text-slate-500">{new Date(event.timestamp).toLocaleTimeString()}</span>
-                </div>
-                <p className="mt-2 text-sm text-slate-700">{event.message}</p>
-              </div>
-            ))
-          )}
-        </CardContent>
-      </Card>
-    </div>
+      </motion.div>
+    </motion.div>
   );
 }

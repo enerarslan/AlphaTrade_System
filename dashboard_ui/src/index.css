@@ -6,35 +6,40 @@
 
 @layer base {
   :root {
-    --background: 45 30% 96%;
-    --foreground: 222 35% 16%;
+    --background: 222 47% 6%;
+    --foreground: 210 40% 92%;
 
-    --card: 0 0% 100%;
-    --card-foreground: 222 35% 16%;
+    --card: 222 40% 9%;
+    --card-foreground: 210 40% 92%;
 
-    --popover: 0 0% 100%;
-    --popover-foreground: 222 35% 16%;
+    --popover: 222 40% 9%;
+    --popover-foreground: 210 40% 92%;
 
-    --primary: 192 88% 33%;
-    --primary-foreground: 0 0% 100%;
+    --primary: 187 85% 43%;
+    --primary-foreground: 222 47% 6%;
 
-    --secondary: 217 32% 92%;
-    --secondary-foreground: 222 35% 16%;
+    --secondary: 217 30% 16%;
+    --secondary-foreground: 210 40% 85%;
 
-    --muted: 214 24% 92%;
-    --muted-foreground: 216 15% 40%;
+    --muted: 217 28% 14%;
+    --muted-foreground: 215 20% 55%;
 
     --accent: 35 92% 51%;
-    --accent-foreground: 222 35% 16%;
+    --accent-foreground: 222 47% 6%;
 
     --destructive: 0 72% 48%;
     --destructive-foreground: 0 0% 100%;
 
-    --border: 217 25% 83%;
-    --input: 217 25% 83%;
-    --ring: 192 88% 33%;
+    --border: 215 25% 18%;
+    --input: 215 25% 18%;
+    --ring: 187 85% 43%;
 
     --radius: 0.85rem;
+
+    --glow-cyan: 0 0 20px rgba(6, 182, 212, 0.3), 0 0 60px rgba(6, 182, 212, 0.1);
+    --glow-emerald: 0 0 20px rgba(16, 185, 129, 0.3), 0 0 60px rgba(16, 185, 129, 0.1);
+    --glow-rose: 0 0 20px rgba(244, 63, 94, 0.3), 0 0 60px rgba(244, 63, 94, 0.1);
+    --glow-amber: 0 0 20px rgba(245, 158, 11, 0.3), 0 0 60px rgba(245, 158, 11, 0.1);
   }
 
   * {
@@ -45,31 +50,99 @@
     @apply bg-background text-foreground antialiased;
     font-family: "Space Grotesk", "Segoe UI", sans-serif;
     min-height: 100vh;
+    background:
+      radial-gradient(ellipse at 15% 5%, rgba(6, 182, 212, 0.08) 0%, transparent 50%),
+      radial-gradient(ellipse at 85% 20%, rgba(16, 185, 129, 0.05) 0%, transparent 50%),
+      radial-gradient(ellipse at 50% 90%, rgba(99, 102, 241, 0.04) 0%, transparent 50%),
+      hsl(222, 47%, 6%);
+    background-attachment: fixed;
   }
 
   code,
   .font-mono {
     font-family: "IBM Plex Mono", monospace;
   }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(222, 40%, 9%);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(215, 25%, 22%);
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(215, 25%, 30%);
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply rounded-2xl border border-white/[0.07] bg-white/[0.03] shadow-lg backdrop-blur-xl;
+  }
+
+  .glass-card {
+    @apply rounded-xl border border-white/[0.08] bg-white/[0.04] backdrop-blur-md;
+  }
+
+  .glass-input {
+    @apply rounded-lg border border-white/[0.12] bg-white/[0.06] px-3 text-slate-200 placeholder-slate-500 backdrop-blur-sm transition-colors focus:border-cyan-500/50 focus:outline-none focus:ring-1 focus:ring-cyan-500/30;
+  }
+
+  .glass-select {
+    @apply rounded-lg border border-white/[0.12] bg-white/[0.06] px-3 text-slate-200 backdrop-blur-sm transition-colors focus:border-cyan-500/50 focus:outline-none focus:ring-1 focus:ring-cyan-500/30;
+    color-scheme: dark;
+  }
+
+  .glass-select option {
+    @apply bg-slate-900 text-slate-200;
+  }
 }
 
 @layer utilities {
+  .glow-cyan {
+    box-shadow: var(--glow-cyan);
+  }
+  .glow-emerald {
+    box-shadow: var(--glow-emerald);
+  }
+  .glow-rose {
+    box-shadow: var(--glow-rose);
+  }
+  .glow-amber {
+    box-shadow: var(--glow-amber);
+  }
+
+  .text-glow-cyan {
+    text-shadow: 0 0 12px rgba(6, 182, 212, 0.5);
+  }
+  .text-glow-emerald {
+    text-shadow: 0 0 12px rgba(16, 185, 129, 0.5);
+  }
+  .text-glow-rose {
+    text-shadow: 0 0 12px rgba(244, 63, 94, 0.5);
+  }
+
   .panel-surface {
-    @apply rounded-2xl border border-slate-200 bg-white/90 shadow-sm backdrop-blur;
+    @apply glass-panel;
   }
 
   .mission-gradient {
     background:
-      radial-gradient(circle at 12% 18%, rgba(15, 118, 110, 0.2), transparent 38%),
-      radial-gradient(circle at 85% 14%, rgba(251, 146, 60, 0.2), transparent 40%),
-      linear-gradient(140deg, #f4f9ff 0%, #f9f7f2 45%, #eef6f4 100%);
+      radial-gradient(ellipse at 15% 5%, rgba(6, 182, 212, 0.06) 0%, transparent 50%),
+      radial-gradient(ellipse at 85% 20%, rgba(16, 185, 129, 0.04) 0%, transparent 50%),
+      hsl(222, 47%, 6%);
   }
 
   .mission-grid {
     background-image:
-      linear-gradient(rgba(148, 163, 184, 0.16) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(148, 163, 184, 0.16) 1px, transparent 1px);
-    background-size: 28px 28px;
+      linear-gradient(rgba(148, 163, 184, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148, 163, 184, 0.04) 1px, transparent 1px);
+    background-size: 32px 32px;
   }
 
   .status-ping::before {
@@ -77,9 +150,21 @@
     position: absolute;
     inset: -2px;
     border-radius: 9999px;
-    background: radial-gradient(circle, rgba(16, 185, 129, 0.35), transparent 65%);
+    background: radial-gradient(circle, rgba(6, 182, 212, 0.35), transparent 65%);
     animation: statusPulse 2.2s ease-in-out infinite;
     z-index: -1;
+  }
+
+  .danger-zone {
+    background:
+      repeating-linear-gradient(
+        -45deg,
+        transparent,
+        transparent 8px,
+        rgba(244, 63, 94, 0.04) 8px,
+        rgba(244, 63, 94, 0.04) 16px
+      );
+    border: 1px solid rgba(244, 63, 94, 0.2);
   }
 }
 
@@ -104,6 +189,36 @@
   }
 }
 
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
 .animate-signal-tape {
   animation: signalTape 28s linear infinite;
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.5s ease-out forwards;
+}
+
+.animate-shimmer {
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.04) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: shimmer 3s ease-in-out infinite;
 }

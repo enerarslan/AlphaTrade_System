@@ -1,270 +1,272 @@
 import { useEffect, useMemo, useState } from "react";
-import { Play, RotateCcw, Square, Zap } from "lucide-react";
+import { motion } from "framer-motion";
+import { Activity, AlertOctagon, Gauge, Play, RefreshCcw, Square, Timer, Zap } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useStore } from "@/lib/store";
 
-const defaultPayload = {
-  mode: "paper" as const,
-  symbols: ["AAPL", "MSFT", "NVDA"],
-  strategy: "momentum",
-  capital: 100000,
+const stagger = {
+  hidden: { opacity: 0 },
+  show: { opacity: 1, transition: { staggerChildren: 0.08 } },
 };
+const fadeUp = {
+  hidden: { opacity: 0, y: 12 },
+  show: { opacity: 1, y: 0, transition: { duration: 0.4, ease: "easeOut" as const } },
+} as const;
 
-export default function TradingTerminalPage() {
+const modeOptions = ["paper", "live", "dry-run"] as const;
+
+export default function TradingPage() {
   const {
-    hasPermission,
-    mfaStatus,
-    orders,
+    tradingStatus,
     tca,
     executionQuality,
-    tradingStatus,
+    orders,
+    jobs,
+    mfaStatus,
+    hasPermission,
+    fetchTradingStatus,
+    fetchTCA,
+    fetchExecutionQuality,
+    fetchOrders,
+    fetchJobs,
     startTrading,
     stopTrading,
     restartTrading,
     activateKillSwitch,
-    createJob,
-    fetchOrders,
-    fetchTCA,
-    fetchExecutionQuality,
-    fetchTradingStatus,
-    fetchJobs,
-    jobs,
+    cancelJob,
   } = useStore();
 
-  const [mode, setMode] = useState<"live" | "paper" | "dry-run">(defaultPayload.mode);
-  const [symbols, setSymbols] = useState(defaultPayload.symbols.join(","));
-  const [strategy, setStrategy] = useState(defaultPayload.strategy);
-  const [capital, setCapital] = useState(defaultPayload.capital);
-  const [killReason, setKillReason] = useState("manual_activation");
+  const [mode, setMode] = useState<(typeof modeOptions)[number]>("paper");
+  const [symbols, setSymbols] = useState("AAPL,MSFT");
+  const [killReason, setKillReason] = useState("");
   const [mfaCode, setMfaCode] = useState("");
-
-  useEffect(() => {
-    void Promise.all([fetchOrders(), fetchTCA(), fetchExecutionQuality(), fetchTradingStatus(), fetchJobs()]);
-  }, [fetchOrders, fetchTCA, fetchExecutionQuality, fetchTradingStatus, fetchJobs]);
-
-  const topOrders = useMemo(() => orders.slice(0, 40), [orders]);
-  const runningJobs = jobs.filter((x) => x.status === "running" || x.status === "queued").slice(0, 6);
-  const canControlTrading = hasPermission("control.trading.start") || hasPermission("control.trading.restart") || hasPermission("control.trading.stop");
-  const canStart = hasPermission("control.trading.start");
-  const canRestart = hasPermission("control.trading.restart");
-  const canStop = hasPermission("control.trading.stop");
-  const canKill = hasPermission("control.risk.kill_switch.activate");
-  const canCreateJobs = hasPermission("control.jobs.create");
   const requiresMfa = Boolean(mfaStatus?.mfa_enabled);
 
-  const tradingPayload = {
-    mode,
-    symbols: symbols.split(",").map((x) => x.trim().toUpperCase()).filter(Boolean),
-    strategy,
-    capital,
-    ...(mfaCode ? { mfa_code: mfaCode } : {}),
-  };
+  useEffect(() => {
+    void fetchTradingStatus();
+    void fetchTCA();
+    void fetchExecutionQuality();
+    void fetchOrders();
+    void fetchJobs();
+    const timer = setInterval(() => {
+      void fetchTradingStatus();
+      void fetchOrders();
+      void fetchJobs();
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [fetchTradingStatus, fetchTCA, fetchExecutionQuality, fetchOrders, fetchJobs]);
+
+  const canControl = hasPermission("control.trading.start");
+  const canKill = hasPermission("control.risk.kill_switch.activate");
+  const activeOrders = useMemo(() => orders.filter((o) => o.status?.toLowerCase() !== "filled" && o.status?.toLowerCase() !== "cancelled").slice(0, 15), [orders]);
+  const recentJobs = useMemo(() => jobs.slice(0, 8), [jobs]);
 
   return (
-    <div className="space-y-6">
-      <section className="grid gap-4 lg:grid-cols-3">
-        <Card className="border-slate-200 bg-white/90 lg:col-span-2">
+    <motion.div variants={stagger} initial="hidden" animate="show" className="space-y-6">
+      {/* Header */}
+      <motion.section variants={fadeUp} className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-6 backdrop-blur-sm">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-500/70">Execution Terminal</p>
+        <h1 className="mt-2 text-3xl font-bold text-slate-100">Trading Desk</h1>
+        <p className="mt-1 text-sm text-slate-400">Engine control, execution quality, active orders, and command orchestration.</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Badge variant={tradingStatus?.running ? "success" : "outline"}>
+            <Activity size={12} className="mr-1" />
+            {tradingStatus?.running ? "Engine Live" : "Engine Idle"}
+          </Badge>
+          {tradingStatus?.running && (
+            <>
+              <Badge variant="outline">PID {tradingStatus.pid}</Badge>
+              <Badge variant="outline">
+                <Timer size={12} className="mr-1" />
+                Since {tradingStatus.started_at ? new Date(tradingStatus.started_at).toLocaleTimeString() : "--"}
+              </Badge>
+            </>
+          )}
+        </div>
+      </motion.section>
+
+      {/* Engine Control + Kill Switch */}
+      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
+        <Card>
           <CardHeader>
-            <CardTitle>Trading Engine Control</CardTitle>
-            <CardDescription>Managed process orchestration for live/paper trading runtime.</CardDescription>
+            <CardTitle className="flex items-center gap-2">
+              <Gauge size={18} className="text-cyan-400" />
+              Engine Controls
+            </CardTitle>
+            <CardDescription>Start, stop, or restart the trading engine.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid gap-3 md:grid-cols-2">
-              <label className="text-sm">
-                Mode
-                <select
-                  className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3"
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value as "live" | "paper" | "dry-run")}
-                >
-                  <option value="paper">paper</option>
-                  <option value="dry-run">dry-run</option>
-                  <option value="live">live</option>
+            <div className="flex flex-wrap gap-3">
+              <label className="block flex-1 text-sm">
+                <span className="mb-1 block text-xs uppercase tracking-wider text-slate-500">Mode</span>
+                <select className="glass-select h-10 w-full" value={mode} onChange={(e) => setMode(e.target.value as typeof mode)}>
+                  {modeOptions.map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
                 </select>
               </label>
-              <label className="text-sm">
-                Strategy
-                <input
-                  className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3"
-                  value={strategy}
-                  onChange={(e) => setStrategy(e.target.value)}
-                />
+              <label className="block flex-[2] text-sm">
+                <span className="mb-1 block text-xs uppercase tracking-wider text-slate-500">Symbols</span>
+                <input className="glass-input h-10 w-full" value={symbols} onChange={(e) => setSymbols(e.target.value)} placeholder="AAPL,MSFT,..." />
               </label>
-              <label className="text-sm md:col-span-2">
-                Symbols (comma-separated)
-                <input
-                  className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3"
-                  value={symbols}
-                  onChange={(e) => setSymbols(e.target.value)}
-                />
-              </label>
-              <label className="text-sm">
-                Capital
-                <input
-                  className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3"
-                  type="number"
-                  value={capital}
-                  onChange={(e) => setCapital(Number(e.target.value))}
-                />
-              </label>
-              {requiresMfa ? (
-                <label className="text-sm">
-                  MFA Code
-                  <input
-                    className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3 font-mono"
-                    value={mfaCode}
-                    onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                    placeholder="6-digit TOTP"
-                  />
-                </label>
-              ) : null}
             </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <Button className="gap-2 bg-emerald-700 text-white hover:bg-emerald-600" onClick={() => void startTrading(tradingPayload)} disabled={!canStart || (mode === "live" && requiresMfa && mfaCode.length !== 6)}>
-                <Play size={16} />
-                Start
+            <div className="flex flex-wrap gap-2">
+              <Button
+                className="gap-2"
+                disabled={!canControl || tradingStatus?.running === true}
+                onClick={() => void startTrading({ mode, symbols: symbols.split(",").map((s) => s.trim()).filter(Boolean), strategy: "default", capital: 100000 })}
+              >
+                <Play size={16} /> Start
               </Button>
-              <Button variant="outline" className="gap-2" onClick={() => void restartTrading(tradingPayload)} disabled={!canRestart || (mode === "live" && requiresMfa && mfaCode.length !== 6)}>
-                <RotateCcw size={16} />
-                Restart
+              <Button
+                variant="secondary"
+                className="gap-2"
+                disabled={!canControl || !tradingStatus?.running}
+                onClick={() => void restartTrading({ mode, symbols: symbols.split(",").map((s) => s.trim()).filter(Boolean), strategy: "default", capital: 100000 })}
+              >
+                <RefreshCcw size={16} /> Restart
               </Button>
-              <Button variant="destructive" className="gap-2" onClick={() => void stopTrading()} disabled={!canStop}>
-                <Square size={16} />
-                Stop
+              <Button
+                variant="destructive"
+                className="gap-2"
+                disabled={!canControl || !tradingStatus?.running}
+                onClick={() => void stopTrading()}
+              >
+                <Square size={16} /> Stop
               </Button>
-              {!canControlTrading ? <p className="text-xs text-rose-700">Role lacks trading control permissions.</p> : null}
             </div>
-
-            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
-              <p className="text-sm font-medium text-amber-900">Emergency Kill Switch</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                <input
-                  className="h-10 min-w-[240px] flex-1 rounded-lg border border-amber-300 bg-white px-3"
-                  value={killReason}
-                  onChange={(e) => setKillReason(e.target.value)}
-                />
-                <Button className="gap-2 bg-rose-700 text-white hover:bg-rose-600" onClick={() => void activateKillSwitch(killReason, mfaCode || undefined)} disabled={!canKill || (requiresMfa && mfaCode.length !== 6)}>
-                  <Zap size={16} />
-                  Trigger Kill Switch
-                </Button>
-              </div>
-              {!canKill ? <p className="mt-2 text-xs text-rose-700">Role lacks kill switch permission.</p> : null}
-            </div>
+            {!canControl && <p className="text-xs text-rose-400">Role lacks trading control permission.</p>}
           </CardContent>
         </Card>
 
-        <Card className="border-slate-200 bg-white/90">
+        <Card className="danger-zone">
           <CardHeader>
-            <CardTitle>Runtime State</CardTitle>
-            <CardDescription>Current process and execution quality</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3 text-sm">
-            <div className="flex items-center justify-between">
-              <span>Engine</span>
-              <Badge variant={tradingStatus?.running ? "success" : "outline"}>
-                {tradingStatus?.running ? "Running" : "Stopped"}
-              </Badge>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>PID</span>
-              <span className="font-mono">{tradingStatus?.pid ?? "--"}</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>Fill Probability</span>
-              <span>{((tca?.fill_probability ?? 0) * 100).toFixed(1)}%</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>Execution Speed</span>
-              <span>{(tca?.execution_speed_ms ?? 0).toFixed(1)} ms</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>Slippage</span>
-              <span>{(tca?.slippage_bps ?? 0).toFixed(2)} bps</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>Arrival Delta</span>
-              <span>{(executionQuality?.arrival_price_delta_bps ?? 0).toFixed(2)} bps</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>Reject Rate</span>
-              <span>{((executionQuality?.rejection_rate ?? 0) * 100).toFixed(2)}%</span>
-            </div>
-          </CardContent>
-        </Card>
-      </section>
-
-      <section className="grid gap-4 lg:grid-cols-2">
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader>
-            <CardTitle>Command Jobs</CardTitle>
-            <CardDescription>Asynchronous operational workloads</CardDescription>
+            <CardTitle className="flex items-center gap-2 text-rose-400">
+              <AlertOctagon size={18} />
+              Kill Switch
+            </CardTitle>
+            <CardDescription>Emergency halt — cancels all orders and stops engine immediately.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={() => void createJob("health", ["check", "--full"])} disabled={!canCreateJobs}>
-                Run Health Check
-              </Button>
-              <Button variant="outline" onClick={() => void createJob("data", ["db-status"])} disabled={!canCreateJobs}>
-                DB Status
-              </Button>
-              <Button variant="outline" onClick={() => void createJob("features", ["compute", "--symbols", "AAPL", "MSFT"])} disabled={!canCreateJobs}>
-                Feature Compute
-              </Button>
+            <label className="block text-sm">
+              <span className="mb-1 block text-xs uppercase tracking-wider text-slate-500">Reason</span>
+              <input className="glass-input h-10 w-full" value={killReason} onChange={(e) => setKillReason(e.target.value)} placeholder="e.g. Flash crash detected" />
+            </label>
+            {requiresMfa && (
+              <label className="block text-sm">
+                <span className="mb-1 block text-xs uppercase tracking-wider text-slate-500">MFA Code</span>
+                <input className="glass-input h-10 w-full font-mono" value={mfaCode} onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6-digit TOTP" />
+              </label>
+            )}
+            <Button
+              variant="destructive"
+              className="w-full gap-2"
+              disabled={!canKill || !killReason || (requiresMfa && mfaCode.length !== 6)}
+              onClick={() => void activateKillSwitch(killReason, mfaCode || undefined)}
+            >
+              <Zap size={16} /> Activate Kill Switch
+            </Button>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* Execution Quality */}
+      <motion.div variants={fadeUp}>
+        <Card>
+          <CardHeader>
+            <CardTitle>Execution Quality</CardTitle>
+            <CardDescription>TCA metrics and execution analytics.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              {[
+                { label: "Fill Prob", value: `${((tca?.fill_probability ?? 0) * 100).toFixed(1)}%`, accent: "emerald" as const },
+                { label: "Slippage", value: `${(tca?.slippage_bps ?? 0).toFixed(2)} bps`, accent: "amber" as const },
+                { label: "Market Impact", value: `${(tca?.market_impact_bps ?? 0).toFixed(2)} bps`, accent: "amber" as const },
+                { label: "Arrival Δ", value: `${(executionQuality?.arrival_price_delta_bps ?? 0).toFixed(2)} bps`, accent: "cyan" as const },
+                { label: "Latency", value: `${Object.values(executionQuality?.latency_distribution_ms ?? {})[0]?.toFixed(1) ?? "--"}ms`, accent: "cyan" as const },
+                { label: "Reject Rate", value: `${((executionQuality?.rejection_rate ?? 0) * 100).toFixed(2)}%`, accent: "rose" as const },
+              ].map((m) => (
+                <div key={m.label} className={`rounded-xl border bg-white/[0.03] px-4 py-3 ${m.accent === "emerald" ? "border-emerald-500/20" : m.accent === "amber" ? "border-amber-500/20" : m.accent === "cyan" ? "border-cyan-500/20" : "border-rose-500/20"}`}>
+                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">{m.label}</p>
+                  <p className={`mt-1 font-mono text-lg font-bold ${m.accent === "emerald" ? "text-emerald-300" : m.accent === "amber" ? "text-amber-300" : m.accent === "cyan" ? "text-cyan-300" : "text-rose-300"}`}>{m.value}</p>
+                </div>
+              ))}
             </div>
-            {runningJobs.length === 0 ? (
-              <p className="text-sm text-slate-500">No running/queued job.</p>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* Order Blotter + Command Jobs */}
+      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Active Orders</CardTitle>
+            <CardDescription>{activeOrders.length} open orders on blotter.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {activeOrders.length === 0 ? (
+              <p className="text-sm text-slate-500">No active orders.</p>
             ) : (
-              runningJobs.map((job) => (
-                <div key={job.job_id} className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm">
-                  <div className="flex items-center justify-between">
-                    <span className="font-medium">{job.command}</span>
-                    <Badge variant="outline">{job.status}</Badge>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-white/[0.06] text-xs uppercase tracking-wider text-slate-500">
+                      <th className="pb-2 pr-4">Symbol</th>
+                      <th className="pb-2 pr-4">Side</th>
+                      <th className="pb-2 pr-4">Qty</th>
+                      <th className="pb-2 pr-4">Price</th>
+                      <th className="pb-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-slate-300">
+                    {activeOrders.map((o) => (
+                      <tr key={o.order_id} className="border-b border-white/[0.04] hover:bg-white/[0.02]">
+                        <td className="py-2 pr-4 font-semibold text-slate-100">{o.symbol}</td>
+                        <td className={`py-2 pr-4 font-mono ${o.side === "BUY" ? "text-emerald-400" : "text-rose-400"}`}>{o.side}</td>
+                        <td className="py-2 pr-4 font-mono">{o.quantity}</td>
+                        <td className="py-2 pr-4 font-mono">${Number(o.limit_price ?? 0).toFixed(2)}</td>
+                        <td className="py-2"><Badge variant="outline">{o.status}</Badge></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Command Jobs</CardTitle>
+            <CardDescription>Recent command orchestration jobs.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {recentJobs.length === 0 ? (
+              <p className="text-sm text-slate-500">No jobs found.</p>
+            ) : (
+              recentJobs.map((job) => (
+                <div key={job.job_id} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                  <div>
+                    <p className="font-medium text-slate-200">{job.command}</p>
+                    <p className="truncate font-mono text-xs text-slate-500">{job.args.join(" ")}</p>
                   </div>
-                  <p className="mt-1 truncate font-mono text-xs text-slate-600">{job.args.join(" ")}</p>
+                  <div className="flex items-center gap-2">
+                    <Badge variant={job.status === "succeeded" ? "success" : job.status === "failed" ? "error" : "warning"}>
+                      {job.status}
+                    </Badge>
+                    {(job.status === "queued" || job.status === "running") && (
+                      <Button variant="ghost" size="sm" onClick={() => void cancelJob(job.job_id)}>Cancel</Button>
+                    )}
+                  </div>
                 </div>
               ))
             )}
           </CardContent>
         </Card>
-
-        <Card className="border-slate-200 bg-white/90">
-          <CardHeader>
-            <CardTitle>Active Blotter</CardTitle>
-            <CardDescription>Latest 40 orders</CardDescription>
-          </CardHeader>
-          <CardContent className="max-h-[420px] overflow-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="sticky top-0 bg-white">
-                <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500">
-                  <th className="py-2">Symbol</th>
-                  <th className="py-2">Side</th>
-                  <th className="py-2">Qty</th>
-                  <th className="py-2">Status</th>
-                  <th className="py-2">Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                {topOrders.map((order) => (
-                  <tr key={order.order_id} className="border-b border-slate-100">
-                    <td className="py-2 font-medium text-slate-800">{order.symbol}</td>
-                    <td className="py-2">{order.side}</td>
-                    <td className="py-2">{order.quantity}</td>
-                    <td className="py-2">
-                      <Badge variant={order.status === "FILLED" ? "success" : "outline"}>{order.status}</Badge>
-                    </td>
-                    <td className="py-2 text-xs text-slate-500">
-                      {order.updated_at ? new Date(order.updated_at).toLocaleTimeString() : "--"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </CardContent>
-        </Card>
-      </section>
-    </div>
+      </motion.div>
+    </motion.div>
   );
 }

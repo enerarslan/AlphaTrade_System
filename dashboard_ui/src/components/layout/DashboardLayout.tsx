@@ -1,5 +1,6 @@
 import { useMemo, useState, type ElementType } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   Activity,
   AlertTriangle,
@@ -14,6 +15,7 @@ import {
   ShieldAlert,
   Workflow,
   X,
+  Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -61,84 +63,105 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <div className="mission-gradient min-h-screen w-full text-slate-900">
-      <div className="pointer-events-none fixed left-[-120px] top-[-140px] h-72 w-72 rounded-full bg-teal-300/20 blur-3xl" />
-      <div className="pointer-events-none fixed bottom-[-130px] right-[-90px] h-80 w-80 rounded-full bg-amber-300/20 blur-3xl" />
+    <div className="min-h-screen w-full text-slate-200">
+      {/* Ambient glow orbs */}
+      <div className="pointer-events-none fixed left-[-180px] top-[-200px] h-[400px] w-[400px] rounded-full bg-cyan-500/[0.06] blur-[100px]" />
+      <div className="pointer-events-none fixed bottom-[-150px] right-[-120px] h-[350px] w-[350px] rounded-full bg-emerald-500/[0.05] blur-[100px]" />
+      <div className="pointer-events-none fixed right-[30%] top-[40%] h-[300px] w-[300px] rounded-full bg-indigo-500/[0.03] blur-[100px]" />
+
       <div className="mx-auto flex max-w-[1800px]">
+        {/* Sidebar */}
         <aside
           className={cn(
-            "fixed inset-y-0 left-0 z-40 w-72 border-r border-slate-200 bg-white/90 p-5 backdrop-blur-xl transition-transform lg:relative lg:translate-x-0",
+            "fixed inset-y-0 left-0 z-40 w-72 border-r border-white/[0.06] bg-slate-950/80 p-5 backdrop-blur-2xl transition-transform lg:relative lg:translate-x-0",
             mobileOpen ? "translate-x-0" : "-translate-x-full",
           )}
         >
           <div className="mb-8 flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">AlphaTrade</p>
-              <h1 className="text-2xl font-bold tracking-tight text-slate-900">Control Plane</h1>
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-cyan-500/20 text-cyan-400">
+                <Zap size={18} />
+              </div>
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.24em] text-cyan-500/70">AlphaTrade</p>
+                <h1 className="text-lg font-bold tracking-tight text-slate-100">Control Plane</h1>
+              </div>
             </div>
             <Button variant="ghost" size="icon" className="lg:hidden" onClick={() => setMobileOpen(false)}>
               <X size={18} />
             </Button>
           </div>
 
-          <nav className="space-y-1.5">
+          <nav className="space-y-1">
             {visibleNavItems.map((item) => {
               const active = location.pathname === item.href;
               return (
                 <Link key={item.href} to={item.href} onClick={() => setMobileOpen(false)}>
-                  <div
+                  <motion.div
+                    whileHover={{ x: 2 }}
                     className={cn(
-                      "group flex items-center justify-between rounded-xl border px-4 py-3 text-sm transition",
+                      "group flex items-center justify-between rounded-xl border px-4 py-3 text-sm transition-all duration-200",
                       active
-                        ? "border-sky-300 bg-sky-50 text-sky-900 shadow-sm"
-                        : "border-transparent text-slate-600 hover:border-slate-200 hover:bg-white",
+                        ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-300 shadow-[0_0_15px_rgba(6,182,212,0.1)]"
+                        : "border-transparent text-slate-400 hover:border-white/[0.08] hover:bg-white/[0.04] hover:text-slate-200",
                     )}
                   >
                     <div className="flex items-center gap-3">
-                      <item.icon size={18} />
+                      <item.icon size={18} className={active ? "text-cyan-400" : ""} />
                       <span className="font-medium">{item.label}</span>
                     </div>
                     {item.href === "/alerts" && activeAlerts > 0 ? (
                       <Badge variant="warning">{activeAlerts}</Badge>
                     ) : null}
-                  </div>
+                    {active && (
+                      <div className="h-1.5 w-1.5 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(6,182,212,0.6)]" />
+                    )}
+                  </motion.div>
                 </Link>
               );
             })}
           </nav>
 
-          <div className="mt-8 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Session</p>
-            <p className="mt-1 text-sm text-slate-700">{user?.username ?? "operator"}</p>
+          {/* Session Card */}
+          <div className="mt-8 rounded-xl border border-white/[0.08] bg-white/[0.03] p-4 backdrop-blur-sm">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">Session</p>
+            <p className="mt-1 text-sm font-medium text-slate-200">{user?.username ?? "operator"}</p>
             <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <Badge variant="outline">{role.toUpperCase()}</Badge>
               <Badge variant={mfaStatus?.mfa_enabled ? "success" : "warning"}>
                 MFA {mfaStatus?.mfa_enabled ? "ON" : "OFF"}
               </Badge>
             </div>
-            <Button className="mt-4 w-full justify-start gap-2 bg-slate-900 text-white hover:bg-slate-800" onClick={onLogout}>
+            <Button className="mt-4 w-full justify-start gap-2" variant="outline" onClick={onLogout}>
               <LogOut size={16} />
               Sign Out
             </Button>
           </div>
         </aside>
 
-        {mobileOpen ? (
-          <button
-            className="fixed inset-0 z-30 bg-slate-900/40 lg:hidden"
-            onClick={() => setMobileOpen(false)}
-            aria-label="Close menu"
-          />
-        ) : null}
+        {/* Mobile overlay */}
+        <AnimatePresence>
+          {mobileOpen && (
+            <motion.button
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-30 bg-black/60 backdrop-blur-sm lg:hidden"
+              onClick={() => setMobileOpen(false)}
+              aria-label="Close menu"
+            />
+          )}
+        </AnimatePresence>
 
+        {/* Main content */}
         <div className="min-h-screen flex-1">
-          <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/80 px-4 py-3 backdrop-blur-xl lg:px-8">
+          <header className="sticky top-0 z-20 border-b border-white/[0.06] bg-slate-950/70 px-4 py-3 backdrop-blur-2xl lg:px-8">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-3">
-                <Button variant="outline" size="icon" className="lg:hidden" onClick={() => setMobileOpen(true)}>
+                <Button variant="ghost" size="icon" className="lg:hidden" onClick={() => setMobileOpen(true)}>
                   <Menu size={18} />
                 </Button>
-                <h2 className="text-lg font-semibold tracking-tight text-slate-900">
+                <h2 className="text-lg font-semibold tracking-tight text-slate-100">
                   {visibleNavItems.find((x) => x.href === location.pathname)?.label ?? "Dashboard"}
                 </h2>
               </div>
@@ -150,16 +173,25 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
                 </Badge>
                 <Badge variant={tradingStatus?.running ? "success" : "outline"}>
                   <BarChart3 size={12} className="mr-1" />
-                  {tradingStatus?.running ? `Trading PID ${tradingStatus.pid}` : "Engine Idle"}
+                  {tradingStatus?.running ? `PID ${tradingStatus.pid}` : "Engine Idle"}
                 </Badge>
                 <span className="hidden text-xs text-slate-500 md:block">
-                  Last refresh: {lastRefreshAt ? new Date(lastRefreshAt).toLocaleTimeString() : "--"}
+                  {lastRefreshAt ? new Date(lastRefreshAt).toLocaleTimeString() : "--"}
                 </span>
               </div>
             </div>
           </header>
 
-          <main className="px-4 py-6 lg:px-8">{children}</main>
+          <main className="px-4 py-6 lg:px-8">
+            <motion.div
+              key={location.pathname}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.3, ease: "easeOut" }}
+            >
+              {children}
+            </motion.div>
+          </main>
         </div>
       </div>
     </div>

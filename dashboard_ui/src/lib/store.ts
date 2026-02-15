@@ -626,14 +626,42 @@ function isStatus(error: unknown, status: number) {
   return maybeResponse?.status === status;
 }
 
+const reconnectTimers: Record<string, ReturnType<typeof setTimeout> | null> = {};
+const reconnectAttempts: Record<string, number> = {};
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function connectSocket(channel: keyof WsState, onMessage: (payload: any) => void, setWs: (connected: boolean) => void) {
+  // Clean up previous
+  if (sockets[channel]) {
+    try { sockets[channel]?.close(); } catch { /* noop */ }
+    sockets[channel] = null;
+  }
+  if (reconnectTimers[channel]) {
+    clearTimeout(reconnectTimers[channel]!);
+    reconnectTimers[channel] = null;
+  }
+
   const ws = new WebSocket(`${websocketBaseUrl}/ws/${channel}`);
   sockets[channel] = ws;
 
-  ws.onopen = () => setWs(true);
-  ws.onclose = () => setWs(false);
-  ws.onerror = () => setWs(false);
+  ws.onopen = () => {
+    reconnectAttempts[channel] = 0;
+    setWs(true);
+  };
+
+  const scheduleReconnect = () => {
+    setWs(false);
+    const attempt = (reconnectAttempts[channel] ?? 0);
+    if (attempt >= 20) return; // give up after 20 attempts
+    const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+    reconnectAttempts[channel] = attempt + 1;
+    reconnectTimers[channel] = setTimeout(() => {
+      connectSocket(channel, onMessage, setWs);
+    }, delay);
+  };
+
+  ws.onclose = scheduleReconnect;
+  ws.onerror = () => { /* onclose will fire */ };
   ws.onmessage = (event) => {
     try {
       const payload = JSON.parse(event.data);
