@@ -138,37 +138,84 @@ class TestParseArgs:
                 "0.6",
                 "--objective-weight-skew",
                 "0.2",
+                "--objective-weight-tail-risk",
+                "0.8",
+                "--objective-weight-symbol-concentration",
+                "0.35",
                 "--holdout-pct",
                 "0.2",
                 "--min-holdout-sharpe",
                 "0.1",
+                "--min-holdout-regime-sharpe",
+                "-0.04",
                 "--max-holdout-drawdown",
                 "0.25",
                 "--max-regime-shift",
                 "0.3",
+                "--max-symbol-concentration-hhi",
+                "0.57",
                 "--label-edge-cost-buffer-bps",
                 "3.0",
+                "--disable-symbol-quality-filter",
+                "--symbol-quality-min-rows",
+                "1600",
+                "--symbol-quality-min-symbols",
+                "11",
+                "--symbol-quality-max-missing-ratio",
+                "0.09",
+                "--symbol-quality-max-extreme-move-ratio",
+                "0.06",
+                "--symbol-quality-max-corporate-action-ratio",
+                "0.015",
+                "--symbol-quality-min-median-dollar-volume",
+                "2200000",
                 "--disable-dynamic-no-trade-band",
+                "--allow-partial-feature-fallback",
                 "--execution-vol-target-daily",
                 "0.01",
                 "--execution-turnover-cap",
                 "0.7",
                 "--execution-cooldown-bars",
                 "4",
+                "--execution-max-symbol-entry-share",
+                "0.63",
+                "--primary-horizon-sweep",
+                "1",
+                "5",
+                "20",
+                "--meta-label-min-confidence",
+                "0.61",
+                "--disable-meta-dynamic-threshold",
             ],
         ):
             args = parse_args()
             assert args.objective_weight_cvar == pytest.approx(0.6)
             assert args.objective_weight_skew == pytest.approx(0.2)
+            assert args.objective_weight_tail_risk == pytest.approx(0.8)
+            assert args.objective_weight_symbol_concentration == pytest.approx(0.35)
             assert args.holdout_pct == pytest.approx(0.2)
             assert args.min_holdout_sharpe == pytest.approx(0.1)
+            assert args.min_holdout_regime_sharpe == pytest.approx(-0.04)
             assert args.max_holdout_drawdown == pytest.approx(0.25)
             assert args.max_regime_shift == pytest.approx(0.3)
+            assert args.max_symbol_concentration_hhi == pytest.approx(0.57)
+            assert args.disable_symbol_quality_filter is True
+            assert args.symbol_quality_min_rows == 1600
+            assert args.symbol_quality_min_symbols == 11
+            assert args.symbol_quality_max_missing_ratio == pytest.approx(0.09)
+            assert args.symbol_quality_max_extreme_move_ratio == pytest.approx(0.06)
+            assert args.symbol_quality_max_corporate_action_ratio == pytest.approx(0.015)
+            assert args.symbol_quality_min_median_dollar_volume == pytest.approx(2_200_000.0)
             assert args.label_edge_cost_buffer_bps == pytest.approx(3.0)
             assert args.disable_dynamic_no_trade_band is True
+            assert args.allow_partial_feature_fallback is True
             assert args.execution_vol_target_daily == pytest.approx(0.01)
             assert args.execution_turnover_cap == pytest.approx(0.7)
             assert args.execution_cooldown_bars == 4
+            assert args.execution_max_symbol_entry_share == pytest.approx(0.63)
+            assert args.primary_horizon_sweep == [1, 5, 20]
+            assert args.meta_label_min_confidence == pytest.approx(0.61)
+            assert args.disable_meta_dynamic_threshold is True
 
     def test_parse_data_download_alias_and_sync_flags(self):
         with patch.object(

@@ -328,6 +328,8 @@ class LightGBMModel(TradingModel):
             "scale_pos_weight",
             "min_gain_to_split",
             "max_bin",
+            "monotone_constraints",
+            "monotone_penalty",
         }
         for key in extra_param_keys:
             if key in self._params:

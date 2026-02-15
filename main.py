@@ -673,6 +673,18 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Inner splits for mandatory nested walk-forward optimization (default: 3)",
     )
     train_parser.add_argument(
+        "--nested-outer-stability-ratio-cap",
+        type=float,
+        default=1.25,
+        help="Maximum allowed dispersion ratio for nested outer Optuna trial surfaces (default: 1.25)",
+    )
+    train_parser.add_argument(
+        "--nested-outer-stability-min-trials",
+        type=int,
+        default=8,
+        help="Minimum completed trials before applying nested outer stability gate (default: 8)",
+    )
+    train_parser.add_argument(
         "--disable-nested-walk-forward",
         action="store_true",
         help="Forbidden in institutional mode; retained for explicit fail-fast validation",
@@ -718,6 +730,24 @@ For more information, visit: https://github.com/alphatrade/docs
         type=float,
         default=0.1,
         help="Negative return skew penalty weight in objective (default: 0.1)",
+    )
+    train_parser.add_argument(
+        "--objective-weight-tail-risk",
+        type=float,
+        default=0.35,
+        help="Tail-risk penalty weight when expected shortfall breaches cap (default: 0.35)",
+    )
+    train_parser.add_argument(
+        "--objective-weight-symbol-concentration",
+        type=float,
+        default=0.20,
+        help="Penalty weight for symbol concentration (HHI) in risk objective (default: 0.20)",
+    )
+    train_parser.add_argument(
+        "--objective-expected-shortfall-cap",
+        type=float,
+        default=0.012,
+        help="Expected shortfall cap used by objective tail-risk penalty (default: 0.012)",
     )
     train_parser.add_argument(
         "--replay-manifest",
@@ -793,6 +823,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Validation gate threshold for holdout Sharpe ratio (default: 0.0)",
     )
     train_parser.add_argument(
+        "--min-holdout-regime-sharpe",
+        type=float,
+        default=-0.10,
+        help="Validation gate threshold for worst holdout regime Sharpe (default: -0.10)",
+    )
+    train_parser.add_argument(
         "--max-holdout-drawdown",
         type=float,
         default=0.35,
@@ -803,6 +839,12 @@ For more information, visit: https://github.com/alphatrade/docs
         type=float,
         default=0.35,
         help="Maximum allowed regime distribution shift across train/test/holdout (default: 0.35)",
+    )
+    train_parser.add_argument(
+        "--max-symbol-concentration-hhi",
+        type=float,
+        default=0.65,
+        help="Validation gate threshold for symbol concentration HHI (default: 0.65)",
     )
     train_parser.add_argument(
         "--label-horizons",
@@ -816,6 +858,13 @@ For more information, visit: https://github.com/alphatrade/docs
         type=int,
         default=5,
         help="Primary horizon used for cost-aware labeling (default: 5)",
+    )
+    train_parser.add_argument(
+        "--primary-horizon-sweep",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Optional sweep of primary horizons (bars) for model-horizon benchmark matrix",
     )
     train_parser.add_argument(
         "--profit-taking",
@@ -902,6 +951,17 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Temporal sample weight decay (default: 0.999)",
     )
     train_parser.add_argument(
+        "--meta-label-min-confidence",
+        type=float,
+        default=0.55,
+        help="Base minimum confidence for meta-label filtering (default: 0.55)",
+    )
+    train_parser.add_argument(
+        "--disable-meta-dynamic-threshold",
+        action="store_true",
+        help="Disable horizon/regime-adaptive meta-label confidence thresholding",
+    )
+    train_parser.add_argument(
         "--feature-groups",
         nargs="+",
         default=["technical", "statistical", "microstructure", "cross_sectional"],
@@ -909,6 +969,47 @@ For more information, visit: https://github.com/alphatrade/docs
             "Feature groups to compute (default: technical statistical "
             "microstructure cross_sectional)"
         ),
+    )
+    train_parser.add_argument(
+        "--disable-symbol-quality-filter",
+        action="store_true",
+        help="Disable symbol-level quality universe filtering before feature generation",
+    )
+    train_parser.add_argument(
+        "--symbol-quality-min-rows",
+        type=int,
+        default=1200,
+        help="Minimum row count required for symbol admission into training universe",
+    )
+    train_parser.add_argument(
+        "--symbol-quality-min-symbols",
+        type=int,
+        default=8,
+        help="Minimum symbol count enforced after quality filtering",
+    )
+    train_parser.add_argument(
+        "--symbol-quality-max-missing-ratio",
+        type=float,
+        default=0.12,
+        help="Maximum allowed missing-bar ratio per symbol",
+    )
+    train_parser.add_argument(
+        "--symbol-quality-max-extreme-move-ratio",
+        type=float,
+        default=0.08,
+        help="Maximum allowed extreme-return ratio per symbol",
+    )
+    train_parser.add_argument(
+        "--symbol-quality-max-corporate-action-ratio",
+        type=float,
+        default=0.02,
+        help="Maximum allowed corporate-action jump ratio per symbol",
+    )
+    train_parser.add_argument(
+        "--symbol-quality-min-median-dollar-volume",
+        type=float,
+        default=1_000_000.0,
+        help="Minimum median dollar volume required per symbol",
     )
     train_parser.add_argument(
         "--disable-cross-sectional",
@@ -919,6 +1020,14 @@ For more information, visit: https://github.com/alphatrade/docs
         "--strict-feature-groups",
         action="store_true",
         help="Fail training if any requested feature group cannot be materialized",
+    )
+    train_parser.add_argument(
+        "--allow-partial-feature-fallback",
+        action="store_true",
+        help=(
+            "Allow partial feature fallback (for example cross-sectional skip or "
+            "Windows emergency fallback); disabled by default for full-feature enforcement"
+        ),
     )
     train_parser.add_argument(
         "--max-cross-sectional-symbols",
@@ -950,6 +1059,11 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Skip writing computed features back to PostgreSQL for this training run",
     )
     train_parser.add_argument(
+        "--windows-fallback-features",
+        action="store_true",
+        help="Force deterministic fallback feature computation on Windows",
+    )
+    train_parser.add_argument(
         "--disable-dynamic-no-trade-band",
         action="store_true",
         help="Disable adaptive no-trade thresholding in execution-aware evaluation",
@@ -971,6 +1085,17 @@ For more information, visit: https://github.com/alphatrade/docs
         type=int,
         default=2,
         help="Cooldown bars before direction flips in execution-aware evaluation (default: 2)",
+    )
+    train_parser.add_argument(
+        "--execution-max-symbol-entry-share",
+        type=float,
+        default=0.68,
+        help="Maximum allowed symbol share of executed entries during evaluation (default: 0.68)",
+    )
+    train_parser.add_argument(
+        "--disable-lightgbm-monotonic-constraints",
+        action="store_true",
+        help="Disable automatic LightGBM monotonic constraints inferred from feature names",
     )
     train_parser.add_argument(
         "--min-deflated-sharpe",

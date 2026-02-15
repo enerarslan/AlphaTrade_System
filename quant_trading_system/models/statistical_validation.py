@@ -72,7 +72,7 @@ def calculate_probability_of_backtest_overfitting(
         choice = rng.choice(len(train_combos), max_combinations, replace=False)
         train_combos = [train_combos[i] for i in choice]
 
-    logits: list[float] = []
+    overfit_probabilities: list[float] = []
     ann = np.sqrt(float(annualization_factor))
 
     for train_indices in train_combos:
@@ -85,18 +85,22 @@ def calculate_probability_of_backtest_overfitting(
         train_sharpe = float(np.mean(train_returns) / train_std * ann) if train_std > 1e-12 else 0.0
         test_sharpe = float(np.mean(test_returns) / test_std * ann) if test_std > 1e-12 else 0.0
 
-        if train_sharpe <= 0:
+        if train_sharpe <= 0.05:
             continue
 
-        ratio = test_sharpe / train_sharpe if abs(train_sharpe) > 1e-12 else 0.0
-        prob_overfit = 1.0 / (1.0 + ratio) if ratio > 0 else 0.9
-        prob_overfit = float(np.clip(prob_overfit, 0.01, 0.99))
-        logits.append(float(np.log(prob_overfit / (1.0 - prob_overfit))))
+        # Map train-vs-test Sharpe generalization gap into a continuous overfitting probability.
+        gap = float(train_sharpe - test_sharpe)
+        scale = float(max(0.35, abs(train_sharpe)))
+        gap_score = float(np.clip(gap / scale, -4.0, 4.0))
+        prob_overfit = float(1.0 / (1.0 + np.exp(-gap_score)))
+        if test_sharpe < 0.0:
+            prob_overfit = float(max(prob_overfit, 0.70))
+        overfit_probabilities.append(float(np.clip(prob_overfit, 0.01, 0.99)))
 
-    if not logits:
-        return 0.5, "Could not compute PBO logits"
+    if not overfit_probabilities:
+        return 0.5, "Could not compute PBO probabilities"
 
-    pbo = float(np.mean(np.array(logits) > 0))
+    pbo = float(np.mean(np.asarray(overfit_probabilities, dtype=float)))
     if pbo < 0.10:
         interpretation = "Very low overfitting risk"
     elif pbo < 0.25:

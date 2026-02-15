@@ -42,6 +42,8 @@ import pickle
 import random
 import re
 import sys
+import time
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +83,19 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("train")
+
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names, but LGBMClassifier was fitted with feature names",
+)
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names, but LGBMRegressor was fitted with feature names",
+)
+warnings.filterwarnings(
+    "ignore",
+    message="no explicit representation of timezones available for np.datetime64",
+)
 
 SUPPORTED_MODELS = [
     "xgboost",
@@ -353,6 +368,11 @@ class TrainingConfig:
     objective_weight_trade_activity: float = 1.0
     objective_weight_cvar: float = 0.4
     objective_weight_skew: float = 0.1
+    objective_weight_tail_risk: float = 0.35
+    objective_weight_symbol_concentration: float = 0.20
+    objective_expected_shortfall_cap: float = 0.012
+    nested_outer_stability_ratio_cap: float = 1.25
+    nested_outer_stability_min_trials: int = 8
 
     # Model-specific parameters
     model_params: dict = field(default_factory=dict)
@@ -362,6 +382,7 @@ class TrainingConfig:
     batch_size: int = 64
     learning_rate: float = 0.001
     early_stopping_rounds: int = 10
+    primary_horizon_sweep: list[int] = field(default_factory=list)
 
     # Validation gates
     min_sharpe_ratio: float = 0.5
@@ -375,8 +396,10 @@ class TrainingConfig:
     max_deflated_sharpe_pvalue: float = 0.10
     max_pbo: float = 0.45
     min_holdout_sharpe: float = 0.0
+    min_holdout_regime_sharpe: float = -0.10
     max_holdout_drawdown: float = 0.35
     max_regime_shift: float = 0.35
+    max_symbol_concentration_hhi: float = 0.65
 
     # Target engineering (Workstream B)
     label_horizons: list[int] = field(default_factory=lambda: [1, 5, 20])
@@ -399,6 +422,8 @@ class TrainingConfig:
     # Meta-labeling (P2-3.5)
     use_meta_labeling: bool = True
     meta_model_type: str = "xgboost"
+    meta_label_min_confidence: float = 0.55
+    meta_label_dynamic_threshold: bool = True
 
     # Multiple testing correction (P1-3.1)
     apply_multiple_testing: bool = True
@@ -423,6 +448,13 @@ class TrainingConfig:
     quality_duplicate_bars_threshold: float = 0.001
     quality_extreme_move_threshold: float = 0.01
     quality_corporate_action_jump_threshold: float = 0.001
+    enable_symbol_quality_filter: bool = True
+    symbol_quality_min_rows: int = 1200
+    symbol_quality_min_symbols: int = 8
+    symbol_quality_max_missing_ratio: float = 0.12
+    symbol_quality_max_extreme_move_ratio: float = 0.08
+    symbol_quality_max_corporate_action_ratio: float = 0.02
+    symbol_quality_min_median_dollar_volume: float = 1_000_000.0
     data_max_abs_return: float = 0.35
     feature_groups: list[str] = field(
         default_factory=lambda: ["technical", "statistical", "microstructure", "cross_sectional"]
@@ -430,15 +462,18 @@ class TrainingConfig:
     enable_cross_sectional: bool = True
     max_cross_sectional_symbols: int = 20
     max_cross_sectional_rows: int = 250000
-    allow_feature_group_fallback: bool = True
+    allow_feature_group_fallback: bool = False
     feature_materialization_batch_rows: int = 5000
     feature_reuse_min_coverage: float = 0.20
     persist_features_to_postgres: bool = True
+    windows_force_fallback_features: bool = False
     holdout_pct: float = 0.15
     dynamic_no_trade_band: bool = True
     execution_vol_target_daily: float = 0.012
     execution_turnover_cap: float = 0.90
     execution_cooldown_bars: int = 2
+    execution_max_symbol_entry_share: float = 0.68
+    lightgbm_use_monotonic_constraints: bool = True
 
     def __post_init__(self):
         if not self.model_name:
@@ -456,11 +491,56 @@ class TrainingConfig:
         )
         self.objective_weight_cvar = max(0.0, float(self.objective_weight_cvar))
         self.objective_weight_skew = max(0.0, float(self.objective_weight_skew))
+        self.objective_weight_tail_risk = max(0.0, float(self.objective_weight_tail_risk))
+        self.objective_weight_symbol_concentration = max(
+            0.0,
+            float(self.objective_weight_symbol_concentration),
+        )
+        self.objective_expected_shortfall_cap = max(
+            1e-5,
+            float(self.objective_expected_shortfall_cap),
+        )
+        self.nested_outer_stability_ratio_cap = max(
+            0.1,
+            float(self.nested_outer_stability_ratio_cap),
+        )
+        self.nested_outer_stability_min_trials = max(3, int(self.nested_outer_stability_min_trials))
+        self.primary_horizon_sweep = sorted(
+            {int(h) for h in self.primary_horizon_sweep if isinstance(h, (int, float, np.integer, np.floating)) and int(h) > 0}
+        )
+        self.meta_label_min_confidence = float(np.clip(float(self.meta_label_min_confidence), 0.45, 0.95))
+        self.meta_label_dynamic_threshold = bool(self.meta_label_dynamic_threshold)
         self.holdout_pct = min(max(float(self.holdout_pct), 0.05), 0.35)
         self.execution_vol_target_daily = max(float(self.execution_vol_target_daily), 1e-4)
         self.execution_turnover_cap = min(max(float(self.execution_turnover_cap), 0.05), 1.0)
         self.execution_cooldown_bars = max(0, int(self.execution_cooldown_bars))
+        self.execution_max_symbol_entry_share = float(
+            np.clip(float(self.execution_max_symbol_entry_share), 0.50, 0.95)
+        )
         self.max_regime_shift = min(max(float(self.max_regime_shift), 0.0), 1.0)
+        self.max_symbol_concentration_hhi = min(
+            max(float(self.max_symbol_concentration_hhi), 0.10),
+            1.0,
+        )
+        self.min_holdout_regime_sharpe = float(
+            np.clip(float(self.min_holdout_regime_sharpe), -3.0, 3.0)
+        )
+        self.enable_symbol_quality_filter = bool(self.enable_symbol_quality_filter)
+        self.symbol_quality_min_rows = max(200, int(self.symbol_quality_min_rows))
+        self.symbol_quality_min_symbols = max(1, int(self.symbol_quality_min_symbols))
+        self.symbol_quality_max_missing_ratio = float(
+            np.clip(float(self.symbol_quality_max_missing_ratio), 0.0, 0.95)
+        )
+        self.symbol_quality_max_extreme_move_ratio = float(
+            np.clip(float(self.symbol_quality_max_extreme_move_ratio), 0.0, 0.95)
+        )
+        self.symbol_quality_max_corporate_action_ratio = float(
+            np.clip(float(self.symbol_quality_max_corporate_action_ratio), 0.0, 0.95)
+        )
+        self.symbol_quality_min_median_dollar_volume = max(
+            0.0,
+            float(self.symbol_quality_min_median_dollar_volume),
+        )
         self.feature_groups = [str(g).strip().lower() for g in self.feature_groups if str(g).strip()]
         if not self.feature_groups:
             self.feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
@@ -655,6 +735,7 @@ class ModelTrainer:
             )
         self._load_data_from_postgres()
         self._sanitize_loaded_data()
+        self._apply_symbol_universe_filters()
         self._capture_data_quality_report()
 
     def _sanitize_loaded_data(self) -> None:
@@ -726,6 +807,160 @@ class ModelTrainer:
             f"duplicates_removed={duplicate_count}, "
             f"invalid_ohlcv_removed={invalid_ohlcv_count}, "
             f"extreme_return_removed={extreme_return_count}"
+        )
+
+    @staticmethod
+    def _symbol_missing_ratio(group: pd.DataFrame) -> float:
+        """Estimate missing-bar ratio for one symbol stream."""
+        if group is None or group.empty:
+            return 1.0
+        ts = pd.to_datetime(group["timestamp"], utc=True, errors="coerce").dropna().sort_values()
+        if len(ts) < 2:
+            return 0.0
+        diffs = ts.diff().dropna().dt.total_seconds()
+        positive_diffs = diffs[diffs > 0]
+        if positive_diffs.empty:
+            return 0.0
+        inferred_bar_seconds = float(np.median(positive_diffs.to_numpy()))
+        if inferred_bar_seconds <= 0:
+            return 0.0
+        regular_gap_limit = inferred_bar_seconds * 1.5
+        session_break_limit = max(inferred_bar_seconds * 24.0, 6.0 * 3600.0)
+        missing_from_gaps = np.where(
+            (positive_diffs > regular_gap_limit) & (positive_diffs <= session_break_limit),
+            np.floor(positive_diffs / inferred_bar_seconds) - 1.0,
+            0.0,
+        )
+        missing_count = float(np.maximum(missing_from_gaps, 0.0).sum())
+        expected_rows = float(len(ts) + missing_count)
+        if expected_rows <= 0.0:
+            return 0.0
+        return float(np.clip(missing_count / expected_rows, 0.0, 1.0))
+
+    def _apply_symbol_universe_filters(self) -> None:
+        """Apply symbol-level quality filter before feature generation."""
+        if self.data is None or self.data.empty:
+            raise ValueError("No data loaded for symbol quality filtering.")
+        if not self.config.enable_symbol_quality_filter:
+            return
+
+        records: list[dict[str, Any]] = []
+        for symbol, group in self.data.groupby("symbol", sort=True):
+            g = group.sort_values("timestamp").reset_index(drop=True)
+            returns = pd.to_numeric(g["close"], errors="coerce").pct_change()
+            returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+            ret_obs = int(len(returns))
+            extreme_ratio = (
+                float((returns.abs() > 0.20).mean()) if ret_obs > 0 else 1.0
+            )
+            corporate_ratio = (
+                float((returns.abs() > 0.35).mean()) if ret_obs > 0 else 1.0
+            )
+            missing_ratio = self._symbol_missing_ratio(g)
+            median_dollar_volume = float(
+                np.nanmedian(
+                    np.nan_to_num(
+                        pd.to_numeric(g["close"], errors="coerce").to_numpy(dtype=float)
+                        * pd.to_numeric(g["volume"], errors="coerce").to_numpy(dtype=float),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                )
+            )
+            rows = int(len(g))
+            passes = (
+                rows >= int(self.config.symbol_quality_min_rows)
+                and missing_ratio <= float(self.config.symbol_quality_max_missing_ratio)
+                and extreme_ratio <= float(self.config.symbol_quality_max_extreme_move_ratio)
+                and corporate_ratio <= float(self.config.symbol_quality_max_corporate_action_ratio)
+                and median_dollar_volume >= float(self.config.symbol_quality_min_median_dollar_volume)
+            )
+            score = (
+                min(1.0, float(rows) / float(max(1, self.config.symbol_quality_min_rows))) * 0.35
+                + max(
+                    0.0,
+                    1.0 - (missing_ratio / max(1e-9, float(self.config.symbol_quality_max_missing_ratio))),
+                ) * 0.25
+                + max(
+                    0.0,
+                    1.0
+                    - (extreme_ratio / max(1e-9, float(self.config.symbol_quality_max_extreme_move_ratio))),
+                ) * 0.20
+                + max(
+                    0.0,
+                    1.0
+                    - (
+                        corporate_ratio
+                        / max(1e-9, float(self.config.symbol_quality_max_corporate_action_ratio))
+                    ),
+                ) * 0.10
+                + min(
+                    1.0,
+                    median_dollar_volume / max(1.0, float(self.config.symbol_quality_min_median_dollar_volume)),
+                ) * 0.10
+            )
+            records.append(
+                {
+                    "symbol": str(symbol),
+                    "rows": rows,
+                    "missing_ratio": float(missing_ratio),
+                    "extreme_move_ratio": float(extreme_ratio),
+                    "corporate_action_ratio": float(corporate_ratio),
+                    "median_dollar_volume": float(median_dollar_volume),
+                    "passes": bool(passes),
+                    "quality_score": float(np.clip(score, 0.0, 1.0)),
+                }
+            )
+
+        if not records:
+            raise ValueError("Symbol quality filter found no symbol records.")
+
+        min_symbols = int(self.config.symbol_quality_min_symbols)
+        passing_symbols = [r["symbol"] for r in records if bool(r["passes"])]
+        if len(passing_symbols) < min_symbols:
+            ranked = sorted(
+                records,
+                key=lambda r: (float(r["quality_score"]), float(r["rows"])),
+                reverse=True,
+            )
+            passing_symbols = [str(r["symbol"]) for r in ranked[: min(min_symbols, len(ranked))]]
+            self.logger.warning(
+                "Symbol quality filter kept fewer than min symbols (%d). "
+                "Using top-quality fallback universe of %d symbols.",
+                min_symbols,
+                len(passing_symbols),
+            )
+
+        keep_set = set(passing_symbols)
+        filtered = self.data[self.data["symbol"].isin(keep_set)].copy().reset_index(drop=True)
+        if filtered.empty:
+            raise ValueError("Symbol quality filter removed entire universe.")
+
+        dropped_symbols = sorted(set(self.data["symbol"].astype(str)) - keep_set)
+        self.data = filtered
+        self.training_metrics["symbol_quality_input_symbols"] = float(len(records))
+        self.training_metrics["symbol_quality_selected_symbols"] = float(len(keep_set))
+        self.training_metrics["symbol_quality_dropped_symbols"] = float(len(dropped_symbols))
+        self.training_metrics["symbol_quality_universe"] = sorted(list(keep_set))
+        self.training_metrics["symbol_quality_dropped_list"] = dropped_symbols
+        self.training_metrics["symbol_quality_report"] = {
+            str(r["symbol"]): {
+                "rows": float(r["rows"]),
+                "missing_ratio": float(r["missing_ratio"]),
+                "extreme_move_ratio": float(r["extreme_move_ratio"]),
+                "corporate_action_ratio": float(r["corporate_action_ratio"]),
+                "median_dollar_volume": float(r["median_dollar_volume"]),
+                "passes": bool(r["passes"]),
+                "quality_score": float(r["quality_score"]),
+            }
+            for r in records
+        }
+        self.logger.info(
+            "Symbol quality filter complete: selected=%d/%d, dropped=%d",
+            len(keep_set),
+            len(records),
+            len(dropped_symbols),
         )
 
     def _load_data_from_postgres(self) -> None:
@@ -959,19 +1194,37 @@ class ModelTrainer:
             self.logger.info("Using feature matrix loaded from PostgreSQL features table")
             return
 
-        # Windows-specific stability guard:
-        # The institutional full feature pipeline can stall on large panel datasets
-        # under native Windows runtime. Fallback path remains deterministic and
-        # keeps the end-to-end training pipeline operational.
-        if os.name == "nt":
+        # 2) Compute full institutional feature set.
+        if os.name == "nt" and self.config.windows_force_fallback_features:
             self.logger.warning(
-                "Using fallback feature computation on Windows for training stability."
+                "Using fallback feature computation on Windows because "
+                "--windows-fallback-features is enabled."
             )
             self._compute_features_fallback()
             return
-
-        # 2) Compute full institutional feature set.
-        self._compute_features_full_pipeline()
+        if os.name == "nt":
+            self.logger.info(
+                "Windows runtime detected: enforcing full feature pipeline."
+            )
+            try:
+                self._compute_features_full_pipeline()
+            except Exception as exc:
+                if self.config.allow_feature_group_fallback:
+                    self.logger.warning(
+                        "Full feature pipeline failed on Windows (%s); "
+                        "allowing deterministic basic fallback because "
+                        "--allow-partial-feature-fallback is enabled.",
+                        exc,
+                    )
+                    self._compute_features_fallback()
+                    return
+                raise RuntimeError(
+                    "Full feature pipeline failed on Windows and partial fallback is disabled. "
+                    "Use --allow-partial-feature-fallback only for emergency continuity, "
+                    "or fix the feature pipeline failure."
+                ) from exc
+        else:
+            self._compute_features_full_pipeline()
 
         # 3) Persist computed features to PostgreSQL for deterministic reuse.
         if self.config.persist_features_to_postgres:
@@ -1029,6 +1282,66 @@ class ModelTrainer:
             horizons = [int(self.config.primary_label_horizon)]
         return max(1, max(horizons))
 
+    def _primary_horizon(self) -> int:
+        """Return configured primary horizon used for horizon-specific policies."""
+        return max(1, int(getattr(self.config, "primary_label_horizon", 1)))
+
+    def _horizon_threshold_policy(self) -> dict[str, float]:
+        """Return thresholding policy calibrated to primary prediction horizon."""
+        horizon = self._primary_horizon()
+        if horizon <= 1:
+            return {
+                "target_rate_scale": 0.75,
+                "min_gap": 0.06,
+                "forced_long_cap": 0.66,
+                "forced_short_floor": 0.34,
+            }
+        if horizon <= 3:
+            return {
+                "target_rate_scale": 0.85,
+                "min_gap": 0.05,
+                "forced_long_cap": 0.67,
+                "forced_short_floor": 0.33,
+            }
+        if horizon <= 5:
+            return {
+                "target_rate_scale": 1.00,
+                "min_gap": 0.04,
+                "forced_long_cap": 0.68,
+                "forced_short_floor": 0.32,
+            }
+        if horizon <= 10:
+            return {
+                "target_rate_scale": 1.05,
+                "min_gap": 0.035,
+                "forced_long_cap": 0.70,
+                "forced_short_floor": 0.30,
+            }
+        return {
+            "target_rate_scale": 1.12,
+            "min_gap": 0.03,
+            "forced_long_cap": 0.72,
+            "forced_short_floor": 0.28,
+        }
+
+    def _meta_confidence_for_horizon(self) -> float:
+        """Derive meta-label confidence floor from primary horizon."""
+        base = float(np.clip(self.config.meta_label_min_confidence, 0.45, 0.95))
+        horizon = self._primary_horizon()
+        if horizon <= 1:
+            adj = 0.08
+        elif horizon <= 3:
+            adj = 0.06
+        elif horizon <= 5:
+            adj = 0.04
+        elif horizon <= 10:
+            adj = 0.02
+        elif horizon <= 20:
+            adj = 0.00
+        else:
+            adj = -0.02
+        return float(np.clip(base + adj, 0.45, 0.95))
+
     @staticmethod
     def _sanitize_feature_columns(columns: list[str]) -> list[str]:
         """Remove columns that should never be part of model feature matrix."""
@@ -1042,6 +1355,68 @@ class ModelTrainer:
                 continue
             cleaned.append(col)
         return cleaned
+
+    def _finalize_feature_matrix(self, matrix: pd.DataFrame) -> pd.DataFrame:
+        """Finalize computed feature matrix with coverage-aware cleaning."""
+        if matrix is None or matrix.empty:
+            raise RuntimeError("Feature matrix is empty after feature computation.")
+
+        working = matrix.copy()
+        working = working.replace([np.inf, -np.inf], np.nan)
+        working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
+        working = working.dropna(subset=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+        if working.empty:
+            raise RuntimeError("Feature matrix has no valid OHLCV rows after initial sanitization.")
+
+        feature_cols = [c for c in working.columns if c not in BASE_MARKET_COLUMNS]
+        feature_cols = self._sanitize_feature_columns(feature_cols)
+        if not feature_cols:
+            raise RuntimeError("No usable feature columns were produced by feature pipeline.")
+
+        min_col_coverage = float(np.clip(self.config.feature_reuse_min_coverage * 0.50, 0.02, 0.35))
+        col_coverage = working[feature_cols].notna().mean(axis=0)
+        kept_feature_cols = [
+            col for col in feature_cols if float(col_coverage.get(col, 0.0)) >= min_col_coverage
+        ]
+        if not kept_feature_cols:
+            sorted_cols = col_coverage.sort_values(ascending=False).index.tolist()
+            kept_feature_cols = sorted_cols[: min(40, len(sorted_cols))]
+        dropped_feature_cols = len(feature_cols) - len(kept_feature_cols)
+        if dropped_feature_cols > 0:
+            self.logger.warning(
+                "Dropping %d sparse feature columns (min_coverage=%.2f%%) to preserve "
+                "full-feature training matrix viability.",
+                dropped_feature_cols,
+                min_col_coverage * 100.0,
+            )
+
+        min_row_coverage = float(np.clip(self.config.feature_reuse_min_coverage * 0.75, 0.05, 0.50))
+        row_coverage = working[kept_feature_cols].notna().mean(axis=1)
+        input_rows = len(working)
+        working = working.loc[row_coverage >= min_row_coverage].copy()
+        if working.empty:
+            raise RuntimeError(
+                "Feature matrix lost all rows after coverage filtering. "
+                "Adjust feature groups or coverage thresholds."
+            )
+
+        working = working.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+        working[kept_feature_cols] = working.groupby("symbol", sort=False)[kept_feature_cols].ffill()
+        working[kept_feature_cols] = working[kept_feature_cols].fillna(0.0)
+        working[kept_feature_cols] = working[kept_feature_cols].replace([np.inf, -np.inf], 0.0)
+
+        final_matrix = working[
+            ["symbol", "timestamp", "open", "high", "low", "close", "volume", *kept_feature_cols]
+        ].copy()
+        self.logger.info(
+            "Feature matrix finalized: rows=%d->%d, features=%d->%d, row_coverage_floor=%.2f%%",
+            input_rows,
+            len(final_matrix),
+            len(feature_cols),
+            len(kept_feature_cols),
+            min_row_coverage * 100.0,
+        )
+        return final_matrix
 
     def _feature_schema_cache_key(
         self,
@@ -1145,6 +1520,8 @@ class ModelTrainer:
 
             combined_features: dict[str, np.ndarray] = {}
             for group in groups_to_compute:
+                group_start = time.perf_counter()
+                self.logger.info(f"  {symbol}: computing {group.value} feature group...")
                 feature_config = FeatureConfig(
                     groups=[group],
                     normalization=NormalizationMethod.NONE,
@@ -1163,7 +1540,15 @@ class ModelTrainer:
                         universe_data=universe_data if group == FeatureGroup.CROSS_SECTIONAL else None,
                         use_cache=feature_config.use_cache,
                     )
+                    group_feature_count = len(feature_set.features)
                     combined_features.update(feature_set.features)
+                    self.logger.info(
+                        "  %s: %s group produced %d features in %.2fs",
+                        symbol,
+                        group.value,
+                        group_feature_count,
+                        time.perf_counter() - group_start,
+                    )
                 except Exception as e:
                     if self.config.allow_feature_group_fallback and group == FeatureGroup.CROSS_SECTIONAL:
                         self.logger.warning(
@@ -1191,8 +1576,8 @@ class ModelTrainer:
             gc.collect()
 
         if features_list:
-            self.features = pd.concat(features_list, ignore_index=True)
-            self.features = self.features.replace([np.inf, -np.inf], np.nan).dropna()
+            raw_features = pd.concat(features_list, ignore_index=True)
+            self.features = self._finalize_feature_matrix(raw_features)
             self.logger.info(
                 f"Total: {len(self.features.columns)} columns for {len(features_list)} symbols"
             )
@@ -1623,6 +2008,12 @@ class ModelTrainer:
         holdout_weights = sample_weights[holdout_mask]
 
         self.labels = dev_frame["label"]
+        if int(self.labels.nunique(dropna=True)) < 2:
+            pos_rate = float(np.mean(pd.to_numeric(self.labels, errors="coerce").fillna(0.0)))
+            raise ValueError(
+                "Label generation produced a single class in development set "
+                f"(pos_rate={pos_rate:.2%}). Adjust label horizons/thresholds before training."
+            )
         self.timestamps = dev_frame["timestamp"].to_numpy()
         self.row_symbols = dev_frame["symbol"].astype(str).to_numpy()
         self.regimes = dev_frame["regime"].astype(str).to_numpy()
@@ -1713,6 +2104,7 @@ class ModelTrainer:
         if not holdout_frame.empty:
             self.holdout_features = holdout_frame[feature_cols].reset_index(drop=True)
         self.feature_names = feature_cols
+        self._apply_model_priors()
 
         self.logger.info(
             f"Created {len(self.labels)} development labels "
@@ -1806,6 +2198,53 @@ class ModelTrainer:
         for key in all_keys:
             divergence += abs(left_distribution.get(key, 0.0) - right_distribution.get(key, 0.0))
         return float(0.5 * divergence)
+
+    @staticmethod
+    def _infer_lightgbm_monotonic_constraints(feature_names: list[str]) -> list[int]:
+        """Infer conservative monotonic constraints from feature names."""
+        constraints: list[int] = []
+        for raw_name in feature_names:
+            name = str(raw_name).strip().lower()
+            direction = 0
+
+            if "momentum" in name:
+                direction = 1
+            elif "volatility" in name or "atr" in name:
+                direction = -1
+
+            constraints.append(int(direction))
+        return constraints
+
+    def _apply_model_priors(self) -> None:
+        """Apply model-family priors that depend on prepared feature schema."""
+        if self.config.model_type != "lightgbm":
+            return
+        if not self.config.lightgbm_use_monotonic_constraints:
+            self.config.model_params.pop("monotone_constraints", None)
+            return
+        if not self.feature_names:
+            return
+
+        constraints = self._infer_lightgbm_monotonic_constraints(self.feature_names)
+        constrained_count = int(np.count_nonzero(constraints))
+        if constrained_count <= 0:
+            self.config.model_params.pop("monotone_constraints", None)
+            self.training_metrics["lightgbm_monotone_constraint_count"] = 0.0
+            return
+
+        # Keep constraints reasonably sparse to avoid forcing brittle directional assumptions.
+        if constrained_count > max(3, int(round(0.80 * len(constraints)))):
+            self.logger.info(
+                "Skipping monotonic constraints because inferred density is too high: %d/%d",
+                constrained_count,
+                len(constraints),
+            )
+            self.config.model_params.pop("monotone_constraints", None)
+            self.training_metrics["lightgbm_monotone_constraint_count"] = 0.0
+            return
+
+        self.config.model_params["monotone_constraints"] = constraints
+        self.training_metrics["lightgbm_monotone_constraint_count"] = float(constrained_count)
 
     def _generate_cv_splits(
         self,
@@ -1967,6 +2406,10 @@ class ModelTrainer:
         X = self.features.values
         y = self.labels.values
         weights = self.sample_weights if self.sample_weights is not None else None
+        regimes = self.regimes if self.regimes is not None and len(self.regimes) == len(y) else None
+        row_symbols = (
+            self.row_symbols if self.row_symbols is not None and len(self.row_symbols) == len(y) else None
+        )
         splits = self._generate_cv_splits(X, y)
         if not splits:
             self.logger.info("No CV splits available for Optuna; keeping configured defaults")
@@ -1980,12 +2423,19 @@ class ModelTrainer:
 
         def objective(trial: "optuna.Trial") -> float:
             params = search_space(trial)
+            param_robustness_penalty = self._parameter_robustness_penalty(
+                self.config.model_type,
+                params,
+            )
             fold_scores: list[float] = []
+            fold_weights: list[float] = []
 
             try:
                 for fold_idx, (train_idx, test_idx) in enumerate(splits):
                     X_train, X_test = X[train_idx], X[test_idx]
                     y_train, y_test = y[train_idx], y[test_idx]
+                    if not self._has_binary_class_support(y_train):
+                        continue
                     fold_params = self._prepare_params_for_train_size(params, len(train_idx))
                     fold_params = self._augment_params_for_train_labels(fold_params, y_train)
                     model = self._create_model(params=fold_params)
@@ -2002,9 +2452,20 @@ class ModelTrainer:
                     y_pred = np.asarray(model.predict(X_test))
                     y_proba = np.asarray(self._get_predictions_proba(model, X_test))
                     train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+                    train_forward_returns = (
+                        np.asarray(self.primary_forward_returns[train_idx], dtype=float)
+                        if isinstance(self.primary_forward_returns, np.ndarray)
+                        and len(self.primary_forward_returns) == len(y)
+                        else None
+                    )
+                    train_regimes = (
+                        np.asarray(regimes[train_idx], dtype=object) if regimes is not None else None
+                    )
                     long_threshold, short_threshold = self._derive_signal_thresholds(
                         train_proba,
                         train_labels=y_train,
+                        train_returns=train_forward_returns,
+                        train_regimes=train_regimes,
                     )
                     y_eval = np.asarray(y_test)
                     eval_len = min(len(y_eval), len(y_pred), len(y_proba))
@@ -2027,6 +2488,11 @@ class ModelTrainer:
                         if self.timestamps is not None and len(self.timestamps) == len(y)
                         else None
                     )
+                    fold_symbols = (
+                        np.asarray(row_symbols[test_idx], dtype=object)
+                        if row_symbols is not None
+                        else None
+                    )
 
                     metrics = self._calculate_fold_metrics(
                         y_eval[-eval_len:],
@@ -2041,15 +2507,31 @@ class ModelTrainer:
                             fold_event_returns[-eval_len:] if fold_event_returns is not None else None
                         ),
                         timestamps=(fold_timestamps[-eval_len:] if fold_timestamps is not None else None),
+                        symbols=(fold_symbols[-eval_len:] if fold_symbols is not None else None),
                     )
                     fold_score = float(metrics["risk_adjusted_score"])
                     if not np.isfinite(fold_score):
                         return -1e9
-                    if float(metrics.get("equity_break", 0.0)) > 0.5:
-                        raise optuna.TrialPruned()
+                    equity_break = float(metrics.get("equity_break", 0.0)) > 0.5
+                    if equity_break:
+                        fold_score -= 0.75
                     fold_scores.append(fold_score)
+                    fold_weight = self._fold_reliability_weight(
+                        metrics,
+                        evaluation_size=eval_len,
+                    )
+                    if equity_break:
+                        fold_weight = min(fold_weight, 0.35)
+                    fold_weights.append(fold_weight)
 
-                    trial.report(float(np.mean(fold_scores)), step=fold_idx)
+                    trial.report(
+                        float(
+                            self._aggregate_fold_objective(fold_scores, fold_weights)
+                            - self._inner_trial_stability_penalty(fold_scores, fold_weights)
+                            - param_robustness_penalty
+                        ),
+                        step=fold_idx,
+                    )
                     if trial.should_prune():
                         raise optuna.TrialPruned()
             except optuna.TrialPruned:
@@ -2060,7 +2542,11 @@ class ModelTrainer:
 
             if not fold_scores:
                 return -1e9
-            return float(np.mean(fold_scores))
+            return float(
+                self._aggregate_fold_objective(fold_scores, fold_weights)
+                - self._inner_trial_stability_penalty(fold_scores, fold_weights)
+                - param_robustness_penalty
+            )
 
         sampler = optuna.samplers.TPESampler(seed=self.config.seed)
         pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
@@ -2154,7 +2640,11 @@ class ModelTrainer:
         X = self.features.values
         y = self.labels.values
         weights = self.sample_weights if self.sample_weights is not None else None
+        regimes = self.regimes if self.regimes is not None and len(self.regimes) == len(y) else None
         timestamps = self.timestamps if self.timestamps is not None and len(self.timestamps) == len(X) else None
+        row_symbols = (
+            self.row_symbols if self.row_symbols is not None and len(self.row_symbols) == len(y) else None
+        )
         panel_outer_count = len(X)
         if timestamps is not None and pd.Series(timestamps).duplicated().any():
             panel_outer_count = int(
@@ -2189,15 +2679,31 @@ class ModelTrainer:
         total_trials = 0
         total_pruned = 0
         self.nested_cv_trace = []
-
-        outer_candidates: list[tuple[float, dict[str, Any], int]] = []
+        outer_candidates: list[tuple[float, float, float, dict[str, Any], int, float]] = []
+        outer_unstable_candidates: list[tuple[float, float, float, dict[str, Any], int, float]] = []
+        outer_stability_ratios: list[float] = []
 
         for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(outer_splits, start=1):
             X_outer_train = X[outer_train_idx]
             y_outer_train = y[outer_train_idx]
             X_outer_test = X[outer_test_idx]
             y_outer_test = y[outer_test_idx]
+            if not self._has_binary_class_support(y_outer_train):
+                self.logger.warning(
+                    "Outer fold %s: training labels contain a single class; fold skipped.",
+                    outer_fold,
+                )
+                continue
             w_outer_train = weights[outer_train_idx] if weights is not None else None
+            regimes_outer_train = (
+                np.asarray(regimes[outer_train_idx], dtype=object) if regimes is not None else None
+            )
+            symbols_outer_train = (
+                np.asarray(row_symbols[outer_train_idx], dtype=object) if row_symbols is not None else None
+            )
+            symbols_outer_test = (
+                np.asarray(row_symbols[outer_test_idx], dtype=object) if row_symbols is not None else None
+            )
             ts_outer_train = timestamps[outer_train_idx] if timestamps is not None else None
             ts_outer_test = timestamps[outer_test_idx] if timestamps is not None else None
             forward_outer_train = (
@@ -2260,10 +2766,17 @@ class ModelTrainer:
                 _w_outer_train: np.ndarray | None = w_outer_train,
                 _forward_outer_train: np.ndarray | None = forward_outer_train,
                 _event_outer_train: np.ndarray | None = event_outer_train,
+                _regimes_outer_train: np.ndarray | None = regimes_outer_train,
+                _symbols_outer_train: np.ndarray | None = symbols_outer_train,
                 _ts_outer_train: np.ndarray | None = ts_outer_train,
             ) -> float:
                 params = search_space(trial)
+                param_robustness_penalty = self._parameter_robustness_penalty(
+                    self.config.model_type,
+                    params,
+                )
                 fold_scores: list[float] = []
+                fold_weights: list[float] = []
                 component_samples: list[dict[str, float]] = []
 
                 try:
@@ -2272,6 +2785,8 @@ class ModelTrainer:
                         X_val = _X_outer_train[inner_val_idx]
                         y_train = _y_outer_train[inner_train_idx]
                         y_val = _y_outer_train[inner_val_idx]
+                        if not self._has_binary_class_support(y_train):
+                            continue
                         fold_params = self._prepare_params_for_train_size(
                             params, len(inner_train_idx)
                         )
@@ -2294,9 +2809,21 @@ class ModelTrainer:
                         y_pred = np.asarray(model.predict(X_val))
                         y_proba = np.asarray(self._get_predictions_proba(model, X_val))
                         train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+                        train_forward_returns = (
+                            np.asarray(_forward_outer_train[inner_train_idx], dtype=float)
+                            if _forward_outer_train is not None
+                            else None
+                        )
+                        train_regimes = (
+                            np.asarray(_regimes_outer_train[inner_train_idx], dtype=object)
+                            if _regimes_outer_train is not None
+                            else None
+                        )
                         long_threshold, short_threshold = self._derive_signal_thresholds(
                             train_proba,
                             train_labels=y_train,
+                            train_returns=train_forward_returns,
+                            train_regimes=train_regimes,
                         )
                         y_eval = np.asarray(y_val)
                         eval_len = min(len(y_eval), len(y_pred), len(y_proba))
@@ -2324,13 +2851,26 @@ class ModelTrainer:
                                 if _ts_outer_train is not None
                                 else None
                             ),
+                            symbols=(
+                                _symbols_outer_train[inner_val_idx][-eval_len:]
+                                if _symbols_outer_train is not None
+                                else None
+                            ),
                         )
                         fold_score = float(metrics["risk_adjusted_score"])
                         if not np.isfinite(fold_score):
                             return -1e9
-                        if float(metrics.get("equity_break", 0.0)) > 0.5:
-                            raise optuna.TrialPruned()
+                        equity_break = float(metrics.get("equity_break", 0.0)) > 0.5
+                        if equity_break:
+                            fold_score -= 0.75
                         fold_scores.append(fold_score)
+                        fold_weight = self._fold_reliability_weight(
+                            metrics,
+                            evaluation_size=eval_len,
+                        )
+                        if equity_break:
+                            fold_weight = min(fold_weight, 0.35)
+                        fold_weights.append(fold_weight)
                         component_samples.append(
                             {
                                 "objective_sharpe_component": float(
@@ -2351,6 +2891,12 @@ class ModelTrainer:
                                 "objective_cvar_penalty": float(
                                     metrics.get("objective_cvar_penalty", 0.0)
                                 ),
+                                "objective_tail_risk_penalty": float(
+                                    metrics.get("objective_tail_risk_penalty", 0.0)
+                                ),
+                                "objective_symbol_concentration_penalty": float(
+                                    metrics.get("objective_symbol_concentration_penalty", 0.0)
+                                ),
                                 "objective_skew_penalty": float(
                                     metrics.get("objective_skew_penalty", 0.0)
                                 ),
@@ -2360,7 +2906,15 @@ class ModelTrainer:
                             }
                         )
 
-                        trial.report(float(np.mean(fold_scores)), step=inner_idx)
+                        aggregate_score = self._aggregate_fold_objective(fold_scores, fold_weights)
+                        stability_penalty = self._inner_trial_stability_penalty(
+                            fold_scores,
+                            fold_weights,
+                        )
+                        trial.report(
+                            float(aggregate_score - stability_penalty - param_robustness_penalty),
+                            step=inner_idx,
+                        )
                         if trial.should_prune():
                             raise optuna.TrialPruned()
                 except optuna.TrialPruned:
@@ -2380,7 +2934,14 @@ class ModelTrainer:
                             for key in component_samples[0]
                         },
                     )
-                return float(np.mean(fold_scores))
+                aggregate_score = self._aggregate_fold_objective(fold_scores, fold_weights)
+                stability_penalty = self._inner_trial_stability_penalty(
+                    fold_scores,
+                    fold_weights,
+                )
+                trial.set_user_attr("param_robustness_penalty", float(param_robustness_penalty))
+                trial.set_user_attr("inner_stability_penalty", float(stability_penalty))
+                return float(aggregate_score - stability_penalty - param_robustness_penalty)
 
             study = optuna.create_study(
                 direction="maximize",
@@ -2415,6 +2976,12 @@ class ModelTrainer:
                 continue
 
             best_trial = max(completed_trials, key=lambda t: float(t.value))
+            trial_values = [float(t.value) for t in completed_trials]
+            outer_surface_stable, outer_stability_ratio = self._outer_trial_stability_gate(
+                trial_values,
+                float(best_trial.value),
+            )
+            outer_stability_ratios.append(float(outer_stability_ratio))
             best_params = dict(best_trial.params)
             best_fold_params = self._prepare_params_for_train_size(
                 best_params, len(outer_train_idx)
@@ -2422,14 +2989,22 @@ class ModelTrainer:
             best_fold_params = self._augment_params_for_train_labels(best_fold_params, y_outer_train)
 
             model = self._create_model(params=best_fold_params)
-            self._fit_model(
-                model=model,
-                X_train=X_outer_train,
-                y_train=y_outer_train,
-                X_val=X_outer_test,
-                y_val=y_outer_test,
-                sample_weights=w_outer_train,
-            )
+            try:
+                self._fit_model(
+                    model=model,
+                    X_train=X_outer_train,
+                    y_train=y_outer_train,
+                    X_val=X_outer_test,
+                    y_val=y_outer_test,
+                    sample_weights=w_outer_train,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Outer fold %s: final fit failed (%s), fold skipped.",
+                    outer_fold,
+                    exc,
+                )
+                continue
 
             y_pred = np.asarray(model.predict(X_outer_test))
             y_proba = np.asarray(self._get_predictions_proba(model, X_outer_test))
@@ -2437,6 +3012,8 @@ class ModelTrainer:
             long_threshold, short_threshold = self._derive_signal_thresholds(
                 train_proba,
                 train_labels=y_outer_train,
+                train_returns=forward_outer_train,
+                train_regimes=regimes_outer_train,
             )
             y_eval = np.asarray(y_outer_test)
             eval_len = min(len(y_eval), len(y_pred), len(y_proba))
@@ -2459,12 +3036,37 @@ class ModelTrainer:
                     event_outer_test[-eval_len:] if event_outer_test is not None else None
                 ),
                 timestamps=(ts_outer_test[-eval_len:] if ts_outer_test is not None else None),
+                symbols=(
+                    symbols_outer_test[-eval_len:] if symbols_outer_test is not None else None
+                ),
             )
             outer_score = float(metrics.get("risk_adjusted_score", -1e9))
             if not np.isfinite(outer_score):
                 continue
-
-            outer_candidates.append((outer_score, best_params, len(outer_train_idx)))
+            outer_reliability = self._fold_reliability_weight(
+                metrics,
+                evaluation_size=eval_len,
+            )
+            outer_adjusted_score = float(outer_score * (0.20 + (0.80 * outer_reliability)))
+            candidate_row = (
+                outer_adjusted_score,
+                outer_score,
+                outer_reliability,
+                best_params,
+                len(outer_train_idx),
+                float(outer_stability_ratio),
+            )
+            if outer_surface_stable:
+                outer_candidates.append(candidate_row)
+            else:
+                outer_unstable_candidates.append(candidate_row)
+                self.logger.warning(
+                    "Outer fold %s: rejected due to unstable Optuna surface "
+                    "(ratio=%.4f > cap=%.4f).",
+                    outer_fold,
+                    outer_stability_ratio,
+                    float(self.config.nested_outer_stability_ratio_cap),
+                )
             self.nested_cv_trace.append(
                 {
                     "outer_fold": int(outer_fold),
@@ -2473,6 +3075,12 @@ class ModelTrainer:
                     "inner_split_count": int(len(inner_splits)),
                     "inner_best_score": float(best_trial.value),
                     "outer_score": outer_score,
+                    "outer_adjusted_score": outer_adjusted_score,
+                    "outer_reliability": outer_reliability,
+                    "outer_stability_ratio": float(outer_stability_ratio),
+                    "outer_candidate_status": (
+                        "accepted" if outer_surface_stable else "rejected_unstable"
+                    ),
                     "best_params": best_params,
                     "objective_components": {
                         "objective_sharpe_component": float(
@@ -2490,31 +3098,75 @@ class ModelTrainer:
                         "objective_trade_activity_penalty": float(
                             metrics.get("objective_trade_activity_penalty", 0.0)
                         ),
+                        "objective_cvar_penalty": float(
+                            metrics.get("objective_cvar_penalty", 0.0)
+                        ),
+                        "objective_tail_risk_penalty": float(
+                            metrics.get("objective_tail_risk_penalty", 0.0)
+                        ),
+                        "objective_skew_penalty": float(
+                            metrics.get("objective_skew_penalty", 0.0)
+                        ),
+                        "objective_equity_break_penalty": float(
+                            metrics.get("objective_equity_break_penalty", 0.0)
+                        ),
                     },
                 }
             )
 
-        if not outer_candidates:
-            raise ValueError(
-                "Nested walk-forward optimization produced no valid outer-fold candidates."
-            )
+        selected_outer_candidates = outer_candidates
+        stability_fallback_used = False
+        if not selected_outer_candidates:
+            if outer_unstable_candidates:
+                stability_fallback_used = True
+                selected_outer_candidates = outer_unstable_candidates
+                self.logger.warning(
+                    "No stable outer-fold candidates passed stability gate; "
+                    "falling back to best unstable candidate."
+                )
+            else:
+                raise ValueError(
+                    "Nested walk-forward optimization produced no valid outer-fold candidates."
+                )
 
-        best_outer_score, best_outer_params, best_outer_train_size = max(
-            outer_candidates, key=lambda x: x[0]
-        )
+        (
+            best_outer_adjusted_score,
+            best_outer_score,
+            best_outer_reliability,
+            best_outer_params,
+            best_outer_train_size,
+            best_outer_stability_ratio,
+        ) = max(selected_outer_candidates, key=lambda x: x[0])
         self.config.model_params = {**self.config.model_params, **best_outer_params}
         self.config.model_params = self._prepare_params_for_train_size(
             self.config.model_params, best_outer_train_size
         )
 
-        outer_scores = [score for score, _, _ in outer_candidates]
+        outer_scores = [raw_score for _, raw_score, _, _, _, _ in selected_outer_candidates]
+        outer_adjusted_scores = [
+            adjusted_score for adjusted_score, _, _, _, _, _ in selected_outer_candidates
+        ]
         self.training_metrics["optuna_trials"] = int(total_trials)
         self.training_metrics["optuna_pruned_trials"] = int(total_pruned)
-        self.training_metrics["optuna_best_score"] = float(best_outer_score)
+        self.training_metrics["optuna_best_score"] = float(best_outer_adjusted_score)
         self.training_metrics["nested_outer_folds"] = int(len(self.nested_cv_trace))
+        self.training_metrics["nested_outer_candidate_folds"] = int(len(outer_candidates))
+        self.training_metrics["nested_outer_unstable_fold_count"] = int(len(outer_unstable_candidates))
+        self.training_metrics["nested_outer_stability_fallback_used"] = bool(stability_fallback_used)
         self.training_metrics["nested_inner_splits"] = int(self.config.nested_inner_splits)
         self.training_metrics["nested_mean_outer_score"] = float(np.mean(outer_scores))
+        self.training_metrics["nested_mean_outer_adjusted_score"] = float(np.mean(outer_adjusted_scores))
         self.training_metrics["nested_best_outer_score"] = float(best_outer_score)
+        self.training_metrics["nested_best_outer_adjusted_score"] = float(best_outer_adjusted_score)
+        self.training_metrics["nested_best_outer_reliability"] = float(best_outer_reliability)
+        self.training_metrics["nested_best_outer_stability_ratio"] = float(best_outer_stability_ratio)
+        if outer_stability_ratios:
+            self.training_metrics["nested_outer_stability_ratio_mean"] = float(
+                np.mean(outer_stability_ratios)
+            )
+            self.training_metrics["nested_outer_stability_ratio_max"] = float(
+                np.max(outer_stability_ratios)
+            )
         self.training_metrics["nested_cv_trace"] = self.nested_cv_trace
 
         if self.nested_cv_trace:
@@ -2524,6 +3176,10 @@ class ModelTrainer:
                 "objective_turnover_penalty",
                 "objective_calibration_penalty",
                 "objective_trade_activity_penalty",
+                "objective_cvar_penalty",
+                "objective_tail_risk_penalty",
+                "objective_skew_penalty",
+                "objective_equity_break_penalty",
             ]
             nested_component_summary = {
                 key: float(
@@ -2541,6 +3197,7 @@ class ModelTrainer:
         self.logger.info(
             "Nested walk-forward optimization complete: "
             f"outer_folds={len(self.nested_cv_trace)}, "
+            f"best_outer_adjusted_score={best_outer_adjusted_score:.6f}, "
             f"best_outer_score={best_outer_score:.6f}"
         )
 
@@ -2601,33 +3258,48 @@ class ModelTrainer:
     def _get_optuna_search_space(self, min_train_size: int | None = None):
         """Return model-specific Optuna search space function."""
         if self.config.model_type == "xgboost":
+            effective_train = max(128, int(min_train_size if min_train_size is not None else 1024))
+            estimators_low = max(180, min(320, int(np.ceil(float(effective_train) * 0.28))))
+            estimators_high = max(360, min(760, int(np.ceil(float(effective_train) * 0.95))))
+            if estimators_high <= estimators_low:
+                estimators_high = estimators_low + 40
+            max_depth_high = 6 if effective_train <= 1200 else 7
+            min_child_high = max(6, min(10, int(np.ceil(np.sqrt(float(effective_train)) * 0.24))))
             return lambda trial: {
-                "n_estimators": trial.suggest_int("n_estimators", 200, 900),
-                "max_depth": trial.suggest_int("max_depth", 3, 7),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.12, log=True),
-                "subsample": trial.suggest_float("subsample", 0.65, 0.95),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.65, 0.95),
-                "min_child_weight": trial.suggest_int("min_child_weight", 2, 10),
-                "reg_alpha": trial.suggest_float("reg_alpha", 1e-6, 5.0, log=True),
-                "reg_lambda": trial.suggest_float("reg_lambda", 1e-6, 5.0, log=True),
-                "gamma": trial.suggest_float("gamma", 0.0, 2.0),
-                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.7, 6.0, log=True),
-                "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 2.5),
+                "n_estimators": trial.suggest_int("n_estimators", estimators_low, estimators_high),
+                "max_depth": trial.suggest_int("max_depth", 3, max_depth_high),
+                "learning_rate": trial.suggest_float("learning_rate", 0.012, 0.08, log=True),
+                "subsample": trial.suggest_float("subsample", 0.72, 0.92),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.72, 0.92),
+                "min_child_weight": trial.suggest_int("min_child_weight", 3, min_child_high),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 2.5, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.3, 4.0, log=True),
+                "gamma": trial.suggest_float("gamma", 0.0, 1.25),
+                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.9, 3.0, log=True),
+                "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 1.5),
             }
 
         if self.config.model_type == "lightgbm":
+            effective_train = max(128, int(min_train_size if min_train_size is not None else 1024))
+            leaf_floor = max(30, int(np.ceil(float(effective_train) * 0.06)))
+            leaf_ceiling = max(leaf_floor, min(220, int(np.ceil(float(effective_train) * 0.24))))
+            num_leaves_high = max(24, min(48, int(np.ceil(float(effective_train) * 0.12))))
+            estimators_high = max(260, min(520, int(np.ceil(float(effective_train) * 0.60))))
+
             return lambda trial: {
-                "n_estimators": trial.suggest_int("n_estimators", 200, 900),
-                "max_depth": trial.suggest_int("max_depth", 3, 12),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.12, log=True),
-                "num_leaves": trial.suggest_int("num_leaves", 24, 128),
-                "feature_fraction": trial.suggest_float("feature_fraction", 0.65, 0.95),
-                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.65, 0.95),
-                "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 120),
-                "lambda_l1": trial.suggest_float("lambda_l1", 1e-6, 5.0, log=True),
-                "lambda_l2": trial.suggest_float("lambda_l2", 1e-6, 5.0, log=True),
-                "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.0, 0.15),
-                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.7, 6.0, log=True),
+                "n_estimators": trial.suggest_int("n_estimators", 180, estimators_high),
+                "max_depth": trial.suggest_int("max_depth", 3, 6),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 16, num_leaves_high),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.75, 0.90),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.76, 0.92),
+                "bagging_freq": trial.suggest_int("bagging_freq", 1, 4),
+                "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", leaf_floor, leaf_ceiling),
+                "lambda_l1": trial.suggest_float("lambda_l1", 0.05, 8.0, log=True),
+                "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 10.0, log=True),
+                "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.03, 0.35),
+                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.95, 1.15),
+                "max_bin": trial.suggest_int("max_bin", 127, 191),
             }
 
         if self.config.model_type == "random_forest":
@@ -2703,6 +3375,40 @@ class ModelTrainer:
     def _prepare_params_for_train_size(self, params: dict, train_size: int) -> dict:
         """Adjust sequence model params for current CV fold size."""
         adjusted = dict(params)
+
+        if self.config.model_type == "lightgbm":
+            leaf_floor = max(20, int(max(1, train_size) * 0.05))
+            existing_leaf = int(adjusted.get("min_data_in_leaf", adjusted.get("min_child_samples", 20)))
+            effective_leaf = max(existing_leaf, leaf_floor)
+            adjusted["min_data_in_leaf"] = effective_leaf
+            adjusted["min_child_samples"] = effective_leaf
+
+            max_leaves = max(16, min(48, int(max(16, train_size // max(effective_leaf, 1)))))
+            existing_leaves = int(adjusted.get("num_leaves", 31))
+            adjusted["num_leaves"] = int(np.clip(existing_leaves, 16, max_leaves))
+
+            existing_depth = int(adjusted.get("max_depth", 6))
+            adjusted["max_depth"] = int(min(existing_depth, 6))
+
+            existing_estimators = int(adjusted.get("n_estimators", 500))
+            adjusted["n_estimators"] = int(min(existing_estimators, 420))
+
+            existing_lr = float(adjusted.get("learning_rate", 0.03))
+            adjusted["learning_rate"] = float(np.clip(existing_lr, 0.015, 0.06))
+
+            adjusted["feature_fraction"] = float(
+                np.clip(float(adjusted.get("feature_fraction", 0.78)), 0.70, 0.90)
+            )
+            adjusted["bagging_fraction"] = float(
+                np.clip(float(adjusted.get("bagging_fraction", 0.82)), 0.70, 0.94)
+            )
+            adjusted["bagging_freq"] = max(1, int(adjusted.get("bagging_freq", 1)))
+            adjusted["lambda_l1"] = max(0.10, float(adjusted.get("lambda_l1", 0.10)))
+            adjusted["lambda_l2"] = max(1.00, float(adjusted.get("lambda_l2", 1.00)))
+            adjusted["scale_pos_weight"] = float(
+                np.clip(float(adjusted.get("scale_pos_weight", 1.0)), 0.90, 1.30)
+            )
+
         if self.config.model_type not in {"lstm", "transformer", "tcn"}:
             return adjusted
 
@@ -2715,6 +3421,322 @@ class ModelTrainer:
         lookback = int(adjusted.get("lookback_window", min(20, max_lookback)))
         adjusted["lookback_window"] = min(lookback, max_lookback)
         return adjusted
+
+    def _fold_reliability_weight(
+        self,
+        metrics: dict[str, float],
+        evaluation_size: int | None = None,
+    ) -> float:
+        """Estimate fold reliability from trade participation and sample support."""
+        eval_size = int(
+            evaluation_size
+            if evaluation_size is not None
+            else metrics.get("test_size", 0)
+        )
+        eval_size = max(1, eval_size)
+        target_trades = float(self._effective_trade_target(eval_size))
+        trade_count = float(max(0.0, metrics.get("trade_count", 0.0)))
+        trade_obs = float(
+            max(
+                0.0,
+                metrics.get(
+                    "trade_return_observations",
+                    metrics.get("active_net_return_observations", trade_count),
+                ),
+            )
+        )
+        active_rate = float(np.clip(metrics.get("active_signal_rate", 0.0), 0.0, 1.0))
+        sharpe_confidence = float(np.clip(metrics.get("sharpe_observation_confidence", 1.0), 0.0, 1.0))
+
+        trade_coverage = float(np.clip(trade_count / max(target_trades, 1.0), 0.0, 1.0))
+        obs_target = max(6.0, target_trades * 1.20)
+        observation_coverage = float(np.clip(trade_obs / obs_target, 0.0, 1.0))
+        active_floor = float(np.clip(target_trades / float(eval_size), 0.02, 0.20))
+        activity_coverage = float(np.clip(active_rate / max(active_floor, 1e-9), 0.0, 1.0))
+
+        weight = 0.20 + (
+            0.80 * ((0.45 * trade_coverage) + (0.35 * observation_coverage) + (0.20 * activity_coverage))
+        )
+        weight *= float(np.clip(0.70 + (0.30 * sharpe_confidence), 0.65, 1.0))
+
+        sharpe = float(metrics.get("sharpe", 0.0))
+        if sharpe < 0.0:
+            weight *= float(np.clip(1.0 + (0.12 * sharpe), 0.65, 1.0))
+        win_rate = float(np.clip(metrics.get("win_rate", 0.5), 0.0, 1.0))
+        if trade_obs >= max(4.0, target_trades * 0.35) and win_rate < 0.45:
+            weight *= float(np.clip(0.85 + ((win_rate - 0.30) * 0.60), 0.72, 1.0))
+
+        return float(np.clip(weight, 0.10, 1.0))
+
+    @staticmethod
+    def _has_binary_class_support(y: np.ndarray | list[float]) -> bool:
+        """Return True when label vector contains both classes."""
+        arr = np.asarray(y, dtype=float).reshape(-1)
+        if arr.size <= 1:
+            return False
+        y_bin = (arr >= 0.5).astype(int)
+        return bool(np.unique(y_bin).size >= 2)
+
+    @staticmethod
+    def _aggregate_fold_objective(fold_scores: list[float], fold_weights: list[float]) -> float:
+        """Aggregate fold objective with stability and downside penalties."""
+        if not fold_scores:
+            return -1e9
+
+        n = min(len(fold_scores), len(fold_weights))
+        if n <= 0:
+            return -1e9
+
+        raw_scores = np.asarray(fold_scores[:n], dtype=float)
+        raw_weights = np.asarray(fold_weights[:n], dtype=float)
+        finite_mask = np.isfinite(raw_scores)
+        if not np.any(finite_mask):
+            return -1e9
+
+        scores = raw_scores[finite_mask]
+        weights = raw_weights[finite_mask]
+        weights = np.nan_to_num(weights, nan=0.0, posinf=1.0, neginf=0.0)
+        weights = np.clip(weights, 0.05, 1.0)
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-12:
+            weights = np.ones_like(scores, dtype=float)
+            weight_sum = float(np.sum(weights))
+        norm_weights = weights / weight_sum
+
+        weighted_mean = float(np.sum(scores * norm_weights))
+        dispersion = float(np.sqrt(np.sum(norm_weights * ((scores - weighted_mean) ** 2))))
+        downside = float(np.sum(norm_weights * np.maximum(0.0, -scores)))
+        lower_tail = float(np.quantile(scores, 0.25)) if scores.size > 0 else 0.0
+        worst_score = float(np.min(scores)) if scores.size > 0 else 0.0
+        tail_penalty = float(max(0.0, -lower_tail) + (0.40 * max(0.0, -worst_score)))
+        negative_fold_ratio = float(np.mean(scores < 0.0)) if scores.size > 0 else 0.0
+        sign_imbalance_penalty = float(np.clip(negative_fold_ratio - 0.35, 0.0, 1.0))
+
+        return float(
+            weighted_mean
+            - (0.12 * dispersion)
+            - (0.18 * downside)
+            - (0.12 * tail_penalty)
+            - (0.08 * sign_imbalance_penalty)
+        )
+
+    @staticmethod
+    def _inner_trial_stability_penalty(
+        fold_scores: list[float],
+        fold_weights: list[float],
+    ) -> float:
+        """Compute additional nested-inner stability penalty for trial ranking."""
+        if not fold_scores:
+            return 0.0
+
+        n = min(len(fold_scores), len(fold_weights))
+        if n <= 1:
+            return 0.0
+
+        raw_scores = np.asarray(fold_scores[:n], dtype=float)
+        raw_weights = np.asarray(fold_weights[:n], dtype=float)
+        finite_mask = np.isfinite(raw_scores)
+        if int(np.count_nonzero(finite_mask)) <= 1:
+            return 0.0
+
+        scores = raw_scores[finite_mask]
+        weights = np.clip(
+            np.nan_to_num(raw_weights[finite_mask], nan=0.0, posinf=1.0, neginf=0.0),
+            0.05,
+            1.0,
+        )
+        weights = weights / max(float(np.sum(weights)), 1e-9)
+
+        weighted_mean = float(np.sum(scores * weights))
+        dispersion = float(np.sqrt(np.sum(weights * ((scores - weighted_mean) ** 2))))
+        lower_quartile = float(np.quantile(scores, 0.25))
+        worst_fold = float(np.min(scores))
+        negative_ratio = float(np.mean(scores < 0.0))
+        iqr = float(np.quantile(scores, 0.75) - np.quantile(scores, 0.25))
+
+        return float(
+            (0.16 * dispersion)
+            + (0.20 * max(0.0, -lower_quartile))
+            + (0.18 * max(0.0, -worst_fold))
+            + (0.10 * max(0.0, negative_ratio - 0.30))
+            + (0.08 * max(0.0, iqr))
+        )
+
+    @staticmethod
+    def _parameter_robustness_penalty(model_type: str, params: dict[str, Any]) -> float:
+        """Penalize hyperparameter extremes that often correlate with overfitting."""
+        mt = str(model_type).strip().lower()
+        p = params if isinstance(params, dict) else {}
+        penalty = 0.0
+
+        if mt == "xgboost":
+            max_depth = float(p.get("max_depth", 5))
+            n_estimators = float(p.get("n_estimators", 400))
+            learning_rate = float(p.get("learning_rate", 0.05))
+            subsample = float(p.get("subsample", 0.82))
+            colsample = float(p.get("colsample_bytree", 0.82))
+            min_child_weight = float(p.get("min_child_weight", 4))
+            scale_pos_weight = float(p.get("scale_pos_weight", 1.0))
+
+            penalty += 0.08 * max(0.0, max_depth - 5.0)
+            penalty += 0.04 * max(0.0, (n_estimators - 620.0) / 180.0)
+            penalty += 0.08 * max(0.0, (learning_rate - 0.055) / 0.025)
+            penalty += 0.05 * max(0.0, abs(subsample - 0.82) / 0.10)
+            penalty += 0.05 * max(0.0, abs(colsample - 0.82) / 0.10)
+            penalty += 0.03 * max(0.0, (6.0 - min_child_weight) / 3.0)
+            penalty += 0.05 * max(0.0, (scale_pos_weight - 2.2) / 0.8)
+            return float(max(0.0, penalty))
+
+        if mt == "lightgbm":
+            num_leaves = float(p.get("num_leaves", 24))
+            max_depth = float(p.get("max_depth", 5))
+            learning_rate = float(p.get("learning_rate", 0.03))
+            min_leaf = float(p.get("min_data_in_leaf", 40))
+
+            penalty += 0.06 * max(0.0, (num_leaves - 36.0) / 12.0)
+            penalty += 0.05 * max(0.0, max_depth - 5.0)
+            penalty += 0.06 * max(0.0, (learning_rate - 0.040) / 0.015)
+            penalty += 0.04 * max(0.0, (35.0 - min_leaf) / 10.0)
+            return float(max(0.0, penalty))
+
+        return 0.0
+
+    @staticmethod
+    def _regime_edge_profile(
+        signals: np.ndarray,
+        returns_arr: np.ndarray | None,
+        regimes_arr: np.ndarray | None,
+    ) -> dict[str, float]:
+        """Summarize regime-level active directional edge for robust thresholding."""
+        if returns_arr is None or regimes_arr is None:
+            return {
+                "evaluated_regimes": 0.0,
+                "mean_edge": 0.0,
+                "worst_edge": 0.0,
+                "edge_dispersion": 0.0,
+                "negative_regime_share": 0.0,
+            }
+
+        signals_arr = np.asarray(signals, dtype=float).reshape(-1)
+        returns = np.asarray(returns_arr, dtype=float).reshape(-1)
+        regimes = np.asarray(regimes_arr, dtype=object).reshape(-1)
+        n = min(len(signals_arr), len(returns), len(regimes))
+        if n <= 0:
+            return {
+                "evaluated_regimes": 0.0,
+                "mean_edge": 0.0,
+                "worst_edge": 0.0,
+                "edge_dispersion": 0.0,
+                "negative_regime_share": 0.0,
+            }
+
+        signals_arr = signals_arr[:n]
+        returns = np.nan_to_num(returns[:n], nan=0.0, posinf=0.0, neginf=0.0)
+        regimes = regimes[:n].astype(str)
+        active_mask = np.abs(signals_arr) > 1e-8
+        if not np.any(active_mask):
+            return {
+                "evaluated_regimes": 0.0,
+                "mean_edge": 0.0,
+                "worst_edge": 0.0,
+                "edge_dispersion": 0.0,
+                "negative_regime_share": 0.0,
+            }
+
+        active_returns = signals_arr * returns
+        regime_edges: list[float] = []
+        regime_counts: list[int] = []
+        min_regime_observations = max(20, int(round(n * 0.02)))
+
+        for regime_name in sorted({str(x).strip() for x in regimes if str(x).strip()}):
+            regime_mask = (regimes == regime_name) & active_mask
+            obs = int(np.count_nonzero(regime_mask))
+            if obs < min_regime_observations:
+                continue
+            regime_edges.append(float(np.mean(active_returns[regime_mask])))
+            regime_counts.append(obs)
+
+        if not regime_edges:
+            return {
+                "evaluated_regimes": 0.0,
+                "mean_edge": 0.0,
+                "worst_edge": 0.0,
+                "edge_dispersion": 0.0,
+                "negative_regime_share": 0.0,
+            }
+
+        edge_arr = np.asarray(regime_edges, dtype=float)
+        count_weights = np.asarray(regime_counts, dtype=float)
+        count_weights = count_weights / max(float(np.sum(count_weights)), 1e-9)
+        return {
+            "evaluated_regimes": float(edge_arr.size),
+            "mean_edge": float(np.sum(edge_arr * count_weights)),
+            "worst_edge": float(np.min(edge_arr)),
+            "edge_dispersion": float(np.std(edge_arr)),
+            "negative_regime_share": float(np.mean(edge_arr < 0.0)),
+        }
+
+    @staticmethod
+    def _infer_regime_side_bias(
+        train_regimes: np.ndarray | None,
+        train_returns: np.ndarray | None = None,
+    ) -> tuple[float, float]:
+        """Infer long/short threshold shifts from regime mix and return drift."""
+        if train_regimes is None:
+            return 0.0, 0.0
+
+        regimes = np.asarray(train_regimes, dtype=str).reshape(-1)
+        if regimes.size == 0:
+            return 0.0, 0.0
+
+        regime_values = np.char.lower(np.char.strip(regimes))
+        bull_tokens = ("bull", "uptrend", "risk_on", "breakout")
+        bear_tokens = ("bear", "downtrend", "risk_off", "crash")
+        bull_score = 0.0
+        bear_score = 0.0
+        for regime_name in regime_values:
+            if any(token in regime_name for token in bull_tokens):
+                bull_score += 1.0
+            if any(token in regime_name for token in bear_tokens):
+                bear_score += 1.0
+
+        sample_size = float(len(regime_values))
+        bull_share = float(bull_score / sample_size)
+        bear_share = float(bear_score / sample_size)
+
+        drift_bias = 0.0
+        if train_returns is not None:
+            returns = np.asarray(train_returns, dtype=float).reshape(-1)
+            returns = returns[np.isfinite(returns)]
+            if returns.size >= 25:
+                mean_ret = float(np.mean(returns))
+                pos_rate = float(np.mean(returns > 0.0))
+                if mean_ret > 2e-5 and pos_rate >= 0.54:
+                    drift_bias += 1.0
+                elif mean_ret < -2e-5 and pos_rate <= 0.46:
+                    drift_bias -= 1.0
+
+        regime_bias = float(np.clip((bull_share - bear_share) + (0.45 * drift_bias), -1.0, 1.0))
+        long_shift = float(np.clip(-0.06 * regime_bias, -0.08, 0.08))
+        short_shift = float(np.clip(-0.10 * regime_bias, -0.12, 0.12))
+        return long_shift, short_shift
+
+    def _outer_trial_stability_gate(
+        self,
+        trial_values: list[float],
+        best_value: float,
+    ) -> tuple[bool, float]:
+        """Check whether outer-fold Optuna surface is stable enough for promotion."""
+        finite_values = [float(v) for v in trial_values if np.isfinite(float(v))]
+        if len(finite_values) < int(self.config.nested_outer_stability_min_trials):
+            return True, 0.0
+
+        values = np.asarray(finite_values, dtype=float)
+        dispersion = float(np.std(values))
+        scale = float(max(0.35, abs(float(best_value))))
+        stability_ratio = float(dispersion / scale)
+        is_stable = bool(stability_ratio <= float(self.config.nested_outer_stability_ratio_cap))
+        return is_stable, stability_ratio
 
     def _effective_trade_target(self, evaluation_size: int | None) -> int:
         """
@@ -2731,7 +3753,7 @@ class ModelTrainer:
         horizon = max(1, int(self._prediction_horizon()))
         density_cap = int(np.ceil(float(eval_size) * 0.12))
         sqrt_cap = int(np.ceil(np.sqrt(float(eval_size))))
-        horizon_cap = int(np.ceil(float(eval_size) / float(max(2, horizon * 2))))
+        horizon_cap = int(np.ceil(float(eval_size) / float(max(2.0, horizon * 2.2))))
         dynamic_cap = max(3, min(density_cap, sqrt_cap, horizon_cap))
         return int(min(configured_target, dynamic_cap))
 
@@ -2739,6 +3761,8 @@ class ModelTrainer:
         self,
         train_proba: np.ndarray | None,
         train_labels: np.ndarray | None = None,
+        train_returns: np.ndarray | None = None,
+        train_regimes: np.ndarray | None = None,
     ) -> tuple[float, float]:
         """Derive leakage-safe long/short thresholds from training probabilities."""
         default_long = 0.55
@@ -2746,15 +3770,27 @@ class ModelTrainer:
         if train_proba is None:
             return default_long, default_short
 
-        values = np.asarray(train_proba, dtype=float).reshape(-1)
-        values = values[np.isfinite(values)]
+        raw_values = np.asarray(train_proba, dtype=float).reshape(-1)
+        finite_mask = np.isfinite(raw_values)
+        values = raw_values[finite_mask]
         if values.size < 25:
             return default_long, default_short
 
         values = np.clip(values, 0.0, 1.0)
         target_trades = self._effective_trade_target(int(values.size))
-        target_rate = min(0.35, max(0.05, float(target_trades) / float(values.size)))
+        threshold_policy = self._horizon_threshold_policy()
+        target_rate_base = min(0.35, max(0.05, float(target_trades) / float(values.size)))
+        target_rate = float(
+            np.clip(
+                target_rate_base * float(threshold_policy["target_rate_scale"]),
+                0.04,
+                0.45,
+            )
+        )
         tail_rate = min(0.25, max(0.03, target_rate * 0.65))
+        min_gap = float(np.clip(float(threshold_policy["min_gap"]), 0.025, 0.08))
+        forced_long_cap = float(np.clip(float(threshold_policy["forced_long_cap"]), 0.55, 0.90))
+        forced_short_floor = float(np.clip(float(threshold_policy["forced_short_floor"]), 0.10, 0.45))
 
         short_threshold = float(np.quantile(values, tail_rate))
         long_threshold = float(np.quantile(values, 1.0 - tail_rate))
@@ -2763,11 +3799,40 @@ class ModelTrainer:
         long_threshold = max(0.51, min(0.99, long_threshold))
 
         labels_arr: np.ndarray | None = None
+        label_positive_rate: float | None = None
         if train_labels is not None:
             candidate_labels = np.asarray(train_labels, dtype=float).reshape(-1)
-            candidate_labels = candidate_labels[np.isfinite(candidate_labels)]
+            if candidate_labels.size == raw_values.size:
+                candidate_labels = candidate_labels[finite_mask]
+            elif candidate_labels.size != values.size:
+                candidate_labels = np.array([], dtype=float)
             if candidate_labels.size == values.size:
-                labels_arr = candidate_labels
+                labels_arr = np.clip(
+                    np.nan_to_num(candidate_labels, nan=0.5, posinf=1.0, neginf=0.0),
+                    0.0,
+                    1.0,
+                )
+                label_positive_rate = float(np.mean(labels_arr >= 0.5))
+
+        returns_arr: np.ndarray | None = None
+        if train_returns is not None:
+            candidate_returns = np.asarray(train_returns, dtype=float).reshape(-1)
+            if candidate_returns.size == raw_values.size:
+                candidate_returns = candidate_returns[finite_mask]
+            elif candidate_returns.size != values.size:
+                candidate_returns = np.array([], dtype=float)
+            if candidate_returns.size == values.size:
+                returns_arr = np.nan_to_num(candidate_returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+        regimes_arr: np.ndarray | None = None
+        if train_regimes is not None:
+            candidate_regimes = np.asarray(train_regimes, dtype=object).reshape(-1)
+            if candidate_regimes.size == raw_values.size:
+                candidate_regimes = candidate_regimes[finite_mask]
+            elif candidate_regimes.size != values.size:
+                candidate_regimes = np.array([], dtype=object)
+            if candidate_regimes.size == values.size:
+                regimes_arr = candidate_regimes
 
         if labels_arr is not None and labels_arr.size >= 40:
             y_bin = (labels_arr >= 0.5).astype(int)
@@ -2833,7 +3898,7 @@ class ModelTrainer:
                 cand_long = float(np.quantile(values, 1.0 - float(np.clip(long_tail, 0.03, 0.40))))
                 cand_short = min(0.49, max(0.01, cand_short))
                 cand_long = max(0.51, min(0.99, cand_long))
-                if cand_long - cand_short < 0.03:
+                if cand_long - cand_short < max(0.025, min_gap * 0.75):
                     continue
 
                 signals = np.where(
@@ -2873,12 +3938,59 @@ class ModelTrainer:
                     )
                 calibration_penalty = float(np.mean((values - y_bin) ** 2))
                 score = (
-                    (0.45 * directional_acc)
-                    + (0.35 * activity_score)
-                    + (0.20 * entry_score)
+                    (0.65 * directional_acc)
+                    + (0.20 * activity_score)
+                    + (0.15 * entry_score)
                     - (0.10 * calibration_penalty)
                     - (0.60 * activity_penalty)
                 )
+                if directional_acc < 0.50:
+                    score -= float((0.50 - directional_acc) * 0.80)
+                if returns_arr is not None and returns_arr.size == values.size:
+                    active_returns = signals * returns_arr
+                    edge_mean = float(np.mean(active_returns[active_mask]))
+                    edge_score = float(np.tanh(edge_mean * 250.0))
+                    long_mask = signals == 1.0
+                    short_mask = signals == -1.0
+                    long_frac = float(np.mean(long_mask[active_mask])) if active_count > 0 else 0.0
+                    short_frac = float(np.mean(short_mask[active_mask])) if active_count > 0 else 0.0
+                    long_edge = (
+                        float(np.mean(returns_arr[long_mask]))
+                        if np.any(long_mask)
+                        else 0.0
+                    )
+                    short_edge = (
+                        float(np.mean(-returns_arr[short_mask]))
+                        if np.any(short_mask)
+                        else 0.0
+                    )
+                    side_penalty = 0.0
+                    if long_edge < 0.0:
+                        side_penalty += long_frac * min(1.0, abs(long_edge) * 250.0)
+                    if short_edge < 0.0:
+                        side_penalty += short_frac * min(1.0, abs(short_edge) * 250.0)
+                    score += (0.55 * edge_score) - (0.45 * side_penalty)
+                    if regimes_arr is not None and regimes_arr.size == values.size:
+                        regime_profile = self._regime_edge_profile(
+                            signals=signals,
+                            returns_arr=returns_arr,
+                            regimes_arr=regimes_arr,
+                        )
+                        if regime_profile["evaluated_regimes"] >= 2.0:
+                            regime_mean_edge = float(regime_profile["mean_edge"])
+                            regime_worst_edge = float(regime_profile["worst_edge"])
+                            regime_dispersion = float(regime_profile["edge_dispersion"])
+                            negative_share = float(regime_profile["negative_regime_share"])
+                            regime_reward = (
+                                (0.35 * np.tanh(regime_mean_edge * 220.0))
+                                + (0.30 * np.tanh(regime_worst_edge * 260.0))
+                            )
+                            regime_penalty = (
+                                (0.50 * max(0.0, -regime_worst_edge * 300.0))
+                                + (0.20 * negative_share)
+                                + (0.10 * regime_dispersion * 300.0)
+                            )
+                            score += float(regime_reward - regime_penalty)
                 if score > best_score:
                     best_score = score
                     best_pair = (cand_long, cand_short)
@@ -2915,10 +4027,97 @@ class ModelTrainer:
             forced_tail = float(min(0.35, max(0.10, enforced_target_rate * 1.10)))
             forced_short = float(np.quantile(values, forced_tail))
             forced_long = float(np.quantile(values, 1.0 - forced_tail))
-            short_threshold = min(0.49, max(0.01, max(forced_short, 0.32)))
-            long_threshold = max(0.51, min(0.99, min(forced_long, 0.68)))
+            short_threshold = min(0.49, max(0.01, max(forced_short, forced_short_floor)))
+            long_threshold = max(0.51, min(0.99, min(forced_long, forced_long_cap)))
 
-        if long_threshold - short_threshold < 0.04:
+        final_active_rate, _ = _activity_rates(long_threshold, short_threshold)
+        min_final_activity = max(0.02, min(0.12, enforced_target_rate * 0.70))
+        if final_active_rate < min_final_activity:
+            proba_center = float(np.clip(np.mean(values), 0.45, 0.55))
+            proba_dispersion = float(np.std(values))
+            adaptive_band = float(np.clip(max(0.03, proba_dispersion * 0.90), 0.03, 0.12))
+            long_threshold = float(np.clip(proba_center + adaptive_band, 0.52, 0.72))
+            short_threshold = float(np.clip(proba_center - adaptive_band, 0.28, 0.48))
+
+        if returns_arr is not None and returns_arr.size == values.size:
+            side_signals = np.where(
+                values >= long_threshold,
+                1.0,
+                np.where(values <= short_threshold, -1.0, 0.0),
+            ).astype(float)
+            long_mask = side_signals == 1.0
+            short_mask = side_signals == -1.0
+            min_side_samples = max(4, int(round(values.size * 0.01)))
+            long_count = int(np.count_nonzero(long_mask))
+            short_count = int(np.count_nonzero(short_mask))
+            long_edge = (
+                float(np.mean(returns_arr[long_mask]))
+                if long_count >= min_side_samples
+                else 0.0
+            )
+            short_edge = (
+                float(np.mean(-returns_arr[short_mask]))
+                if short_count >= min_side_samples
+                else 0.0
+            )
+            long_edge_mag = abs(float(long_edge))
+            short_edge_mag = abs(float(short_edge))
+            severe_edge_cutoff = 4e-4
+            if long_edge > 1e-5 and short_edge < -1e-5:
+                short_cap = 0.12 if short_edge_mag >= severe_edge_cutoff else 0.18
+                short_threshold = min(short_threshold, short_cap)
+            elif short_edge > 1e-5 and long_edge < -1e-5:
+                long_floor = 0.88 if long_edge_mag >= severe_edge_cutoff else 0.82
+                long_threshold = max(long_threshold, long_floor)
+            elif long_edge < -1e-5 and short_edge < -1e-5:
+                edge_floor = 0.92 if max(long_edge_mag, short_edge_mag) >= severe_edge_cutoff else 0.86
+                edge_cap = 0.08 if max(long_edge_mag, short_edge_mag) >= severe_edge_cutoff else 0.14
+                long_threshold = max(long_threshold, edge_floor)
+                short_threshold = min(short_threshold, edge_cap)
+
+        if label_positive_rate is not None:
+            if label_positive_rate >= 0.52:
+                short_threshold = min(short_threshold, 0.20)
+            elif label_positive_rate <= 0.48:
+                long_threshold = max(long_threshold, 0.80)
+
+        regime_long_shift, regime_short_shift = self._infer_regime_side_bias(
+            regimes_arr,
+            returns_arr,
+        )
+        if abs(regime_long_shift) > 1e-9 or abs(regime_short_shift) > 1e-9:
+            long_threshold = float(np.clip(long_threshold + regime_long_shift, 0.51, 0.95))
+            short_threshold = float(np.clip(short_threshold + regime_short_shift, 0.05, 0.49))
+
+        if (
+            regimes_arr is not None
+            and returns_arr is not None
+            and regimes_arr.size == values.size
+            and returns_arr.size == values.size
+        ):
+            final_signals = np.where(
+                values >= long_threshold,
+                1.0,
+                np.where(values <= short_threshold, -1.0, 0.0),
+            ).astype(float)
+            final_regime_profile = self._regime_edge_profile(
+                signals=final_signals,
+                returns_arr=returns_arr,
+                regimes_arr=regimes_arr,
+            )
+            if final_regime_profile["evaluated_regimes"] >= 2.0:
+                worst_regime_edge = float(final_regime_profile["worst_edge"])
+                negative_share = float(final_regime_profile["negative_regime_share"])
+                safety_shift = 0.0
+                if worst_regime_edge < -3e-4 or negative_share >= 0.70:
+                    safety_shift = 0.03
+                elif worst_regime_edge < -1e-4 or negative_share >= 0.50:
+                    safety_shift = 0.015
+                if safety_shift > 0.0:
+                    long_threshold = float(np.clip(long_threshold + safety_shift, 0.52, 0.94))
+                    short_threshold = float(np.clip(short_threshold - safety_shift, 0.06, 0.48))
+
+        if long_threshold - short_threshold < min_gap:
             long_threshold = default_long
             short_threshold = default_short
 
@@ -2947,9 +4146,9 @@ class ModelTrainer:
             if clipped_ratio >= 3.0:
                 adjusted.setdefault("max_delta_step", 1.0)
         elif self.config.model_type == "lightgbm":
-            if clipped_ratio >= 1.25:
+            if clipped_ratio >= 1.60:
                 adjusted.setdefault("is_unbalance", True)
-                adjusted.setdefault("scale_pos_weight", clipped_ratio)
+                adjusted.setdefault("scale_pos_weight", float(np.clip(clipped_ratio, 1.0, 4.0)))
         elif self.config.model_type == "random_forest":
             adjusted.setdefault("class_weight", "balanced_subsample")
             if os.name == "nt":
@@ -2974,13 +4173,20 @@ class ModelTrainer:
     def _quick_cv_score(self, params: dict) -> float:
         """Quick cross-validation score for optimization."""
         scores: list[float] = []
+        score_weights: list[float] = []
         X = self.features.values
         y = self.labels.values
         weights = self.sample_weights if self.sample_weights is not None else None
+        regimes = self.regimes if self.regimes is not None and len(self.regimes) == len(y) else None
+        row_symbols = (
+            self.row_symbols if self.row_symbols is not None and len(self.row_symbols) == len(y) else None
+        )
 
         for train_idx, test_idx in self._generate_cv_splits(X, y):
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
+            if not self._has_binary_class_support(y_train):
+                continue
             fold_params = self._prepare_params_for_train_size(params, len(train_idx))
             fold_params = self._augment_params_for_train_labels(fold_params, y_train)
             model = self._create_model(params=fold_params)
@@ -2997,9 +4203,17 @@ class ModelTrainer:
             y_pred = np.asarray(model.predict(X_test))
             y_proba = np.asarray(self._get_predictions_proba(model, X_test))
             train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+            train_forward_returns = (
+                np.asarray(self.primary_forward_returns[train_idx], dtype=float)
+                if isinstance(self.primary_forward_returns, np.ndarray)
+                and len(self.primary_forward_returns) == len(y)
+                else None
+            )
             long_threshold, short_threshold = self._derive_signal_thresholds(
                 train_proba,
                 train_labels=y_train,
+                train_returns=train_forward_returns,
+                train_regimes=(np.asarray(regimes[train_idx], dtype=object) if regimes is not None else None),
             )
             eval_len = min(len(y_test), len(y_pred), len(y_proba))
             if eval_len <= 1:
@@ -3021,6 +4235,11 @@ class ModelTrainer:
                 if self.timestamps is not None and len(self.timestamps) == len(y)
                 else None
             )
+            fold_symbols = (
+                np.asarray(row_symbols[test_idx], dtype=object)
+                if row_symbols is not None
+                else None
+            )
 
             metrics = self._calculate_fold_metrics(
                 np.asarray(y_test)[-eval_len:],
@@ -3035,10 +4254,17 @@ class ModelTrainer:
                     fold_event_returns[-eval_len:] if fold_event_returns is not None else None
                 ),
                 timestamps=(fold_timestamps[-eval_len:] if fold_timestamps is not None else None),
+                symbols=(fold_symbols[-eval_len:] if fold_symbols is not None else None),
             )
             scores.append(float(metrics["risk_adjusted_score"]))
+            score_weights.append(
+                self._fold_reliability_weight(
+                    metrics,
+                    evaluation_size=eval_len,
+                )
+            )
 
-        return float(np.mean(scores)) if scores else -1e9
+        return self._aggregate_fold_objective(scores, score_weights) if scores else -1e9
 
     def _train_with_cv(self) -> None:
         """
@@ -3053,6 +4279,10 @@ class ModelTrainer:
         X = self.features.values
         y = self.labels.values
         weights = self.sample_weights if self.sample_weights is not None else None
+        regimes = self.regimes if self.regimes is not None and len(self.regimes) == len(y) else None
+        row_symbols = (
+            self.row_symbols if self.row_symbols is not None and len(self.row_symbols) == len(y) else None
+        )
 
         # Train with CV
         fold_results = []
@@ -3067,6 +4297,11 @@ class ModelTrainer:
 
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
+            if not self._has_binary_class_support(y_train):
+                self.logger.warning(
+                    f"Fold {fold_idx + 1}: training labels contain a single class, skipping fold"
+                )
+                continue
             w_train = weights[train_idx] if weights is not None else None
 
             # Create and train model
@@ -3088,9 +4323,17 @@ class ModelTrainer:
             y_pred = np.asarray(model.predict(X_test))
             y_proba = np.asarray(self._get_predictions_proba(model, X_test))
             train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+            train_forward_returns = (
+                np.asarray(self.primary_forward_returns[train_idx], dtype=float)
+                if isinstance(self.primary_forward_returns, np.ndarray)
+                and len(self.primary_forward_returns) == len(y)
+                else None
+            )
             long_threshold, short_threshold = self._derive_signal_thresholds(
                 train_proba,
                 train_labels=y_train,
+                train_returns=train_forward_returns,
+                train_regimes=(np.asarray(regimes[train_idx], dtype=object) if regimes is not None else None),
             )
 
             y_eval = np.asarray(y_test)
@@ -3128,6 +4371,11 @@ class ModelTrainer:
                 if self.timestamps is not None and len(self.timestamps) == len(y)
                 else None
             )
+            fold_symbols = (
+                np.asarray(row_symbols[eval_indices], dtype=object)
+                if row_symbols is not None
+                else None
+            )
             metrics = self._calculate_fold_metrics(
                 y_eval,
                 y_pred,
@@ -3137,6 +4385,7 @@ class ModelTrainer:
                 realized_forward_returns=fold_forward_returns,
                 event_net_returns=fold_event_returns,
                 timestamps=fold_timestamps,
+                symbols=fold_symbols,
             )
             if self.regimes is not None and len(self.regimes) == len(y):
                 train_regime_dist = self._regime_distribution(self.regimes[train_idx])
@@ -3151,6 +4400,12 @@ class ModelTrainer:
             metrics["test_size"] = len(y_eval)
             metrics["long_threshold"] = float(long_threshold)
             metrics["short_threshold"] = float(short_threshold)
+            fold_reliability = self._fold_reliability_weight(metrics, evaluation_size=eval_len)
+            metrics["fold_reliability"] = float(fold_reliability)
+            metrics["selection_score"] = float(
+                float(metrics.get("risk_adjusted_score", -1e9))
+                * (0.20 + (0.80 * fold_reliability))
+            )
             net_returns, execution_details = self._compute_net_returns(
                 y_eval,
                 y_proba,
@@ -3159,6 +4414,7 @@ class ModelTrainer:
                 realized_forward_returns=fold_forward_returns,
                 event_net_returns=fold_event_returns,
                 timestamps=fold_timestamps,
+                symbols=fold_symbols,
                 return_details=True,
             )
             trade_mask = np.asarray(execution_details.get("trade_mask", []), dtype=bool)
@@ -3181,7 +4437,8 @@ class ModelTrainer:
                 f"Fold {fold_idx + 1}: Accuracy={metrics['accuracy']:.4f}, "
                 f"Sharpe={metrics.get('sharpe', 0):.4f}, "
                 f"Trades={int(metrics.get('trade_count', 0))}, "
-                f"RiskScore={metrics.get('risk_adjusted_score', 0):.4f}"
+                f"RiskScore={metrics.get('risk_adjusted_score', 0):.4f}, "
+                f"Reliability={metrics.get('fold_reliability', 0):.3f}"
             )
 
         # Select best model or use ensemble
@@ -3417,6 +4674,14 @@ class ModelTrainer:
             self._train_deep_learning_model(model, X_train, y_train, X_val, y_val)
             return
 
+        model_module = str(getattr(model.__class__, "__module__", ""))
+        fit_feature_names: list[str] = []
+        if model_module.startswith("quant_trading_system.models"):
+            if self.feature_names and len(self.feature_names) == int(X_train.shape[1]):
+                fit_feature_names = [str(name) for name in self.feature_names]
+            else:
+                fit_feature_names = [f"f{i}" for i in range(int(X_train.shape[1]))]
+
         candidate_calls: list[tuple[dict[str, Any], ...]] = []
         if sample_weights is not None:
             candidate_calls.extend(
@@ -3436,8 +4701,11 @@ class ModelTrainer:
 
         last_error: Exception | None = None
         for (kwargs,) in candidate_calls:
+            call_kwargs = dict(kwargs)
+            if fit_feature_names:
+                call_kwargs.setdefault("feature_names", fit_feature_names)
             try:
-                model.fit(X_train, y_train, **kwargs)
+                model.fit(X_train, y_train, **call_kwargs)
                 return
             except TypeError as exc:
                 last_error = exc
@@ -3505,6 +4773,7 @@ class ModelTrainer:
         realized_forward_returns: np.ndarray | None = None,
         event_net_returns: np.ndarray | None = None,
         timestamps: np.ndarray | None = None,
+        symbols: np.ndarray | None = None,
     ) -> dict:
         """Calculate metrics for a single fold."""
         from sklearn.metrics import (
@@ -3529,8 +4798,6 @@ class ModelTrainer:
             long_threshold = 0.55
             short_threshold = 0.45
 
-        y_pred_binary = (y_pred >= 0.5).astype(int) if not np.array_equal(y_pred, y_pred.astype(int)) else y_pred
-        y_true_binary = (y_true >= 0.5).astype(int) if not np.array_equal(y_true, y_true.astype(int)) else y_true
         if realized_forward_returns is not None:
             realized_forward_returns = self._align_probabilities(
                 np.asarray(realized_forward_returns, dtype=float),
@@ -3543,6 +4810,50 @@ class ModelTrainer:
                 target_len=len(y_proba),
                 fill_value=0.0,
             )
+        aligned_symbols: np.ndarray | None = None
+        if symbols is not None:
+            raw_symbols = np.asarray(symbols, dtype=object).reshape(-1)
+            if raw_symbols.size == len(y_proba):
+                aligned_symbols = raw_symbols
+            elif raw_symbols.size > len(y_proba):
+                aligned_symbols = raw_symbols[-len(y_proba):]
+            else:
+                aligned_symbols = None
+
+        aligned_timestamps: np.ndarray | None = None
+        if timestamps is not None:
+            raw_timestamps = np.asarray(timestamps).reshape(-1)
+            if raw_timestamps.size == len(y_proba):
+                aligned_timestamps = raw_timestamps
+            elif raw_timestamps.size > len(y_proba):
+                aligned_timestamps = raw_timestamps[-len(y_proba):]
+            else:
+                aligned_timestamps = None
+
+        # Panel-safe execution ordering: ensure all execution/risk metrics are evaluated
+        # in chronological order across symbols, not in symbol-block order.
+        if aligned_timestamps is not None and len(aligned_timestamps) == len(y_proba):
+            ts_dt = pd.to_datetime(aligned_timestamps, utc=True, errors="coerce")
+            if not ts_dt.isna().all():
+                ts_int = np.asarray(ts_dt.view("int64"), dtype=np.int64)
+                sort_idx = np.argsort(ts_int, kind="stable")
+                y_true = y_true[sort_idx]
+                y_pred = y_pred[sort_idx]
+                y_proba = y_proba[sort_idx]
+                if realized_forward_returns is not None and len(realized_forward_returns) == len(sort_idx):
+                    realized_forward_returns = realized_forward_returns[sort_idx]
+                if event_net_returns is not None and len(event_net_returns) == len(sort_idx):
+                    event_net_returns = event_net_returns[sort_idx]
+                aligned_timestamps = aligned_timestamps[sort_idx]
+                if aligned_symbols is not None and len(aligned_symbols) == len(sort_idx):
+                    aligned_symbols = aligned_symbols[sort_idx]
+
+        y_pred_binary = (
+            (y_pred >= 0.5).astype(int) if not np.array_equal(y_pred, y_pred.astype(int)) else y_pred
+        )
+        y_true_binary = (
+            (y_true >= 0.5).astype(int) if not np.array_equal(y_true, y_true.astype(int)) else y_true
+        )
 
         metrics = {
             "accuracy": float(accuracy_score(y_true_binary, y_pred_binary)),
@@ -3562,7 +4873,8 @@ class ModelTrainer:
                 short_threshold=short_threshold,
                 realized_forward_returns=realized_forward_returns,
                 event_net_returns=event_net_returns,
-                timestamps=timestamps,
+                timestamps=aligned_timestamps,
+                symbols=aligned_symbols,
                 return_details=True,
             )
             positions = np.asarray(execution_details.get("positions", np.zeros(len(net_returns))), dtype=float)
@@ -3575,27 +4887,92 @@ class ModelTrainer:
                 execution_details.get("entry_mask", trade_mask),
                 dtype=bool,
             )
-            trade_returns = net_returns[trade_mask]
+            portfolio_returns = np.asarray(
+                execution_details.get("portfolio_returns", net_returns),
+                dtype=float,
+            )
+            portfolio_turnover_series = np.asarray(
+                execution_details.get("portfolio_turnover_series", turnover_series),
+                dtype=float,
+            )
+            portfolio_trade_mask = np.asarray(
+                execution_details.get(
+                    "portfolio_trade_mask",
+                    np.abs(portfolio_returns) > 0.0,
+                ),
+                dtype=bool,
+            )
+            trade_returns = portfolio_returns[portfolio_trade_mask]
+            performance_returns = (
+                portfolio_returns
+                if portfolio_returns.size > 0
+                else trade_returns
+            )
 
-            turnover = float(np.mean(turnover_series))
+            turnover = float(np.mean(portfolio_turnover_series))
             trade_count = int(np.count_nonzero(entry_mask))
-            active_signal_rate = float(np.mean(trade_mask))
-            std = float(np.std(trade_returns)) if trade_returns.size > 0 else 0.0
-            sharpe = float(np.mean(trade_returns) / std * np.sqrt(252)) if std > 1e-12 else 0.0
-            max_dd = self._max_drawdown(trade_returns)
-            win_rate = float(np.mean(trade_returns > 0)) if trade_returns.size > 0 else 0.0
-            annual_return = float(np.mean(trade_returns) * 252) if trade_returns.size > 0 else 0.0
+            active_signal_rate = float(np.mean(portfolio_trade_mask))
+            std = float(np.std(performance_returns)) if performance_returns.size > 0 else 0.0
+            sharpe = (
+                float(np.mean(performance_returns) / std * np.sqrt(252))
+                if std > 1e-12
+                else 0.0
+            )
+            max_dd = self._max_drawdown(performance_returns)
+            trade_obs_count = int(len(trade_returns))
+            min_obs_for_confident_sharpe = max(
+                6,
+                int(round(float(self._effective_trade_target(int(len(y_proba)))) * 0.80)),
+            )
+            sharpe_observation_confidence = float(
+                np.clip(
+                    float(trade_obs_count) / float(max(1, min_obs_for_confident_sharpe)),
+                    0.10,
+                    1.0,
+                )
+            )
+            sharpe = float(sharpe * sharpe_observation_confidence)
+            if trade_obs_count > 0:
+                wins = int(np.count_nonzero(trade_returns > 0))
+                prior_strength = float(np.clip(min_obs_for_confident_sharpe * 0.35, 2.0, 10.0))
+                win_rate = float(
+                    (float(wins) + (0.5 * prior_strength))
+                    / (float(trade_obs_count) + prior_strength)
+                )
+            else:
+                win_rate = 0.0
+            annual_return = (
+                float(np.mean(performance_returns) * 252)
+                if performance_returns.size > 0
+                else 0.0
+            )
             calmar = annual_return / max_dd if max_dd > 1e-9 else annual_return
-            if trade_returns.size > 0:
+            if performance_returns.size > 0:
                 alpha = 0.05
-                tail_cutoff = float(np.quantile(trade_returns, alpha))
-                cvar = float(np.mean(trade_returns[trade_returns <= tail_cutoff]))
+                tail_cutoff = float(np.quantile(performance_returns, alpha))
+                cvar = float(np.mean(performance_returns[performance_returns <= tail_cutoff]))
                 expected_shortfall = float(abs(cvar))
-                skew = float(pd.Series(trade_returns).skew())
+                skew = float(pd.Series(performance_returns).skew())
             else:
                 cvar = 0.0
                 expected_shortfall = 0.0
                 skew = 0.0
+
+            symbol_concentration_hhi = 0.0
+            symbol_effective_count = 0.0
+            entry_symbol_count = 0.0
+            if aligned_symbols is not None and len(aligned_symbols) == len(y_proba):
+                entry_symbols = np.asarray(aligned_symbols[entry_mask], dtype=object)
+                if entry_symbols.size > 0:
+                    symbol_counts = pd.Series(entry_symbols).value_counts(normalize=True)
+                    if not symbol_counts.empty:
+                        shares = symbol_counts.to_numpy(dtype=float)
+                        symbol_concentration_hhi = float(np.sum(shares ** 2))
+                        symbol_effective_count = float(
+                            1.0 / max(symbol_concentration_hhi, 1e-9)
+                        )
+                        entry_symbol_count = float(symbol_counts.shape[0])
+
             equity_break = float(1.0 if max_dd > (self.config.max_drawdown * 1.5) else 0.0)
             objective_components = self._compute_objective_components(
                 sharpe=sharpe,
@@ -3606,6 +4983,7 @@ class ModelTrainer:
                 cvar=cvar,
                 skew=skew,
                 expected_shortfall=expected_shortfall,
+                symbol_concentration_hhi=symbol_concentration_hhi,
                 equity_break=equity_break,
                 evaluation_size=int(len(y_proba)),
             )
@@ -3621,10 +4999,14 @@ class ModelTrainer:
                     "annual_return": annual_return,
                     "calmar": calmar,
                     "trade_return_observations": float(len(trade_returns)),
+                    "sharpe_observation_confidence": float(sharpe_observation_confidence),
                     "cvar_95": cvar,
                     "expected_shortfall": expected_shortfall,
                     "return_skew": skew,
                     "equity_break": equity_break,
+                    "symbol_concentration_hhi": float(symbol_concentration_hhi),
+                    "symbol_effective_count": float(symbol_effective_count),
+                    "entry_symbol_count": float(entry_symbol_count),
                     "objective_sharpe_component": float(
                         objective_components["objective_sharpe_component"]
                     ),
@@ -3643,6 +5025,12 @@ class ModelTrainer:
                     "objective_cvar_penalty": float(
                         objective_components["objective_cvar_penalty"]
                     ),
+                    "objective_tail_risk_penalty": float(
+                        objective_components["objective_tail_risk_penalty"]
+                    ),
+                    "objective_symbol_concentration_penalty": float(
+                        objective_components["objective_symbol_concentration_penalty"]
+                    ),
                     "objective_skew_penalty": float(
                         objective_components["objective_skew_penalty"]
                     ),
@@ -3650,6 +5038,9 @@ class ModelTrainer:
                         objective_components["objective_equity_break_penalty"]
                     ),
                     "objective_trade_target": float(objective_components["objective_trade_target"]),
+                    "objective_expected_shortfall_cap": float(
+                        objective_components["objective_expected_shortfall_cap"]
+                    ),
                     "risk_adjusted_score": float(objective_components["risk_adjusted_score"]),
                 }
             )
@@ -3665,19 +5056,28 @@ class ModelTrainer:
                     "annual_return": 0.0,
                     "calmar": 0.0,
                     "trade_return_observations": 0.0,
+                    "sharpe_observation_confidence": 0.0,
                     "cvar_95": 0.0,
                     "expected_shortfall": 0.0,
                     "return_skew": 0.0,
                     "equity_break": 0.0,
+                    "symbol_concentration_hhi": 0.0,
+                    "symbol_effective_count": 0.0,
+                    "entry_symbol_count": 0.0,
                     "objective_sharpe_component": 0.0,
                     "objective_drawdown_penalty": 0.0,
                     "objective_turnover_penalty": 0.0,
                     "objective_calibration_penalty": 0.0,
                     "objective_trade_activity_penalty": 0.0,
                     "objective_cvar_penalty": 0.0,
+                    "objective_tail_risk_penalty": 0.0,
+                    "objective_symbol_concentration_penalty": 0.0,
                     "objective_skew_penalty": 0.0,
                     "objective_equity_break_penalty": 0.0,
                     "objective_trade_target": float(self._effective_trade_target(int(len(y_proba)))),
+                    "objective_expected_shortfall_cap": float(
+                        self.config.objective_expected_shortfall_cap
+                    ),
                     "risk_adjusted_score": -1e9,
                 }
             )
@@ -3704,6 +5104,7 @@ class ModelTrainer:
         cvar: float,
         skew: float,
         expected_shortfall: float,
+        symbol_concentration_hhi: float,
         equity_break: float,
         evaluation_size: int | None = None,
     ) -> dict[str, float]:
@@ -3713,6 +5114,17 @@ class ModelTrainer:
         turnover_penalty = float(-self.config.objective_weight_turnover * turnover)
         calibration_penalty = float(-self.config.objective_weight_calibration * brier_score)
         cvar_penalty = float(-self.config.objective_weight_cvar * max(0.0, expected_shortfall))
+        expected_shortfall_cap = float(max(1e-6, self.config.objective_expected_shortfall_cap))
+        tail_risk_excess = float(
+            max(0.0, (float(expected_shortfall) - expected_shortfall_cap) / expected_shortfall_cap)
+        )
+        tail_risk_penalty = float(
+            -self.config.objective_weight_tail_risk * min(2.0, tail_risk_excess)
+        )
+        concentration_excess = float(max(0.0, float(symbol_concentration_hhi) - 0.35))
+        symbol_concentration_penalty = float(
+            -self.config.objective_weight_symbol_concentration * min(1.5, concentration_excess / 0.35)
+        )
         skew_penalty = float(-self.config.objective_weight_skew * max(0.0, -float(skew)))
         equity_break_penalty = float(-2.0 * max(0.0, float(equity_break)))
         min_trades_target = self._effective_trade_target(evaluation_size)
@@ -3730,6 +5142,8 @@ class ModelTrainer:
             + calibration_penalty
             + trade_activity_penalty
             + cvar_penalty
+            + tail_risk_penalty
+            + symbol_concentration_penalty
             + skew_penalty
             + equity_break_penalty
         )
@@ -3740,9 +5154,12 @@ class ModelTrainer:
             "objective_calibration_penalty": calibration_penalty,
             "objective_trade_activity_penalty": trade_activity_penalty,
             "objective_cvar_penalty": cvar_penalty,
+            "objective_tail_risk_penalty": tail_risk_penalty,
+            "objective_symbol_concentration_penalty": symbol_concentration_penalty,
             "objective_skew_penalty": skew_penalty,
             "objective_equity_break_penalty": equity_break_penalty,
             "objective_trade_target": float(min_trades_target),
+            "objective_expected_shortfall_cap": float(expected_shortfall_cap),
             "risk_adjusted_score": float(total),
         }
 
@@ -3754,6 +5171,7 @@ class ModelTrainer:
         short_threshold: float,
         realized_returns: np.ndarray | None = None,
         timestamps: np.ndarray | None = None,
+        symbols: np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         """Build execution-aware position profile from probabilities."""
         y_proba = np.asarray(y_proba, dtype=float)
@@ -3775,19 +5193,21 @@ class ModelTrainer:
         if self.config.dynamic_no_trade_band:
             uncertainty = 1.0 - (2.0 * np.abs(y_proba - 0.5))
             uncertainty = np.clip(uncertainty, 0.0, 1.0)
-            if realized_returns is not None and len(realized_returns) == n_samples:
-                realized_series = pd.Series(np.nan_to_num(realized_returns, nan=0.0))
-                rolling_vol = (
-                    realized_series.rolling(max(8, self.config.label_volatility_lookback), min_periods=3)
-                    .std()
-                    .fillna(0.0)
-                    .to_numpy(dtype=float)
-                )
-                vol_anchor = float(np.median(rolling_vol[rolling_vol > 0])) if np.any(rolling_vol > 0) else 0.0
-                if vol_anchor > 0.0:
-                    vol_scale = np.clip((rolling_vol / vol_anchor) - 1.0, 0.0, 2.0)
-                else:
-                    vol_scale = np.zeros(n_samples, dtype=float)
+            proba_velocity = np.abs(np.diff(y_proba, prepend=y_proba[0]))
+            proba_rolling_vol = (
+                pd.Series(proba_velocity)
+                .rolling(max(8, self.config.label_volatility_lookback), min_periods=3)
+                .mean()
+                .fillna(0.0)
+                .to_numpy(dtype=float)
+            )
+            vol_anchor = (
+                float(np.median(proba_rolling_vol[proba_rolling_vol > 0]))
+                if np.any(proba_rolling_vol > 0)
+                else 0.0
+            )
+            if vol_anchor > 0.0:
+                vol_scale = np.clip((proba_rolling_vol / vol_anchor) - 1.0, 0.0, 2.0)
             else:
                 vol_scale = np.zeros(n_samples, dtype=float)
 
@@ -3830,6 +5250,60 @@ class ModelTrainer:
                 long_series = np.minimum(long_series, np.full(n_samples, forced_long, dtype=float))
                 short_series = np.maximum(short_series, np.full(n_samples, forced_short, dtype=float))
                 raw_signals = _generate_signals(long_series, short_series)
+                observed_activity = float(np.mean(raw_signals != 0.0))
+
+            if observed_activity < (target_activity_rate * 0.50):
+                center = float(np.clip(np.median(y_proba), 0.45, 0.55))
+                dispersion = float(np.std(y_proba))
+                center_band = float(np.clip(max(0.02, dispersion * 0.75), 0.02, 0.10))
+                emergency_long = float(np.clip(center + center_band, 0.51, 0.66))
+                emergency_short = float(np.clip(center - center_band, 0.34, 0.49))
+                long_series = np.minimum(long_series, np.full(n_samples, emergency_long, dtype=float))
+                short_series = np.maximum(short_series, np.full(n_samples, emergency_short, dtype=float))
+                raw_signals = _generate_signals(long_series, short_series)
+
+            # Regime-conditioned biasing from model confidence trend (leakage-safe).
+            if n_samples >= 12:
+                centered_proba = y_proba - 0.5
+                drift_window = max(8, int(self.config.label_volatility_lookback))
+                rolling_mean = (
+                    pd.Series(centered_proba)
+                    .rolling(drift_window, min_periods=4)
+                    .mean()
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
+                rolling_std = (
+                    pd.Series(centered_proba)
+                    .rolling(drift_window, min_periods=4)
+                    .std()
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
+                normalized_drift = np.tanh(
+                    rolling_mean / np.clip(rolling_std * 1.8 + 0.02, 0.02, None)
+                )
+                bull_bias = np.clip(normalized_drift, 0.0, 1.0)
+                bear_bias = np.clip(-normalized_drift, 0.0, 1.0)
+
+                long_series = np.clip(long_series - (0.022 * bull_bias) + (0.018 * bear_bias), 0.51, 0.995)
+                short_series = np.clip(short_series - (0.018 * bull_bias) + (0.022 * bear_bias), 0.005, 0.49)
+                strong_bull = bull_bias >= 0.65
+                strong_bear = bear_bias >= 0.65
+                if np.any(strong_bull):
+                    short_series[strong_bull] = np.minimum(short_series[strong_bull], 0.24)
+                    long_series[strong_bull] = np.minimum(long_series[strong_bull], 0.64)
+                if np.any(strong_bear):
+                    long_series[strong_bear] = np.maximum(long_series[strong_bear], 0.76)
+                    short_series[strong_bear] = np.maximum(short_series[strong_bear], 0.40)
+                min_gap = 0.02
+                gap_mask = (long_series - short_series) < min_gap
+                if np.any(gap_mask):
+                    midpoint = (long_series + short_series) / 2.0
+                    long_series[gap_mask] = np.clip(midpoint[gap_mask] + (0.5 * min_gap), 0.51, 0.995)
+                    short_series[gap_mask] = np.clip(midpoint[gap_mask] - (0.5 * min_gap), 0.005, 0.49)
+
+                raw_signals = _generate_signals(long_series, short_series)
 
         # Execution cooldown suppresses immediate direction flips in noisy regions.
         cooldown_bars = int(self.config.execution_cooldown_bars)
@@ -3849,23 +5323,68 @@ class ModelTrainer:
                     last_direction = direction
             raw_signals = filtered_signals
 
-        if realized_returns is not None and len(realized_returns) == n_samples:
-            realized_series = pd.Series(np.nan_to_num(realized_returns, nan=0.0))
-            rolling_vol = (
-                realized_series.rolling(max(8, self.config.label_volatility_lookback), min_periods=3)
-                .std()
-                .fillna(0.0)
-                .to_numpy(dtype=float)
-            )
-        else:
-            proba_proxy = np.abs(np.diff(y_proba, prepend=y_proba[0]))
-            rolling_vol = (
-                pd.Series(proba_proxy)
-                .rolling(12, min_periods=3)
-                .mean()
-                .fillna(0.0)
-                .to_numpy(dtype=float)
-            )
+        # Symbol diversification guardrail: thin weakest entries from dominant symbols
+        # to reduce concentration risk while preserving strongest edges.
+        if symbols is not None:
+            symbols_arr = np.asarray(symbols, dtype=object).reshape(-1)
+            if symbols_arr.size == n_samples:
+                unique_symbols = pd.unique(pd.Series(symbols_arr.astype(str)))
+                unique_count = int(len(unique_symbols))
+                if unique_count >= 2:
+                    min_balanced_share = float(1.0 / max(1, unique_count))
+                    symbol_share_cap = float(
+                        max(
+                            self.config.execution_max_symbol_entry_share,
+                            min(0.95, min_balanced_share + 0.12),
+                        )
+                    )
+                    adjusted_signals = raw_signals.copy()
+                    for _ in range(3):
+                        provisional_trade_mask = np.abs(adjusted_signals) > 1e-8
+                        provisional_prev = np.concatenate([[0.0], adjusted_signals[:-1]])
+                        provisional_entry_mask = provisional_trade_mask & (
+                            (np.abs(provisional_prev) <= 1e-8)
+                            | (np.sign(adjusted_signals) != np.sign(provisional_prev))
+                        )
+                        entry_idx = np.flatnonzero(provisional_entry_mask)
+                        if entry_idx.size <= 0:
+                            break
+                        entry_symbols = pd.Series(symbols_arr[entry_idx].astype(str))
+                        share = entry_symbols.value_counts(normalize=True)
+                        if share.empty or float(share.max()) <= (symbol_share_cap + 1e-9):
+                            break
+                        total_entries = int(entry_idx.size)
+                        target_max_entries = max(
+                            1,
+                            int(np.floor(float(total_entries) * symbol_share_cap)),
+                        )
+                        changed = False
+                        for dominant_symbol, dominant_count in share.mul(total_entries).items():
+                            dominant_count_int = int(round(float(dominant_count)))
+                            excess = dominant_count_int - target_max_entries
+                            if excess <= 0:
+                                continue
+                            dominant_mask = symbols_arr[entry_idx].astype(str) == str(dominant_symbol)
+                            dominant_entry_idx = entry_idx[dominant_mask]
+                            if dominant_entry_idx.size <= 0:
+                                continue
+                            strengths = np.abs(y_proba[dominant_entry_idx] - 0.5)
+                            drop_n = int(min(excess, dominant_entry_idx.size))
+                            drop_order = np.argsort(strengths)[:drop_n]
+                            adjusted_signals[dominant_entry_idx[drop_order]] = 0.0
+                            changed = True
+                        if not changed:
+                            break
+                    raw_signals = adjusted_signals
+
+        proba_proxy = np.abs(np.diff(y_proba, prepend=y_proba[0]))
+        rolling_vol = (
+            pd.Series(proba_proxy)
+            .rolling(max(8, self.config.label_volatility_lookback), min_periods=3)
+            .mean()
+            .fillna(0.0)
+            .to_numpy(dtype=float)
+        )
 
         per_bar_vol_target = float(self.config.execution_vol_target_daily / np.sqrt(252.0))
         leverage = np.clip(per_bar_vol_target / np.clip(rolling_vol, 1e-8, None), 0.0, 1.5)
@@ -3895,63 +5414,31 @@ class ModelTrainer:
             "entry_mask": entry_mask.astype(bool),
         }
 
-    def _compute_net_returns(
+    def _compute_single_stream_net_returns(
         self,
+        *,
         y_true: np.ndarray,
         y_proba: np.ndarray,
-        long_threshold: float = 0.55,
-        short_threshold: float = 0.45,
-        realized_forward_returns: np.ndarray | None = None,
-        event_net_returns: np.ndarray | None = None,
-        timestamps: np.ndarray | None = None,
-        return_details: bool = False,
-    ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
-        """Compute strategy net returns from model signals and realized returns."""
-        y_true = np.asarray(y_true)
-        y_proba = np.asarray(y_proba)
-        if len(y_proba) <= 1:
-            empty_returns = np.array([], dtype=float)
-            if return_details:
-                return empty_returns, {
-                    "positions": np.array([], dtype=float),
-                    "turnover_series": np.array([], dtype=float),
-                    "trade_mask": np.array([], dtype=bool),
-                    "entry_mask": np.array([], dtype=bool),
-                }
-            return empty_returns
-
-        short_threshold = float(np.clip(short_threshold, 0.01, 0.49))
-        long_threshold = float(np.clip(long_threshold, 0.51, 0.99))
-        if long_threshold <= short_threshold:
-            long_threshold = 0.55
-            short_threshold = 0.45
-
-        realized = None
-        if realized_forward_returns is not None:
-            realized = self._align_probabilities(
-                np.asarray(realized_forward_returns, dtype=float),
-                len(y_proba),
-                fill_value=0.0,
-            )
-        elif event_net_returns is not None:
-            realized = self._align_probabilities(
-                np.asarray(event_net_returns, dtype=float),
-                len(y_proba),
-                fill_value=0.0,
-            )
-
+        long_threshold: float,
+        short_threshold: float,
+        realized_returns: np.ndarray | None,
+        timestamps: np.ndarray | None,
+        symbols: np.ndarray | None,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Compute execution profile and net returns for a single stream."""
         execution_profile = self._build_execution_profile(
             y_proba=y_proba,
             long_threshold=long_threshold,
             short_threshold=short_threshold,
-            realized_returns=realized,
+            realized_returns=realized_returns,
             timestamps=timestamps,
+            symbols=symbols,
         )
         positions = np.asarray(execution_profile["positions"], dtype=float)
         turnover_series = np.asarray(execution_profile["turnover_series"], dtype=float)
 
-        if realized is not None:
-            raw_alpha = positions * realized
+        if realized_returns is not None:
+            raw_alpha = positions * realized_returns
         else:
             # Conservative fallback when realized returns are unavailable.
             y_direction = np.where(y_true >= 0.5, 1.0, -1.0)
@@ -3963,17 +5450,266 @@ class ModelTrainer:
             / 10000.0,
         )
         trading_cost = turnover_series * trading_cost_rate
-        net_returns = raw_alpha - trading_cost
-        net_returns = np.nan_to_num(net_returns.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+        net_returns = np.nan_to_num(
+            (raw_alpha - trading_cost).astype(float),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        return net_returns, execution_profile
+
+    @staticmethod
+    def _aggregate_panel_portfolio_series(
+        *,
+        timestamps: np.ndarray | None,
+        net_returns: np.ndarray,
+        turnover_series: np.ndarray,
+        trade_mask: np.ndarray,
+        entry_mask: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Aggregate row-level panel execution to timestamp-level portfolio series."""
+        n_rows = int(len(net_returns))
+        row_fallback = {
+            "portfolio_returns": np.asarray(net_returns, dtype=float),
+            "portfolio_turnover_series": np.asarray(turnover_series, dtype=float),
+            "portfolio_trade_mask": np.asarray(trade_mask, dtype=bool),
+            "portfolio_entry_mask": np.asarray(entry_mask, dtype=bool),
+        }
+        if n_rows <= 0 or timestamps is None:
+            return row_fallback
+
+        timestamp_arr = np.asarray(timestamps).reshape(-1)
+        if timestamp_arr.size != n_rows:
+            return row_fallback
+
+        ts_dt = pd.to_datetime(timestamp_arr, utc=True, errors="coerce")
+        valid_mask = np.asarray(~pd.isna(ts_dt), dtype=bool)
+        if (not np.any(valid_mask)) or (not np.all(valid_mask)):
+            return row_fallback
+
+        ts_int = np.asarray(ts_dt.view("int64"), dtype=np.int64)
+        sort_idx = np.argsort(ts_int, kind="stable")
+        sorted_ts = ts_int[sort_idx]
+        sorted_net = np.asarray(net_returns[sort_idx], dtype=float)
+        sorted_turnover = np.asarray(turnover_series[sort_idx], dtype=float)
+        sorted_trade = np.asarray(trade_mask[sort_idx], dtype=bool).astype(np.int8)
+        sorted_entry = np.asarray(entry_mask[sort_idx], dtype=bool).astype(np.int8)
+
+        unique_ts, start_idx, counts = np.unique(
+            sorted_ts,
+            return_index=True,
+            return_counts=True,
+        )
+        del unique_ts  # Only aggregation outputs are required downstream.
+
+        portfolio_returns = np.add.reduceat(sorted_net, start_idx) / np.clip(counts, 1, None)
+        portfolio_turnover_series = (
+            np.add.reduceat(sorted_turnover, start_idx) / np.clip(counts, 1, None)
+        )
+        portfolio_trade_mask = np.maximum.reduceat(sorted_trade, start_idx).astype(bool)
+        portfolio_entry_mask = np.maximum.reduceat(sorted_entry, start_idx).astype(bool)
+
+        return {
+            "portfolio_returns": np.asarray(portfolio_returns, dtype=float),
+            "portfolio_turnover_series": np.asarray(portfolio_turnover_series, dtype=float),
+            "portfolio_trade_mask": np.asarray(portfolio_trade_mask, dtype=bool),
+            "portfolio_entry_mask": np.asarray(portfolio_entry_mask, dtype=bool),
+        }
+
+    def _compute_net_returns(
+        self,
+        y_true: np.ndarray,
+        y_proba: np.ndarray,
+        long_threshold: float = 0.55,
+        short_threshold: float = 0.45,
+        realized_forward_returns: np.ndarray | None = None,
+        event_net_returns: np.ndarray | None = None,
+        timestamps: np.ndarray | None = None,
+        symbols: np.ndarray | None = None,
+        return_details: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Compute strategy net returns from model signals and realized returns."""
+        y_true = np.asarray(y_true)
+        y_proba = np.asarray(y_proba)
+        n_rows = int(len(y_proba))
+        if n_rows <= 1:
+            empty_returns = np.array([], dtype=float)
+            if return_details:
+                return empty_returns, {
+                    "positions": np.array([], dtype=float),
+                    "turnover_series": np.array([], dtype=float),
+                    "trade_mask": np.array([], dtype=bool),
+                    "entry_mask": np.array([], dtype=bool),
+                    "portfolio_returns": np.array([], dtype=float),
+                    "portfolio_turnover_series": np.array([], dtype=float),
+                    "portfolio_trade_mask": np.array([], dtype=bool),
+                    "portfolio_entry_mask": np.array([], dtype=bool),
+                }
+            return empty_returns
+
+        short_threshold = float(np.clip(short_threshold, 0.01, 0.49))
+        long_threshold = float(np.clip(long_threshold, 0.51, 0.99))
+        if long_threshold <= short_threshold:
+            long_threshold = 0.55
+            short_threshold = 0.45
+
+        realized: np.ndarray | None = None
+        if realized_forward_returns is not None:
+            realized = self._align_probabilities(
+                np.asarray(realized_forward_returns, dtype=float),
+                n_rows,
+                fill_value=0.0,
+            )
+        elif event_net_returns is not None:
+            realized = self._align_probabilities(
+                np.asarray(event_net_returns, dtype=float),
+                n_rows,
+                fill_value=0.0,
+            )
+
+        timestamp_arr: np.ndarray | None = None
+        if timestamps is not None:
+            candidate_timestamps = np.asarray(timestamps).reshape(-1)
+            if candidate_timestamps.size == n_rows:
+                timestamp_arr = candidate_timestamps
+
+        symbols_arr: np.ndarray | None = None
+        if symbols is not None:
+            candidate_symbols = np.asarray(symbols, dtype=object).reshape(-1)
+            if candidate_symbols.size == n_rows:
+                symbols_arr = candidate_symbols
+
+        unique_symbol_count = (
+            int(pd.Series(symbols_arr.astype(str)).nunique())
+            if symbols_arr is not None and symbols_arr.size == n_rows
+            else 0
+        )
+
+        if unique_symbol_count >= 2:
+            row_net_returns = np.zeros(n_rows, dtype=float)
+            row_positions = np.zeros(n_rows, dtype=float)
+            row_turnover = np.zeros(n_rows, dtype=float)
+            row_trade_mask = np.zeros(n_rows, dtype=bool)
+            row_entry_mask = np.zeros(n_rows, dtype=bool)
+
+            sort_key: np.ndarray | None = None
+            if timestamp_arr is not None:
+                ts_dt = pd.to_datetime(timestamp_arr, utc=True, errors="coerce")
+                if not np.asarray(pd.isna(ts_dt), dtype=bool).any():
+                    sort_key = np.asarray(ts_dt.view("int64"), dtype=np.int64)
+
+            symbol_labels = symbols_arr.astype(str)
+            for symbol_name in pd.unique(pd.Series(symbol_labels)):
+                symbol_idx = np.flatnonzero(symbol_labels == str(symbol_name))
+                if symbol_idx.size <= 0:
+                    continue
+                if sort_key is not None and symbol_idx.size > 1:
+                    local_order = np.argsort(sort_key[symbol_idx], kind="stable")
+                    symbol_idx = symbol_idx[local_order]
+
+                symbol_realized = (
+                    np.asarray(realized[symbol_idx], dtype=float)
+                    if realized is not None and len(realized) == n_rows
+                    else None
+                )
+                symbol_timestamps = (
+                    np.asarray(timestamp_arr[symbol_idx], dtype=object)
+                    if timestamp_arr is not None and len(timestamp_arr) == n_rows
+                    else None
+                )
+                symbol_net, symbol_details = self._compute_single_stream_net_returns(
+                    y_true=np.asarray(y_true[symbol_idx], dtype=float),
+                    y_proba=np.asarray(y_proba[symbol_idx], dtype=float),
+                    long_threshold=long_threshold,
+                    short_threshold=short_threshold,
+                    realized_returns=symbol_realized,
+                    timestamps=symbol_timestamps,
+                    symbols=None,
+                )
+                row_net_returns[symbol_idx] = np.asarray(symbol_net, dtype=float)
+                row_positions[symbol_idx] = np.asarray(
+                    symbol_details.get("positions", np.zeros(len(symbol_idx))),
+                    dtype=float,
+                )
+                row_turnover[symbol_idx] = np.asarray(
+                    symbol_details.get("turnover_series", np.zeros(len(symbol_idx))),
+                    dtype=float,
+                )
+                row_trade_mask[symbol_idx] = np.asarray(
+                    symbol_details.get("trade_mask", np.zeros(len(symbol_idx), dtype=bool)),
+                    dtype=bool,
+                )
+                row_entry_mask[symbol_idx] = np.asarray(
+                    symbol_details.get("entry_mask", np.zeros(len(symbol_idx), dtype=bool)),
+                    dtype=bool,
+                )
+
+            execution_profile: dict[str, np.ndarray] = {
+                "positions": row_positions,
+                "turnover_series": row_turnover,
+                "trade_mask": row_trade_mask,
+                "entry_mask": row_entry_mask,
+            }
+            execution_profile.update(
+                self._aggregate_panel_portfolio_series(
+                    timestamps=timestamp_arr,
+                    net_returns=row_net_returns,
+                    turnover_series=row_turnover,
+                    trade_mask=row_trade_mask,
+                    entry_mask=row_entry_mask,
+                )
+            )
+
+            if return_details:
+                return row_net_returns, execution_profile
+            return row_net_returns
+
+        net_returns, execution_profile = self._compute_single_stream_net_returns(
+            y_true=np.asarray(y_true, dtype=float),
+            y_proba=np.asarray(y_proba, dtype=float),
+            long_threshold=long_threshold,
+            short_threshold=short_threshold,
+            realized_returns=realized,
+            timestamps=timestamp_arr,
+            symbols=symbols_arr,
+        )
+        execution_profile.update(
+            {
+                "portfolio_returns": np.asarray(net_returns, dtype=float),
+                "portfolio_turnover_series": np.asarray(
+                    execution_profile.get("turnover_series", np.zeros_like(net_returns)),
+                    dtype=float,
+                ),
+                "portfolio_trade_mask": np.asarray(
+                    execution_profile.get(
+                        "trade_mask",
+                        np.zeros(len(net_returns), dtype=bool),
+                    ),
+                    dtype=bool,
+                ),
+                "portfolio_entry_mask": np.asarray(
+                    execution_profile.get(
+                        "entry_mask",
+                        np.zeros(len(net_returns), dtype=bool),
+                    ),
+                    dtype=bool,
+                ),
+            }
+        )
         if return_details:
-            return net_returns, execution_profile
-        return net_returns
+            return np.asarray(net_returns, dtype=float), execution_profile
+        return np.asarray(net_returns, dtype=float)
 
     def _select_final_model(self, models: list, fold_results: list[dict]) -> None:
         """Select final model from CV folds."""
         def _fold_trade_target(result: dict[str, Any]) -> float:
             test_size = int(result.get("test_size", 0))
             return float(self._effective_trade_target(test_size if test_size > 0 else None))
+
+        def _fold_selection_score(result: dict[str, Any]) -> float:
+            raw_score = float(result.get("risk_adjusted_score", result.get("sharpe", 0.0)))
+            reliability = self._fold_reliability_weight(result, int(result.get("test_size", 0)))
+            return float(raw_score * (0.20 + (0.80 * reliability)))
 
         eligible_indices = [
             idx
@@ -3990,15 +5726,15 @@ class ModelTrainer:
         # Select model with best risk-adjusted score among eligible folds.
         best_idx = max(
             candidate_indices,
-            key=lambda i: float(
-                fold_results[i].get(
-                    "risk_adjusted_score",
-                    fold_results[i].get("sharpe", 0.0),
-                )
-            ),
+            key=lambda i: _fold_selection_score(fold_results[i]),
         )
         self.model = models[best_idx]
         self.training_metrics["selected_cv_fold"] = float(best_idx + 1)
+        self.training_metrics["selected_cv_fold_score"] = _fold_selection_score(fold_results[best_idx])
+        self.training_metrics["selected_cv_fold_reliability"] = self._fold_reliability_weight(
+            fold_results[best_idx],
+            int(fold_results[best_idx].get("test_size", 0)),
+        )
         self.logger.info(f"Selected model from fold {best_idx + 1}")
 
     def _fit_model_full_dataset(
@@ -4009,6 +5745,14 @@ class ModelTrainer:
         sample_weights: np.ndarray | None,
     ) -> None:
         """Fit final production model on full dataset with robust kwargs handling."""
+        model_module = str(getattr(model.__class__, "__module__", ""))
+        fit_feature_names: list[str] = []
+        if model_module.startswith("quant_trading_system.models"):
+            if self.feature_names and len(self.feature_names) == int(X.shape[1]):
+                fit_feature_names = [str(name) for name in self.feature_names]
+            else:
+                fit_feature_names = [f"f{i}" for i in range(int(X.shape[1]))]
+
         candidate_calls: list[dict[str, Any]] = []
         if sample_weights is not None:
             candidate_calls.extend(
@@ -4021,8 +5765,11 @@ class ModelTrainer:
 
         last_error: Exception | None = None
         for kwargs in candidate_calls:
+            call_kwargs = dict(kwargs)
+            if fit_feature_names:
+                call_kwargs.setdefault("feature_names", fit_feature_names)
             try:
-                model.fit(X, y, **kwargs)
+                model.fit(X, y, **call_kwargs)
                 return
             except (TypeError, ValueError) as exc:
                 last_error = exc
@@ -4085,6 +5832,9 @@ class ModelTrainer:
             "expected_shortfall",
             "return_skew",
             "equity_break",
+            "symbol_concentration_hhi",
+            "symbol_effective_count",
+            "entry_symbol_count",
             "turnover",
             "annual_return",
             "calmar",
@@ -4093,6 +5843,8 @@ class ModelTrainer:
             "regime_shift",
             "trade_return_observations",
             "active_net_return_observations",
+            "fold_reliability",
+            "selection_score",
             "train_size",
             "test_size",
             "net_return_observations",
@@ -4103,8 +5855,11 @@ class ModelTrainer:
             "objective_calibration_penalty",
             "objective_trade_activity_penalty",
             "objective_cvar_penalty",
+            "objective_tail_risk_penalty",
+            "objective_symbol_concentration_penalty",
             "objective_skew_penalty",
             "objective_equity_break_penalty",
+            "objective_expected_shortfall_cap",
             "risk_adjusted_score",
         ]
 
@@ -4131,6 +5886,12 @@ class ModelTrainer:
             ),
             "objective_cvar_penalty": float(
                 self.training_metrics.get("mean_objective_cvar_penalty", 0.0)
+            ),
+            "objective_tail_risk_penalty": float(
+                self.training_metrics.get("mean_objective_tail_risk_penalty", 0.0)
+            ),
+            "objective_symbol_concentration_penalty": float(
+                self.training_metrics.get("mean_objective_symbol_concentration_penalty", 0.0)
             ),
             "objective_skew_penalty": float(
                 self.training_metrics.get("mean_objective_skew_penalty", 0.0)
@@ -4169,6 +5930,8 @@ class ModelTrainer:
         long_threshold, short_threshold = self._derive_signal_thresholds(
             train_proba,
             train_labels=train_labels,
+            train_returns=self.primary_forward_returns,
+            train_regimes=self.regimes,
         )
         holdout_metrics = self._calculate_fold_metrics(
             y_true=y_holdout,
@@ -4179,6 +5942,11 @@ class ModelTrainer:
             realized_forward_returns=self.holdout_primary_forward_returns,
             event_net_returns=self.holdout_cost_aware_event_returns,
             timestamps=self.holdout_timestamps,
+            symbols=(
+                np.asarray(self.holdout_symbols, dtype=object)
+                if self.holdout_symbols is not None and len(self.holdout_symbols) == len(y_holdout)
+                else None
+            ),
         )
 
         holdout_regime_shift = self._regime_shift_score(
@@ -4186,6 +5954,71 @@ class ModelTrainer:
             self._regime_distribution(self.holdout_regimes),
         )
         holdout_metrics["regime_shift"] = float(holdout_regime_shift)
+
+        holdout_regime_metrics: dict[str, dict[str, float]] = {}
+        holdout_worst_regime_sharpe = float(holdout_metrics.get("sharpe", 0.0))
+        holdout_regime_sample_floor = max(30, int(round(0.05 * len(y_holdout))))
+        if self.holdout_regimes is not None and len(self.holdout_regimes) == len(y_holdout):
+            regime_arr = np.asarray(self.holdout_regimes, dtype=str).reshape(-1)
+            unique_regimes = sorted({str(r).strip() for r in regime_arr if str(r).strip()})
+            holdout_symbols_arr = (
+                np.asarray(self.holdout_symbols, dtype=object).reshape(-1)
+                if self.holdout_symbols is not None and len(self.holdout_symbols) == len(y_holdout)
+                else None
+            )
+            for regime_name in unique_regimes:
+                regime_mask = regime_arr == regime_name
+                regime_rows = int(np.count_nonzero(regime_mask))
+                if regime_rows < holdout_regime_sample_floor:
+                    continue
+                regime_metrics = self._calculate_fold_metrics(
+                    y_true=y_holdout[regime_mask],
+                    y_pred=y_holdout_pred[regime_mask],
+                    y_proba=y_holdout_proba[regime_mask],
+                    long_threshold=long_threshold,
+                    short_threshold=short_threshold,
+                    realized_forward_returns=(
+                        np.asarray(self.holdout_primary_forward_returns, dtype=float)[regime_mask]
+                        if self.holdout_primary_forward_returns is not None
+                        and len(self.holdout_primary_forward_returns) == len(y_holdout)
+                        else None
+                    ),
+                    event_net_returns=(
+                        np.asarray(self.holdout_cost_aware_event_returns, dtype=float)[regime_mask]
+                        if self.holdout_cost_aware_event_returns is not None
+                        and len(self.holdout_cost_aware_event_returns) == len(y_holdout)
+                        else None
+                    ),
+                    timestamps=(
+                        np.asarray(self.holdout_timestamps, dtype="datetime64[ns]")[regime_mask]
+                        if self.holdout_timestamps is not None
+                        and len(self.holdout_timestamps) == len(y_holdout)
+                        else None
+                    ),
+                    symbols=(
+                        holdout_symbols_arr[regime_mask]
+                        if holdout_symbols_arr is not None
+                        else None
+                    ),
+                )
+                holdout_regime_metrics[str(regime_name)] = {
+                    "rows": float(regime_rows),
+                    "sharpe": float(regime_metrics.get("sharpe", 0.0)),
+                    "max_drawdown": float(regime_metrics.get("max_drawdown", 0.0)),
+                    "trade_count": float(regime_metrics.get("trade_count", 0.0)),
+                    "risk_adjusted_score": float(regime_metrics.get("risk_adjusted_score", -1e9)),
+                    "symbol_concentration_hhi": float(
+                        regime_metrics.get("symbol_concentration_hhi", 0.0)
+                    ),
+                }
+            if holdout_regime_metrics:
+                holdout_worst_regime_sharpe = float(
+                    min(v.get("sharpe", 0.0) for v in holdout_regime_metrics.values())
+                )
+
+        self.training_metrics["holdout_worst_regime_sharpe"] = float(holdout_worst_regime_sharpe)
+        self.training_metrics["holdout_regime_count_evaluated"] = float(len(holdout_regime_metrics))
+        self.training_metrics["holdout_regime_metrics"] = holdout_regime_metrics
 
         for key, value in holdout_metrics.items():
             if isinstance(value, (int, float, np.floating, np.integer)):
@@ -4196,9 +6029,11 @@ class ModelTrainer:
         self.training_metrics["holdout_short_threshold"] = float(short_threshold)
 
         self.logger.info(
-            "Holdout metrics - Accuracy: %.4f, Sharpe: %.4f, Drawdown: %.4f, RegimeShift: %.4f",
+            "Holdout metrics - Accuracy: %.4f, Sharpe: %.4f, WorstRegimeSharpe: %.4f, "
+            "Drawdown: %.4f, RegimeShift: %.4f",
             self.training_metrics.get("holdout_accuracy", 0.0),
             self.training_metrics.get("holdout_sharpe", 0.0),
+            self.training_metrics.get("holdout_worst_regime_sharpe", holdout_worst_regime_sharpe),
             self.training_metrics.get("holdout_max_drawdown", 0.0),
             self.training_metrics.get("holdout_regime_shift", holdout_regime_shift),
         )
@@ -4219,7 +6054,17 @@ class ModelTrainer:
         self.training_metrics["effective_min_trades_gate"] = effective_min_trades
         holdout_available = float(self.training_metrics.get("holdout_rows", 0.0)) > 0.0
         holdout_sharpe = float(self.training_metrics.get("holdout_sharpe", -1.0))
+        holdout_worst_regime_sharpe = float(
+            self.training_metrics.get("holdout_worst_regime_sharpe", holdout_sharpe)
+        )
         holdout_drawdown = float(self.training_metrics.get("holdout_max_drawdown", 1.0))
+        symbol_concentration_metric = float(
+            max(
+                self.training_metrics.get("mean_symbol_concentration_hhi", 0.0),
+                self.training_metrics.get("holdout_symbol_concentration_hhi", 0.0),
+            )
+        )
+        self.training_metrics["effective_symbol_concentration_gate_metric"] = symbol_concentration_metric
         effective_max_pbo = float(
             self.training_metrics.get("effective_max_pbo_gate", self.config.max_pbo)
         )
@@ -4306,10 +6151,26 @@ class ModelTrainer:
                 holdout_drawdown if holdout_available else self.config.max_holdout_drawdown,
                 self.config.max_holdout_drawdown,
             ),
+            "min_holdout_regime_sharpe": (
+                (holdout_worst_regime_sharpe >= self.config.min_holdout_regime_sharpe)
+                if holdout_available
+                else True,
+                (
+                    holdout_worst_regime_sharpe
+                    if holdout_available
+                    else self.config.min_holdout_regime_sharpe
+                ),
+                self.config.min_holdout_regime_sharpe,
+            ),
             "max_regime_shift": (
                 regime_shift_metric <= self.config.max_regime_shift,
                 regime_shift_metric,
                 self.config.max_regime_shift,
+            ),
+            "max_symbol_concentration_hhi": (
+                symbol_concentration_metric <= self.config.max_symbol_concentration_hhi,
+                symbol_concentration_metric,
+                self.config.max_symbol_concentration_hhi,
             ),
             "nested_walk_forward_trace": (
                 (
@@ -4408,9 +6269,18 @@ class ModelTrainer:
                 "mean_sharpe": float(self.training_metrics.get("mean_sharpe", 0.0)),
                 "mean_max_drawdown": float(self.training_metrics.get("mean_max_drawdown", 1.0)),
                 "mean_trade_count": float(self.training_metrics.get("mean_trade_count", 0.0)),
+                "mean_symbol_concentration_hhi": float(
+                    self.training_metrics.get("mean_symbol_concentration_hhi", 0.0)
+                ),
                 "holdout_sharpe": float(self.training_metrics.get("holdout_sharpe", 0.0)),
                 "holdout_max_drawdown": float(self.training_metrics.get("holdout_max_drawdown", 1.0)),
                 "holdout_regime_shift": float(self.training_metrics.get("holdout_regime_shift", 0.0)),
+                "holdout_symbol_concentration_hhi": float(
+                    self.training_metrics.get("holdout_symbol_concentration_hhi", 0.0)
+                ),
+                "holdout_worst_regime_sharpe": float(
+                    self.training_metrics.get("holdout_worst_regime_sharpe", 0.0)
+                ),
                 "deflated_sharpe": float(self.training_metrics.get("deflated_sharpe", 0.0)),
                 "deflated_sharpe_p_value": float(
                     self.training_metrics.get("deflated_sharpe_p_value", 1.0)
@@ -4449,14 +6319,18 @@ class ModelTrainer:
             "kill_switch_guardrails": {
                 "max_intraday_drawdown": float(min(self.config.max_drawdown, self.config.max_holdout_drawdown)),
                 "max_regime_shift": float(self.config.max_regime_shift),
-                "min_live_sharpe_rolling": float(max(self.config.min_holdout_sharpe, 0.0)),
+                "min_live_sharpe_rolling": float(
+                    max(self.config.min_holdout_sharpe, self.config.min_holdout_regime_sharpe, 0.0)
+                ),
                 "min_trade_count_rolling": int(self.config.min_trades),
+                "max_symbol_concentration_hhi": float(self.config.max_symbol_concentration_hhi),
             },
             "tca_guardrails": {
                 "expected_cost_bps": total_cost_bps,
                 "max_slippage_bps": float(total_cost_bps * 1.5),
                 "max_turnover": float(self.config.execution_turnover_cap),
                 "execution_cooldown_bars": int(self.config.execution_cooldown_bars),
+                "max_symbol_entry_share": float(self.config.execution_max_symbol_entry_share),
             },
         }
 
@@ -4500,7 +6374,28 @@ class ModelTrainer:
                 f"Meta-labeling uses OOF predictions: {usable_count}/{len(self.features)} samples"
             )
 
-            meta_cfg = MetaLabelConfig(model_type=self.config.meta_model_type)
+            meta_dynamic_threshold = bool(self.config.meta_label_dynamic_threshold)
+            if meta_dynamic_threshold:
+                meta_min_confidence = self._meta_confidence_for_horizon()
+            else:
+                meta_min_confidence = float(np.clip(self.config.meta_label_min_confidence, 0.45, 0.95))
+            self.training_metrics["meta_label_min_confidence"] = meta_min_confidence
+            self.training_metrics["meta_label_dynamic_threshold"] = (
+                1.0 if meta_dynamic_threshold else 0.0
+            )
+            self.training_metrics["meta_label_primary_horizon"] = float(self._primary_horizon())
+
+            meta_cfg = MetaLabelConfig(
+                model_type=self.config.meta_model_type,
+                min_confidence=meta_min_confidence,
+                dynamic_threshold=meta_dynamic_threshold,
+            )
+            self.logger.info(
+                "Meta-label threshold policy: min_confidence=%.3f dynamic=%s horizon=%d",
+                meta_min_confidence,
+                str(meta_dynamic_threshold).lower(),
+                self._primary_horizon(),
+            )
             self.meta_model = MetaLabeler(config=meta_cfg)
 
             signal_series = pd.Series(
@@ -4927,8 +6822,10 @@ class ModelTrainer:
                 "min_win_rate": self.config.min_win_rate,
                 "min_trades": self.config.min_trades,
                 "min_holdout_sharpe": self.config.min_holdout_sharpe,
+                "min_holdout_regime_sharpe": self.config.min_holdout_regime_sharpe,
                 "max_holdout_drawdown": self.config.max_holdout_drawdown,
                 "max_regime_shift": self.config.max_regime_shift,
+                "max_symbol_concentration_hhi": self.config.max_symbol_concentration_hhi,
                 "min_deflated_sharpe": self.config.min_deflated_sharpe,
                 "max_deflated_sharpe_pvalue": self.config.max_deflated_sharpe_pvalue,
                 "max_pbo": self.config.max_pbo,
@@ -5152,8 +7049,15 @@ def _governance_score(result: dict[str, Any]) -> float:
     score = 0.0
     score += _metric_as_float(metrics, "mean_risk_adjusted_score", -1.0) * 1.0
     score += _metric_as_float(metrics, "holdout_sharpe", _metric_as_float(metrics, "mean_sharpe", 0.0)) * 0.6
+    score += _metric_as_float(
+        metrics,
+        "holdout_worst_regime_sharpe",
+        _metric_as_float(metrics, "holdout_sharpe", 0.0),
+    ) * 0.35
     score += _metric_as_float(metrics, "deflated_sharpe", _metric_as_float(metrics, "mean_sharpe", 0.0)) * 0.4
     score -= _metric_as_float(metrics, "holdout_max_drawdown", _metric_as_float(metrics, "mean_max_drawdown", 1.0)) * 0.75
+    score -= _metric_as_float(metrics, "mean_symbol_concentration_hhi", 0.0) * 0.35
+    score -= _metric_as_float(metrics, "holdout_symbol_concentration_hhi", 0.0) * 0.20
     score -= _metric_as_float(metrics, "pbo", 1.0) * 0.25
     if not bool(result.get("success", False)):
         score -= 5.0
@@ -5167,9 +7071,16 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
         metrics = result.get("training_metrics", {})
         if not isinstance(metrics, dict):
             metrics = {}
+        raw_primary_horizon = result.get("primary_label_horizon", metrics.get("primary_label_horizon", 0))
+        try:
+            primary_horizon = int(float(raw_primary_horizon))
+        except (TypeError, ValueError):
+            primary_horizon = 0
         rows.append(
             {
                 "model_type": str(model_type),
+                "primary_label_horizon": int(max(primary_horizon, 0)),
+                "run_id": str(result.get("run_id") or ""),
                 "success": bool(result.get("success", False)),
                 "governance_score": _governance_score(result),
                 "mean_accuracy": _metric_as_float(metrics, "mean_accuracy", 0.0),
@@ -5181,6 +7092,15 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
                 "holdout_sharpe": _metric_as_float(metrics, "holdout_sharpe", 0.0),
                 "holdout_max_drawdown": _metric_as_float(metrics, "holdout_max_drawdown", 1.0),
                 "holdout_regime_shift": _metric_as_float(metrics, "holdout_regime_shift", 0.0),
+                "holdout_worst_regime_sharpe": _metric_as_float(
+                    metrics, "holdout_worst_regime_sharpe", 0.0
+                ),
+                "mean_symbol_concentration_hhi": _metric_as_float(
+                    metrics, "mean_symbol_concentration_hhi", 0.0
+                ),
+                "holdout_symbol_concentration_hhi": _metric_as_float(
+                    metrics, "holdout_symbol_concentration_hhi", 0.0
+                ),
                 "mean_trade_count": _metric_as_float(metrics, "mean_trade_count", 0.0),
                 "registry_version_id": str(result.get("registry_version_id") or ""),
                 "model_name": str(result.get("model_name") or model_type),
@@ -5377,12 +7297,57 @@ def run_training(args: argparse.Namespace) -> int:
         overall_success = True
         results: list[tuple[str, dict[str, Any]]] = []
         replay_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        configured_name = str(getattr(args, "name", "") or "").strip()
 
         def _cfg_value(key: str, fallback: Any) -> Any:
             value = replay_config.get(key, fallback)
             return fallback if value is None else value
 
-        for model_type in model_list:
+        raw_primary_horizon_sweep = _cfg_value(
+            "primary_horizon_sweep",
+            getattr(args, "primary_horizon_sweep", []),
+        )
+        if isinstance(raw_primary_horizon_sweep, (list, tuple, set)):
+            primary_horizon_sweep = sorted(
+                {
+                    int(h)
+                    for h in raw_primary_horizon_sweep
+                    if isinstance(h, (int, float, np.integer, np.floating)) and int(h) > 0
+                }
+            )
+        elif raw_primary_horizon_sweep:
+            try:
+                parsed_h = int(raw_primary_horizon_sweep)
+                primary_horizon_sweep = [parsed_h] if parsed_h > 0 else []
+            except (TypeError, ValueError):
+                primary_horizon_sweep = []
+        else:
+            primary_horizon_sweep = []
+
+        base_primary_horizon = int(
+            _cfg_value("primary_label_horizon", getattr(args, "primary_horizon", 5))
+        )
+        if base_primary_horizon <= 0:
+            base_primary_horizon = 5
+        if not primary_horizon_sweep:
+            primary_horizon_sweep = [base_primary_horizon]
+
+        run_specs = [
+            {"model_type": model_type, "primary_horizon": int(primary_horizon)}
+            for model_type in model_list
+            for primary_horizon in primary_horizon_sweep
+        ]
+        is_multi_run = len(run_specs) > 1
+        logger.info(
+            "Training sweep configured: %d run(s), models=%s, primary_horizons=%s",
+            len(run_specs),
+            ",".join(model_list),
+            primary_horizon_sweep,
+        )
+
+        for run_index, run_spec in enumerate(run_specs, start=1):
+            model_type = str(run_spec["model_type"])
+            primary_horizon = int(run_spec["primary_horizon"])
             model_params = _load_model_defaults(
                 model_type=model_type,
                 use_gpu=True,
@@ -5391,14 +7356,17 @@ def run_training(args: argparse.Namespace) -> int:
             if isinstance(replay_model_params, dict):
                 model_params = {**model_params, **replay_model_params}
 
-            configured_name = str(getattr(args, "name", "") or "").strip()
+            run_name_suffix = f"{model_type}_h{primary_horizon}"
             if configured_name:
-                model_name = configured_name
+                model_name = configured_name if not is_multi_run else f"{configured_name}_{run_name_suffix}"
             elif replay_config:
                 replay_base_name = str(replay_config.get("model_name") or model_type).strip()
-                model_name = f"{replay_base_name}_replay_{replay_timestamp}"
+                if is_multi_run:
+                    model_name = f"{replay_base_name}_{run_name_suffix}_replay_{replay_timestamp}"
+                else:
+                    model_name = f"{replay_base_name}_replay_{replay_timestamp}"
             else:
-                model_name = ""
+                model_name = "" if not is_multi_run else f"{run_name_suffix}_{replay_timestamp}"
 
             raw_horizons = _cfg_value("label_horizons", getattr(args, "label_horizons", [1, 5, 20]))
             if isinstance(raw_horizons, (list, tuple)):
@@ -5463,6 +7431,18 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "nested_inner_splits", 3),
                     )
                 ),
+                nested_outer_stability_ratio_cap=float(
+                    _cfg_value(
+                        "nested_outer_stability_ratio_cap",
+                        getattr(args, "nested_outer_stability_ratio_cap", 1.25),
+                    )
+                ),
+                nested_outer_stability_min_trials=int(
+                    _cfg_value(
+                        "nested_outer_stability_min_trials",
+                        getattr(args, "nested_outer_stability_min_trials", 8),
+                    )
+                ),
                 require_nested_trace_for_promotion=True,
                 require_objective_breakdown_for_promotion=True,
                 objective_weight_sharpe=float(
@@ -5507,12 +7487,43 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "objective_weight_skew", 0.1),
                     )
                 ),
+                objective_weight_tail_risk=float(
+                    _cfg_value(
+                        "objective_weight_tail_risk",
+                        getattr(args, "objective_weight_tail_risk", 0.35),
+                    )
+                ),
+                objective_weight_symbol_concentration=float(
+                    _cfg_value(
+                        "objective_weight_symbol_concentration",
+                        getattr(args, "objective_weight_symbol_concentration", 0.20),
+                    )
+                ),
+                objective_expected_shortfall_cap=float(
+                    _cfg_value(
+                        "objective_expected_shortfall_cap",
+                        getattr(args, "objective_expected_shortfall_cap", 0.012),
+                    )
+                ),
                 epochs=int(_cfg_value("epochs", getattr(args, "epochs", 100))),
                 batch_size=int(_cfg_value("batch_size", getattr(args, "batch_size", 64))),
                 learning_rate=float(
                     _cfg_value("learning_rate", getattr(args, "learning_rate", 0.001))
                 ),
+                primary_horizon_sweep=primary_horizon_sweep,
                 use_meta_labeling=True,
+                meta_label_min_confidence=float(
+                    _cfg_value(
+                        "meta_label_min_confidence",
+                        getattr(args, "meta_label_min_confidence", 0.55),
+                    )
+                ),
+                meta_label_dynamic_threshold=bool(
+                    _cfg_value(
+                        "meta_label_dynamic_threshold",
+                        not bool(getattr(args, "disable_meta_dynamic_threshold", False)),
+                    )
+                ),
                 apply_multiple_testing=True,
                 correction_method="deflated_sharpe",
                 use_gpu=True,
@@ -5545,6 +7556,12 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "min_holdout_sharpe", 0.0),
                     )
                 ),
+                min_holdout_regime_sharpe=float(
+                    _cfg_value(
+                        "min_holdout_regime_sharpe",
+                        getattr(args, "min_holdout_regime_sharpe", -0.10),
+                    )
+                ),
                 max_holdout_drawdown=float(
                     _cfg_value(
                         "max_holdout_drawdown",
@@ -5557,10 +7574,14 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "max_regime_shift", 0.35),
                     )
                 ),
-                label_horizons=label_horizons,
-                primary_label_horizon=int(
-                    _cfg_value("primary_label_horizon", getattr(args, "primary_horizon", 5))
+                max_symbol_concentration_hhi=float(
+                    _cfg_value(
+                        "max_symbol_concentration_hhi",
+                        getattr(args, "max_symbol_concentration_hhi", 0.65),
+                    )
                 ),
+                label_horizons=label_horizons,
+                primary_label_horizon=primary_horizon,
                 label_profit_taking_threshold=float(
                     _cfg_value("label_profit_taking_threshold", getattr(args, "profit_taking", 0.015))
                 ),
@@ -5625,6 +7646,48 @@ def run_training(args: argparse.Namespace) -> int:
                     )
                 ),
                 feature_groups=feature_groups,
+                enable_symbol_quality_filter=bool(
+                    _cfg_value(
+                        "enable_symbol_quality_filter",
+                        not bool(getattr(args, "disable_symbol_quality_filter", False)),
+                    )
+                ),
+                symbol_quality_min_rows=int(
+                    _cfg_value(
+                        "symbol_quality_min_rows",
+                        getattr(args, "symbol_quality_min_rows", 1200),
+                    )
+                ),
+                symbol_quality_min_symbols=int(
+                    _cfg_value(
+                        "symbol_quality_min_symbols",
+                        getattr(args, "symbol_quality_min_symbols", 8),
+                    )
+                ),
+                symbol_quality_max_missing_ratio=float(
+                    _cfg_value(
+                        "symbol_quality_max_missing_ratio",
+                        getattr(args, "symbol_quality_max_missing_ratio", 0.12),
+                    )
+                ),
+                symbol_quality_max_extreme_move_ratio=float(
+                    _cfg_value(
+                        "symbol_quality_max_extreme_move_ratio",
+                        getattr(args, "symbol_quality_max_extreme_move_ratio", 0.08),
+                    )
+                ),
+                symbol_quality_max_corporate_action_ratio=float(
+                    _cfg_value(
+                        "symbol_quality_max_corporate_action_ratio",
+                        getattr(args, "symbol_quality_max_corporate_action_ratio", 0.02),
+                    )
+                ),
+                symbol_quality_min_median_dollar_volume=float(
+                    _cfg_value(
+                        "symbol_quality_min_median_dollar_volume",
+                        getattr(args, "symbol_quality_min_median_dollar_volume", 1_000_000.0),
+                    )
+                ),
                 enable_cross_sectional=bool(
                     _cfg_value(
                         "enable_cross_sectional",
@@ -5646,7 +7709,8 @@ def run_training(args: argparse.Namespace) -> int:
                 allow_feature_group_fallback=bool(
                     _cfg_value(
                         "allow_feature_group_fallback",
-                        not bool(getattr(args, "strict_feature_groups", False)),
+                        bool(getattr(args, "allow_partial_feature_fallback", False))
+                        and not bool(getattr(args, "strict_feature_groups", False)),
                     )
                 ),
                 feature_materialization_batch_rows=int(
@@ -5665,6 +7729,12 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "persist_features_to_postgres",
                         not bool(getattr(args, "skip_feature_persist", False)),
+                    )
+                ),
+                windows_force_fallback_features=bool(
+                    _cfg_value(
+                        "windows_force_fallback_features",
+                        bool(getattr(args, "windows_fallback_features", False)),
                     )
                 ),
                 data_max_abs_return=float(
@@ -5703,12 +7773,26 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "execution_cooldown_bars", 2),
                     )
                 ),
+                execution_max_symbol_entry_share=float(
+                    _cfg_value(
+                        "execution_max_symbol_entry_share",
+                        getattr(args, "execution_max_symbol_entry_share", 0.68),
+                    )
+                ),
+                lightgbm_use_monotonic_constraints=bool(
+                    _cfg_value(
+                        "lightgbm_use_monotonic_constraints",
+                        not bool(getattr(args, "disable_lightgbm_monotonic_constraints", False)),
+                    )
+                ),
                 output_dir=str(getattr(args, "output_dir", "models")),
                 model_params=model_params,
             )
 
             logger.info("-" * 80)
+            logger.info(f"Run {run_index}/{len(run_specs)}")
             logger.info(f"Model type: {config.model_type}")
+            logger.info(f"Primary horizon: {config.primary_label_horizon}")
             logger.info(f"Symbols: {config.symbols or 'all available'}")
             logger.info("Data source: PostgreSQL (mandatory)")
             logger.info("Redis cache: enabled (mandatory)")
@@ -5742,6 +7826,7 @@ def run_training(args: argparse.Namespace) -> int:
                         "holdout_pct": config.holdout_pct,
                         "execution_turnover_cap": config.execution_turnover_cap,
                         "execution_cooldown_bars": config.execution_cooldown_bars,
+                        "execution_max_symbol_entry_share": config.execution_max_symbol_entry_share,
                     },
                     symbols=config.symbols,
                 )
@@ -5764,10 +7849,11 @@ def run_training(args: argparse.Namespace) -> int:
                         success=False,
                         error=str(model_exc),
                     )
-                if requested_model == "all":
+                if requested_model == "all" or is_multi_run:
                     logger.error(
-                        "Model %s failed during all-model sweep; continuing. Error: %s",
+                        "Model %s horizon=%s failed during sweep; continuing. Error: %s",
                         config.model_type,
+                        config.primary_label_horizon,
                         model_exc,
                     )
                     results.append(
@@ -5780,6 +7866,8 @@ def run_training(args: argparse.Namespace) -> int:
                                 "model_path": None,
                                 "training_duration_seconds": 0.0,
                                 "training_metrics": {},
+                                "primary_label_horizon": int(config.primary_label_horizon),
+                                "run_id": f"{config.model_type}_h{int(config.primary_label_horizon)}",
                                 "error": str(model_exc),
                             },
                         )
@@ -5787,6 +7875,16 @@ def run_training(args: argparse.Namespace) -> int:
                     overall_success = False
                     continue
                 raise
+
+            if not isinstance(result, dict):
+                result = {"success": False, "training_metrics": {}, "error": "invalid_result_payload"}
+            result.setdefault("model_type", config.model_type)
+            result.setdefault("model_name", config.model_name)
+            result["primary_label_horizon"] = int(config.primary_label_horizon)
+            result["run_id"] = f"{config.model_type}_h{int(config.primary_label_horizon)}"
+            metrics_payload = result.get("training_metrics")
+            if isinstance(metrics_payload, dict):
+                metrics_payload.setdefault("primary_label_horizon", float(config.primary_label_horizon))
 
             registry_entry: dict[str, Any] | None = None
             model_path = result.get("model_path")
@@ -5837,9 +7935,6 @@ def run_training(args: argparse.Namespace) -> int:
             results.append((model_type, result))
             if not result.get("success", False):
                 overall_success = False
-
-            if requested_model != "all":
-                break
 
         benchmark_json_path: Path | None = None
         benchmark_csv_path: Path | None = None
@@ -6000,6 +8095,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--nested-outer-splits", type=int, default=4)
     parser.add_argument("--nested-inner-splits", type=int, default=3)
+    parser.add_argument("--nested-outer-stability-ratio-cap", type=float, default=1.25)
+    parser.add_argument("--nested-outer-stability-min-trials", type=int, default=8)
     parser.add_argument(
         "--disable-nested-walk-forward",
         action="store_true",
@@ -6012,6 +8109,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--objective-weight-trade-activity", type=float, default=1.0)
     parser.add_argument("--objective-weight-cvar", type=float, default=0.4)
     parser.add_argument("--objective-weight-skew", type=float, default=0.1)
+    parser.add_argument("--objective-weight-tail-risk", type=float, default=0.35)
+    parser.add_argument("--objective-weight-symbol-concentration", type=float, default=0.20)
+    parser.add_argument("--objective-expected-shortfall-cap", type=float, default=0.012)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=0.001)
@@ -6030,8 +8130,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-trades", type=int, default=100)
     parser.add_argument("--holdout-pct", type=float, default=0.15)
     parser.add_argument("--min-holdout-sharpe", type=float, default=0.0)
+    parser.add_argument("--min-holdout-regime-sharpe", type=float, default=-0.10)
     parser.add_argument("--max-holdout-drawdown", type=float, default=0.35)
     parser.add_argument("--max-regime-shift", type=float, default=0.35)
+    parser.add_argument("--max-symbol-concentration-hhi", type=float, default=0.65)
     parser.add_argument(
         "--use-gpu",
         action="store_true",
@@ -6059,6 +8161,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--label-horizons", nargs="+", type=int, default=[1, 5, 20])
     parser.add_argument("--primary-horizon", type=int, default=5)
+    parser.add_argument(
+        "--primary-horizon-sweep",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Optional sweep of primary horizons (bars) for model-horizon benchmark matrix.",
+    )
     parser.add_argument("--profit-taking", type=float, default=0.015)
     parser.add_argument("--stop-loss", type=float, default=0.010)
     parser.add_argument("--max-holding", type=int, default=20)
@@ -6074,11 +8183,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label-regime-lookback", type=int, default=30)
     parser.add_argument("--label-temporal-weight-decay", type=float, default=0.999)
     parser.add_argument(
+        "--meta-label-min-confidence",
+        type=float,
+        default=0.55,
+        help="Base minimum confidence for meta-label filtering.",
+    )
+    parser.add_argument(
+        "--disable-meta-dynamic-threshold",
+        action="store_true",
+        help="Disable horizon/regime-adaptive meta-label confidence thresholding.",
+    )
+    parser.add_argument(
         "--feature-groups",
         nargs="+",
         default=["technical", "statistical", "microstructure", "cross_sectional"],
         help="Feature groups to compute (default: technical statistical microstructure cross_sectional)",
     )
+    parser.add_argument(
+        "--disable-symbol-quality-filter",
+        action="store_true",
+        help="Disable symbol-level quality universe filtering before feature generation.",
+    )
+    parser.add_argument("--symbol-quality-min-rows", type=int, default=1200)
+    parser.add_argument("--symbol-quality-min-symbols", type=int, default=8)
+    parser.add_argument("--symbol-quality-max-missing-ratio", type=float, default=0.12)
+    parser.add_argument("--symbol-quality-max-extreme-move-ratio", type=float, default=0.08)
+    parser.add_argument("--symbol-quality-max-corporate-action-ratio", type=float, default=0.02)
+    parser.add_argument("--symbol-quality-min-median-dollar-volume", type=float, default=1_000_000.0)
     parser.add_argument(
         "--disable-cross-sectional",
         action="store_true",
@@ -6088,6 +8219,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-feature-groups",
         action="store_true",
         help="Fail run if any requested feature group cannot be materialized.",
+    )
+    parser.add_argument(
+        "--allow-partial-feature-fallback",
+        action="store_true",
+        help=(
+            "Allow partial feature fallback (for example cross-sectional skip or "
+            "Windows emergency fallback). Disabled by default for full-feature enforcement."
+        ),
     )
     parser.add_argument(
         "--max-cross-sectional-symbols",
@@ -6118,10 +8257,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip persisting computed features to PostgreSQL.",
     )
+    parser.add_argument(
+        "--windows-fallback-features",
+        action="store_true",
+        help="Force deterministic basic feature fallback on Windows instead of full feature pipeline.",
+    )
     parser.add_argument("--disable-dynamic-no-trade-band", action="store_true")
     parser.add_argument("--execution-vol-target-daily", type=float, default=0.012)
     parser.add_argument("--execution-turnover-cap", type=float, default=0.90)
     parser.add_argument("--execution-cooldown-bars", type=int, default=2)
+    parser.add_argument("--execution-max-symbol-entry-share", type=float, default=0.68)
+    parser.add_argument(
+        "--disable-lightgbm-monotonic-constraints",
+        action="store_true",
+        help="Disable automatic LightGBM monotonic constraints inferred from feature names.",
+    )
     parser.add_argument("--min-deflated-sharpe", type=float, default=0.10)
     parser.add_argument("--max-deflated-sharpe-pvalue", type=float, default=0.10)
     parser.add_argument("--max-pbo", type=float, default=0.45)

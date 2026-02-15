@@ -48,6 +48,49 @@ class StatisticalFeature(ABC):
             raise ValueError(f"Missing required columns: {missing}")
 
 
+def _adaptive_sampling_step(n_rows: int, base_step: int = 1) -> int:
+    """Scale expensive rolling computations for large datasets."""
+    step = max(1, int(base_step))
+    n_rows = max(0, int(n_rows))
+    if n_rows >= 100_000:
+        return max(step, 40)
+    if n_rows >= 50_000:
+        return max(step, 24)
+    if n_rows >= 20_000:
+        return max(step, 12)
+    if n_rows >= 10_000:
+        return max(step, 6)
+    return step
+
+
+def _sample_indices(start_idx: int, end_exclusive: int, step: int) -> list[int]:
+    """Build sampled rolling indices and always include the terminal row."""
+    if end_exclusive <= start_idx:
+        return []
+    step = max(1, int(step))
+    indices = list(range(int(start_idx), int(end_exclusive), step))
+    last_idx = int(end_exclusive) - 1
+    if not indices:
+        return [last_idx]
+    if indices[-1] != last_idx:
+        indices.append(last_idx)
+    return indices
+
+
+def _forward_fill_nan(arr: np.ndarray) -> np.ndarray:
+    """Fast forward fill for 1D float arrays."""
+    out = np.asarray(arr, dtype=float).reshape(-1).copy()
+    if out.size == 0:
+        return out
+    mask = np.isnan(out)
+    if bool(np.all(mask)):
+        return out
+    idx = np.where(~mask, np.arange(out.size), 0)
+    np.maximum.accumulate(idx, out=idx)
+    out[mask] = out[idx[mask]]
+    return out
+
+
 # =============================================================================
 # RETURNS & DISTRIBUTIONS
 # =============================================================================
@@ -523,11 +566,18 @@ class PartialAutocorrelation(StatisticalFeature):
 class HurstExponent(StatisticalFeature):
     """Hurst exponent for long-range dependence detection."""
 
-    def __init__(self, window: int = 100, min_lag: int = 2, max_lag: int = 20):
+    def __init__(
+        self,
+        window: int = 100,
+        min_lag: int = 2,
+        max_lag: int = 20,
+        compute_step: int = 5,
+    ):
         super().__init__("HurstExponent")
         self.window = window
         self.min_lag = min_lag
         self.max_lag = max_lag
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
@@ -535,9 +585,12 @@ class HurstExponent(StatisticalFeature):
         results = {}
 
         hurst = np.full(len(close), np.nan)
-        for i in range(self.window - 1, len(close)):
+        step = _adaptive_sampling_step(len(close), self.compute_step)
+        for i in _sample_indices(self.window - 1, len(close), step):
             data = close[i - self.window + 1 : i + 1]
             hurst[i] = self._compute_hurst(data)
+        if step > 1:
+            hurst = _forward_fill_nan(hurst)
 
         results[f"hurst_{self.window}"] = hurst
 
@@ -637,6 +690,7 @@ class ADFStatistic(StatisticalFeature):
         max_lag: int | None = None,
         regression: str = "c",
         autolag: str = "AIC",
+        compute_step: int = 4,
     ):
         """
         Initialize ADF test calculator.
@@ -652,6 +706,7 @@ class ADFStatistic(StatisticalFeature):
         self.max_lag = max_lag
         self.regression = regression
         self.autolag = autolag
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
@@ -662,15 +717,22 @@ class ADFStatistic(StatisticalFeature):
         adf_stat = np.full(n, np.nan)
         adf_pvalue = np.full(n, np.nan)
         adf_lags = np.full(n, np.nan)
-        adf_is_stationary = np.zeros(n)  # 1 if stationary at 5% level
+        adf_is_stationary = np.full(n, np.nan)  # 1 if stationary at 5% level
 
-        for i in range(self.window - 1, n):
+        step = _adaptive_sampling_step(n, self.compute_step)
+        for i in _sample_indices(self.window - 1, n, step):
             data = close[i - self.window + 1 : i + 1]
             stat, pvalue, used_lag, is_stat = self._adf_test(data)
             adf_stat[i] = stat
             adf_pvalue[i] = pvalue
             adf_lags[i] = used_lag
             adf_is_stationary[i] = is_stat
+        if step > 1:
+            adf_stat = _forward_fill_nan(adf_stat)
+            adf_pvalue = _forward_fill_nan(adf_pvalue)
+            adf_lags = _forward_fill_nan(adf_lags)
+            adf_is_stationary = _forward_fill_nan(adf_is_stationary)
+        adf_is_stationary = np.nan_to_num(adf_is_stationary, nan=0.0)
 
         results[f"adf_stat_{self.window}"] = adf_stat
         results[f"adf_pvalue_{self.window}"] = adf_pvalue
@@ -878,9 +940,10 @@ class ADFStatistic(StatisticalFeature):
 class HalfLife(StatisticalFeature):
     """Half-life of mean reversion."""
 
-    def __init__(self, window: int = 60):
+    def __init__(self, window: int = 60, compute_step: int = 3):
         super().__init__("HalfLife")
         self.window = window
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
@@ -888,9 +951,12 @@ class HalfLife(StatisticalFeature):
         results = {}
 
         half_life = np.full(len(close), np.nan)
-        for i in range(self.window - 1, len(close)):
+        step = _adaptive_sampling_step(len(close), self.compute_step)
+        for i in _sample_indices(self.window - 1, len(close), step):
             data = close[i - self.window + 1 : i + 1]
             half_life[i] = self._compute_half_life(data)
+        if step > 1:
+            half_life = _forward_fill_nan(half_life)
 
         results[f"half_life_{self.window}"] = half_life
 
@@ -927,9 +993,10 @@ class HalfLife(StatisticalFeature):
 class OUParameters(StatisticalFeature):
     """Ornstein-Uhlenbeck process parameters (theta, mu, sigma)."""
 
-    def __init__(self, window: int = 60):
+    def __init__(self, window: int = 60, compute_step: int = 3):
         super().__init__("OUParams")
         self.window = window
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
@@ -940,11 +1007,16 @@ class OUParameters(StatisticalFeature):
         mu = np.full(len(close), np.nan)
         sigma = np.full(len(close), np.nan)
 
-        for i in range(self.window - 1, len(close)):
+        step = _adaptive_sampling_step(len(close), self.compute_step)
+        for i in _sample_indices(self.window - 1, len(close), step):
             data = close[i - self.window + 1 : i + 1]
             params = self._fit_ou(data)
             if params is not None:
                 theta[i], mu[i], sigma[i] = params
+        if step > 1:
+            theta = _forward_fill_nan(theta)
+            mu = _forward_fill_nan(mu)
+            sigma = _forward_fill_nan(sigma)
 
         results[f"ou_theta_{self.window}"] = theta
         results[f"ou_mu_{self.window}"] = mu
@@ -990,9 +1062,10 @@ class OUParameters(StatisticalFeature):
 class MeanReversionStrength(StatisticalFeature):
     """Mean reversion strength indicator."""
 
-    def __init__(self, window: int = 60):
+    def __init__(self, window: int = 60, compute_step: int = 3):
         super().__init__("MRStrength")
         self.window = window
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
@@ -1000,9 +1073,12 @@ class MeanReversionStrength(StatisticalFeature):
         results = {}
 
         strength = np.full(len(close), np.nan)
-        for i in range(self.window - 1, len(close)):
+        step = _adaptive_sampling_step(len(close), self.compute_step)
+        for i in _sample_indices(self.window - 1, len(close), step):
             data = close[i - self.window + 1 : i + 1]
             strength[i] = self._mr_strength(data)
+        if step > 1:
+            strength = _forward_fill_nan(strength)
 
         results[f"mr_strength_{self.window}"] = strength
 
