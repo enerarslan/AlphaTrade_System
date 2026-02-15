@@ -27,6 +27,7 @@ from quant_trading_system.core.data_types import (
     Position,
     TimeInForce,
 )
+from quant_trading_system.core.exceptions import ExecutionError, OrderSubmissionError
 from quant_trading_system.core.events import EventBus
 from quant_trading_system.execution.alpaca_client import (
     AccountInfo,
@@ -68,6 +69,7 @@ from quant_trading_system.execution.position_tracker import (
     SettlementStatus,
     TradeRecord,
 )
+from quant_trading_system.risk.limits import KillSwitch, KillSwitchReason
 
 
 # =============================================================================
@@ -754,6 +756,75 @@ class TestOrderManagerIntegration:
 
         assert managed.state == OrderState.VALIDATED
         assert managed.order.symbol == "AAPL"
+
+    @pytest.mark.asyncio
+    async def test_submit_order_blocked_when_kill_switch_active(self):
+        """Submit must be rejected when shared kill switch is active."""
+        mock_client = MagicMock(spec=AlpacaClient)
+        mock_client.submit_order = AsyncMock()
+        kill_switch = KillSwitch(cooldown_minutes=0)
+        kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
+
+        manager = OrderManager(client=mock_client, kill_switch=kill_switch)
+        request = OrderRequest(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.MARKET,
+        )
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("50000"),
+            buying_power=Decimal("50000"),
+        )
+        managed = manager.create_order(
+            request=request,
+            portfolio=portfolio,
+            current_price=Decimal("100"),
+        )
+
+        with pytest.raises(OrderSubmissionError, match="Kill switch is active"):
+            await manager.submit_order(managed)
+
+        assert managed.state == OrderState.REJECTED
+        assert managed.error_message == "Kill switch active: manual_activation"
+        mock_client.submit_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_modify_order_blocked_when_kill_switch_active(self):
+        """Modify must be rejected when shared kill switch is active."""
+        mock_client = MagicMock(spec=AlpacaClient)
+        mock_client.replace_order = AsyncMock()
+        kill_switch = KillSwitch(cooldown_minutes=0)
+        manager = OrderManager(client=mock_client, kill_switch=kill_switch)
+
+        request = OrderRequest(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("100"),
+        )
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("50000"),
+            buying_power=Decimal("50000"),
+        )
+        managed = manager.create_order(
+            request=request,
+            portfolio=portfolio,
+            current_price=Decimal("100"),
+        )
+        managed.broker_order = MagicMock(order_id="broker-order-1")
+        kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
+
+        with pytest.raises(ExecutionError, match="Kill switch is active"):
+            await manager.modify_order(
+                managed.order.order_id,
+                quantity=Decimal("12"),
+            )
+
+        mock_client.replace_order.assert_not_awaited()
 
     def test_get_active_orders_empty(self):
         """Test getting active orders when empty."""

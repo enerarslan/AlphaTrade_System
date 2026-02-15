@@ -39,9 +39,11 @@ from quant_trading_system.core.events import (
 )
 from quant_trading_system.core.exceptions import ExecutionError, TradingSystemError, StrategyError
 from quant_trading_system.risk.limits import (
+    CheckResult,
     KillSwitch,
     KillSwitchReason,
     PreTradeRiskChecker,
+    RiskLimitsManager,
     RiskLimitsConfig,
 )
 from quant_trading_system.execution.alpaca_client import AlpacaClient
@@ -232,17 +234,24 @@ class TradingEngine:
         self._consecutive_strategy_exceptions: int = 0
         self._last_successful_iteration: datetime | None = None
 
-        # P0 FIX (January 2026 Audit): Global KillSwitch integration
-        # The trading engine was using its own local kill switch flag without
-        # integrating with the global KillSwitch singleton. This created a
-        # critical safety gap where orders could be submitted when the global
-        # kill switch was active.
-        self._global_kill_switch = KillSwitch()
+        # Use OrderManager's kill switch when available so submit/modify checks
+        # and engine-level checks are guaranteed to share the same state.
+        shared_kill_switch = getattr(order_manager, "kill_switch", None)
+        self._global_kill_switch = (
+            shared_kill_switch if isinstance(shared_kill_switch, KillSwitch) else KillSwitch()
+        )
 
-        # P0 FIX (January 2026 Audit): PreTradeRiskChecker integration
-        # Pre-trade risk checks were implemented but never used in the order flow.
-        # Now ALL orders must pass through PreTradeRiskChecker before submission.
-        self._risk_checker = PreTradeRiskChecker(RiskLimitsConfig())
+        # Centralized risk manager wiring (shared kill switch + pre-trade checks).
+        risk_config = RiskLimitsConfig(
+            daily_loss_limit_pct=self.config.max_daily_loss_pct,
+            drawdown_halt_threshold=self.config.kill_switch_drawdown,
+            max_daily_trades=self.config.max_daily_trades,
+        )
+        self._risk_checker = PreTradeRiskChecker(risk_config)
+        self._risk_limits_manager = RiskLimitsManager(risk_config, event_bus)
+        # Enforce a single kill switch state and pre-trade checker across components.
+        self._risk_limits_manager.kill_switch = self._global_kill_switch
+        self._risk_limits_manager.pre_trade = self._risk_checker
 
         # Register for order events
         order_manager.on_fill(self._on_order_fill)
@@ -774,13 +783,14 @@ class TradingEngine:
                 # P0 FIX: Pre-trade risk check with portfolio lock for atomicity
                 # FIX: Use check_all() instead of non-existent check_order()
                 with self._risk_checker.portfolio_lock:
-                    risk_results = self._risk_checker.check_all(
+                    can_submit, risk_results = self._risk_limits_manager.pre_trade_check(
                         managed.order, portfolio, current_price or Decimal("0")
                     )
 
                     # Check if any risk check failed
-                    failed_checks = [r for r in risk_results if not r.passed]
-                    if failed_checks:
+                    failed_checks = [r for r in risk_results if r.result == CheckResult.FAILED]
+                    warning_checks = [r for r in risk_results if r.result == CheckResult.WARNING]
+                    if not can_submit or failed_checks:
                         # P0 FIX (January 2026 Audit): Use 'message' attribute instead of 'reason'
                         # RiskCheckResult dataclass has 'message' field, not 'reason'
                         reasons = "; ".join(r.message for r in failed_checks if r.message)
@@ -789,6 +799,11 @@ class TradingEngine:
                             f"- {reasons}"
                         )
                         continue
+                    if warning_checks:
+                        warning_text = "; ".join(w.message for w in warning_checks if w.message)
+                        logger.warning(
+                            f"Order risk warnings for {request.symbol}: {warning_text}"
+                        )
 
                     await self.order_manager.submit_order(
                         managed=managed,
@@ -921,13 +936,13 @@ class TradingEngine:
             )
             return False
 
-        # Check drawdown limit (now actually works since max_drawdown is calculated)
-        if self._metrics.max_drawdown > self.config.kill_switch_drawdown:
-            self.trigger_kill_switch(
-                f"Max drawdown exceeded: {self._metrics.max_drawdown:.2%} "
-                f"(threshold: {self.config.kill_switch_drawdown:.2%})"
-            )
+        # Centralized drawdown policy through risk manager.
+        drawdown_result = self._risk_limits_manager.check_drawdown_limits(self._metrics.max_drawdown)
+        if drawdown_result.result == CheckResult.FAILED:
+            self.trigger_kill_switch(drawdown_result.message)
             return False
+        if drawdown_result.result == CheckResult.WARNING:
+            logger.warning(drawdown_result.message)
 
         return True
 

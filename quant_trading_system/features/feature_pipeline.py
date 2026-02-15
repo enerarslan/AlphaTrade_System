@@ -508,24 +508,78 @@ class FeaturePipeline:
         Returns:
             Cache key string.
         """
-        # Create deterministic key from data characteristics
+        config_hash = self._get_output_config_hash()
+
+        # Create deterministic key from data characteristics.
+        # Include output-affecting config hash and interior samples (not only boundaries)
+        # to reduce stale-cache collisions.
         key_parts = [
             symbol,
+            f"cfg:{config_hash}",
             str(len(df)),
             str(df.columns),
         ]
+        n_rows = len(df)
+        sample_idx = (
+            np.linspace(0, n_rows - 1, num=min(12, n_rows), dtype=int).tolist()
+            if n_rows > 0
+            else []
+        )
+
         # Add first/last timestamps if available
         if "timestamp" in df.columns or "date" in df.columns:
             time_col = "timestamp" if "timestamp" in df.columns else "date"
             key_parts.append(str(df[time_col][0]))
             key_parts.append(str(df[time_col][-1]))
+            if sample_idx:
+                ts_samples = [str(df[time_col][int(i)]) for i in sample_idx]
+                key_parts.append("|".join(ts_samples))
         elif "close" in df.columns:
             # Use price as fallback identifier
             key_parts.append(f"{df['close'][0]:.4f}")
             key_parts.append(f"{df['close'][-1]:.4f}")
 
+        for col in ("open", "high", "low", "close", "volume"):
+            if col not in df.columns or not sample_idx:
+                continue
+            try:
+                arr = df[col].to_numpy().astype(np.float64)
+                sampled = arr[np.asarray(sample_idx, dtype=int)]
+                sampled = np.nan_to_num(sampled, nan=0.0, posinf=0.0, neginf=0.0)
+                key_parts.append(
+                    f"{col}:{','.join(f'{v:.6f}' for v in sampled)}"
+                )
+            except Exception:
+                # Skip unstable columns from key fingerprinting.
+                continue
+
         key_string = "|".join(key_parts)
         return hashlib.md5(key_string.encode()).hexdigest()
+
+    def _get_output_config_hash(self) -> str:
+        """Return deterministic hash for config fields that affect feature outputs."""
+        config_payload = {
+            "groups": [group.value for group in self.config.groups],
+            "normalization": self.config.normalization.value,
+            "normalization_window": self.config.normalization_window,
+            "fill_nan": self.config.fill_nan,
+            "fill_method": self.config.fill_method,
+            "max_nan_ratio": self.config.max_nan_ratio,
+            "variance_threshold": self.config.variance_threshold,
+            "correlation_threshold": self.config.correlation_threshold,
+            "include_targets": self.config.include_targets,
+            "target_horizons": self.config.target_horizons,
+            "use_gpu": self.config.use_gpu,
+            "use_optimized_pipeline": self.config.use_optimized_pipeline,
+            "gpu_min_batch_size": self.config.gpu_min_batch_size,
+            "parallel_workers": self.config.parallel_workers,
+        }
+        serialized = json.dumps(
+            config_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.md5(serialized.encode()).hexdigest()
 
     def compute(
         self,

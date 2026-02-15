@@ -17,10 +17,18 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Iterator
 
 import numpy as np
+import pandas as pd
 from scipy.stats import uniform
 
 from quant_trading_system.backtest.analyzer import PerformanceAnalyzer
-from quant_trading_system.backtest.engine import BacktestConfig, BacktestEngine, BacktestState, Strategy
+from quant_trading_system.backtest.engine import (
+    BacktestConfig,
+    BacktestEngine,
+    BacktestState,
+    Strategy,
+    WalkForwardReport,
+    WalkForwardValidator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +514,8 @@ class StrategyOptimizer:
         walk_forward: WalkForwardOptimizer | None = None,
         backtest_config: BacktestConfig | None = None,
         objective: str = "sharpe",  # 'sharpe', 'sortino', 'return', 'calmar'
+        walk_forward_validator: WalkForwardValidator | None = None,
+        enable_walk_forward_audit: bool = True,
     ) -> None:
         """Initialize strategy optimizer.
 
@@ -515,12 +525,16 @@ class StrategyOptimizer:
             walk_forward: Walk-forward optimizer settings.
             backtest_config: Backtest configuration.
             objective: Optimization objective metric.
+            walk_forward_validator: Validator used for full-period walk-forward audit.
+            enable_walk_forward_audit: Run post-optimization walk-forward audit.
         """
         self.strategy_factory = strategy_factory
         self.param_spaces = param_spaces
         self.walk_forward = walk_forward or WalkForwardOptimizer()
         self.backtest_config = backtest_config or BacktestConfig()
         self.objective = objective
+        self.walk_forward_validator = walk_forward_validator or WalkForwardValidator()
+        self.enable_walk_forward_audit = bool(enable_walk_forward_audit)
         self._analyzer = PerformanceAnalyzer()
 
     def _get_objective_value(self, backtest_state: BacktestState) -> float:
@@ -541,6 +555,131 @@ class StrategyOptimizer:
         except Exception as e:
             logger.warning(f"Error calculating objective: {e}")
             return float("-inf")
+
+    @staticmethod
+    def _select_robust_window(windows: list[OptimizationWindow]) -> OptimizationWindow | None:
+        """Select parameter window using OOS performance and IS/OOS stability.
+
+        Uses a conservative score:
+        score = OOS_metric - 0.25 * abs(IS_metric - OOS_metric)
+        """
+        candidates = [w for w in windows if w.best_params]
+        if not candidates:
+            return None
+
+        def _score(window: OptimizationWindow) -> float:
+            is_metric = float(window.train_metric)
+            oos_metric = float(window.test_metric)
+            consistency_penalty = 0.25 * abs(is_metric - oos_metric)
+            return oos_metric - consistency_penalty
+
+        return max(
+            candidates,
+            key=lambda w: (_score(w), float(w.test_metric), float(w.train_metric)),
+        )
+
+    @staticmethod
+    def _normalize_validation_frame(frame: pd.DataFrame) -> pd.DataFrame | None:
+        """Normalize OHLCV frame to DatetimeIndex for walk-forward validation."""
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return None
+
+        normalized = frame.copy()
+        if not isinstance(normalized.index, pd.DatetimeIndex):
+            if "timestamp" not in normalized.columns:
+                return None
+            normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], errors="coerce", utc=True)
+            normalized = normalized.dropna(subset=["timestamp"]).set_index("timestamp")
+        else:
+            normalized.index = pd.to_datetime(normalized.index, errors="coerce", utc=True)
+            normalized = normalized[~normalized.index.isna()]
+
+        if normalized.empty:
+            return None
+
+        normalized = normalized[~normalized.index.duplicated(keep="last")].sort_index()
+        required_cols = {"open", "high", "low", "close", "volume"}
+        lower_map = {c.lower(): c for c in normalized.columns}
+        if not required_cols.issubset(set(lower_map.keys())):
+            return None
+
+        # Canonical lowercase column names for engine compatibility.
+        normalized = normalized.rename(columns={v: k for k, v in lower_map.items()})
+        return normalized
+
+    def _extract_validation_dataset(
+        self,
+        handler: Any,
+    ) -> tuple[dict[str, pd.DataFrame] | None, str | None]:
+        """Extract dict[symbol -> pandas DataFrame] from a data handler."""
+        raw_data = None
+        for attr in ("_data", "data"):
+            candidate = getattr(handler, attr, None)
+            if isinstance(candidate, dict):
+                raw_data = candidate
+                break
+
+        if not isinstance(raw_data, dict) or not raw_data:
+            return None, "data_handler_missing_dict_dataset"
+
+        dataset: dict[str, pd.DataFrame] = {}
+        for symbol, frame in raw_data.items():
+            normalized = self._normalize_validation_frame(frame)
+            if normalized is not None:
+                dataset[str(symbol)] = normalized
+
+        if not dataset:
+            return None, "dataset_missing_valid_ohlcv_frames"
+        return dataset, None
+
+    def _build_walk_forward_metadata(self, report: WalkForwardReport) -> dict[str, Any]:
+        """Convert walk-forward report into lightweight metadata payload."""
+        return {
+            "status": "completed",
+            "is_valid": bool(report.is_valid),
+            "n_windows": int(len(report.windows)),
+            "validation_messages": list(report.validation_messages),
+            "aggregate_metrics": dict(report.aggregate_metrics),
+            "total_trades": int(report.total_trades),
+        }
+
+    def _run_walk_forward_audit(
+        self,
+        data_handler_factory: Callable[[datetime, datetime], Any],
+        start_date: datetime,
+        end_date: datetime,
+        best_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run post-optimization walk-forward validation audit."""
+        if not self.enable_walk_forward_audit:
+            return {"status": "disabled", "reason": "walk_forward_audit_disabled"}
+        if not best_params:
+            return {"status": "skipped", "reason": "empty_best_params"}
+
+        try:
+            full_handler = data_handler_factory(start_date, end_date)
+        except Exception as exc:
+            logger.warning(f"Walk-forward audit skipped: failed to build full handler: {exc}")
+            return {"status": "skipped", "reason": "data_handler_factory_failure", "error": str(exc)}
+
+        dataset, error_reason = self._extract_validation_dataset(full_handler)
+        if dataset is None:
+            return {"status": "skipped", "reason": error_reason or "dataset_unavailable"}
+
+        try:
+            report = self.walk_forward_validator.run_validation(
+                data=dataset,
+                strategy_factory=lambda _train_df: self.strategy_factory(best_params),
+                config=BacktestConfig(
+                    initial_capital=self.backtest_config.initial_capital,
+                    start_date=start_date,
+                    end_date=end_date,
+                ),
+            )
+            return self._build_walk_forward_metadata(report)
+        except Exception as exc:
+            logger.warning(f"Walk-forward audit execution failed: {exc}")
+            return {"status": "failed", "reason": "walk_forward_validator_error", "error": str(exc)}
 
     def optimize(
         self,
@@ -633,18 +772,30 @@ class StrategyOptimizer:
         # Aggregate results
         elapsed = time.time() - start_time
 
-        # Find overall best params (from most recent window or average)
-        best_params = windows[-1].best_params or {}
+        selected_window = self._select_robust_window(windows)
+        if selected_window is None:
+            best_params = {}
+            best_metric = 0.0
+        else:
+            best_params = selected_window.best_params or {}
+            best_metric = float(selected_window.test_metric)
+
+        walk_forward_audit = self._run_walk_forward_audit(
+            data_handler_factory=data_handler_factory,
+            start_date=start_date,
+            end_date=end_date,
+            best_params=best_params,
+        )
 
         # Calculate metrics
         is_metrics = [w.train_metric for w in windows]
         avg_is = np.mean(is_metrics) if is_metrics else 0
         avg_oos = np.mean(oos_metrics) if oos_metrics else 0
-        is_ratio = avg_is / avg_oos if avg_oos > 0 else float("inf")
+        is_ratio = avg_is / abs(avg_oos) if avg_oos != 0 else float("inf")
 
         return OptimizationResult(
             best_params=best_params,
-            best_metric=windows[-1].train_metric,
+            best_metric=best_metric,
             all_results=all_results,
             windows=windows,
             oos_metric=avg_oos,
@@ -657,6 +808,8 @@ class StrategyOptimizer:
                 "n_windows": len(windows),
                 "is_metrics": is_metrics,
                 "oos_metrics": oos_metrics,
+                "selected_window_id": selected_window.window_id if selected_window else None,
+                "walk_forward_audit": walk_forward_audit,
             },
         )
 

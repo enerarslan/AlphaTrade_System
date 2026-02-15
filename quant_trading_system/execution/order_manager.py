@@ -579,6 +579,7 @@ class OrderManager:
         retry_delay: float = 1.0,
         order_timeout_minutes: int | None = None,
         enable_idempotency: bool = True,
+        kill_switch: KillSwitch | None = None,
     ) -> None:
         """Initialize order manager.
 
@@ -595,11 +596,14 @@ class OrderManager:
             order_timeout_minutes: MAJOR FIX - Auto-cancel orders older than this.
                                    Default is 30 minutes. Set to 0 to disable.
             enable_idempotency: P1-H3 Enhancement - Enable duplicate order detection.
+            kill_switch: Shared kill switch instance. If None, creates a default
+                        local instance for backward compatibility.
         """
         self.client = client
         self.event_bus = event_bus
         self.validator = validator or OrderValidator()
         self.router = router or SmartOrderRouter()
+        self.kill_switch = kill_switch or KillSwitch()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         # MAJOR FIX: Order timeout for auto-cancel of stale orders
@@ -639,6 +643,13 @@ class OrderManager:
 
         # Register for trade updates
         client.on_trade_update(self._handle_trade_update)
+
+    def _get_kill_switch_reason(self) -> str:
+        """Get current kill switch reason as user-facing text."""
+        reason = self.kill_switch.state.reason
+        if reason is None:
+            return "unknown"
+        return reason.value
 
     async def start(self) -> None:
         """Start order monitoring."""
@@ -797,13 +808,13 @@ class OrderManager:
             # P0-1 FIX (January 2026 Audit): Atomic kill switch check immediately before
             # broker submission to prevent TOCTOU vulnerability. Without this check,
             # orders validated before kill switch activation could still be submitted.
-            kill_switch = KillSwitch()
-            if kill_switch.is_active():
+            if self.kill_switch.is_active():
+                reason = self._get_kill_switch_reason()
                 managed.state = OrderState.REJECTED
-                managed.error_message = f"Kill switch active: {kill_switch._reason}"
+                managed.error_message = f"Kill switch active: {reason}"
                 self._publish_order_event(EventType.ORDER_REJECTED, managed)
                 raise OrderSubmissionError(
-                    f"Order rejected: Kill switch is active ({kill_switch._reason})",
+                    f"Order rejected: Kill switch is active ({reason})",
                     order_id=str(managed.order.order_id),
                     symbol=managed.order.symbol,
                 )
@@ -979,10 +990,10 @@ class OrderManager:
         # Without these checks, modify_order() could bypass kill switch and risk limits.
 
         # Check 1: Kill switch must not be active
-        kill_switch = KillSwitch()
-        if kill_switch.is_active():
+        if self.kill_switch.is_active():
+            reason = self._get_kill_switch_reason()
             raise ExecutionError(
-                f"Cannot modify order: Kill switch is active ({kill_switch._reason})"
+                f"Cannot modify order: Kill switch is active ({reason})"
             )
 
         # Check 2: Validate new quantity if provided

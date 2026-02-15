@@ -400,6 +400,9 @@ class TrainingConfig:
     max_holdout_drawdown: float = 0.35
     max_regime_shift: float = 0.35
     max_symbol_concentration_hhi: float = 0.65
+    min_holdout_symbol_coverage: float = 0.60
+    min_holdout_symbol_p25_sharpe: float = -0.10
+    max_holdout_symbol_underwater_ratio: float = 0.55
 
     # Target engineering (Workstream B)
     label_horizons: list[int] = field(default_factory=lambda: [1, 5, 20])
@@ -474,6 +477,9 @@ class TrainingConfig:
     execution_cooldown_bars: int = 2
     execution_max_symbol_entry_share: float = 0.68
     lightgbm_use_monotonic_constraints: bool = True
+    auto_live_profile_enabled: bool = True
+    auto_live_profile_symbol_threshold: int = 40
+    auto_live_profile_min_years: float = 4.0
 
     def __post_init__(self):
         if not self.model_name:
@@ -522,9 +528,21 @@ class TrainingConfig:
             max(float(self.max_symbol_concentration_hhi), 0.10),
             1.0,
         )
+        self.min_holdout_symbol_coverage = float(
+            np.clip(float(self.min_holdout_symbol_coverage), 0.0, 1.0)
+        )
+        self.min_holdout_symbol_p25_sharpe = float(
+            np.clip(float(self.min_holdout_symbol_p25_sharpe), -3.0, 3.0)
+        )
+        self.max_holdout_symbol_underwater_ratio = float(
+            np.clip(float(self.max_holdout_symbol_underwater_ratio), 0.0, 1.0)
+        )
         self.min_holdout_regime_sharpe = float(
             np.clip(float(self.min_holdout_regime_sharpe), -3.0, 3.0)
         )
+        self.auto_live_profile_enabled = bool(self.auto_live_profile_enabled)
+        self.auto_live_profile_symbol_threshold = max(1, int(self.auto_live_profile_symbol_threshold))
+        self.auto_live_profile_min_years = max(0.5, float(self.auto_live_profile_min_years))
         self.enable_symbol_quality_filter = bool(self.enable_symbol_quality_filter)
         self.symbol_quality_min_rows = max(200, int(self.symbol_quality_min_rows))
         self.symbol_quality_min_symbols = max(1, int(self.symbol_quality_min_symbols))
@@ -737,6 +755,108 @@ class ModelTrainer:
         self._sanitize_loaded_data()
         self._apply_symbol_universe_filters()
         self._capture_data_quality_report()
+        self._apply_live_multi_symbol_profile()
+
+    def _apply_live_multi_symbol_profile(self) -> None:
+        """Auto-tune training config for large multi-symbol live deployment datasets."""
+        if self.data is None or self.data.empty:
+            return
+
+        symbol_count = int(self.data["symbol"].nunique())
+        ts = pd.to_datetime(self.data["timestamp"], utc=True, errors="coerce").dropna()
+        if ts.empty:
+            return
+
+        span_days = float((ts.max() - ts.min()).total_seconds() / 86400.0)
+        span_years = span_days / 365.25
+        row_count = int(len(self.data))
+        qualifies = bool(
+            self.config.auto_live_profile_enabled
+            and symbol_count >= int(self.config.auto_live_profile_symbol_threshold)
+            and span_years >= float(self.config.auto_live_profile_min_years)
+        )
+
+        self.training_metrics["dataset_symbol_count"] = float(symbol_count)
+        self.training_metrics["dataset_timespan_years"] = float(span_years)
+        self.training_metrics["dataset_rows"] = float(row_count)
+        self.training_metrics["auto_live_profile_applied"] = bool(qualifies)
+        self.training_metrics["training_profile_mode"] = (
+            "institutional_live_multi_symbol" if qualifies else "default"
+        )
+
+        if not qualifies:
+            return
+
+        updates: dict[str, tuple[float, float]] = {}
+
+        def _raise_floor(attr: str, target: float, as_int: bool = False) -> None:
+            current_raw = getattr(self.config, attr)
+            current = float(current_raw)
+            new_float = float(max(current, target))
+            new_raw = int(round(new_float)) if as_int else float(new_float)
+            setattr(self.config, attr, new_raw)
+            if abs(new_float - current) > 1e-12:
+                updates[attr] = (current, float(new_raw))
+
+        def _tighten_ceiling(attr: str, target: float, as_int: bool = False) -> None:
+            current_raw = getattr(self.config, attr)
+            current = float(current_raw)
+            new_float = float(min(current, target))
+            new_raw = int(round(new_float)) if as_int else float(new_float)
+            setattr(self.config, attr, new_raw)
+            if abs(new_float - current) > 1e-12:
+                updates[attr] = (current, float(new_raw))
+
+        _raise_floor("n_trials", 180.0, as_int=True)
+        _raise_floor("n_splits", 6.0, as_int=True)
+        _raise_floor("nested_outer_splits", 5.0, as_int=True)
+        _raise_floor("nested_inner_splits", 4.0, as_int=True)
+        _raise_floor("min_trades", 180.0, as_int=True)
+        _raise_floor("holdout_pct", 0.20)
+        _raise_floor("objective_weight_tail_risk", 0.45)
+        _raise_floor("objective_weight_symbol_concentration", 0.30)
+        _raise_floor("objective_weight_cvar", 0.55)
+        _raise_floor("min_holdout_sharpe", 0.10)
+        _raise_floor("min_holdout_regime_sharpe", 0.00)
+        _raise_floor("min_holdout_symbol_coverage", 0.65)
+        _raise_floor("min_holdout_symbol_p25_sharpe", -0.05)
+        _tighten_ceiling("max_pbo", 0.35)
+        _tighten_ceiling("max_holdout_drawdown", 0.30)
+        _tighten_ceiling("max_symbol_concentration_hhi", 0.55)
+        _tighten_ceiling("max_holdout_symbol_underwater_ratio", 0.45)
+
+        current_max_symbols = int(getattr(self.config, "max_cross_sectional_symbols"))
+        target_max_symbols = int(max(current_max_symbols, symbol_count + 4))
+        if target_max_symbols != current_max_symbols:
+            self.config.max_cross_sectional_symbols = int(target_max_symbols)
+            updates["max_cross_sectional_symbols"] = (
+                float(current_max_symbols),
+                float(target_max_symbols),
+            )
+
+        current_max_rows = int(getattr(self.config, "max_cross_sectional_rows"))
+        target_max_rows = int(max(current_max_rows, int(round(row_count * 1.2))))
+        if target_max_rows != current_max_rows:
+            self.config.max_cross_sectional_rows = int(target_max_rows)
+            updates["max_cross_sectional_rows"] = (
+                float(current_max_rows),
+                float(target_max_rows),
+            )
+
+        if not bool(self.config.enable_cross_sectional):
+            self.config.enable_cross_sectional = True
+            updates["enable_cross_sectional"] = (0.0, 1.0)
+
+        self.training_metrics["auto_live_profile_updates"] = {
+            key: {"from": float(old), "to": float(new)}
+            for key, (old, new) in updates.items()
+        }
+        self.logger.info(
+            "Applied institutional live multi-symbol profile: symbols=%d years=%.2f updates=%d",
+            symbol_count,
+            span_years,
+            len(updates),
+        )
 
     def _sanitize_loaded_data(self) -> None:
         """Apply deterministic OHLCV sanitization before feature/label generation."""
@@ -5948,6 +6068,11 @@ class ModelTrainer:
                 else None
             ),
         )
+        holdout_symbols_arr = (
+            np.asarray(self.holdout_symbols, dtype=object).reshape(-1)
+            if self.holdout_symbols is not None and len(self.holdout_symbols) == len(y_holdout)
+            else None
+        )
 
         holdout_regime_shift = self._regime_shift_score(
             self._regime_distribution(self.regimes),
@@ -5961,11 +6086,6 @@ class ModelTrainer:
         if self.holdout_regimes is not None and len(self.holdout_regimes) == len(y_holdout):
             regime_arr = np.asarray(self.holdout_regimes, dtype=str).reshape(-1)
             unique_regimes = sorted({str(r).strip() for r in regime_arr if str(r).strip()})
-            holdout_symbols_arr = (
-                np.asarray(self.holdout_symbols, dtype=object).reshape(-1)
-                if self.holdout_symbols is not None and len(self.holdout_symbols) == len(y_holdout)
-                else None
-            )
             for regime_name in unique_regimes:
                 regime_mask = regime_arr == regime_name
                 regime_rows = int(np.count_nonzero(regime_mask))
@@ -6016,9 +6136,90 @@ class ModelTrainer:
                     min(v.get("sharpe", 0.0) for v in holdout_regime_metrics.values())
                 )
 
+        holdout_symbol_metrics: dict[str, dict[str, float]] = {}
+        holdout_symbol_count_total = 0.0
+        holdout_symbol_count_evaluated = 0.0
+        holdout_symbol_coverage_ratio = 0.0
+        holdout_symbol_sharpe_median = float(holdout_metrics.get("sharpe", 0.0))
+        holdout_symbol_sharpe_p25 = float(holdout_symbol_sharpe_median)
+        holdout_symbol_sharpe_std = 0.0
+        holdout_symbol_underwater_ratio = 0.0
+        holdout_symbol_worst_sharpe = float(holdout_symbol_sharpe_median)
+        holdout_symbol_sample_floor = max(20, int(round(0.01 * len(y_holdout))))
+        if holdout_symbols_arr is not None:
+            unique_symbols = sorted({str(s).strip() for s in holdout_symbols_arr if str(s).strip()})
+            holdout_symbol_count_total = float(len(unique_symbols))
+            for symbol_name in unique_symbols:
+                symbol_mask = holdout_symbols_arr == symbol_name
+                symbol_rows = int(np.count_nonzero(symbol_mask))
+                if symbol_rows < holdout_symbol_sample_floor:
+                    continue
+                symbol_metrics = self._calculate_fold_metrics(
+                    y_true=y_holdout[symbol_mask],
+                    y_pred=y_holdout_pred[symbol_mask],
+                    y_proba=y_holdout_proba[symbol_mask],
+                    long_threshold=long_threshold,
+                    short_threshold=short_threshold,
+                    realized_forward_returns=(
+                        np.asarray(self.holdout_primary_forward_returns, dtype=float)[symbol_mask]
+                        if self.holdout_primary_forward_returns is not None
+                        and len(self.holdout_primary_forward_returns) == len(y_holdout)
+                        else None
+                    ),
+                    event_net_returns=(
+                        np.asarray(self.holdout_cost_aware_event_returns, dtype=float)[symbol_mask]
+                        if self.holdout_cost_aware_event_returns is not None
+                        and len(self.holdout_cost_aware_event_returns) == len(y_holdout)
+                        else None
+                    ),
+                    timestamps=(
+                        np.asarray(self.holdout_timestamps, dtype="datetime64[ns]")[symbol_mask]
+                        if self.holdout_timestamps is not None
+                        and len(self.holdout_timestamps) == len(y_holdout)
+                        else None
+                    ),
+                    symbols=holdout_symbols_arr[symbol_mask],
+                )
+                holdout_symbol_metrics[str(symbol_name)] = {
+                    "rows": float(symbol_rows),
+                    "sharpe": float(symbol_metrics.get("sharpe", 0.0)),
+                    "max_drawdown": float(symbol_metrics.get("max_drawdown", 0.0)),
+                    "trade_count": float(symbol_metrics.get("trade_count", 0.0)),
+                    "risk_adjusted_score": float(symbol_metrics.get("risk_adjusted_score", -1e9)),
+                    "sharpe_observation_confidence": float(
+                        symbol_metrics.get("sharpe_observation_confidence", 0.0)
+                    ),
+                }
+            holdout_symbol_count_evaluated = float(len(holdout_symbol_metrics))
+            if holdout_symbol_count_total > 0.0:
+                holdout_symbol_coverage_ratio = float(
+                    holdout_symbol_count_evaluated / holdout_symbol_count_total
+                )
+            if holdout_symbol_metrics:
+                symbol_sharpes = np.asarray(
+                    [m.get("sharpe", 0.0) for m in holdout_symbol_metrics.values()],
+                    dtype=float,
+                )
+                holdout_symbol_sharpe_median = float(np.median(symbol_sharpes))
+                holdout_symbol_sharpe_p25 = float(np.quantile(symbol_sharpes, 0.25))
+                holdout_symbol_sharpe_std = float(np.std(symbol_sharpes))
+                holdout_symbol_worst_sharpe = float(np.min(symbol_sharpes))
+                holdout_symbol_underwater_ratio = float(np.mean(symbol_sharpes < 0.0))
+
         self.training_metrics["holdout_worst_regime_sharpe"] = float(holdout_worst_regime_sharpe)
         self.training_metrics["holdout_regime_count_evaluated"] = float(len(holdout_regime_metrics))
         self.training_metrics["holdout_regime_metrics"] = holdout_regime_metrics
+        self.training_metrics["holdout_symbol_count_total"] = float(holdout_symbol_count_total)
+        self.training_metrics["holdout_symbol_count_evaluated"] = float(holdout_symbol_count_evaluated)
+        self.training_metrics["holdout_symbol_coverage_ratio"] = float(holdout_symbol_coverage_ratio)
+        self.training_metrics["holdout_symbol_sharpe_median"] = float(holdout_symbol_sharpe_median)
+        self.training_metrics["holdout_symbol_sharpe_p25"] = float(holdout_symbol_sharpe_p25)
+        self.training_metrics["holdout_symbol_sharpe_std"] = float(holdout_symbol_sharpe_std)
+        self.training_metrics["holdout_symbol_worst_sharpe"] = float(holdout_symbol_worst_sharpe)
+        self.training_metrics["holdout_symbol_underwater_ratio"] = float(
+            holdout_symbol_underwater_ratio
+        )
+        self.training_metrics["holdout_symbol_metrics"] = holdout_symbol_metrics
 
         for key, value in holdout_metrics.items():
             if isinstance(value, (int, float, np.floating, np.integer)):
@@ -6030,12 +6231,14 @@ class ModelTrainer:
 
         self.logger.info(
             "Holdout metrics - Accuracy: %.4f, Sharpe: %.4f, WorstRegimeSharpe: %.4f, "
-            "Drawdown: %.4f, RegimeShift: %.4f",
+            "Drawdown: %.4f, RegimeShift: %.4f, SymbolCoverage: %.2f%%, UnderwaterSymbols: %.2f%%",
             self.training_metrics.get("holdout_accuracy", 0.0),
             self.training_metrics.get("holdout_sharpe", 0.0),
             self.training_metrics.get("holdout_worst_regime_sharpe", holdout_worst_regime_sharpe),
             self.training_metrics.get("holdout_max_drawdown", 0.0),
             self.training_metrics.get("holdout_regime_shift", holdout_regime_shift),
+            self.training_metrics.get("holdout_symbol_coverage_ratio", 0.0) * 100.0,
+            self.training_metrics.get("holdout_symbol_underwater_ratio", 0.0) * 100.0,
         )
 
     def _validate_model(self) -> bool:
@@ -6054,10 +6257,59 @@ class ModelTrainer:
         self.training_metrics["effective_min_trades_gate"] = effective_min_trades
         holdout_available = float(self.training_metrics.get("holdout_rows", 0.0)) > 0.0
         holdout_sharpe = float(self.training_metrics.get("holdout_sharpe", -1.0))
+        effective_holdout_sharpe = (
+            float(self._effective_holdout_sharpe_metric(holdout_sharpe))
+            if holdout_available
+            else float(self.config.min_holdout_sharpe)
+        )
+        self.training_metrics["effective_holdout_sharpe_gate_metric"] = effective_holdout_sharpe
+        holdout_sharpe_consistency = (
+            float(holdout_sharpe - float(self.training_metrics.get("mean_sharpe", holdout_sharpe)))
+            if holdout_available
+            else 0.0
+        )
+        holdout_sharpe_consistency_floor = -float(
+            max(0.75, abs(float(self.config.min_holdout_sharpe)) + 0.15)
+        )
+        self.training_metrics["effective_holdout_sharpe_consistency_metric"] = (
+            holdout_sharpe_consistency
+        )
         holdout_worst_regime_sharpe = float(
             self.training_metrics.get("holdout_worst_regime_sharpe", holdout_sharpe)
         )
         holdout_drawdown = float(self.training_metrics.get("holdout_max_drawdown", 1.0))
+        holdout_symbol_coverage = float(
+            self.training_metrics.get(
+                "holdout_symbol_coverage_ratio",
+                self.config.min_holdout_symbol_coverage,
+            )
+        )
+        holdout_symbol_sharpe_p25 = float(
+            self.training_metrics.get(
+                "holdout_symbol_sharpe_p25",
+                self.config.min_holdout_symbol_p25_sharpe,
+            )
+        )
+        holdout_symbol_underwater_ratio = float(
+            self.training_metrics.get(
+                "holdout_symbol_underwater_ratio",
+                self.config.max_holdout_symbol_underwater_ratio,
+            )
+        )
+        self.training_metrics["effective_holdout_symbol_coverage_metric"] = holdout_symbol_coverage
+        self.training_metrics["effective_holdout_symbol_p25_sharpe_metric"] = (
+            holdout_symbol_sharpe_p25
+        )
+        self.training_metrics["effective_holdout_symbol_underwater_ratio_metric"] = (
+            holdout_symbol_underwater_ratio
+        )
+        effective_pbo_metric = float(
+            self.training_metrics.get(
+                "effective_pbo_gate_metric",
+                self.training_metrics.get("pbo", 1.0),
+            )
+        )
+        self.training_metrics["effective_pbo_gate_metric"] = effective_pbo_metric
         symbol_concentration_metric = float(
             max(
                 self.training_metrics.get("mean_symbol_concentration_hhi", 0.0),
@@ -6137,14 +6389,23 @@ class ModelTrainer:
                 self.config.max_deflated_sharpe_pvalue,
             ),
             "max_pbo": (
-                self.training_metrics.get("pbo", 1.0) <= effective_max_pbo,
-                self.training_metrics.get("pbo", 1.0),
+                effective_pbo_metric <= effective_max_pbo,
+                effective_pbo_metric,
                 effective_max_pbo,
             ),
             "min_holdout_sharpe": (
-                (holdout_sharpe >= self.config.min_holdout_sharpe) if holdout_available else True,
-                holdout_sharpe if holdout_available else self.config.min_holdout_sharpe,
+                (effective_holdout_sharpe >= self.config.min_holdout_sharpe)
+                if holdout_available
+                else True,
+                effective_holdout_sharpe if holdout_available else self.config.min_holdout_sharpe,
                 self.config.min_holdout_sharpe,
+            ),
+            "holdout_sharpe_consistency": (
+                (holdout_sharpe_consistency >= holdout_sharpe_consistency_floor)
+                if holdout_available
+                else True,
+                holdout_sharpe_consistency if holdout_available else holdout_sharpe_consistency_floor,
+                holdout_sharpe_consistency_floor,
             ),
             "max_holdout_drawdown": (
                 (holdout_drawdown <= self.config.max_holdout_drawdown) if holdout_available else True,
@@ -6161,6 +6422,39 @@ class ModelTrainer:
                     else self.config.min_holdout_regime_sharpe
                 ),
                 self.config.min_holdout_regime_sharpe,
+            ),
+            "min_holdout_symbol_coverage": (
+                (holdout_symbol_coverage >= self.config.min_holdout_symbol_coverage)
+                if holdout_available
+                else True,
+                (
+                    holdout_symbol_coverage
+                    if holdout_available
+                    else self.config.min_holdout_symbol_coverage
+                ),
+                self.config.min_holdout_symbol_coverage,
+            ),
+            "min_holdout_symbol_p25_sharpe": (
+                (holdout_symbol_sharpe_p25 >= self.config.min_holdout_symbol_p25_sharpe)
+                if holdout_available
+                else True,
+                (
+                    holdout_symbol_sharpe_p25
+                    if holdout_available
+                    else self.config.min_holdout_symbol_p25_sharpe
+                ),
+                self.config.min_holdout_symbol_p25_sharpe,
+            ),
+            "max_holdout_symbol_underwater_ratio": (
+                (holdout_symbol_underwater_ratio <= self.config.max_holdout_symbol_underwater_ratio)
+                if holdout_available
+                else True,
+                (
+                    holdout_symbol_underwater_ratio
+                    if holdout_available
+                    else self.config.max_holdout_symbol_underwater_ratio
+                ),
+                self.config.max_holdout_symbol_underwater_ratio,
             ),
             "max_regime_shift": (
                 regime_shift_metric <= self.config.max_regime_shift,
@@ -6281,6 +6575,15 @@ class ModelTrainer:
                 "holdout_worst_regime_sharpe": float(
                     self.training_metrics.get("holdout_worst_regime_sharpe", 0.0)
                 ),
+                "holdout_symbol_coverage_ratio": float(
+                    self.training_metrics.get("holdout_symbol_coverage_ratio", 0.0)
+                ),
+                "holdout_symbol_sharpe_p25": float(
+                    self.training_metrics.get("holdout_symbol_sharpe_p25", 0.0)
+                ),
+                "holdout_symbol_underwater_ratio": float(
+                    self.training_metrics.get("holdout_symbol_underwater_ratio", 0.0)
+                ),
                 "deflated_sharpe": float(self.training_metrics.get("deflated_sharpe", 0.0)),
                 "deflated_sharpe_p_value": float(
                     self.training_metrics.get("deflated_sharpe_p_value", 1.0)
@@ -6290,6 +6593,12 @@ class ModelTrainer:
             "data": {
                 "development_rows": int(self.training_metrics.get("development_rows", 0)),
                 "holdout_rows": int(self.training_metrics.get("holdout_rows", 0)),
+                "holdout_symbol_count_total": int(
+                    self.training_metrics.get("holdout_symbol_count_total", 0)
+                ),
+                "holdout_symbol_count_evaluated": int(
+                    self.training_metrics.get("holdout_symbol_count_evaluated", 0)
+                ),
                 "regime_distribution_train": regime_mix,
                 "regime_distribution_holdout": holdout_regime_mix,
             },
@@ -6321,6 +6630,11 @@ class ModelTrainer:
                 "max_regime_shift": float(self.config.max_regime_shift),
                 "min_live_sharpe_rolling": float(
                     max(self.config.min_holdout_sharpe, self.config.min_holdout_regime_sharpe, 0.0)
+                ),
+                "min_holdout_symbol_coverage": float(self.config.min_holdout_symbol_coverage),
+                "min_holdout_symbol_p25_sharpe": float(self.config.min_holdout_symbol_p25_sharpe),
+                "max_holdout_symbol_underwater_ratio": float(
+                    self.config.max_holdout_symbol_underwater_ratio
                 ),
                 "min_trade_count_rolling": int(self.config.min_trades),
                 "max_symbol_concentration_hhi": float(self.config.max_symbol_concentration_hhi),
@@ -6453,28 +6767,78 @@ class ModelTrainer:
                 returns=returns,
                 n_trials=n_trials,
             )
-            pbo, interpretation = calculate_probability_of_backtest_overfitting(returns)
+            pbo, interpretation, pbo_diagnostics = calculate_probability_of_backtest_overfitting(
+                returns,
+                return_diagnostics=True,
+            )
             deflation = (
                 deflated_sharpe / sharpe
                 if abs(sharpe) > 1e-12
                 else 0.0
             )
             pbo = float(np.nan_to_num(pbo, nan=1.0, posinf=1.0, neginf=1.0))
+            pbo_upper_95 = float(
+                np.clip(pbo_diagnostics.get("pbo_ci_upper_95", pbo), 0.0, 1.0)
+            )
+            pbo_reliability = float(
+                np.clip(pbo_diagnostics.get("pbo_reliability", 0.0), 0.0, 1.0)
+            )
+            holdout_available = float(self.training_metrics.get("holdout_rows", 0.0)) > 0.0
+            holdout_sharpe = float(
+                self.training_metrics.get(
+                    "holdout_sharpe",
+                    self.training_metrics.get("mean_sharpe", 0.0),
+                )
+            )
+            sharpe_gap_baseline = max(abs(sharpe), 0.25)
+            holdout_gap_ratio = float(
+                np.clip(
+                    (sharpe - holdout_sharpe) / sharpe_gap_baseline,
+                    0.0,
+                    1.5,
+                )
+            ) if holdout_available else 0.0
+            effective_pbo_metric = self._effective_pbo_gate_metric(
+                base_pbo=pbo,
+                pbo_upper_95=pbo_upper_95,
+                pbo_reliability=pbo_reliability,
+                holdout_gap_ratio=holdout_gap_ratio,
+            )
             self.training_metrics["deflated_sharpe"] = deflated_sharpe
             self.training_metrics["deflated_sharpe_p_value"] = p_value
             self.training_metrics["sharpe_deflation_factor"] = deflation
             self.training_metrics["pbo"] = pbo
             self.training_metrics["pbo_interpretation"] = interpretation
+            self.training_metrics["pbo_ci_upper_95"] = pbo_upper_95
+            self.training_metrics["pbo_ci_lower_95"] = float(
+                np.clip(pbo_diagnostics.get("pbo_ci_lower_95", pbo), 0.0, 1.0)
+            )
+            self.training_metrics["pbo_probability_stability"] = float(
+                np.clip(pbo_diagnostics.get("pbo_probability_stability", 0.0), 0.0, 1.0)
+            )
+            self.training_metrics["pbo_reliability"] = pbo_reliability
+            self.training_metrics["pbo_holdout_gap_ratio"] = holdout_gap_ratio
+            self.training_metrics["effective_pbo_gate_metric"] = float(effective_pbo_metric)
             self.training_metrics["effective_max_pbo_gate"] = self._effective_pbo_threshold(
                 sample_size=int(returns.size),
                 interpretation=str(interpretation),
+                holdout_gap_ratio=holdout_gap_ratio,
+                pbo_reliability=(pbo_reliability if int(returns.size) >= 80 else None),
             )
 
             self.logger.info(
                 f"Deflated Sharpe: {deflated_sharpe:.4f} "
                 f"(original: {sharpe:.4f}, p-value: {p_value:.4f}, deflation: {deflation:.4f})"
             )
-            self.logger.info(f"PBO: {pbo:.2%} ({interpretation})")
+            self.logger.info(
+                "PBO: %.2f%% (gate_metric=%.2f%%, ci95_upper=%.2f%%, reliability=%.3f, holdout_gap=%.3f) %s",
+                pbo * 100.0,
+                effective_pbo_metric * 100.0,
+                pbo_upper_95 * 100.0,
+                pbo_reliability,
+                holdout_gap_ratio,
+                interpretation,
+            )
 
         elif self.config.correction_method == "bonferroni":
             # Bonferroni correction (conservative)
@@ -6492,7 +6856,13 @@ class ModelTrainer:
             self.training_metrics["bh_adjusted_p"] = adjusted_p
             self.logger.info(f"BH-adjusted p-value: {adjusted_p:.4f}")
 
-    def _effective_pbo_threshold(self, sample_size: int, interpretation: str) -> float:
+    def _effective_pbo_threshold(
+        self,
+        sample_size: int,
+        interpretation: str,
+        holdout_gap_ratio: float = 0.0,
+        pbo_reliability: float | None = None,
+    ) -> float:
         """Adjust PBO gate for low-sample statistical uncertainty."""
         base_threshold = float(np.clip(self.config.max_pbo, 0.05, 0.95))
         if sample_size <= 0:
@@ -6502,7 +6872,79 @@ class ModelTrainer:
         uncertainty_slack = (1.0 - reliability) * 0.10
         if interpretation.lower().startswith("insufficient"):
             uncertainty_slack = max(uncertainty_slack, 0.10)
-        return float(min(0.60, max(base_threshold, base_threshold + uncertainty_slack)))
+        threshold = float(min(0.60, max(base_threshold, base_threshold + uncertainty_slack)))
+
+        holdout_penalty = float(np.clip(holdout_gap_ratio, 0.0, 1.5)) * 0.08
+        reliability_penalty = 0.0
+        if pbo_reliability is not None:
+            reliability_penalty = float(np.clip((0.50 - float(pbo_reliability)), 0.0, 0.50)) * 0.08
+
+        threshold -= (holdout_penalty + reliability_penalty)
+        return float(np.clip(threshold, 0.15, 0.60))
+
+    @staticmethod
+    def _effective_pbo_gate_metric(
+        base_pbo: float,
+        pbo_upper_95: float,
+        pbo_reliability: float,
+        holdout_gap_ratio: float,
+    ) -> float:
+        """Build conservative PBO gate metric from uncertainty and OOS degradation."""
+        pbo = float(np.clip(base_pbo, 0.0, 1.0))
+        pbo_ci_upper = float(np.clip(pbo_upper_95, pbo, 1.0))
+        reliability = float(np.clip(pbo_reliability, 0.0, 1.0))
+        holdout_gap = float(np.clip(holdout_gap_ratio, 0.0, 1.5))
+
+        uncertainty_lift = float(1.0 - reliability) * 0.10
+        ci_lift = float(np.clip(pbo_ci_upper - pbo, 0.0, 1.0)) * 0.55
+        holdout_lift = holdout_gap * 0.12
+        return float(np.clip(pbo + uncertainty_lift + ci_lift + holdout_lift, 0.0, 1.0))
+
+    def _effective_holdout_sharpe_metric(self, holdout_sharpe: float) -> float:
+        """Shrink holdout Sharpe by confidence and CV->holdout deterioration."""
+        holdout_rows = max(0.0, float(self.training_metrics.get("holdout_rows", 0.0)))
+        holdout_trade_obs = max(
+            0.0,
+            float(self.training_metrics.get("holdout_trade_return_observations", 0.0)),
+        )
+        holdout_sharpe_confidence = float(
+            np.clip(self.training_metrics.get("holdout_sharpe_observation_confidence", 0.0), 0.0, 1.0)
+        )
+        expected_trade_target = float(
+            self._effective_trade_target(int(round(holdout_rows)) if holdout_rows > 0 else None)
+        )
+        obs_coverage = float(np.clip(holdout_trade_obs / max(expected_trade_target, 1.0), 0.0, 1.0))
+
+        train_regimes = self._regime_distribution(self.regimes)
+        regime_target = max(1.0, float(len(train_regimes)))
+        holdout_regime_count = max(
+            0.0,
+            float(self.training_metrics.get("holdout_regime_count_evaluated", 0.0)),
+        )
+        regime_coverage = float(np.clip(holdout_regime_count / regime_target, 0.0, 1.0))
+        confidence = float(
+            np.clip(
+                (0.55 * holdout_sharpe_confidence) + (0.30 * obs_coverage) + (0.15 * regime_coverage),
+                0.0,
+                1.0,
+            )
+        )
+
+        mean_sharpe = float(self.training_metrics.get("mean_sharpe", 0.0))
+        sharpe_gap_baseline = max(abs(mean_sharpe), 0.25)
+        degradation_ratio = float(
+            np.clip((mean_sharpe - holdout_sharpe) / sharpe_gap_baseline, 0.0, 1.5)
+        )
+        uncertainty_penalty = (1.0 - confidence) * 0.22
+        degradation_penalty = degradation_ratio * 0.18
+        adjusted_holdout_sharpe = float(holdout_sharpe - uncertainty_penalty - degradation_penalty)
+
+        self.training_metrics["holdout_sharpe_gate_confidence"] = float(confidence)
+        self.training_metrics["holdout_sharpe_gate_obs_coverage"] = float(obs_coverage)
+        self.training_metrics["holdout_sharpe_gate_regime_coverage"] = float(regime_coverage)
+        self.training_metrics["holdout_sharpe_gap_ratio"] = float(degradation_ratio)
+
+        return adjusted_holdout_sharpe
 
     def _compute_shap_values(self) -> None:
         """
@@ -6823,6 +7265,9 @@ class ModelTrainer:
                 "min_trades": self.config.min_trades,
                 "min_holdout_sharpe": self.config.min_holdout_sharpe,
                 "min_holdout_regime_sharpe": self.config.min_holdout_regime_sharpe,
+                "min_holdout_symbol_coverage": self.config.min_holdout_symbol_coverage,
+                "min_holdout_symbol_p25_sharpe": self.config.min_holdout_symbol_p25_sharpe,
+                "max_holdout_symbol_underwater_ratio": self.config.max_holdout_symbol_underwater_ratio,
                 "max_holdout_drawdown": self.config.max_holdout_drawdown,
                 "max_regime_shift": self.config.max_regime_shift,
                 "max_symbol_concentration_hhi": self.config.max_symbol_concentration_hhi,
@@ -7236,6 +7681,8 @@ def run_training(args: argparse.Namespace) -> int:
     """
     # SQL statement-level INFO logs materially slow long feature upsert phases.
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.engine.base.Engine").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
 
     logger.info("=" * 80)
@@ -7562,6 +8009,24 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "min_holdout_regime_sharpe", -0.10),
                     )
                 ),
+                min_holdout_symbol_coverage=float(
+                    _cfg_value(
+                        "min_holdout_symbol_coverage",
+                        getattr(args, "min_holdout_symbol_coverage", 0.60),
+                    )
+                ),
+                min_holdout_symbol_p25_sharpe=float(
+                    _cfg_value(
+                        "min_holdout_symbol_p25_sharpe",
+                        getattr(args, "min_holdout_symbol_p25_sharpe", -0.10),
+                    )
+                ),
+                max_holdout_symbol_underwater_ratio=float(
+                    _cfg_value(
+                        "max_holdout_symbol_underwater_ratio",
+                        getattr(args, "max_holdout_symbol_underwater_ratio", 0.55),
+                    )
+                ),
                 max_holdout_drawdown=float(
                     _cfg_value(
                         "max_holdout_drawdown",
@@ -7783,6 +8248,24 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "lightgbm_use_monotonic_constraints",
                         not bool(getattr(args, "disable_lightgbm_monotonic_constraints", False)),
+                    )
+                ),
+                auto_live_profile_enabled=bool(
+                    _cfg_value(
+                        "auto_live_profile_enabled",
+                        not bool(getattr(args, "disable_auto_live_profile", False)),
+                    )
+                ),
+                auto_live_profile_symbol_threshold=int(
+                    _cfg_value(
+                        "auto_live_profile_symbol_threshold",
+                        getattr(args, "auto_live_profile_symbol_threshold", 40),
+                    )
+                ),
+                auto_live_profile_min_years=float(
+                    _cfg_value(
+                        "auto_live_profile_min_years",
+                        getattr(args, "auto_live_profile_min_years", 4.0),
                     )
                 ),
                 output_dir=str(getattr(args, "output_dir", "models")),
@@ -8131,9 +8614,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--holdout-pct", type=float, default=0.15)
     parser.add_argument("--min-holdout-sharpe", type=float, default=0.0)
     parser.add_argument("--min-holdout-regime-sharpe", type=float, default=-0.10)
+    parser.add_argument("--min-holdout-symbol-coverage", type=float, default=0.60)
+    parser.add_argument("--min-holdout-symbol-p25-sharpe", type=float, default=-0.10)
+    parser.add_argument("--max-holdout-symbol-underwater-ratio", type=float, default=0.55)
     parser.add_argument("--max-holdout-drawdown", type=float, default=0.35)
     parser.add_argument("--max-regime-shift", type=float, default=0.35)
     parser.add_argument("--max-symbol-concentration-hhi", type=float, default=0.65)
+    parser.add_argument(
+        "--disable-auto-live-profile",
+        action="store_true",
+        help="Disable automatic institutional profile tuning for large multi-symbol datasets.",
+    )
+    parser.add_argument("--auto-live-profile-symbol-threshold", type=int, default=40)
+    parser.add_argument("--auto-live-profile-min-years", type=float, default=4.0)
     parser.add_argument(
         "--use-gpu",
         action="store_true",

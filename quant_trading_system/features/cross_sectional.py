@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import polars as pl
 from scipy import stats
 
@@ -93,6 +94,83 @@ class CrossSectionalFeature(ABC):
         min_len = min(len(base), len(other))
         return base[:min_len], other[:min_len]
 
+    @staticmethod
+    def _window_returns(close: np.ndarray, window: int) -> np.ndarray:
+        """Compute trailing window returns aligned to input length."""
+        arr = np.asarray(close, dtype=np.float64).reshape(-1)
+        n = int(arr.size)
+        ret = np.full(n, np.nan, dtype=np.float64)
+        if window <= 0 or window >= n:
+            return ret
+
+        base = arr[:-window]
+        nxt = arr[window:]
+        valid = np.abs(base) > 1e-12
+        out = np.full(n - window, np.nan, dtype=np.float64)
+        out[valid] = (nxt[valid] - base[valid]) / base[valid]
+        ret[window:] = out
+        return ret
+
+    @staticmethod
+    def _log_returns(close: np.ndarray) -> np.ndarray:
+        """Compute log returns aligned to input length."""
+        arr = np.asarray(close, dtype=np.float64).reshape(-1)
+        if arr.size == 0:
+            return np.array([], dtype=np.float64)
+        safe = np.where(arr > 1e-12, arr, np.nan)
+        return np.diff(np.log(safe), prepend=np.nan)
+
+    def _align_to_base(
+        self,
+        base_df: pl.DataFrame,
+        other_df: pl.DataFrame,
+        values: np.ndarray,
+    ) -> np.ndarray:
+        """Align an array from other_df onto base_df timestamps when available."""
+        base_len = len(base_df)
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if base_len <= 0:
+            return np.array([], dtype=np.float64)
+
+        if "timestamp" in base_df.columns and "timestamp" in other_df.columns:
+            try:
+                base_ts = pd.to_datetime(
+                    base_df["timestamp"].to_numpy(),
+                    utc=True,
+                    errors="coerce",
+                )
+                other_ts = pd.to_datetime(
+                    other_df["timestamp"].to_numpy(),
+                    utc=True,
+                    errors="coerce",
+                )
+                series = pd.Series(arr, index=pd.DatetimeIndex(other_ts))
+                series = series[~series.index.isna()]
+                series = series[~series.index.duplicated(keep="last")]
+                aligned = series.reindex(pd.DatetimeIndex(base_ts)).to_numpy(dtype=np.float64)
+                if aligned.shape[0] == base_len:
+                    return aligned
+            except Exception:
+                pass
+
+        if arr.size >= base_len:
+            return arr[:base_len]
+        padded = np.full(base_len, np.nan, dtype=np.float64)
+        padded[: arr.size] = arr
+        return padded
+
+    def _aligned_column(
+        self,
+        base_df: pl.DataFrame,
+        other_df: pl.DataFrame,
+        column: str,
+    ) -> np.ndarray | None:
+        """Return other_df[column] aligned to base_df timestamps/length."""
+        if column not in other_df.columns:
+            return None
+        values = other_df[column].to_numpy().astype(np.float64)
+        return self._align_to_base(base_df, other_df, values)
+
 
 # =============================================================================
 # RELATIVE METRICS
@@ -121,10 +199,7 @@ class RelativeStrength(CrossSectionalFeature):
             benchmark = df[self.benchmark_col].to_numpy().astype(np.float64)
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
-            if "close" in spy_df.columns:
-                close, benchmark = self.align_series(df, "close", spy_df, "close")
-            else:
-                benchmark = None
+            benchmark = self._aligned_column(df, spy_df, "close")
         else:
             benchmark = None
 
@@ -134,17 +209,32 @@ class RelativeStrength(CrossSectionalFeature):
                 results[f"rs_vs_benchmark_{window}"] = np.zeros(len(close))
             return results
 
-        # Compute relative strength for each window
+        # Compute relative strength for each window (vectorized for large universes)
         for window in self.windows:
-            rs = np.full(len(close), np.nan)
-            for i in range(window, len(close)):
-                asset_ret = (close[i] - close[i - window]) / close[i - window]
-                bench_ret = (benchmark[i] - benchmark[i - window]) / benchmark[i - window]
+            n = len(close)
+            rs = np.full(n, np.nan)
+            if window <= 0 or window >= n:
+                results[f"rs_vs_benchmark_{window}"] = rs
+                continue
 
-                if bench_ret != 0:
-                    rs[i] = asset_ret / bench_ret
-                else:
-                    rs[i] = 0
+            close_base = close[:-window]
+            close_next = close[window:]
+            bench_base = benchmark[:-window]
+            bench_next = benchmark[window:]
+
+            asset_ret = np.full(n - window, np.nan, dtype=np.float64)
+            bench_ret = np.full(n - window, np.nan, dtype=np.float64)
+
+            valid_asset = np.isfinite(close_base) & np.isfinite(close_next) & (np.abs(close_base) > 1e-12)
+            valid_bench = np.isfinite(bench_base) & np.isfinite(bench_next) & (np.abs(bench_base) > 1e-12)
+
+            asset_ret[valid_asset] = (close_next[valid_asset] - close_base[valid_asset]) / close_base[valid_asset]
+            bench_ret[valid_bench] = (bench_next[valid_bench] - bench_base[valid_bench]) / bench_base[valid_bench]
+
+            ratio = np.full(n - window, np.nan, dtype=np.float64)
+            valid_ratio = np.isfinite(asset_ret) & np.isfinite(bench_ret) & (np.abs(bench_ret) > 1e-12)
+            ratio[valid_ratio] = asset_ret[valid_ratio] / bench_ret[valid_ratio]
+            rs[window:] = ratio
 
             results[f"rs_vs_benchmark_{window}"] = rs
 
@@ -173,10 +263,7 @@ class BetaToMarket(CrossSectionalFeature):
             benchmark = df[self.benchmark_col].to_numpy().astype(np.float64)
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
-            if "close" in spy_df.columns:
-                close, benchmark = self.align_series(df, "close", spy_df, "close")
-            else:
-                benchmark = None
+            benchmark = self._aligned_column(df, spy_df, "close")
         else:
             benchmark = None
 
@@ -186,8 +273,8 @@ class BetaToMarket(CrossSectionalFeature):
             return results
 
         # Compute returns
-        asset_ret = np.diff(np.log(close), prepend=np.nan)
-        bench_ret = np.diff(np.log(benchmark), prepend=np.nan)
+        asset_ret = self._log_returns(close)
+        bench_ret = self._log_returns(benchmark)
 
         for window in self.windows:
             beta = np.full(len(close), np.nan)
@@ -229,10 +316,7 @@ class RelativeVolume(CrossSectionalFeature):
             bench_vol = df[self.benchmark_col].to_numpy().astype(np.float64)
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
-            if "volume" in spy_df.columns:
-                volume, bench_vol = self.align_series(df, "volume", spy_df, "volume")
-            else:
-                bench_vol = None
+            bench_vol = self._aligned_column(df, spy_df, "volume")
         else:
             bench_vol = None
 
@@ -240,13 +324,22 @@ class RelativeVolume(CrossSectionalFeature):
             results[f"rel_volume_{self.window}"] = np.ones(len(volume))
             return results
 
-        # Compute rolling relative volume
+        # Compute rolling relative volume (vectorized)
         rel_vol = np.full(len(volume), np.nan)
-        for i in range(self.window - 1, len(volume)):
-            vol_avg = np.mean(volume[i - self.window + 1 : i + 1])
-            bench_avg = np.mean(bench_vol[i - self.window + 1 : i + 1])
-            if bench_avg > 0:
-                rel_vol[i] = vol_avg / bench_avg
+        window = int(self.window)
+        if 0 < window <= len(volume):
+            min_obs = max(3, window // 2)
+            for i in range(window - 1, len(volume)):
+                vol_window = volume[i - window + 1 : i + 1]
+                bench_window = bench_vol[i - window + 1 : i + 1]
+                valid_mask = np.isfinite(vol_window) & np.isfinite(bench_window)
+                if np.sum(valid_mask) < min_obs:
+                    continue
+
+                vol_avg = np.mean(vol_window[valid_mask])
+                bench_avg = np.mean(bench_window[valid_mask])
+                if bench_avg > 1e-12:
+                    rel_vol[i] = vol_avg / bench_avg
 
         results[f"rel_volume_{self.window}"] = rel_vol
 
@@ -280,45 +373,31 @@ class PercentileRank(CrossSectionalFeature):
                 results[f"return_percentile_{window}"] = np.full(len(close), 0.5)
             return results
 
-        # Compute returns for main symbol
-        main_returns = {}
-        for window in self.windows:
-            ret = np.full(len(close), np.nan)
-            ret[window:] = (close[window:] - close[:-window]) / close[:-window]
-            main_returns[window] = ret
-
-        # Compute returns for all symbols in universe
-        universe_returns = {window: [] for window in self.windows}
-        for symbol, symbol_df in universe_data.items():
-            if "close" not in symbol_df.columns:
-                continue
-            sym_close = symbol_df["close"].to_numpy().astype(np.float64)
-            for window in self.windows:
-                ret = np.full(len(sym_close), np.nan)
-                ret[window:] = (sym_close[window:] - sym_close[:-window]) / sym_close[:-window]
-                universe_returns[window].append(ret)
-
         # Compute percentile rank
         for window in self.windows:
             percentile = np.full(len(close), np.nan)
-            main_ret = main_returns[window]
-            all_returns = universe_returns[window]
+            main_ret = self._window_returns(close, window)
+            all_returns: list[np.ndarray] = []
+
+            for symbol_df in universe_data.values():
+                if "close" not in symbol_df.columns:
+                    continue
+                sym_close = symbol_df["close"].to_numpy().astype(np.float64)
+                sym_ret = self._window_returns(sym_close, window)
+                all_returns.append(self._align_to_base(df, symbol_df, sym_ret))
 
             if not all_returns:
                 results[f"return_percentile_{window}"] = np.full(len(close), 0.5)
                 continue
 
-            # Align lengths
-            min_len = min(len(main_ret), min(len(r) for r in all_returns))
-
-            for i in range(window, min_len):
+            for i in range(window, len(close)):
                 if np.isnan(main_ret[i]):
                     continue
 
                 # Get cross-sectional returns at this point
                 cs_returns = [main_ret[i]]
                 for ret in all_returns:
-                    if i < len(ret) and not np.isnan(ret[i]):
+                    if i < len(ret) and np.isfinite(ret[i]):
                         cs_returns.append(ret[i])
 
                 if len(cs_returns) > 1:
@@ -359,14 +438,13 @@ class ZScoreVsUniverse(CrossSectionalFeature):
 
         # Compute returns for all symbols
         universe_returns = {window: [] for window in self.windows}
-        for symbol, symbol_df in universe_data.items():
+        for symbol_df in universe_data.values():
             if "close" not in symbol_df.columns:
                 continue
             sym_close = symbol_df["close"].to_numpy().astype(np.float64)
             for window in self.windows:
-                ret = np.full(len(sym_close), np.nan)
-                ret[window:] = (sym_close[window:] - sym_close[:-window]) / sym_close[:-window]
-                universe_returns[window].append(ret)
+                ret = self._window_returns(sym_close, window)
+                universe_returns[window].append(self._align_to_base(df, symbol_df, ret))
 
         for window in self.windows:
             zscore = np.full(len(close), np.nan)
@@ -377,15 +455,13 @@ class ZScoreVsUniverse(CrossSectionalFeature):
                 results[f"zscore_universe_{window}"] = np.zeros(len(close))
                 continue
 
-            min_len = min(len(main_ret), min(len(r) for r in all_returns))
-
-            for i in range(window, min_len):
+            for i in range(window, len(close)):
                 if np.isnan(main_ret[i]):
                     continue
 
                 cs_returns = []
                 for ret in all_returns:
-                    if i < len(ret) and not np.isnan(ret[i]):
+                    if np.isfinite(ret[i]):
                         cs_returns.append(ret[i])
 
                 if len(cs_returns) > 1:
@@ -428,14 +504,13 @@ class DistanceFromMedian(CrossSectionalFeature):
             main_returns[window] = ret
 
         universe_returns = {window: [] for window in self.windows}
-        for symbol, symbol_df in universe_data.items():
+        for symbol_df in universe_data.values():
             if "close" not in symbol_df.columns:
                 continue
             sym_close = symbol_df["close"].to_numpy().astype(np.float64)
             for window in self.windows:
-                ret = np.full(len(sym_close), np.nan)
-                ret[window:] = (sym_close[window:] - sym_close[:-window]) / sym_close[:-window]
-                universe_returns[window].append(ret)
+                ret = self._window_returns(sym_close, window)
+                universe_returns[window].append(self._align_to_base(df, symbol_df, ret))
 
         for window in self.windows:
             dist = np.full(len(close), np.nan)
@@ -446,15 +521,13 @@ class DistanceFromMedian(CrossSectionalFeature):
                 results[f"dist_median_{window}"] = np.zeros(len(close))
                 continue
 
-            min_len = min(len(main_ret), min(len(r) for r in all_returns))
-
-            for i in range(window, min_len):
+            for i in range(window, len(close)):
                 if np.isnan(main_ret[i]):
                     continue
 
                 cs_returns = []
                 for ret in all_returns:
-                    if i < len(ret) and not np.isnan(ret[i]):
+                    if np.isfinite(ret[i]):
                         cs_returns.append(ret[i])
 
                 if len(cs_returns) > 0:
@@ -529,21 +602,15 @@ class RollingCorrelation(CrossSectionalFeature):
             benchmark = df[self.benchmark_col].to_numpy().astype(np.float64)
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
-            if "close" in spy_df.columns:
-                benchmark = spy_df["close"].to_numpy().astype(np.float64)
-                min_len = min(len(close), len(benchmark))
-                close = close[:min_len]
-                benchmark = benchmark[:min_len]
-            else:
-                benchmark = None
+            benchmark = self._aligned_column(df, spy_df, "close")
         else:
             benchmark = None
 
         # Compute returns
-        asset_ret = np.diff(np.log(close), prepend=np.nan)
+        asset_ret = self._log_returns(close)
 
         if benchmark is not None:
-            bench_ret = np.diff(np.log(benchmark), prepend=np.nan)
+            bench_ret = self._log_returns(benchmark)
 
             corr_benchmark = np.full(len(close), np.nan)
             for i in range(self.window, len(close)):
@@ -562,13 +629,11 @@ class RollingCorrelation(CrossSectionalFeature):
         # Correlation with VIX if available
         if universe_data and "VIX" in universe_data:
             vix_df = universe_data["VIX"]
-            if "close" in vix_df.columns:
-                vix = vix_df["close"].to_numpy().astype(np.float64)
-                min_len = min(len(close), len(vix))
-                vix_ret = np.diff(np.log(vix[:min_len]), prepend=np.nan)
-
-                corr_vix = np.full(min_len, np.nan)
-                for i in range(self.window, min_len):
+            vix_aligned = self._aligned_column(df, vix_df, "close")
+            if vix_aligned is not None:
+                vix_ret = self._log_returns(vix_aligned)
+                corr_vix = np.full(len(close), np.nan)
+                for i in range(self.window, len(close)):
                     asset_window = asset_ret[i - self.window + 1 : i + 1]
                     vix_window = vix_ret[i - self.window + 1 : i + 1]
 
@@ -576,10 +641,6 @@ class RollingCorrelation(CrossSectionalFeature):
                     if np.sum(valid_mask) > 2:
                         corr = np.corrcoef(asset_window[valid_mask], vix_window[valid_mask])
                         corr_vix[i] = corr[0, 1]
-
-                # Pad to original length
-                if min_len < len(close):
-                    corr_vix = np.pad(corr_vix, (0, len(close) - min_len), constant_values=np.nan)
 
                 results[f"corr_vix_{self.window}"] = corr_vix
 
@@ -643,95 +704,87 @@ class FactorLoadings(CrossSectionalFeature):
         close = df["close"].to_numpy().astype(np.float64)
         results = {}
 
+        # Initialize outputs
+        for i in range(self.n_factors):
+            results[f"factor_loading_{i + 1}"] = np.full(len(close), np.nan)
+        results["idiosyncratic_vol"] = np.full(len(close), np.nan)
+
         if universe_data is None or len(universe_data) < self.n_factors:
             for i in range(self.n_factors):
                 results[f"factor_loading_{i + 1}"] = np.zeros(len(close))
             results["idiosyncratic_vol"] = np.zeros(len(close))
             return results
 
-        # Compute returns for all symbols
-        all_returns = []
-        symbol_names = []
-        main_symbol_idx = None
-
-        for idx, (symbol, symbol_df) in enumerate(universe_data.items()):
+        # Compute returns for universe and align to main symbol timeline
+        all_returns: list[np.ndarray] = []
+        for symbol_df in universe_data.values():
             if "close" not in symbol_df.columns:
                 continue
             sym_close = symbol_df["close"].to_numpy().astype(np.float64)
-            ret = np.diff(np.log(sym_close), prepend=np.nan)
-            all_returns.append(ret)
-            symbol_names.append(symbol)
-
-        # Add main symbol if not in universe
-        main_ret = np.diff(np.log(close), prepend=np.nan)
-        if len(all_returns) > 0:
-            # Align lengths
-            min_len = min(len(main_ret), min(len(r) for r in all_returns))
-            main_ret = main_ret[:min_len]
-            all_returns = [r[:min_len] for r in all_returns]
-
-        # Initialize outputs
-        for i in range(self.n_factors):
-            results[f"factor_loading_{i + 1}"] = np.full(len(close), np.nan)
-        results["idiosyncratic_vol"] = np.full(len(close), np.nan)
+            sym_ret = self._log_returns(sym_close)
+            all_returns.append(self._align_to_base(df, symbol_df, sym_ret))
 
         if len(all_returns) < self.n_factors:
+            for i in range(self.n_factors):
+                results[f"factor_loading_{i + 1}"] = np.zeros(len(close))
+            results["idiosyncratic_vol"] = np.zeros(len(close))
             return results
 
-        # Rolling PCA
-        for t in range(self.window, min_len):
-            # Build return matrix for window
-            return_matrix = np.column_stack(
-                [r[t - self.window + 1 : t + 1] for r in all_returns]
-            )
+        main_ret = self._log_returns(close)
 
-            # Handle NaNs
-            valid_rows = ~np.any(np.isnan(return_matrix), axis=1)
-            if np.sum(valid_rows) < self.n_factors:
+        # Rolling PCA + regression for factor exposures
+        for t in range(self.window, len(close)):
+            window_slice = slice(t - self.window + 1, t + 1)
+            return_matrix = np.column_stack([r[window_slice] for r in all_returns])
+            main_window = main_ret[window_slice]
+
+            valid_rows = np.isfinite(main_window) & ~np.any(~np.isfinite(return_matrix), axis=1)
+            if np.sum(valid_rows) < max(self.n_factors + 2, 8):
                 continue
 
             return_matrix = return_matrix[valid_rows]
+            main_window = main_window[valid_rows]
 
-            # Standardize
-            mean = np.mean(return_matrix, axis=0)
-            std = np.std(return_matrix, axis=0, ddof=1)
-            std = np.where(std == 0, 1, std)
-            standardized = (return_matrix - mean) / std
-
-            try:
-                # SVD for PCA
-                _, s, Vt = np.linalg.svd(standardized, full_matrices=False)
-
-                # Get loadings for main symbol (project onto factors)
-                main_window = main_ret[t - self.window + 1 : t + 1]
-                main_window = main_window[valid_rows]
-                main_standardized = (main_window - np.mean(main_window)) / (
-                    np.std(main_window, ddof=1) or 1
-                )
-
-                loadings = main_standardized @ Vt.T[: self.n_factors].T
-
-                for i in range(min(self.n_factors, len(loadings))):
-                    results[f"factor_loading_{i + 1}"][t] = loadings[i]
-
-                # Idiosyncratic volatility (residual after removing factor exposure)
-                factor_returns = standardized @ Vt.T[: self.n_factors].T @ Vt[: self.n_factors]
-                residuals = main_standardized - (
-                    main_standardized @ Vt.T[: self.n_factors].T @ Vt[: self.n_factors]
-                ).mean()
-                results["idiosyncratic_vol"][t] = np.std(residuals, ddof=1)
-
-            except np.linalg.LinAlgError:
+            # Drop zero-variance assets for numerical stability
+            asset_std = np.std(return_matrix, axis=0, ddof=1)
+            non_constant_assets = asset_std > 1e-12
+            if np.sum(non_constant_assets) < self.n_factors:
                 continue
 
-        # Pad back to original length
-        if min_len < len(close):
-            for key in results:
-                results[key] = np.pad(
-                    results[key][:min_len],
-                    (0, len(close) - min_len),
-                    constant_values=np.nan,
-                )
+            return_matrix = return_matrix[:, non_constant_assets]
+            matrix_mean = np.mean(return_matrix, axis=0)
+            matrix_std = np.std(return_matrix, axis=0, ddof=1)
+            matrix_std = np.where(matrix_std <= 1e-12, 1.0, matrix_std)
+            standardized = (return_matrix - matrix_mean) / matrix_std
+
+            main_std = np.std(main_window, ddof=1)
+            if main_std <= 1e-12:
+                continue
+            main_standardized = (main_window - np.mean(main_window)) / main_std
+
+            try:
+                # Principal component directions for cross-sectional returns
+                _, _, vt = np.linalg.svd(standardized, full_matrices=False)
+                n_components = min(self.n_factors, vt.shape[0], vt.shape[1])
+                if n_components <= 0:
+                    continue
+
+                factor_scores = standardized @ vt[:n_components].T
+                if factor_scores.shape[0] <= n_components:
+                    continue
+
+                # Main asset loading to PCA factor time series
+                loadings, _, _, _ = np.linalg.lstsq(factor_scores, main_standardized, rcond=None)
+
+                for i in range(n_components):
+                    results[f"factor_loading_{i + 1}"][t] = loadings[i]
+
+                residuals = main_standardized - factor_scores @ loadings
+                if residuals.size > 1:
+                    results["idiosyncratic_vol"][t] = np.std(residuals, ddof=1)
+
+            except (np.linalg.LinAlgError, ValueError):
+                continue
 
         return results
 
@@ -762,13 +815,7 @@ class IdiosyncraticVolatility(CrossSectionalFeature):
             benchmark = df["benchmark"].to_numpy().astype(np.float64)
         elif universe_data and "SPY" in universe_data:
             spy_df = universe_data["SPY"]
-            if "close" in spy_df.columns:
-                benchmark = spy_df["close"].to_numpy().astype(np.float64)
-                min_len = min(len(close), len(benchmark))
-                close = close[:min_len]
-                benchmark = benchmark[:min_len]
-            else:
-                benchmark = None
+            benchmark = self._aligned_column(df, spy_df, "close")
         else:
             benchmark = None
 
@@ -833,27 +880,22 @@ class CorrelationCentrality(CrossSectionalFeature):
 
         # Compute returns for all symbols
         all_returns = []
-        for symbol, symbol_df in universe_data.items():
+        for symbol_df in universe_data.values():
             if "close" not in symbol_df.columns:
                 continue
             sym_close = symbol_df["close"].to_numpy().astype(np.float64)
-            ret = np.diff(np.log(sym_close), prepend=np.nan)
-            all_returns.append(ret)
+            ret = self._log_returns(sym_close)
+            all_returns.append(self._align_to_base(df, symbol_df, ret))
 
-        main_ret = np.diff(np.log(close), prepend=np.nan)
+        main_ret = self._log_returns(close)
 
         if len(all_returns) < 2:
             results["corr_centrality"] = np.zeros(len(close))
             return results
 
-        # Align lengths
-        min_len = min(len(main_ret), min(len(r) for r in all_returns))
-        main_ret = main_ret[:min_len]
-        all_returns = [r[:min_len] for r in all_returns]
-
         centrality = np.full(len(close), np.nan)
 
-        for t in range(self.window, min_len):
+        for t in range(self.window, len(close)):
             # Compute correlation of main asset with all others
             correlations = []
             for other_ret in all_returns:
@@ -868,14 +910,6 @@ class CorrelationCentrality(CrossSectionalFeature):
             if correlations:
                 # Centrality = average absolute correlation
                 centrality[t] = np.mean(correlations)
-
-        # Pad to original length
-        if min_len < len(close):
-            centrality = np.pad(
-                centrality[:min_len],
-                (0, len(close) - min_len),
-                constant_values=np.nan,
-            )
 
         results["corr_centrality"] = centrality
 

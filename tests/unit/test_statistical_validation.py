@@ -32,3 +32,19 @@ def test_calculate_probability_of_backtest_overfitting_in_range() -> None:
 
     assert 0.0 <= pbo <= 1.0
     assert interpretation != ""
+
+
+def test_calculate_probability_of_backtest_overfitting_diagnostics_in_range() -> None:
+    rng = np.random.default_rng(11)
+    returns = rng.normal(0.0001, 0.012, size=1000)
+
+    pbo, interpretation, diagnostics = calculate_probability_of_backtest_overfitting(
+        returns,
+        return_diagnostics=True,
+    )
+
+    assert 0.0 <= pbo <= 1.0
+    assert interpretation != ""
+    assert diagnostics["pbo_ci_lower_95"] <= pbo <= diagnostics["pbo_ci_upper_95"]
+    assert 0.0 <= diagnostics["pbo_reliability"] <= 1.0
+    assert diagnostics["pbo_combinations_used"] > 0.0

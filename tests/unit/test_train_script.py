@@ -61,9 +61,15 @@ def _base_args(**overrides):
         "holdout_pct": 0.15,
         "min_holdout_sharpe": 0.0,
         "min_holdout_regime_sharpe": -0.10,
+        "min_holdout_symbol_coverage": 0.60,
+        "min_holdout_symbol_p25_sharpe": -0.10,
+        "max_holdout_symbol_underwater_ratio": 0.55,
         "max_holdout_drawdown": 0.35,
         "max_regime_shift": 0.35,
         "max_symbol_concentration_hhi": 0.65,
+        "disable_auto_live_profile": False,
+        "auto_live_profile_symbol_threshold": 40,
+        "auto_live_profile_min_years": 4.0,
         "feature_groups": ["technical", "statistical", "microstructure", "cross_sectional"],
         "disable_symbol_quality_filter": False,
         "symbol_quality_min_rows": 1200,
@@ -1471,12 +1477,23 @@ def test_build_parser_supports_advanced_risk_and_execution_flags():
             "0.1",
             "--min-holdout-regime-sharpe",
             "-0.05",
+            "--min-holdout-symbol-coverage",
+            "0.67",
+            "--min-holdout-symbol-p25-sharpe",
+            "-0.03",
+            "--max-holdout-symbol-underwater-ratio",
+            "0.4",
             "--max-holdout-drawdown",
             "0.3",
             "--max-regime-shift",
             "0.25",
             "--max-symbol-concentration-hhi",
             "0.6",
+            "--disable-auto-live-profile",
+            "--auto-live-profile-symbol-threshold",
+            "44",
+            "--auto-live-profile-min-years",
+            "4.5",
             "--label-edge-cost-buffer-bps",
             "2.5",
             "--disable-symbol-quality-filter",
@@ -1514,9 +1531,15 @@ def test_build_parser_supports_advanced_risk_and_execution_flags():
     assert args.holdout_pct == pytest.approx(0.2)
     assert args.min_holdout_sharpe == pytest.approx(0.1)
     assert args.min_holdout_regime_sharpe == pytest.approx(-0.05)
+    assert args.min_holdout_symbol_coverage == pytest.approx(0.67)
+    assert args.min_holdout_symbol_p25_sharpe == pytest.approx(-0.03)
+    assert args.max_holdout_symbol_underwater_ratio == pytest.approx(0.4)
     assert args.max_holdout_drawdown == pytest.approx(0.3)
     assert args.max_regime_shift == pytest.approx(0.25)
     assert args.max_symbol_concentration_hhi == pytest.approx(0.6)
+    assert args.disable_auto_live_profile is True
+    assert args.auto_live_profile_symbol_threshold == 44
+    assert args.auto_live_profile_min_years == pytest.approx(4.5)
     assert args.disable_symbol_quality_filter is True
     assert args.symbol_quality_min_rows == 1400
     assert args.symbol_quality_min_symbols == 9
@@ -1712,6 +1735,53 @@ def test_multiple_testing_correction_sets_effective_pbo_gate_and_source():
     assert float(trainer.training_metrics["effective_max_pbo_gate"]) >= 0.45
 
 
+def test_multiple_testing_correction_records_pbo_diagnostics_and_gate_metric():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            correction_method="deflated_sharpe",
+            n_trials=25,
+            max_pbo=0.45,
+        )
+    )
+    rng = np.random.default_rng(123)
+    trainer.training_metrics = {
+        "mean_sharpe": 0.9,
+        "holdout_rows": 320.0,
+        "holdout_sharpe": 0.1,
+    }
+    trainer.cv_results = [{"fold": 1}, {"fold": 2}, {"fold": 3}]
+    trainer.cv_return_series = [rng.normal(0.0006, 0.011, size=420)]
+
+    trainer._apply_multiple_testing_correction()
+
+    assert "pbo_ci_upper_95" in trainer.training_metrics
+    assert "pbo_reliability" in trainer.training_metrics
+    assert "effective_pbo_gate_metric" in trainer.training_metrics
+    assert float(trainer.training_metrics["effective_pbo_gate_metric"]) >= float(
+        trainer.training_metrics["pbo"]
+    )
+
+
+def test_effective_pbo_threshold_tightens_with_holdout_gap():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost", max_pbo=0.45))
+
+    relaxed = trainer._effective_pbo_threshold(
+        sample_size=300,
+        interpretation="Moderate overfitting risk",
+        holdout_gap_ratio=0.0,
+        pbo_reliability=0.8,
+    )
+    tightened = trainer._effective_pbo_threshold(
+        sample_size=300,
+        interpretation="Moderate overfitting risk",
+        holdout_gap_ratio=1.2,
+        pbo_reliability=0.2,
+    )
+
+    assert tightened < relaxed
+
+
 def test_validate_model_fails_when_pbo_gate_breaches():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -1765,6 +1835,212 @@ def test_validate_model_uses_effective_pbo_gate_override():
     assert passed is True
     assert trainer.validation_results["gates"]["max_pbo"][0] is True
     assert trainer.validation_results["gates"]["max_pbo"][2] == pytest.approx(0.55)
+
+
+def test_validate_model_uses_effective_pbo_gate_metric_when_present():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            max_pbo=0.45,
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 20.0,
+        "mean_test_size": 50.0,
+        "mean_risk_adjusted_score": 0.25,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.20,
+        "effective_pbo_gate_metric": 0.55,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["gates"]["max_pbo"][0] is False
+    assert trainer.validation_results["gates"]["max_pbo"][1] == pytest.approx(0.55)
+
+
+def test_validate_model_holdout_sharpe_gate_uses_confidence_adjustment():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            min_holdout_sharpe=0.0,
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 12.0,
+        "mean_test_size": 80.0,
+        "mean_risk_adjusted_score": 0.25,
+        "mean_symbol_concentration_hhi": 0.25,
+        "holdout_rows": 300.0,
+        "holdout_sharpe": 0.12,
+        "holdout_trade_return_observations": 2.0,
+        "holdout_sharpe_observation_confidence": 0.10,
+        "holdout_regime_count_evaluated": 1.0,
+        "holdout_worst_regime_sharpe": 0.12,
+        "holdout_max_drawdown": 0.12,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.20,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["gates"]["min_holdout_sharpe"][0] is False
+    assert trainer.training_metrics["effective_holdout_sharpe_gate_metric"] < 0.0
+
+
+def test_validate_model_fails_when_holdout_symbol_coverage_breaches():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            min_holdout_symbol_coverage=0.70,
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 14.0,
+        "mean_test_size": 80.0,
+        "mean_risk_adjusted_score": 0.25,
+        "mean_symbol_concentration_hhi": 0.25,
+        "holdout_rows": 260.0,
+        "holdout_sharpe": 0.25,
+        "holdout_worst_regime_sharpe": 0.10,
+        "holdout_max_drawdown": 0.12,
+        "holdout_symbol_coverage_ratio": 0.45,
+        "holdout_symbol_sharpe_p25": 0.05,
+        "holdout_symbol_underwater_ratio": 0.20,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.20,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["gates"]["min_holdout_symbol_coverage"][0] is False
+
+
+def test_validate_model_fails_when_holdout_symbol_underwater_ratio_breaches():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            max_holdout_symbol_underwater_ratio=0.35,
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 14.0,
+        "mean_test_size": 80.0,
+        "mean_risk_adjusted_score": 0.25,
+        "mean_symbol_concentration_hhi": 0.25,
+        "holdout_rows": 260.0,
+        "holdout_sharpe": 0.25,
+        "holdout_worst_regime_sharpe": 0.10,
+        "holdout_max_drawdown": 0.12,
+        "holdout_symbol_coverage_ratio": 0.85,
+        "holdout_symbol_sharpe_p25": 0.05,
+        "holdout_symbol_underwater_ratio": 0.60,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.20,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["gates"]["max_holdout_symbol_underwater_ratio"][0] is False
+
+
+def test_auto_live_profile_applies_for_5y_46_symbol_dataset():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            n_trials=40,
+            n_splits=4,
+            nested_outer_splits=3,
+            nested_inner_splits=2,
+            max_pbo=0.45,
+            min_holdout_sharpe=0.0,
+            min_holdout_regime_sharpe=-0.10,
+        )
+    )
+    symbols = [f"S{i:02d}" for i in range(46)]
+    dates = pd.date_range("2019-01-01", "2024-12-31", freq="10D", tz="UTC")
+    rows = [
+        {"symbol": symbol, "timestamp": ts}
+        for symbol in symbols
+        for ts in dates
+    ]
+    trainer.data = pd.DataFrame(rows)
+
+    trainer._apply_live_multi_symbol_profile()
+
+    assert trainer.training_metrics["auto_live_profile_applied"] is True
+    assert trainer.training_metrics["training_profile_mode"] == "institutional_live_multi_symbol"
+    assert trainer.config.n_trials >= 180
+    assert trainer.config.n_splits >= 6
+    assert trainer.config.nested_outer_splits >= 5
+    assert trainer.config.max_pbo <= 0.35
+    assert trainer.config.min_holdout_sharpe >= 0.10
+    assert trainer.config.min_holdout_symbol_coverage >= 0.65
+
+
+def test_auto_live_profile_skips_small_or_short_dataset():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            n_trials=80,
+            auto_live_profile_symbol_threshold=40,
+            auto_live_profile_min_years=4.0,
+        )
+    )
+    symbols = [f"S{i:02d}" for i in range(12)]
+    dates = pd.date_range("2023-01-01", "2024-01-01", freq="14D", tz="UTC")
+    rows = [
+        {"symbol": symbol, "timestamp": ts}
+        for symbol in symbols
+        for ts in dates
+    ]
+    trainer.data = pd.DataFrame(rows)
+
+    trainer._apply_live_multi_symbol_profile()
+
+    assert trainer.training_metrics["auto_live_profile_applied"] is False
+    assert trainer.training_metrics["training_profile_mode"] == "default"
+    assert trainer.config.n_trials == 80
 
 
 def test_validate_model_fails_when_symbol_concentration_gate_breaches():

@@ -101,6 +101,26 @@ class DummyConstantModel(TradingModel):
         return {}
 
 
+class DummyStatefulFitModel(TradingModel):
+    """Model whose predictions depend on fit count to detect fold leakage."""
+
+    def __init__(self, name: str = "dummy_stateful", bias: float = 0.0) -> None:
+        super().__init__(name=name, model_type=ModelType.REGRESSOR, bias=bias)
+        self.fit_calls = 0
+
+    def fit(self, X, y, **kwargs):
+        self.fit_calls += 1
+        self._is_fitted = True
+        return self
+
+    def predict(self, X):
+        X_arr = np.asarray(X)
+        return np.full(X_arr.shape[0], float(self.fit_calls), dtype=float)
+
+    def get_feature_importance(self):
+        return {}
+
+
 # ==================== Base Model Tests ====================
 
 
@@ -539,6 +559,28 @@ class TestModelManagerInstitutionalValidation:
         assert len(result["outer_folds"]) == 2
         assert "summary" in result
         assert "robust_params" in result
+
+    def test_cross_validate_uses_fresh_model_instance_per_fold(self, temp_model_dir):
+        """Cross-validation should not leak model fit state across folds."""
+        X = np.random.randn(120, 4)
+        y = np.zeros(120, dtype=float)
+
+        manager = ModelManager(registry_path=temp_model_dir)
+        model = DummyStatefulFitModel()
+
+        result = manager.cross_validate(
+            model=model,
+            X=X,
+            y=y,
+            cv_method=SplitMethod.EXPANDING_WINDOW,
+            n_splits=3,
+            metrics=["mse"],
+            gap=0,
+        )
+
+        mse_values = result["mse_values"]
+        assert len(mse_values) == 3
+        assert all(np.isclose(value, 1.0) for value in mse_values)
 
 
 class TestModelRegistry:

@@ -28,9 +28,11 @@ from quant_trading_system.backtest.engine import (
 from quant_trading_system.backtest.optimizer import (
     GeneticOptimizer,
     GridSearchOptimizer,
+    OptimizationWindow,
     OverfitDetector,
     ParameterSpace,
     RandomSearchOptimizer,
+    StrategyOptimizer,
     WalkForwardOptimizer,
 )
 from quant_trading_system.backtest.simulator import (
@@ -690,6 +692,199 @@ class TestWalkForwardOptimizer:
         for window in windows:
             assert window.train_end < window.test_start
             assert window.test_end <= end
+
+
+class TestStrategyOptimizerSelection:
+    """Tests robust parameter window selection logic."""
+
+    def test_select_robust_window_not_last_window_biased(self):
+        """Selection should prefer best OOS/stability window, not always the last window."""
+        start = datetime(2020, 1, 1)
+
+        windows = [
+            OptimizationWindow(
+                window_id=0,
+                train_start=start,
+                train_end=start + timedelta(days=180),
+                test_start=start + timedelta(days=185),
+                test_end=start + timedelta(days=270),
+                best_params={"lookback": 10},
+                train_metric=1.0,
+                test_metric=0.7,
+            ),
+            OptimizationWindow(
+                window_id=1,
+                train_start=start + timedelta(days=90),
+                train_end=start + timedelta(days=270),
+                test_start=start + timedelta(days=275),
+                test_end=start + timedelta(days=360),
+                best_params={"lookback": 20},
+                train_metric=1.1,
+                test_metric=0.9,
+            ),
+            OptimizationWindow(
+                window_id=2,
+                train_start=start + timedelta(days=180),
+                train_end=start + timedelta(days=360),
+                test_start=start + timedelta(days=365),
+                test_end=start + timedelta(days=450),
+                best_params={"lookback": 30},
+                train_metric=2.5,
+                test_metric=0.2,
+            ),
+        ]
+
+        selected = StrategyOptimizer._select_robust_window(windows)
+
+        assert selected is not None
+        assert selected.window_id == 1
+        assert selected.best_params == {"lookback": 20}
+
+    def test_select_robust_window_returns_none_without_candidates(self):
+        """Selection should gracefully handle missing best_params."""
+        start = datetime(2020, 1, 1)
+        windows = [
+            OptimizationWindow(
+                window_id=0,
+                train_start=start,
+                train_end=start + timedelta(days=180),
+                test_start=start + timedelta(days=185),
+                test_end=start + timedelta(days=270),
+                best_params=None,
+                train_metric=1.0,
+                test_metric=0.8,
+            ),
+        ]
+
+        assert StrategyOptimizer._select_robust_window(windows) is None
+
+    def test_optimize_populates_walk_forward_audit_metadata(self, monkeypatch):
+        """Optimize should persist walk-forward audit evidence in result metadata."""
+        from quant_trading_system.backtest.engine import WalkForwardReport
+
+        class _DummyStrategy(Strategy):
+            def generate_signals(self, data_handler, portfolio):
+                return []
+
+        class _FakeEngine:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self):
+                return object()
+
+        class _FakeHandler:
+            def __init__(self, data):
+                self._data = data
+
+        class _StubValidator:
+            def run_validation(self, data, strategy_factory, config):
+                assert "AAPL" in data
+                return WalkForwardReport(
+                    windows=[],
+                    aggregate_metrics={"sharpe_ratio": 0.82},
+                    is_valid=True,
+                    validation_messages=["ok"],
+                    total_trades=12,
+                    combined_equity_curve=[],
+                )
+
+        monkeypatch.setattr("quant_trading_system.backtest.optimizer.BacktestEngine", _FakeEngine)
+        monkeypatch.setattr(
+            "quant_trading_system.backtest.optimizer.StrategyOptimizer._get_objective_value",
+            lambda self, state: 1.0,
+        )
+
+        idx = pd.date_range("2024-01-01", periods=120, freq="D", tz="UTC")
+        dataset = {
+            "AAPL": pd.DataFrame({
+                "open": np.linspace(100, 110, len(idx)),
+                "high": np.linspace(101, 111, len(idx)),
+                "low": np.linspace(99, 109, len(idx)),
+                "close": np.linspace(100, 110, len(idx)),
+                "volume": np.full(len(idx), 1000),
+            }, index=idx)
+        }
+
+        optimizer = StrategyOptimizer(
+            strategy_factory=lambda params: _DummyStrategy(),
+            param_spaces=[ParameterSpace("x", "continuous", 0.0, 1.0)],
+            walk_forward=WalkForwardOptimizer(
+                train_period_days=30,
+                test_period_days=15,
+                step_days=15,
+                purge_days=0,
+            ),
+            walk_forward_validator=_StubValidator(),
+        )
+
+        result = optimizer.optimize(
+            data_handler_factory=lambda _s, _e: _FakeHandler(dataset),
+            start_date=datetime(2024, 1, 1),
+            end_date=datetime(2024, 6, 30),
+            n_iterations=2,
+        )
+
+        audit = result.metadata.get("walk_forward_audit", {})
+        assert audit.get("status") == "completed"
+        assert audit.get("is_valid") is True
+        assert audit.get("total_trades") == 12
+        assert audit.get("aggregate_metrics", {}).get("sharpe_ratio") == pytest.approx(0.82)
+
+    def test_optimize_skips_walk_forward_audit_when_dataset_missing(self, monkeypatch):
+        """Optimize should skip walk-forward audit when handler dataset is unavailable."""
+        class _DummyStrategy(Strategy):
+            def generate_signals(self, data_handler, portfolio):
+                return []
+
+        class _FakeEngine:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self):
+                return object()
+
+        class _NoDatasetHandler:
+            pass
+
+        class _NeverCalledValidator:
+            def __init__(self):
+                self.called = False
+
+            def run_validation(self, data, strategy_factory, config):
+                self.called = True
+                raise AssertionError("Validator should not be called without dataset")
+
+        validator = _NeverCalledValidator()
+        monkeypatch.setattr("quant_trading_system.backtest.optimizer.BacktestEngine", _FakeEngine)
+        monkeypatch.setattr(
+            "quant_trading_system.backtest.optimizer.StrategyOptimizer._get_objective_value",
+            lambda self, state: 0.5,
+        )
+
+        optimizer = StrategyOptimizer(
+            strategy_factory=lambda params: _DummyStrategy(),
+            param_spaces=[ParameterSpace("x", "continuous", 0.0, 1.0)],
+            walk_forward=WalkForwardOptimizer(
+                train_period_days=30,
+                test_period_days=15,
+                step_days=15,
+                purge_days=0,
+            ),
+            walk_forward_validator=validator,
+        )
+
+        result = optimizer.optimize(
+            data_handler_factory=lambda _s, _e: _NoDatasetHandler(),
+            start_date=datetime(2024, 1, 1),
+            end_date=datetime(2024, 6, 30),
+            n_iterations=2,
+        )
+
+        audit = result.metadata.get("walk_forward_audit", {})
+        assert audit.get("status") == "skipped"
+        assert audit.get("reason") == "data_handler_missing_dict_dataset"
+        assert validator.called is False
 
 
 class TestParameterSpace:

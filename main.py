@@ -829,6 +829,24 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Validation gate threshold for worst holdout regime Sharpe (default: -0.10)",
     )
     train_parser.add_argument(
+        "--min-holdout-symbol-coverage",
+        type=float,
+        default=0.60,
+        help="Validation gate threshold for evaluated holdout symbol coverage ratio (default: 0.60)",
+    )
+    train_parser.add_argument(
+        "--min-holdout-symbol-p25-sharpe",
+        type=float,
+        default=-0.10,
+        help="Validation gate threshold for holdout symbol Sharpe 25th percentile (default: -0.10)",
+    )
+    train_parser.add_argument(
+        "--max-holdout-symbol-underwater-ratio",
+        type=float,
+        default=0.55,
+        help="Validation gate threshold for fraction of holdout symbols with negative Sharpe (default: 0.55)",
+    )
+    train_parser.add_argument(
         "--max-holdout-drawdown",
         type=float,
         default=0.35,
@@ -845,6 +863,23 @@ For more information, visit: https://github.com/alphatrade/docs
         type=float,
         default=0.65,
         help="Validation gate threshold for symbol concentration HHI (default: 0.65)",
+    )
+    train_parser.add_argument(
+        "--disable-auto-live-profile",
+        action="store_true",
+        help="Disable automatic profile tuning for large multi-symbol live training datasets",
+    )
+    train_parser.add_argument(
+        "--auto-live-profile-symbol-threshold",
+        type=int,
+        default=40,
+        help="Minimum symbol count to activate auto live profile (default: 40)",
+    )
+    train_parser.add_argument(
+        "--auto-live-profile-min-years",
+        type=float,
+        default=4.0,
+        help="Minimum data history years to activate auto live profile (default: 4.0)",
     )
     train_parser.add_argument(
         "--label-horizons",

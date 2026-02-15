@@ -491,7 +491,8 @@ class SequentialTester(StatisticalTester):
         alpha: float = 0.05,
     ) -> TestResult:
         """Perform sequential test with adjusted boundaries."""
-        # Get adjusted alpha for current interim analysis
+        # Advance to the next look before spending alpha.
+        self._current_analysis = min(self._current_analysis + 1, self.n_analyses)
         information_fraction = min(1.0, self._current_analysis / self.n_analyses)
         adjusted_alpha = self._obrien_fleming_boundary(alpha, information_fraction)
 

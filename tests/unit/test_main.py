@@ -148,12 +148,23 @@ class TestParseArgs:
                 "0.1",
                 "--min-holdout-regime-sharpe",
                 "-0.04",
+                "--min-holdout-symbol-coverage",
+                "0.66",
+                "--min-holdout-symbol-p25-sharpe",
+                "-0.02",
+                "--max-holdout-symbol-underwater-ratio",
+                "0.42",
                 "--max-holdout-drawdown",
                 "0.25",
                 "--max-regime-shift",
                 "0.3",
                 "--max-symbol-concentration-hhi",
                 "0.57",
+                "--disable-auto-live-profile",
+                "--auto-live-profile-symbol-threshold",
+                "45",
+                "--auto-live-profile-min-years",
+                "4.5",
                 "--label-edge-cost-buffer-bps",
                 "3.0",
                 "--disable-symbol-quality-filter",
@@ -196,9 +207,15 @@ class TestParseArgs:
             assert args.holdout_pct == pytest.approx(0.2)
             assert args.min_holdout_sharpe == pytest.approx(0.1)
             assert args.min_holdout_regime_sharpe == pytest.approx(-0.04)
+            assert args.min_holdout_symbol_coverage == pytest.approx(0.66)
+            assert args.min_holdout_symbol_p25_sharpe == pytest.approx(-0.02)
+            assert args.max_holdout_symbol_underwater_ratio == pytest.approx(0.42)
             assert args.max_holdout_drawdown == pytest.approx(0.25)
             assert args.max_regime_shift == pytest.approx(0.3)
             assert args.max_symbol_concentration_hhi == pytest.approx(0.57)
+            assert args.disable_auto_live_profile is True
+            assert args.auto_live_profile_symbol_threshold == 45
+            assert args.auto_live_profile_min_years == pytest.approx(4.5)
             assert args.disable_symbol_quality_filter is True
             assert args.symbol_quality_min_rows == 1600
             assert args.symbol_quality_min_symbols == 11

@@ -519,6 +519,89 @@ class TestCrossSectionalFeatures:
         # Returns zeros when no universe data available
         assert "zscore_universe_5" in result or "zscore_universe_20" in result
 
+    def test_zscore_uses_timestamp_alignment_not_row_index(self):
+        """Z-score should respect timestamp alignment for universe returns."""
+        from quant_trading_system.features.cross_sectional import ZScoreVsUniverse
+
+        base_ts = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(8)]
+        base_df = pl.DataFrame({
+            "timestamp": base_ts,
+            "close": [100, 101, 102, 103, 104, 105, 106, 107],
+        })
+
+        shifted_df = pl.DataFrame({
+            "timestamp": [datetime(2024, 1, 3) + timedelta(days=i) for i in range(8)],
+            "close": [100, 102, 104, 106, 108, 110, 112, 114],
+        })
+        aligned_df = pl.DataFrame({
+            "timestamp": base_ts,
+            "close": [100, 100, 101, 101, 102, 102, 103, 103],
+        })
+
+        zscore = ZScoreVsUniverse(windows=[1])
+        result = zscore.compute(base_df, {"SHIFTED": shifted_df, "ALIGNED": aligned_df})
+        values = result["zscore_universe_1"]
+
+        # At index 2 (2024-01-03), shifted universe return is still NaN after alignment.
+        # This should leave only one valid universe point and z-score should remain NaN.
+        assert np.isnan(values[2])
+        assert np.isfinite(values[5])
+
+    def test_factor_loadings_handle_misaligned_universe(self):
+        """FactorLoadings should be stable with timestamp-misaligned universe data."""
+        from quant_trading_system.features.cross_sectional import FactorLoadings
+
+        np.random.seed(7)
+        n = 140
+        base_ts = [datetime(2023, 1, 1) + timedelta(days=i) for i in range(n)]
+        base_close = 100.0 * np.exp(np.cumsum(np.random.normal(0.0004, 0.01, n)))
+        base_df = pl.DataFrame({"timestamp": base_ts, "close": base_close})
+
+        universe_data: dict[str, pl.DataFrame] = {}
+        for idx in range(6):
+            shift = idx + 1
+            ts = [datetime(2023, 1, 1) + timedelta(days=shift + i) for i in range(n)]
+            close = 90.0 * np.exp(np.cumsum(np.random.normal(0.0003, 0.012, n)))
+            universe_data[f"S{idx}"] = pl.DataFrame({"timestamp": ts, "close": close})
+
+        feature = FactorLoadings(window=30, n_factors=3)
+        result = feature.compute(base_df, universe_data)
+
+        assert len(result["factor_loading_1"]) == n
+        assert len(result["idiosyncratic_vol"]) == n
+        assert np.isfinite(result["factor_loading_1"]).sum() > 0
+        assert np.isfinite(result["idiosyncratic_vol"]).sum() > 0
+
+    def test_correlation_centrality_uses_timestamp_alignment(self):
+        """CorrelationCentrality should not fabricate early overlap via row-index alignment."""
+        from quant_trading_system.features.cross_sectional import CorrelationCentrality
+
+        base_ts = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(12)]
+        base_close = np.linspace(100.0, 111.0, 12)
+        base_df = pl.DataFrame({"timestamp": base_ts, "close": base_close})
+
+        # Both universe symbols start later than base timestamps.
+        shifted_a = pl.DataFrame({
+            "timestamp": [datetime(2024, 1, 5) + timedelta(days=i) for i in range(12)],
+            "close": np.linspace(50.0, 62.0, 12),
+        })
+        shifted_b = pl.DataFrame({
+            "timestamp": [datetime(2024, 1, 6) + timedelta(days=i) for i in range(12)],
+            "close": np.linspace(80.0, 92.0, 12),
+        })
+        shifted_c = pl.DataFrame({
+            "timestamp": [datetime(2024, 1, 7) + timedelta(days=i) for i in range(12)],
+            "close": np.linspace(120.0, 132.0, 12),
+        })
+
+        feature = CorrelationCentrality(window=4)
+        result = feature.compute(base_df, {"A": shifted_a, "B": shifted_b, "C": shifted_c})
+        centrality = result["corr_centrality"]
+
+        # Early window has no true overlap; alignment should keep it NaN.
+        assert np.isnan(centrality[4])
+        assert np.isfinite(centrality).sum() > 0
+
 
 class TestFeaturePipeline:
     """Tests for feature pipeline."""
@@ -569,6 +652,108 @@ class TestFeaturePipeline:
         # Result is a FeatureSet object
         assert result is not None
         assert result.num_features > 0
+
+    def test_cache_key_deterministic_for_equivalent_configs(self, sample_ohlcv_df):
+        """Test cache key is deterministic for equivalent output configs."""
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+        )
+
+        config_a = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL],
+            include_targets=True,
+            target_horizons=[1, 5],
+            fill_method="ffill",
+            use_optimized_pipeline=False,
+        )
+        config_b = FeatureConfig(
+            groups=[FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL],
+            include_targets=True,
+            target_horizons=[1, 5],
+            fill_method="ffill",
+            use_optimized_pipeline=False,
+        )
+
+        key_a = FeaturePipeline(config_a)._generate_cache_key(sample_ohlcv_df, "TEST")
+        key_b = FeaturePipeline(config_b)._generate_cache_key(sample_ohlcv_df, "TEST")
+
+        assert key_a == key_b
+
+    def test_cache_key_changes_when_output_config_changes(self, sample_ohlcv_df):
+        """Test cache key changes when output-affecting config fields change."""
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+            NormalizationMethod,
+        )
+
+        pipeline = FeaturePipeline(
+            FeatureConfig(
+                groups=[FeatureGroup.TECHNICAL],
+                fill_method="ffill",
+                include_targets=False,
+                target_horizons=[1],
+                use_optimized_pipeline=False,
+            )
+        )
+
+        key_base = pipeline._generate_cache_key(sample_ohlcv_df, "TEST")
+
+        pipeline.config.normalization = NormalizationMethod.ZSCORE
+        key_norm = pipeline._generate_cache_key(sample_ohlcv_df, "TEST")
+        assert key_norm != key_base
+
+        pipeline.config.fill_method = "zero"
+        key_fill = pipeline._generate_cache_key(sample_ohlcv_df, "TEST")
+        assert key_fill != key_norm
+
+        pipeline.config.include_targets = True
+        pipeline.config.target_horizons = [1, 5]
+        key_targets = pipeline._generate_cache_key(sample_ohlcv_df, "TEST")
+        assert key_targets != key_fill
+
+        pipeline.config.groups = [FeatureGroup.STATISTICAL]
+        key_groups = pipeline._generate_cache_key(sample_ohlcv_df, "TEST")
+        assert key_groups != key_targets
+
+    def test_cache_invalidates_after_config_change(self, sample_ohlcv_df):
+        """Test cache miss occurs after changing output-affecting config."""
+        from quant_trading_system.features.feature_pipeline import (
+            FeaturePipeline,
+            FeatureConfig,
+            FeatureGroup,
+            NormalizationMethod,
+        )
+
+        pipeline = FeaturePipeline(
+            FeatureConfig(
+                groups=[FeatureGroup.TECHNICAL],
+                use_cache=True,
+                use_optimized_pipeline=False,
+            )
+        )
+
+        pipeline.compute(sample_ohlcv_df, symbol="CACHE_TEST")
+        stats_after_first = pipeline.get_cache_stats()
+        assert stats_after_first["hits"] == 0
+        assert stats_after_first["misses"] == 1
+        assert stats_after_first["size"] == 1
+
+        pipeline.compute(sample_ohlcv_df, symbol="CACHE_TEST")
+        stats_after_second = pipeline.get_cache_stats()
+        assert stats_after_second["hits"] == 1
+        assert stats_after_second["misses"] == 1
+        assert stats_after_second["size"] == 1
+
+        pipeline.config.normalization = NormalizationMethod.ZSCORE
+        pipeline.compute(sample_ohlcv_df, symbol="CACHE_TEST")
+        stats_after_config_change = pipeline.get_cache_stats()
+        assert stats_after_config_change["hits"] == 1
+        assert stats_after_config_change["misses"] == 2
+        assert stats_after_config_change["size"] == 2
 
     def test_feature_validator(self, sample_ohlcv_df):
         """Test feature validator."""

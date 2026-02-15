@@ -8,6 +8,7 @@ optimization, model selection, versioning, and registry management.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import shutil
 from dataclasses import dataclass
@@ -1249,20 +1250,45 @@ class ModelManager:
 
         results: dict[str, list[float]] = {metric: [] for metric in metrics}
 
+        def _instantiate_fresh_model(template: TradingModel) -> TradingModel:
+            """Create an unfitted model instance with the same constructor params."""
+            init_signature = inspect.signature(template.__class__.__init__)
+            accepts_var_kwargs = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in init_signature.parameters.values()
+            )
+
+            base_kwargs: dict[str, Any] = {}
+            for key, value in {
+                "name": template.name,
+                "version": template.version,
+                "model_type": template.model_type,
+            }.items():
+                if accepts_var_kwargs or key in init_signature.parameters:
+                    base_kwargs[key] = value
+
+            model_params = template.get_params()
+            for key, value in model_params.items():
+                if accepts_var_kwargs or key in init_signature.parameters:
+                    base_kwargs[key] = value
+
+            return template.__class__(**base_kwargs)
+
         for train_idx, test_idx in splits:
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
 
-            # Train on fold
-            model.fit(X_train, y_train)
-            predictions = model.predict(X_test)
+            # Train a fresh instance per fold to avoid model state leakage.
+            fold_model = _instantiate_fresh_model(model)
+            fold_model.fit(X_train, y_train)
+            predictions = fold_model.predict(X_test)
 
             # Calculate metrics
             fold_metrics = self._calculate_metrics(
                 y_test,
                 predictions,
                 metrics,
-                model.model_type,
+                fold_model.model_type,
                 assumed_cost_bps=assumed_cost_bps,
                 annualization_factor=annualization_factor,
             )
@@ -1297,7 +1323,7 @@ class ModelManager:
         random_state: int | None = 42,
         assumed_cost_bps: float = 5.0,
         turnover_penalty_bps: float = 0.0,
-        annualization_factor: float = 252.0,
+        annualization_factor: float = 26 * 252,
     ) -> dict[str, Any]:
         """Run institutional nested CV with inner optimization and outer OOS scoring."""
 
