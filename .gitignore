@@ -107,4 +107,6 @@ Thumbs.db
 
 # Local assistant/tooling folders
 .claude/
+/AGENTS.md
+/CLAUDE.md
 
