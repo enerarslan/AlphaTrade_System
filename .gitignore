@@ -5,8 +5,8 @@ __pycache__/
 *.so
 .Python
 build/
-develop-eggs/
 dist/
+develop-eggs/
 downloads/
 eggs/
 .eggs/
@@ -25,21 +25,27 @@ wheels/
 venv/
 ENV/
 
-# IDE
-.idea/
-*.swp
-*.swo
-
-# Testing
+# Tool caches
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Test and coverage artifacts
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
-# Logs
+# Logs and runtime files
 logs/
 *.log
+dump.rdb
+nul
 
-# Environment variables and secrets - CRITICAL: Never commit these
+# Environment variables and local secrets
 .env
 .env.local
 .env.production
@@ -47,7 +53,7 @@ logs/
 .env.*.local
 *.env
 
-# Security - API keys, credentials, certificates
+# Security artifacts (credentials/certs/keys)
 *.pem
 *.key
 *.crt
@@ -58,21 +64,18 @@ secrets.json
 service-account*.json
 *_credentials.yaml
 *_secrets.yaml
-
-# AWS credentials
 .aws/
 aws_credentials
-
-# Vault tokens
 .vault-token
 
-# Data
+# Data and local artifacts
 data/
 *.csv
 *.parquet
+backtest_results/
 
-# Trained model artifacts (root-level models/ directory only)
-# Note: /models/ only matches root, not quant_trading_system/models/ (source code)
+# Trained model artifacts (root-level models/ only)
+# Note: /models/ only matches root, not quant_trading_system/models/ source code
 /models/
 *.pkl
 *.joblib
@@ -81,17 +84,27 @@ data/
 # Jupyter
 .ipynb_checkpoints/
 
+# Frontend artifacts
+dashboard_ui/node_modules/
+dashboard_ui/dist/
+dashboard_ui/.vite/
+dashboard_ui/coverage/
+dashboard_ui/.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
 # OS
 .DS_Store
 Thumbs.db
-nul
 
-
-.gitignore/
+# Local assistant/tooling folders
 .claude/
-.vscode/
-CLAUDE.md/
-AGENTS.md/
-alembic.ini/
-dumb.rdb/
 
