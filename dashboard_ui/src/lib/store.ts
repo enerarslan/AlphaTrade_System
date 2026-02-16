@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api, buildApiUrl, clearAccessToken, getAccessToken, setAccessToken } from "./api";
+import { pushNotification } from "./notifications";
 
 type HealthCheckResult = {
   component: string;
@@ -1644,9 +1645,16 @@ export const useStore = create<DashboardState>((set, get) => ({
           return;
         }
         if (payload?.type === "alert" && payload.data) {
+          const alertData = payload.data;
           set((state) => ({
-            alerts: [payload.data, ...state.alerts].slice(0, 200),
+            alerts: [alertData, ...state.alerts].slice(0, 200),
           }));
+          // Push toast notification
+          pushNotification(
+            alertData.title ?? "Alert",
+            alertData.message ?? "",
+            alertData.severity ?? "INFO",
+          );
         }
       },
       (connected) => updateWs("alerts", connected),

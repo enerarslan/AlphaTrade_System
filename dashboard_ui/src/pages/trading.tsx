@@ -5,6 +5,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useStore } from "@/lib/store";
+import DataGrid from "@/components/ui/data-grid";
+import { type ColumnDef } from "@tanstack/react-table";
+import MiniGauge from "@/components/ui/mini-gauge";
+import PanelLayout from "@/components/layout/PanelLayout";
 
 const stagger = {
   hidden: { opacity: 0 },
@@ -16,6 +20,55 @@ const fadeUp = {
 } as const;
 
 const modeOptions = ["paper", "live", "dry-run"] as const;
+
+type OrderRow = {
+  order_id: string;
+  symbol: string;
+  side: string;
+  order_type: string;
+  quantity: number;
+  filled_qty: number;
+  limit_price: number | null;
+  status: string;
+  created_at: string;
+};
+
+const orderColumns: ColumnDef<OrderRow, unknown>[] = [
+  { accessorKey: "symbol", header: "Symbol", size: 80 },
+  {
+    accessorKey: "side",
+    header: "Side",
+    size: 60,
+    cell: ({ getValue }) => {
+      const v = getValue() as string;
+      return <span className={v === "BUY" ? "text-emerald-400" : "text-rose-400"}>{v}</span>;
+    },
+  },
+  { accessorKey: "quantity", header: "Qty", size: 60 },
+  {
+    accessorKey: "limit_price",
+    header: "Price",
+    size: 70,
+    cell: ({ getValue }) => {
+      const v = getValue() as number | null;
+      return v != null ? `$${v.toFixed(2)}` : "MKT";
+    },
+  },
+  { accessorKey: "order_type", header: "Type", size: 60 },
+  {
+    accessorKey: "status",
+    header: "Status",
+    size: 70,
+    cell: ({ getValue }) => {
+      const v = getValue() as string;
+      const variant = v === "FILLED" ? "success" : v === "CANCELLED" ? "error" : "outline";
+      return <Badge variant={variant}>{v}</Badge>;
+    },
+  },
+  { accessorKey: "created_at", header: "Time", size: 100,
+    cell: ({ getValue }) => new Date(getValue() as string).toLocaleTimeString(),
+  },
+];
 
 export default function TradingPage() {
   const {
@@ -60,7 +113,6 @@ export default function TradingPage() {
 
   const canControl = hasPermission("control.trading.start");
   const canKill = hasPermission("control.risk.kill_switch.activate");
-  const activeOrders = useMemo(() => orders.filter((o) => o.status?.toLowerCase() !== "filled" && o.status?.toLowerCase() !== "cancelled").slice(0, 15), [orders]);
   const recentJobs = useMemo(() => jobs.slice(0, 8), [jobs]);
 
   return (
@@ -172,7 +224,7 @@ export default function TradingPage() {
         </Card>
       </motion.div>
 
-      {/* Execution Quality */}
+      {/* Execution Quality — with MiniGauges */}
       <motion.div variants={fadeUp}>
         <Card>
           <CardHeader>
@@ -180,92 +232,104 @@ export default function TradingPage() {
             <CardDescription>TCA metrics and execution analytics.</CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
-              {[
-                { label: "Fill Prob", value: `${((tca?.fill_probability ?? 0) * 100).toFixed(1)}%`, accent: "emerald" as const },
-                { label: "Slippage", value: `${(tca?.slippage_bps ?? 0).toFixed(2)} bps`, accent: "amber" as const },
-                { label: "Market Impact", value: `${(tca?.market_impact_bps ?? 0).toFixed(2)} bps`, accent: "amber" as const },
-                { label: "Arrival Δ", value: `${(executionQuality?.arrival_price_delta_bps ?? 0).toFixed(2)} bps`, accent: "cyan" as const },
-                { label: "Latency", value: `${Object.values(executionQuality?.latency_distribution_ms ?? {})[0]?.toFixed(1) ?? "--"}ms`, accent: "cyan" as const },
-                { label: "Reject Rate", value: `${((executionQuality?.rejection_rate ?? 0) * 100).toFixed(2)}%`, accent: "rose" as const },
-              ].map((m) => (
-                <div key={m.label} className={`rounded-xl border bg-white/[0.03] px-4 py-3 ${m.accent === "emerald" ? "border-emerald-500/20" : m.accent === "amber" ? "border-amber-500/20" : m.accent === "cyan" ? "border-cyan-500/20" : "border-rose-500/20"}`}>
-                  <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">{m.label}</p>
-                  <p className={`mt-1 font-mono text-lg font-bold ${m.accent === "emerald" ? "text-emerald-300" : m.accent === "amber" ? "text-amber-300" : m.accent === "cyan" ? "text-cyan-300" : "text-rose-300"}`}>{m.value}</p>
-                </div>
-              ))}
+            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-emerald-500/20 bg-white/[0.02] p-3">
+                <MiniGauge value={tca?.fill_probability ?? 0} size={48} label={`${((tca?.fill_probability ?? 0) * 100).toFixed(0)}%`} thresholds={[0.7, 0.9]} />
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">Fill Prob</span>
+              </div>
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-amber-500/20 bg-white/[0.02] p-3">
+                <MiniGauge value={Math.min(1, (tca?.slippage_bps ?? 0) / 10)} size={48} label={`${(tca?.slippage_bps ?? 0).toFixed(1)}`} thresholds={[0.3, 0.6]} />
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">Slippage bps</span>
+              </div>
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-amber-500/20 bg-white/[0.02] p-3">
+                <MiniGauge value={Math.min(1, (tca?.market_impact_bps ?? 0) / 10)} size={48} label={`${(tca?.market_impact_bps ?? 0).toFixed(1)}`} thresholds={[0.3, 0.6]} />
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">Mkt Impact</span>
+              </div>
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-cyan-500/20 bg-white/[0.02] p-3">
+                <MiniGauge value={Math.min(1, Math.abs(executionQuality?.arrival_price_delta_bps ?? 0) / 5)} size={48} label={`${(executionQuality?.arrival_price_delta_bps ?? 0).toFixed(1)}`} thresholds={[0.4, 0.7]} />
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">Arrival Δ</span>
+              </div>
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-cyan-500/20 bg-white/[0.02] p-3">
+                <MiniGauge value={Math.min(1, (Object.values(executionQuality?.latency_distribution_ms ?? {})[0] ?? 0) / 100)} size={48} label={`${(Object.values(executionQuality?.latency_distribution_ms ?? {})[0]?.toFixed(0) ?? "--")}ms`} thresholds={[0.5, 0.8]} />
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">Latency</span>
+              </div>
+              <div className="flex flex-col items-center gap-2 rounded-xl border border-rose-500/20 bg-white/[0.02] p-3">
+                <MiniGauge value={executionQuality?.rejection_rate ?? 0} size={48} label={`${((executionQuality?.rejection_rate ?? 0) * 100).toFixed(1)}%`} thresholds={[0.05, 0.15]} />
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">Reject Rate</span>
+              </div>
             </div>
           </CardContent>
         </Card>
       </motion.div>
 
-      {/* Order Blotter + Command Jobs */}
-      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Active Orders</CardTitle>
-            <CardDescription>{activeOrders.length} open orders on blotter.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {activeOrders.length === 0 ? (
-              <p className="text-sm text-slate-500">No active orders.</p>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm">
-                  <thead>
-                    <tr className="border-b border-white/[0.06] text-xs uppercase tracking-wider text-slate-500">
-                      <th className="pb-2 pr-4">Symbol</th>
-                      <th className="pb-2 pr-4">Side</th>
-                      <th className="pb-2 pr-4">Qty</th>
-                      <th className="pb-2 pr-4">Price</th>
-                      <th className="pb-2">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="text-slate-300">
-                    {activeOrders.map((o) => (
-                      <tr key={o.order_id} className="border-b border-white/[0.04] hover:bg-white/[0.02]">
-                        <td className="py-2 pr-4 font-semibold text-slate-100">{o.symbol}</td>
-                        <td className={`py-2 pr-4 font-mono ${o.side === "BUY" ? "text-emerald-400" : "text-rose-400"}`}>{o.side}</td>
-                        <td className="py-2 pr-4 font-mono">{o.quantity}</td>
-                        <td className="py-2 pr-4 font-mono">${Number(o.limit_price ?? 0).toFixed(2)}</td>
-                        <td className="py-2"><Badge variant="outline">{o.status}</Badge></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Command Jobs</CardTitle>
-            <CardDescription>Recent command orchestration jobs.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {recentJobs.length === 0 ? (
-              <p className="text-sm text-slate-500">No jobs found.</p>
-            ) : (
-              recentJobs.map((job) => (
-                <div key={job.job_id} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                  <div>
-                    <p className="font-medium text-slate-200">{job.command}</p>
-                    <p className="truncate font-mono text-xs text-slate-500">{job.args.join(" ")}</p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Badge variant={job.status === "succeeded" ? "success" : job.status === "failed" ? "error" : "warning"}>
-                      {job.status}
-                    </Badge>
-                    {(job.status === "queued" || job.status === "running") && (
-                      <Button variant="ghost" size="sm" onClick={() => void cancelJob(job.job_id)}>Cancel</Button>
+      {/* Order Blotter + Command Jobs — Resizable Panels */}
+      <motion.div variants={fadeUp}>
+        <PanelLayout
+          orientation="horizontal"
+          storageKey="trading-blotter-jobs"
+          panels={[
+            {
+              id: "blotter",
+              defaultSize: 60,
+              minSize: 35,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle>Order Blotter</CardTitle>
+                    <CardDescription>{orders.length} total orders. Sortable, filterable, exportable.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    {orders.length === 0 ? (
+                      <p className="text-sm text-slate-500">No orders.</p>
+                    ) : (
+                      <DataGrid
+                        data={orders}
+                        columns={orderColumns}
+                        maxHeight={400}
+                        exportFilename="orders"
+                      />
                     )}
-                  </div>
-                </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
+                  </CardContent>
+                </Card>
+              ),
+            },
+            {
+              id: "jobs",
+              defaultSize: 40,
+              minSize: 25,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle>Command Jobs</CardTitle>
+                    <CardDescription>Recent command orchestration jobs.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {recentJobs.length === 0 ? (
+                      <p className="text-sm text-slate-500">No jobs found.</p>
+                    ) : (
+                      recentJobs.map((job) => (
+                        <div key={job.job_id} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                          <div>
+                            <p className="font-medium text-slate-200">{job.command}</p>
+                            <p className="truncate font-mono text-xs text-slate-500">{job.args.join(" ")}</p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Badge variant={job.status === "succeeded" ? "success" : job.status === "failed" ? "error" : "warning"}>
+                              {job.status}
+                            </Badge>
+                            {(job.status === "queued" || job.status === "running") && (
+                              <Button variant="ghost" size="sm" onClick={() => void cancelJob(job.job_id)}>Cancel</Button>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </CardContent>
+                </Card>
+              ),
+            },
+          ]}
+        />
       </motion.div>
     </motion.div>
   );

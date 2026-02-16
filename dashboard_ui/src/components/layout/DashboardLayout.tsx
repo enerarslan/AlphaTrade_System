@@ -1,8 +1,7 @@
-import { useMemo, useState, type ElementType } from "react";
+import { useEffect, useMemo, useState, type ElementType } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Activity,
   AlertTriangle,
   BarChart3,
   Boxes,
@@ -21,6 +20,10 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { hasPermissionForRole, useStore } from "@/lib/store";
+import ConnectionStatus from "@/components/live/ConnectionStatus";
+import CommandPalette from "@/components/ui/command-palette";
+import { NotificationToaster } from "@/lib/notifications";
+import HotkeyHelp from "@/components/ui/hotkey-help";
 
 type NavItem = {
   icon: ElementType;
@@ -44,7 +47,7 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
   const location = useLocation();
   const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const { user, role, mfaStatus, ws, tradingStatus, logout, alerts, lastRefreshAt } = useStore();
+  const { user, role, mfaStatus, tradingStatus, logout, alerts, lastRefreshAt } = useStore();
 
   const activeAlerts = useMemo(
     () => alerts.filter((x) => x.status !== "RESOLVED").length,
@@ -55,15 +58,25 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
     [role],
   );
 
-  const wsAllConnected = ws.portfolio && ws.orders && ws.signals && ws.alerts;
+  const { connectLiveChannels, disconnectLiveChannels } = useStore();
+
+  // Auto-connect WebSocket channels
+  useEffect(() => {
+    connectLiveChannels();
+    return () => disconnectLiveChannels();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onLogout = () => {
+    disconnectLiveChannels();
     logout();
     navigate("/login");
   };
 
   return (
     <div className="min-h-screen w-full text-slate-200">
+      <CommandPalette />
+      <NotificationToaster />
+      <HotkeyHelp />
       {/* Ambient glow orbs */}
       <div className="pointer-events-none fixed left-[-180px] top-[-200px] h-[400px] w-[400px] rounded-full bg-cyan-500/[0.06] blur-[100px]" />
       <div className="pointer-events-none fixed bottom-[-150px] right-[-120px] h-[350px] w-[350px] rounded-full bg-emerald-500/[0.05] blur-[100px]" />
@@ -167,10 +180,7 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
               </div>
 
               <div className="flex items-center gap-2">
-                <Badge variant={wsAllConnected ? "success" : "warning"}>
-                  <Activity size={12} className="mr-1" />
-                  {wsAllConnected ? "Live Feeds" : "Reconnect"}
-                </Badge>
+                <ConnectionStatus />
                 <Badge variant={tradingStatus?.running ? "success" : "outline"}>
                   <BarChart3 size={12} className="mr-1" />
                   {tradingStatus?.running ? `PID ${tradingStatus.pid}` : "Engine Idle"}

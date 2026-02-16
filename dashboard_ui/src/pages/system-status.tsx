@@ -15,6 +15,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useStore } from "@/lib/store";
+import DataGrid from "@/components/ui/data-grid";
+import { type ColumnDef } from "@tanstack/react-table";
+import PanelLayout from "@/components/layout/PanelLayout";
 
 const stagger = {
   hidden: { opacity: 0 },
@@ -30,6 +33,75 @@ function StatusDot({ ok }: { ok: boolean }) {
     <span className={`inline-block h-2.5 w-2.5 rounded-full ${ok ? "bg-emerald-400 shadow-[0_0_6px_rgba(16,185,129,0.5)]" : "bg-rose-400 shadow-[0_0_6px_rgba(244,63,94,0.5)]"}`} />
   );
 }
+
+/* ── DataGrid column definitions ── */
+
+type AuditRow = {
+  timestamp: string;
+  action: string;
+  user: string;
+  status: string;
+  details: Record<string, unknown>;
+  prev_hash: string;
+  record_hash: string;
+};
+
+const auditColumns: ColumnDef<AuditRow, unknown>[] = [
+  {
+    accessorKey: "timestamp",
+    header: "Time",
+    size: 130,
+    cell: ({ getValue }) => new Date(getValue() as string).toLocaleString(),
+  },
+  { accessorKey: "action", header: "Action", size: 140 },
+  { accessorKey: "user", header: "User", size: 100 },
+  {
+    accessorKey: "status",
+    header: "Status",
+    size: 80,
+    cell: ({ getValue }) => {
+      const v = getValue() as string;
+      const variant = v === "SUCCESS" ? "success" : v === "FAILURE" ? "error" : "outline";
+      return <Badge variant={variant}>{v}</Badge>;
+    },
+  },
+  {
+    accessorKey: "record_hash",
+    header: "Hash",
+    size: 100,
+    cell: ({ getValue }) => (
+      <span className="font-mono text-slate-500 text-[10px]">{(getValue() as string).slice(0, 12)}…</span>
+    ),
+  },
+];
+
+type LogRow = {
+  timestamp: string;
+  level: string;
+  category: string;
+  message: string;
+};
+
+const logColumns: ColumnDef<LogRow, unknown>[] = [
+  {
+    accessorKey: "timestamp",
+    header: "Time",
+    size: 100,
+    cell: ({ getValue }) => new Date(getValue() as string).toLocaleTimeString(),
+  },
+  {
+    accessorKey: "level",
+    header: "Level",
+    size: 70,
+    cell: ({ getValue }) => {
+      const v = getValue() as string;
+      const color = v === "ERROR" ? "text-rose-400" : v === "WARNING" ? "text-amber-400" : "text-slate-400";
+      return <span className={`font-mono text-xs ${color}`}>{v}</span>;
+    },
+  },
+  { accessorKey: "category", header: "Category", size: 90 },
+  { accessorKey: "message", header: "Message" },
+];
 
 export default function SystemStatusPage() {
   const {
@@ -89,8 +161,6 @@ export default function SystemStatusPage() {
     }));
   }, [health]);
 
-  const recentLogs = useMemo(() => logs.slice(0, 20), [logs]);
-  const recentAudit = useMemo(() => auditTrail.slice(0, 10), [auditTrail]);
   const recentJobs = useMemo(() => jobs.slice(0, 8), [jobs]);
   const recentIncidents = useMemo(() => incidents.slice(0, 8), [incidents]);
 
@@ -140,122 +210,153 @@ export default function SystemStatusPage() {
         </Card>
       </motion.div>
 
-      {/* SLO + Jobs */}
-      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Gauge size={18} className="text-emerald-400" />
-              SLO Status
-            </CardTitle>
-            <CardDescription>Service-level objectives.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-2 text-sm">
-            {!sloStatus ? (
-              <p className="text-slate-500">No SLO data.</p>
-            ) : (
-              Object.entries(sloStatus).map(([key, val]) => (
-                <div key={key} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                  <span className="text-slate-400">{key.replaceAll("_", " ")}</span>
-                  <span className="font-mono text-slate-200">{typeof val === "number" ? val.toFixed(3) : String(val)}</span>
-                </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Play size={18} className="text-cyan-400" />
-              Command Jobs
-            </CardTitle>
-            <CardDescription>Orchestrated job queue.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {recentJobs.length === 0 ? (
-              <p className="text-sm text-slate-500">No jobs.</p>
-            ) : (
-              recentJobs.map((job) => (
-                <div key={job.job_id} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                  <div>
-                    <p className="font-medium text-slate-200">{job.command}</p>
-                    <p className="truncate font-mono text-xs text-slate-500">{job.args.join(" ")}</p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Badge variant={job.status === "succeeded" ? "success" : job.status === "failed" ? "error" : "warning"}>{job.status}</Badge>
-                    {(job.status === "queued" || job.status === "running") && (
-                      <Button variant="ghost" size="sm" onClick={() => void cancelJob(job.job_id)}>Cancel</Button>
+      {/* SLO + Jobs — Resizable */}
+      <motion.div variants={fadeUp}>
+        <PanelLayout
+          orientation="horizontal"
+          storageKey="ops-slo-jobs"
+          panels={[
+            {
+              id: "slo",
+              defaultSize: 50,
+              minSize: 30,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Gauge size={18} className="text-emerald-400" />
+                      SLO Status
+                    </CardTitle>
+                    <CardDescription>Service-level objectives.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-2 text-sm">
+                    {!sloStatus ? (
+                      <p className="text-slate-500">No SLO data.</p>
+                    ) : (
+                      Object.entries(sloStatus).map(([key, val]) => (
+                        <div key={key} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                          <span className="text-slate-400">{key.replaceAll("_", " ")}</span>
+                          <span className="font-mono text-slate-200">{typeof val === "number" ? val.toFixed(3) : String(val)}</span>
+                        </div>
+                      ))
                     )}
-                  </div>
-                </div>
-              ))
-            )}
-          </CardContent>
-        </Card>
+                  </CardContent>
+                </Card>
+              ),
+            },
+            {
+              id: "jobs",
+              defaultSize: 50,
+              minSize: 30,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Play size={18} className="text-cyan-400" />
+                      Command Jobs
+                    </CardTitle>
+                    <CardDescription>Orchestrated job queue.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {recentJobs.length === 0 ? (
+                      <p className="text-sm text-slate-500">No jobs.</p>
+                    ) : (
+                      recentJobs.map((job) => (
+                        <div key={job.job_id} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                          <div>
+                            <p className="font-medium text-slate-200">{job.command}</p>
+                            <p className="truncate font-mono text-xs text-slate-500">{job.args.join(" ")}</p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Badge variant={job.status === "succeeded" ? "success" : job.status === "failed" ? "error" : "warning"}>{job.status}</Badge>
+                            {(job.status === "queued" || job.status === "running") && (
+                              <Button variant="ghost" size="sm" onClick={() => void cancelJob(job.job_id)}>Cancel</Button>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </CardContent>
+                </Card>
+              ),
+            },
+          ]}
+        />
       </motion.div>
 
-      {/* Logs + Audit */}
-      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <FileText size={18} className="text-amber-400" />
-              System Logs
-            </CardTitle>
-            <CardDescription>Recent system log entries.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="max-h-80 space-y-1 overflow-y-auto rounded-xl border border-white/[0.06] bg-slate-950/60 p-3 font-mono text-xs">
-              {recentLogs.length === 0 ? (
-                <p className="text-slate-500">No logs.</p>
-              ) : (
-                recentLogs.map((log, i) => (
-                  <div key={i} className="flex gap-2 leading-relaxed">
-                    <span className="shrink-0 text-slate-600">{new Date(log.timestamp).toLocaleTimeString()}</span>
-                    <span className={log.level === "ERROR" ? "text-rose-400" : log.level === "WARNING" ? "text-amber-400" : "text-slate-400"}>
-                      [{log.level}]
-                    </span>
-                    <span className="text-slate-300">{log.message}</span>
-                  </div>
-                ))
-              )}
-            </div>
-          </CardContent>
-        </Card>
-
-        {canReadAudit && (
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <ScrollText size={18} className="text-cyan-400" />
-                Audit Trail
-              </CardTitle>
-              <CardDescription>Immutable audit log with integrity hashes.</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {recentAudit.length === 0 ? (
-                <p className="text-sm text-slate-500">No audit entries.</p>
-              ) : (
-                  recentAudit.map((a, i) => (
-                  <div key={i} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs">
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-slate-200">{a.action}</span>
-                      <span className="text-slate-500">{new Date(a.timestamp).toLocaleString()}</span>
-                    </div>
-                    <p className="text-slate-500">by {a.user} — {a.status}</p>
-                    {a.record_hash && <p className="font-mono text-slate-600 truncate">hash: {a.record_hash}</p>}
-                  </div>
-                ))
-              )}
-              {canManageAudit && (
-                <Button variant="outline" size="sm" onClick={() => void exportAuditTrail("json")}>
-                  Export Audit Trail
-                </Button>
-              )}
-            </CardContent>
-          </Card>
-        )}
+      {/* Logs + Audit — Resizable with DataGrids */}
+      <motion.div variants={fadeUp}>
+        <PanelLayout
+          orientation="horizontal"
+          storageKey="ops-logs-audit"
+          panels={[
+            {
+              id: "logs",
+              defaultSize: canReadAudit ? 50 : 100,
+              minSize: 30,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <FileText size={18} className="text-amber-400" />
+                      System Logs
+                    </CardTitle>
+                    <CardDescription>Recent system log entries.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    {logs.length === 0 ? (
+                      <p className="text-sm text-slate-500">No logs.</p>
+                    ) : (
+                      <DataGrid
+                        data={logs}
+                        columns={logColumns}
+                        maxHeight={380}
+                        exportFilename="system_logs"
+                      />
+                    )}
+                  </CardContent>
+                </Card>
+              ),
+            },
+            ...(canReadAudit
+              ? [
+                  {
+                    id: "audit",
+                    defaultSize: 50,
+                    minSize: 30,
+                    children: (
+                      <Card className="h-full">
+                        <CardHeader>
+                          <CardTitle className="flex items-center gap-2">
+                            <ScrollText size={18} className="text-cyan-400" />
+                            Audit Trail
+                          </CardTitle>
+                          <CardDescription>Immutable audit log with integrity hashes.</CardDescription>
+                        </CardHeader>
+                        <CardContent className="space-y-3">
+                          {auditTrail.length === 0 ? (
+                            <p className="text-sm text-slate-500">No audit entries.</p>
+                          ) : (
+                            <DataGrid
+                              data={auditTrail}
+                              columns={auditColumns}
+                              maxHeight={340}
+                              exportFilename="audit_trail"
+                            />
+                          )}
+                          {canManageAudit && (
+                            <Button variant="outline" size="sm" onClick={() => void exportAuditTrail("json")}>
+                              Export Audit Trail
+                            </Button>
+                          )}
+                        </CardContent>
+                      </Card>
+                    ),
+                  },
+                ]
+              : []),
+          ]}
+        />
       </motion.div>
 
       {/* Incidents + SIEM + Runbooks */}
