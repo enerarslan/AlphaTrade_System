@@ -69,7 +69,7 @@ aws_credentials
 .vault-token
 
 # Data and local artifacts
-data/
+/data/
 *.csv
 *.parquet
 backtest_results/

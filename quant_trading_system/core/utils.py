@@ -53,6 +53,7 @@ class BacktestModeError(Exception):
     This prevents look-ahead bias by forcing explicit datetime specification
     during backtesting instead of using real-world current time.
     """
+
     pass
 
 
@@ -253,6 +254,8 @@ def get_us_market_holidays(year: int) -> set[datetime]:
 # Cache holidays by year with thread-safe access
 _holiday_cache: dict[int, set[datetime]] = {}
 _holiday_cache_lock = threading.RLock()
+_early_close_cache: dict[int, set[datetime]] = {}
+_early_close_cache_lock = threading.RLock()
 
 
 def is_market_holiday(dt: datetime | None = None) -> bool:
@@ -290,6 +293,112 @@ def is_market_holiday(dt: datetime | None = None) -> bool:
             return True
 
     return False
+
+
+def get_us_market_early_closes(year: int) -> set[datetime]:
+    """Get US market early-close dates for a given year.
+
+    Includes common NYSE/NASDAQ 1:00 PM ET closes:
+    - Day after Thanksgiving
+    - Session before Independence Day holiday
+    - Session before Christmas holiday
+
+    Args:
+        year: Year to calculate.
+
+    Returns:
+        Set of early-close dates at midnight ET.
+    """
+
+    early_closes: set[datetime] = set()
+    holidays = get_us_market_holidays(year)
+
+    def nth_weekday(target_year: int, month: int, weekday: int, n: int) -> datetime:
+        first_day = datetime(target_year, month, 1, tzinfo=EASTERN)
+        first_weekday = first_day.weekday()
+        days_until = (weekday - first_weekday) % 7
+        return first_day + timedelta(days=days_until + (n - 1) * 7)
+
+    def observed_holiday(date: datetime) -> datetime:
+        if date.weekday() == 5:
+            return date - timedelta(days=1)
+        if date.weekday() == 6:
+            return date + timedelta(days=1)
+        return date
+
+    def add_trading_day(date: datetime) -> None:
+        date = date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=EASTERN)
+        if date.weekday() >= 5:
+            return
+        if any(h.date() == date.date() for h in holidays):
+            return
+        early_closes.add(date)
+
+    # Day after Thanksgiving
+    thanksgiving = nth_weekday(year, 11, 3, 4)  # 4th Thursday in Nov
+    add_trading_day(thanksgiving + timedelta(days=1))
+
+    # Session before Independence Day (or observed holiday)
+    independence_day = datetime(year, 7, 4, tzinfo=EASTERN)
+    observed_independence = observed_holiday(independence_day)
+    candidate = observed_independence - timedelta(days=1)
+    while candidate.weekday() >= 5 or any(h.date() == candidate.date() for h in holidays):
+        candidate -= timedelta(days=1)
+    add_trading_day(candidate)
+
+    # Session before Christmas (or observed holiday)
+    christmas = datetime(year, 12, 25, tzinfo=EASTERN)
+    observed_christmas = observed_holiday(christmas)
+    candidate = observed_christmas - timedelta(days=1)
+    while candidate.weekday() >= 5 or any(h.date() == candidate.date() for h in holidays):
+        candidate -= timedelta(days=1)
+    add_trading_day(candidate)
+
+    return early_closes
+
+
+def is_market_early_close(dt: datetime | None = None) -> bool:
+    """Check whether a datetime falls on an early-close session date."""
+    if dt is None:
+        dt = eastern_now()
+    else:
+        dt = to_eastern(dt)
+
+    if dt.weekday() >= 5 or is_market_holiday(dt):
+        return False
+
+    year = dt.year
+    with _early_close_cache_lock:
+        if year not in _early_close_cache:
+            _early_close_cache[year] = get_us_market_early_closes(year)
+        early_closes = _early_close_cache[year]
+
+    return any(date.date() == dt.date() for date in early_closes)
+
+
+def get_market_session_bounds(date: datetime | None = None) -> tuple[datetime, datetime]:
+    """Get regular-session open/close bounds for a date in Eastern time.
+
+    For early-close sessions, close time is 1:00 PM ET.
+    """
+    if date is None:
+        if is_backtest_mode():
+            backtest_time = get_backtest_time()
+            if backtest_time is None:
+                raise BacktestModeError(
+                    "get_market_session_bounds() called with date=None during backtest "
+                    "mode, but no simulated time is set."
+                )
+            date = to_eastern(backtest_time)
+        else:
+            date = eastern_now()
+    else:
+        date = to_eastern(date)
+
+    market_open = date.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_hour = 13 if is_market_early_close(date) else 16
+    market_close = date.replace(hour=close_hour, minute=0, second=0, microsecond=0)
+    return market_open, market_close
 
 
 def get_next_trading_day(dt: datetime | None = None) -> datetime:
@@ -425,10 +534,7 @@ def is_market_open(dt: datetime | None = None) -> bool:
     if is_market_holiday(dt):
         return False
 
-    # Time check (9:30 AM - 4:00 PM ET)
-    market_open = dt.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = dt.replace(hour=16, minute=0, second=0, microsecond=0)
-
+    market_open, market_close = get_market_session_bounds(dt)
     return market_open <= dt <= market_close
 
 
@@ -449,22 +555,8 @@ def get_market_open_time(date: datetime | None = None) -> datetime:
         BacktestModeError: If date is None during backtest mode and no
             simulated time has been set via set_backtest_time().
     """
-    if date is None:
-        # CRITICAL: Prevent look-ahead bias during backtesting
-        if is_backtest_mode():
-            backtest_time = get_backtest_time()
-            if backtest_time is None:
-                raise BacktestModeError(
-                    "get_market_open_time() called with date=None during backtest mode, "
-                    "but no simulated time has been set. Either pass an explicit "
-                    "datetime or call set_backtest_time() first to prevent look-ahead bias."
-                )
-            date = to_eastern(backtest_time)
-        else:
-            date = eastern_now()
-    else:
-        date = to_eastern(date)
-    return date.replace(hour=9, minute=30, second=0, microsecond=0)
+    session_open, _ = get_market_session_bounds(date)
+    return session_open
 
 
 def get_market_close_time(date: datetime | None = None) -> datetime:
@@ -484,22 +576,8 @@ def get_market_close_time(date: datetime | None = None) -> datetime:
         BacktestModeError: If date is None during backtest mode and no
             simulated time has been set via set_backtest_time().
     """
-    if date is None:
-        # CRITICAL: Prevent look-ahead bias during backtesting
-        if is_backtest_mode():
-            backtest_time = get_backtest_time()
-            if backtest_time is None:
-                raise BacktestModeError(
-                    "get_market_close_time() called with date=None during backtest mode, "
-                    "but no simulated time has been set. Either pass an explicit "
-                    "datetime or call set_backtest_time() first to prevent look-ahead bias."
-                )
-            date = to_eastern(backtest_time)
-        else:
-            date = eastern_now()
-    else:
-        date = to_eastern(date)
-    return date.replace(hour=16, minute=0, second=0, microsecond=0)
+    _, session_close = get_market_session_bounds(date)
+    return session_close
 
 
 def bars_to_timedelta(bars: int, timeframe: str = "15Min") -> timedelta:
@@ -725,6 +803,7 @@ def generate_id(prefix: str = "", length: int = 8) -> str:
         Generated ID string.
     """
     import uuid
+
     random_part = uuid.uuid4().hex[:length]
     if prefix:
         return f"{prefix}_{random_part}"
@@ -761,6 +840,7 @@ def memoize(func: F, maxsize: int = 1024) -> F:
         Memoized function.
     """
     from collections import OrderedDict
+
     cache: OrderedDict[tuple, Any] = OrderedDict()
 
     @functools.wraps(func)
@@ -798,8 +878,10 @@ def timed_cache(seconds: int, maxsize: int = 512) -> Callable[[F], F]:
     Returns:
         Decorator function.
     """
+
     def decorator(func: F) -> F:
         from collections import OrderedDict
+
         cache: OrderedDict[tuple, tuple[Any, float]] = OrderedDict()
 
         @functools.wraps(func)
@@ -855,6 +937,7 @@ def retry(
     Returns:
         Decorator function.
     """
+
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -966,6 +1049,7 @@ def timed(func: F) -> F:
     Returns:
         Wrapped function that logs execution time.
     """
+
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         start = time.perf_counter()
@@ -1074,11 +1158,13 @@ def validate_order_params(
     Raises:
         ValidationError: If strict=True and validation fails.
     """
+
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             # Build param dict from args and kwargs
             import inspect
+
             sig = inspect.signature(func)
             bound = sig.bind_partial(*args, **kwargs)
             bound.apply_defaults()
@@ -1160,6 +1246,7 @@ def validate_model_input(
     Raises:
         ValidationError: If validation fails.
     """
+
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -1179,7 +1266,7 @@ def validate_model_input(
                 raise ValidationError(f"{features_param} cannot be None")
 
             # Convert to numpy if needed
-            if hasattr(X, 'values'):  # DataFrame/Series
+            if hasattr(X, "values"):  # DataFrame/Series
                 X = X.values
 
             if not isinstance(X, np.ndarray):
@@ -1249,10 +1336,12 @@ def validate_positive(
         def create_order(self, quantity: Decimal, price: Decimal):
             ...
     """
+
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             import inspect
+
             sig = inspect.signature(func)
             bound = sig.bind_partial(*args, **kwargs)
             bound.apply_defaults()
@@ -1309,10 +1398,12 @@ def validate_range(
         def set_signal(self, confidence: float):
             ...
     """
+
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             import inspect
+
             sig = inspect.signature(func)
             bound = sig.bind_partial(*args, **kwargs)
             bound.apply_defaults()
@@ -1328,29 +1419,19 @@ def validate_range(
             try:
                 num_value = float(value)
             except (ValueError, TypeError):
-                raise ValidationError(
-                    f"{param_name} must be a number, got {type(value).__name__}"
-                )
+                raise ValidationError(f"{param_name} must be a number, got {type(value).__name__}")
 
             if min_value is not None:
                 if inclusive and num_value < min_value:
-                    raise ValidationError(
-                        f"{param_name} must be >= {min_value}, got {num_value}"
-                    )
+                    raise ValidationError(f"{param_name} must be >= {min_value}, got {num_value}")
                 elif not inclusive and num_value <= min_value:
-                    raise ValidationError(
-                        f"{param_name} must be > {min_value}, got {num_value}"
-                    )
+                    raise ValidationError(f"{param_name} must be > {min_value}, got {num_value}")
 
             if max_value is not None:
                 if inclusive and num_value > max_value:
-                    raise ValidationError(
-                        f"{param_name} must be <= {max_value}, got {num_value}"
-                    )
+                    raise ValidationError(f"{param_name} must be <= {max_value}, got {num_value}")
                 elif not inclusive and num_value >= max_value:
-                    raise ValidationError(
-                        f"{param_name} must be < {max_value}, got {num_value}"
-                    )
+                    raise ValidationError(f"{param_name} must be < {max_value}, got {num_value}")
 
             return func(*args, **kwargs)
 

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable, Iterator
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,14 @@ from quant_trading_system.backtest.simulator import (
     create_pessimistic_simulator,
 )
 from quant_trading_system.core.reproducibility import set_global_seed
+from quant_trading_system.core.utils import get_market_session_bounds, is_market_holiday, to_eastern
+from quant_trading_system.risk.limits import (
+    CheckResult,
+    KillSwitchReason,
+    RiskCheckResult,
+    RiskLimitsConfig,
+    RiskLimitsManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +103,7 @@ class BacktestConfig:
     # Time filters
     start_date: datetime | None = None
     end_date: datetime | None = None
+    enforce_market_calendar: bool = True
 
     # JPMORGAN FIX: Market simulation settings
     use_market_simulator: bool = True  # Enable realistic market simulation
@@ -103,6 +113,14 @@ class BacktestConfig:
 
     # Reproducibility
     random_seed: int | None = 42
+
+    # Execution quality and capacity controls
+    enable_execution_quality_gate: bool = True
+    min_orders_for_execution_gate: int = 20
+    max_avg_slippage_bps: float = 35.0
+    max_fill_rejection_rate: float = 0.20
+    capacity_safety_buffer: float = 1.0
+    min_capacity_multiplier: float = 0.25
 
 
 @dataclass
@@ -282,7 +300,11 @@ class PandasDataHandler(DataHandler):
                 # Round to 8 decimal places to satisfy OHLCVBar validation
                 bar = OHLCVBar(
                     symbol=symbol,
-                    timestamp=current_date.to_pydatetime() if hasattr(current_date, 'to_pydatetime') else current_date,
+                    timestamp=(
+                        current_date.to_pydatetime()
+                        if hasattr(current_date, "to_pydatetime")
+                        else current_date
+                    ),
                     open=Decimal(str(round(row.get("open", row.get("Open", 0)), 8))),
                     high=Decimal(str(round(row.get("high", row.get("High", 0)), 8))),
                     low=Decimal(str(round(row.get("low", row.get("Low", 0)), 8))),
@@ -323,6 +345,7 @@ class PolarsDataHandler(DataHandler):
         """
         try:
             import polars as pl
+
             self._pl = pl
         except ImportError:
             raise ImportError("Polars is required for PolarsDataHandler")
@@ -365,10 +388,18 @@ class PolarsDataHandler(DataHandler):
 
         # Apply date filters
         if start_date:
-            start_naive = start_date.replace(tzinfo=None) if hasattr(start_date, 'tzinfo') and start_date.tzinfo else start_date
+            start_naive = (
+                start_date.replace(tzinfo=None)
+                if hasattr(start_date, "tzinfo") and start_date.tzinfo
+                else start_date
+            )
             dates = [d for d in dates if d >= start_naive]
         if end_date:
-            end_naive = end_date.replace(tzinfo=None) if hasattr(end_date, 'tzinfo') and end_date.tzinfo else end_date
+            end_naive = (
+                end_date.replace(tzinfo=None)
+                if hasattr(end_date, "tzinfo") and end_date.tzinfo
+                else end_date
+            )
             dates = [d for d in dates if d <= end_naive]
 
         self._dates = dates
@@ -518,11 +549,21 @@ class BacktestEngine:
         self._market_conditions: dict[str, MarketConditions] = {}
         self._volatility_window: int = 20  # Bars for volatility calculation
         self._price_history: dict[str, deque] = {}
+        self._is_intraday_data: bool | None = None
+
+        # Execution quality telemetry for capacity and hard gating.
+        self._orders_submitted_total: int = 0
+        self._orders_rejected_total: int = 0
+        self._recent_slippage_bps: deque[float] = deque(maxlen=250)
 
         # Callbacks
         self._on_bar_callbacks: list[Callable] = []
         self._on_signal_callbacks: list[Callable] = []
         self._on_fill_callbacks: list[Callable] = []
+
+        # Backtest risk controls (pre-trade + drawdown kill switch).
+        self._risk_limits_manager = RiskLimitsManager(self._build_risk_limits_config())
+        self._risk_limits_manager.kill_switch.cancel_orders_callback = self._cancel_pending_orders
 
     def _create_market_simulator(self) -> MarketSimulator:
         """Create market simulator based on execution mode."""
@@ -538,6 +579,86 @@ class BacktestEngine:
                 commission_bps=self.config.commission_bps,
                 base_slippage_bps=self.config.slippage_bps,
             )
+
+    def _build_risk_limits_config(self) -> RiskLimitsConfig:
+        """Build risk-limits config tuned for deterministic backtests."""
+        halt = min(1.0, max(0.001, float(self.config.max_drawdown_halt)))
+        reduce = max(0.0, min(halt * 0.8, halt - 0.001))
+        warning = max(0.0, min(halt * 0.5, reduce))
+        position_pct = min(1.0, max(0.0, float(self.config.max_position_pct)))
+        max_order_value = self.config.initial_capital * Decimal(
+            str(max(self.config.max_leverage, 1.0))
+        )
+        max_position_value = self.config.initial_capital * Decimal(
+            str(max(self.config.max_position_pct, 1.0))
+        )
+
+        return RiskLimitsConfig(
+            max_position_pct=position_pct,
+            drawdown_warning_threshold=warning,
+            drawdown_reduce_threshold=reduce,
+            drawdown_halt_threshold=halt,
+            max_position_value=max_position_value,
+            max_order_value=max_order_value,
+            min_order_value=Decimal("0"),
+            max_daily_trades=1_000_000,
+            max_daily_turnover_pct=10_000.0,
+            trading_start_hour=0,
+            trading_start_minute=0,
+            trading_end_hour=23,
+            trading_end_minute=59,
+        )
+
+    def _cancel_pending_orders(self) -> int:
+        """Cancel all pending orders and return the cancelled count."""
+        if self._state is None:
+            return 0
+        cancelled = len(self._state.pending_orders)
+        self._state.pending_orders.clear()
+        return cancelled
+
+    def _infer_intraday_data(self) -> bool:
+        """Infer whether the loaded bars are intraday from handler timestamps."""
+        dates = getattr(self.data_handler, "_dates", None)
+        if not isinstance(dates, list) or len(dates) < 2:
+            return False
+
+        try:
+            first = pd.Timestamp(dates[0]).to_pydatetime()
+            second = pd.Timestamp(dates[1]).to_pydatetime()
+        except Exception:
+            return False
+
+        return abs((second - first).total_seconds()) < 86_400
+
+    def _to_market_time(self, timestamp: datetime) -> datetime:
+        """Normalize bar timestamp to Eastern market time.
+
+        Naive bars are treated as already in market time to avoid
+        UTC assumptions for daily datasets.
+        """
+        if timestamp.tzinfo is None:
+            return timestamp.replace(tzinfo=ZoneInfo("America/New_York"))
+        return to_eastern(timestamp)
+
+    def _is_bar_in_trading_session(self, timestamp: datetime) -> bool:
+        """Check whether a bar timestamp is inside a valid market session."""
+        if not self.config.enforce_market_calendar:
+            return True
+
+        market_ts = self._to_market_time(timestamp)
+        if market_ts.weekday() >= 5 or is_market_holiday(market_ts):
+            return False
+
+        if self._is_intraday_data is None:
+            self._is_intraday_data = self._infer_intraday_data()
+
+        intraday = self._is_intraday_data or market_ts.time() != datetime.min.time()
+        if not intraday:
+            return True
+
+        session_open, session_close = get_market_session_bounds(market_ts)
+        return session_open <= market_ts <= session_close
 
     def run(self) -> BacktestState:
         """Run the backtest.
@@ -584,22 +705,29 @@ class BacktestEngine:
 
         # JPMORGAN FIX: Initialize price history for volatility calculation
         self._price_history = {
-            s: deque(maxlen=self._volatility_window)
-            for s in self.data_handler.get_symbols()
+            s: deque(maxlen=self._volatility_window) for s in self.data_handler.get_symbols()
         }
         self._market_conditions = {}
+        self._is_intraday_data = self._infer_intraday_data()
+        self._orders_submitted_total = 0
+        self._orders_rejected_total = 0
+        self._recent_slippage_bps.clear()
 
         # Reset data handler if supported
-        if hasattr(self.data_handler, 'reset'):
+        if hasattr(self.data_handler, "reset"):
             self.data_handler.reset()
 
     def _process_bar(self) -> None:
         """Process current bar for all symbols."""
+        processed_any_bar = False
         for symbol in self.data_handler.get_symbols():
             bar = self.data_handler.get_current_bar(symbol)
             if bar is None:
                 continue
+            if not self._is_bar_in_trading_session(bar.timestamp):
+                continue
 
+            processed_any_bar = True
             self._state.timestamp = bar.timestamp
             self._state.bars_processed += 1
 
@@ -616,6 +744,9 @@ class BacktestEngine:
             for callback in self._on_bar_callbacks:
                 callback(symbol, bar)
 
+        if not processed_any_bar:
+            return
+
         # P1: Track regime state if detector available
         if self._regime_detector is not None:
             try:
@@ -623,9 +754,7 @@ class BacktestEngine:
                 # The detector should accept price data and return a RegimeState
                 regime_state = self._detect_current_regime()
                 if regime_state is not None:
-                    self._state.regime_history.append(
-                        (self._state.timestamp, regime_state)
-                    )
+                    self._state.regime_history.append((self._state.timestamp, regime_state))
             except Exception as e:
                 logger.debug(f"Regime detection failed: {e}")
 
@@ -665,10 +794,7 @@ class BacktestEngine:
         volatility = 0.02  # Default
         if len(self._price_history[symbol]) >= 2:
             prices = list(self._price_history[symbol])
-            returns = [
-                (prices[i] - prices[i-1]) / prices[i-1]
-                for i in range(1, len(prices))
-            ]
+            returns = [(prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))]
             if returns:
                 volatility = float(np.std(returns) * np.sqrt(252))  # Annualized
 
@@ -763,9 +889,9 @@ class BacktestEngine:
 
         # Check rejection
         if fill_result.fill_type == FillType.REJECTED:
-            logger.debug(
-                f"Order rejected: {order.symbol} - {fill_result.rejection_reason}"
-            )
+            self._orders_rejected_total += 1
+            self._enforce_execution_quality_gate()
+            logger.debug(f"Order rejected: {order.symbol} - {fill_result.rejection_reason}")
             return None
 
         # Check if we can afford the fill
@@ -775,6 +901,8 @@ class BacktestEngine:
             fill_result.fill_quantity,
             fill_result.commission,
         ):
+            self._orders_rejected_total += 1
+            self._enforce_execution_quality_gate()
             return None
 
         return fill_result
@@ -797,7 +925,11 @@ class BacktestEngine:
             position = self._state.positions.get(order.symbol)
             if position is None and not self.config.allow_short:
                 return False
-            if position is not None and position.quantity < fill_quantity and not self.config.allow_short:
+            if (
+                position is not None
+                and position.quantity < fill_quantity
+                and not self.config.allow_short
+            ):
                 return False
 
         # Liquidity participation constraints.
@@ -866,8 +998,12 @@ class BacktestEngine:
             close_ratio = closing_qty / tracked_qty if tracked_qty > 0 else Decimal("1")
             exit_ratio = closing_qty / fill_quantity if fill_quantity > 0 else Decimal("0")
 
-            entry_commission = Decimal(str(open_pos.get("total_commission", Decimal("0")))) * close_ratio
-            entry_slippage = Decimal(str(open_pos.get("total_slippage", Decimal("0")))) * close_ratio
+            entry_commission = (
+                Decimal(str(open_pos.get("total_commission", Decimal("0")))) * close_ratio
+            )
+            entry_slippage = (
+                Decimal(str(open_pos.get("total_slippage", Decimal("0")))) * close_ratio
+            )
             exit_commission = commission * exit_ratio
             exit_slippage = slippage * exit_ratio
             total_commission = entry_commission + exit_commission
@@ -936,13 +1072,15 @@ class BacktestEngine:
                 prev_qty = Decimal(str(tracked.get("quantity", Decimal("0"))))
                 prev_entry = Decimal(str(tracked.get("entry_price", fill_price)))
                 total_qty = prev_qty + opening_qty
-                weighted_entry = (
-                    (prev_entry * prev_qty) + (fill_price * opening_qty)
-                ) / total_qty
+                weighted_entry = ((prev_entry * prev_qty) + (fill_price * opening_qty)) / total_qty
                 tracked["entry_price"] = weighted_entry
                 tracked["quantity"] = total_qty
-                tracked["total_commission"] = Decimal(str(tracked.get("total_commission", Decimal("0")))) + open_commission
-                tracked["total_slippage"] = Decimal(str(tracked.get("total_slippage", Decimal("0")))) + open_slippage
+                tracked["total_commission"] = (
+                    Decimal(str(tracked.get("total_commission", Decimal("0")))) + open_commission
+                )
+                tracked["total_slippage"] = (
+                    Decimal(str(tracked.get("total_slippage", Decimal("0")))) + open_slippage
+                )
                 self._open_positions[order.symbol] = tracked
             else:
                 self._open_positions[order.symbol] = {
@@ -960,7 +1098,9 @@ class BacktestEngine:
             self._open_positions.pop(order.symbol, None)
         else:
             tracked = self._open_positions.get(order.symbol)
-            avg_entry = Decimal(str(tracked.get("entry_price", fill_price))) if tracked else fill_price
+            avg_entry = (
+                Decimal(str(tracked.get("entry_price", fill_price))) if tracked else fill_price
+            )
             self._state.positions[order.symbol] = Position(
                 symbol=order.symbol,
                 quantity=new_qty,
@@ -979,6 +1119,7 @@ class BacktestEngine:
                 quantity=fill_result.partial_remaining,
                 signal_id=order.signal_id,
             )
+            self._risk_limits_manager.on_order_submitted(remaining_order, fill_price)
             self._state.pending_orders.append(remaining_order)
             logger.debug(
                 f"Partial fill for {order.symbol}: {fill_quantity} filled, "
@@ -986,6 +1127,18 @@ class BacktestEngine:
             )
 
         self._state.orders_filled += 1
+        self._record_execution_quality(fill_result)
+        risk_results = self._risk_limits_manager.on_order_filled(
+            order=order,
+            fill_price=fill_price,
+            estimated_cost=fill_result.total_cost,
+            actual_cost=fill_result.total_cost,
+        )
+        for result in risk_results:
+            if result.result == CheckResult.FAILED:
+                logger.warning(f"Post-trade risk failure ({result.check_name}): {result.message}")
+            elif result.result == CheckResult.WARNING:
+                logger.warning(f"Post-trade risk warning ({result.check_name}): {result.message}")
         self.strategy.on_fill(order)
 
         for callback in self._on_fill_callbacks:
@@ -1085,11 +1238,16 @@ class BacktestEngine:
         bar = self.data_handler.get_current_bar(signal.symbol)
         if bar is None:
             return
+        if not self._execution_quality_gate_open():
+            return
 
         # Determine order side based on signal direction
         if signal.direction == Direction.LONG:
             side = OrderSide.BUY
         elif signal.direction == Direction.SHORT:
+            existing = self._state.positions.get(signal.symbol)
+            if not self.config.allow_short and (existing is None or existing.quantity <= 0):
+                return
             side = OrderSide.SELL
         else:
             return
@@ -1112,6 +1270,13 @@ class BacktestEngine:
             price=bar.close,
         )
 
+        # Long-only mode can sell only up to existing long quantity.
+        if side == OrderSide.SELL and not self.config.allow_short:
+            position = self._state.positions.get(signal.symbol)
+            if position is None or position.quantity <= 0:
+                return
+            quantity = min(quantity, position.quantity)
+
         if quantity <= 0:
             return
 
@@ -1124,7 +1289,148 @@ class BacktestEngine:
             signal_id=signal.signal_id,
         )
 
+        can_submit, risk_results = self._evaluate_pre_trade_risk(order, bar.close)
+        if not can_submit:
+            failures = [r.message for r in risk_results if r.result == CheckResult.FAILED]
+            if failures:
+                logger.debug(
+                    f"Order rejected by pre-trade risk for {order.symbol}: {'; '.join(failures)}"
+                )
+            return
+
+        for result in risk_results:
+            if result.result == CheckResult.WARNING:
+                logger.warning(f"Pre-trade risk warning ({result.check_name}): {result.message}")
+
+        self._risk_limits_manager.on_order_submitted(order, bar.close)
+        self._orders_submitted_total += 1
         self._state.pending_orders.append(order)
+
+    def _evaluate_pre_trade_risk(
+        self,
+        order: Order,
+        current_price: Decimal,
+    ) -> tuple[bool, list[RiskCheckResult]]:
+        """Run pre-trade checks with controlled short-sale handling."""
+        portfolio = self._get_portfolio()
+        can_submit, results = self._risk_limits_manager.pre_trade_check(
+            order, portfolio, current_price
+        )
+        if can_submit:
+            return True, results
+
+        if not self.config.allow_short or order.side != OrderSide.SELL:
+            return False, results
+
+        position = portfolio.get_position(order.symbol)
+        opening_or_extending_short = (
+            position is None or position.quantity <= 0 or order.quantity > position.quantity
+        )
+        if not opening_or_extending_short:
+            return False, results
+
+        filtered_failures = [
+            result
+            for result in results
+            if not (
+                result.result == CheckResult.FAILED
+                and result.check_name == "buying_power"
+                and "Insufficient position to sell" in result.message
+            )
+        ]
+        allow_after_filter = not any(r.result == CheckResult.FAILED for r in filtered_failures)
+        return allow_after_filter, filtered_failures
+
+    def _execution_quality_metrics(self) -> tuple[float, float]:
+        """Return (avg_slippage_bps, rejection_rate)."""
+        if self._recent_slippage_bps:
+            avg_slippage_bps = float(np.mean(self._recent_slippage_bps))
+        else:
+            avg_slippage_bps = 0.0
+
+        if self._orders_submitted_total > 0:
+            rejection_rate = self._orders_rejected_total / self._orders_submitted_total
+        else:
+            rejection_rate = 0.0
+
+        return avg_slippage_bps, rejection_rate
+
+    def _record_execution_quality(self, fill_result: FillResult) -> None:
+        """Record execution quality statistics from a fill."""
+        notional = fill_result.fill_price * fill_result.fill_quantity
+        if notional > 0:
+            slippage_bps = float((fill_result.total_cost / notional) * Decimal("10000"))
+            self._recent_slippage_bps.append(max(0.0, slippage_bps))
+        self._enforce_execution_quality_gate()
+
+    def _get_capacity_multiplier(self) -> float:
+        """Dynamic capacity multiplier from execution quality telemetry."""
+        base = min(1.0, max(0.05, float(self.config.capacity_safety_buffer)))
+        if not self.config.enable_execution_quality_gate:
+            return base
+
+        min_orders = max(1, int(self.config.min_orders_for_execution_gate))
+        if self._orders_submitted_total < min_orders:
+            return base
+
+        avg_slippage_bps, rejection_rate = self._execution_quality_metrics()
+        rej_limit = max(1e-9, float(self.config.max_fill_rejection_rate))
+        slip_limit = max(1e-9, float(self.config.max_avg_slippage_bps))
+
+        rejection_factor = max(0.0, 1.0 - (rejection_rate / rej_limit))
+        slippage_factor = max(0.0, 1.0 - (avg_slippage_bps / slip_limit))
+        soft_factor = max(
+            float(self.config.min_capacity_multiplier), min(rejection_factor, slippage_factor)
+        )
+        return base * soft_factor
+
+    def _execution_quality_gate_open(self) -> bool:
+        """Check hard execution quality gate and activate kill switch on breach."""
+        if not self.config.enable_execution_quality_gate:
+            return True
+
+        kill_switch = self._risk_limits_manager.kill_switch
+        if kill_switch.is_active():
+            return False
+
+        min_orders = max(1, int(self.config.min_orders_for_execution_gate))
+        if self._orders_submitted_total < min_orders:
+            return True
+
+        avg_slippage_bps, rejection_rate = self._execution_quality_metrics()
+        breach_messages: list[str] = []
+
+        if avg_slippage_bps > float(self.config.max_avg_slippage_bps):
+            breach_messages.append(
+                f"avg_slippage_bps={avg_slippage_bps:.2f} > {self.config.max_avg_slippage_bps:.2f}"
+            )
+        if rejection_rate > float(self.config.max_fill_rejection_rate):
+            breach_messages.append(
+                f"rejection_rate={rejection_rate:.2%} > {self.config.max_fill_rejection_rate:.2%}"
+            )
+
+        if not breach_messages:
+            return True
+
+        trigger_value = max(
+            avg_slippage_bps / max(1e-9, float(self.config.max_avg_slippage_bps)),
+            rejection_rate / max(1e-9, float(self.config.max_fill_rejection_rate)),
+        )
+        kill_switch.activate(
+            reason=KillSwitchReason.LIMIT_BREACH,
+            trigger_value=trigger_value,
+            activated_by="backtest_execution_quality_gate",
+            flatten_positions=False,
+        )
+        logger.warning(
+            "Execution quality gate triggered: %s",
+            "; ".join(breach_messages),
+        )
+        return False
+
+    def _enforce_execution_quality_gate(self) -> None:
+        """Evaluate hard execution gate after each execution outcome."""
+        self._execution_quality_gate_open()
 
     def _estimate_additional_exposure(
         self,
@@ -1152,7 +1458,9 @@ class BacktestEngine:
             volume_cap = Decimal(str(bar_volume)) * Decimal(str(self.config.max_participation_rate))
             caps.append(max(Decimal("0"), volume_cap))
 
-        adv_reference = avg_daily_volume if avg_daily_volume is not None else self.config.avg_daily_volume
+        adv_reference = (
+            avg_daily_volume if avg_daily_volume is not None else self.config.avg_daily_volume
+        )
         if self.config.max_adv_order_pct > 0 and adv_reference and adv_reference > 0:
             adv_cap = Decimal(str(adv_reference)) * Decimal(str(self.config.max_adv_order_pct))
             caps.append(max(Decimal("0"), adv_cap))
@@ -1160,7 +1468,8 @@ class BacktestEngine:
         if not caps:
             return Decimal("Infinity")
 
-        return min(caps)
+        capacity_multiplier = Decimal(str(self._get_capacity_multiplier()))
+        return min(caps) * capacity_multiplier
 
     def _cap_quantity_to_liquidity(
         self,
@@ -1226,14 +1535,10 @@ class BacktestEngine:
 
     def _update_equity(self) -> None:
         """Update equity and equity curve."""
-        position_value = sum(
-            p.market_value for p in self._state.positions.values()
-        )
+        position_value = sum(p.market_value for p in self._state.positions.values())
         self._state.equity = self._state.cash + position_value
 
-        self._state.equity_curve.append(
-            (self._state.timestamp, float(self._state.equity))
-        )
+        self._state.equity_curve.append((self._state.timestamp, float(self._state.equity)))
 
         # Update holding periods
         for symbol in self._open_positions:
@@ -1241,6 +1546,9 @@ class BacktestEngine:
 
     def _check_halt_conditions(self) -> bool:
         """Check if backtest should halt."""
+        if self._risk_limits_manager.kill_switch.is_active():
+            return True
+
         if len(self._state.equity_curve) < 2:
             return False
 
@@ -1248,7 +1556,14 @@ class BacktestEngine:
         current_equity = float(self._state.equity)
         drawdown = 1 - current_equity / peak_equity
 
-        return drawdown >= self.config.max_drawdown_halt
+        drawdown_result = self._risk_limits_manager.check_drawdown_limits(drawdown)
+        if drawdown_result.result == CheckResult.FAILED:
+            logger.warning(drawdown_result.message)
+            return True
+        if drawdown_result.result == CheckResult.WARNING:
+            logger.warning(drawdown_result.message)
+
+        return False
 
     def _get_portfolio(self) -> Portfolio:
         """Get current portfolio state."""
@@ -1299,17 +1614,20 @@ class BacktestEngine:
 
         # Create DataFrame-like structure for regime detector
         import pandas as pd
-        price_df = pd.DataFrame({
-            'close': prices,
-        })
+
+        price_df = pd.DataFrame(
+            {
+                "close": prices,
+            }
+        )
 
         # Calculate returns for volatility estimation
-        price_df['returns'] = price_df['close'].pct_change()
+        price_df["returns"] = price_df["close"].pct_change()
 
         # Try different detector interfaces
-        if hasattr(self._regime_detector, 'detect'):
+        if hasattr(self._regime_detector, "detect"):
             return self._regime_detector.detect(price_df)
-        elif hasattr(self._regime_detector, 'detect_regime'):
+        elif hasattr(self._regime_detector, "detect_regime"):
             return self._regime_detector.detect_regime(price_df)
         elif callable(self._regime_detector):
             return self._regime_detector(price_df)
@@ -1422,6 +1740,7 @@ class VectorizedBacktest:
 @dataclass
 class WalkForwardWindow:
     """Configuration for a single walk-forward validation window."""
+
     train_start: datetime
     train_end: datetime
     test_start: datetime
@@ -1433,6 +1752,7 @@ class WalkForwardWindow:
 @dataclass
 class WalkForwardResult:
     """Results from a single walk-forward window."""
+
     window_id: int
     train_start: datetime
     train_end: datetime
@@ -1448,6 +1768,7 @@ class WalkForwardResult:
 @dataclass
 class WalkForwardReport:
     """Aggregate report from walk-forward validation."""
+
     windows: list[WalkForwardResult]
     aggregate_metrics: dict[str, float]
     is_valid: bool
@@ -1543,10 +1864,26 @@ class WalkForwardValidator:
                 break
 
             window = WalkForwardWindow(
-                train_start=dates.iloc[start_idx].to_pydatetime() if hasattr(dates.iloc[start_idx], 'to_pydatetime') else dates.iloc[start_idx],
-                train_end=dates.iloc[train_end_idx - 1].to_pydatetime() if hasattr(dates.iloc[train_end_idx - 1], 'to_pydatetime') else dates.iloc[train_end_idx - 1],
-                test_start=dates.iloc[test_start_idx].to_pydatetime() if hasattr(dates.iloc[test_start_idx], 'to_pydatetime') else dates.iloc[test_start_idx],
-                test_end=dates.iloc[test_end_idx - 1].to_pydatetime() if hasattr(dates.iloc[test_end_idx - 1], 'to_pydatetime') else dates.iloc[test_end_idx - 1],
+                train_start=(
+                    dates.iloc[start_idx].to_pydatetime()
+                    if hasattr(dates.iloc[start_idx], "to_pydatetime")
+                    else dates.iloc[start_idx]
+                ),
+                train_end=(
+                    dates.iloc[train_end_idx - 1].to_pydatetime()
+                    if hasattr(dates.iloc[train_end_idx - 1], "to_pydatetime")
+                    else dates.iloc[train_end_idx - 1]
+                ),
+                test_start=(
+                    dates.iloc[test_start_idx].to_pydatetime()
+                    if hasattr(dates.iloc[test_start_idx], "to_pydatetime")
+                    else dates.iloc[test_start_idx]
+                ),
+                test_end=(
+                    dates.iloc[test_end_idx - 1].to_pydatetime()
+                    if hasattr(dates.iloc[test_end_idx - 1], "to_pydatetime")
+                    else dates.iloc[test_end_idx - 1]
+                ),
                 window_id=i,
                 gap_bars=self.gap_bars,
             )
@@ -1606,25 +1943,32 @@ class WalkForwardValidator:
             for symbol, symbol_df in data.items():
                 # Handle both index and regular datetime index
                 idx = symbol_df.index
-                if hasattr(idx, 'tz') and idx.tz is not None:
+                if hasattr(idx, "tz") and idx.tz is not None:
                     # Timezone-aware, make window dates aware
                     from datetime import timezone as tz
-                    train_mask = (idx >= pd.Timestamp(window.train_start, tz=idx.tz)) & \
-                                 (idx <= pd.Timestamp(window.train_end, tz=idx.tz))
-                    test_mask = (idx >= pd.Timestamp(window.test_start, tz=idx.tz)) & \
-                                (idx <= pd.Timestamp(window.test_end, tz=idx.tz))
+
+                    train_mask = (idx >= pd.Timestamp(window.train_start, tz=idx.tz)) & (
+                        idx <= pd.Timestamp(window.train_end, tz=idx.tz)
+                    )
+                    test_mask = (idx >= pd.Timestamp(window.test_start, tz=idx.tz)) & (
+                        idx <= pd.Timestamp(window.test_end, tz=idx.tz)
+                    )
                 else:
-                    train_mask = (idx >= pd.Timestamp(window.train_start)) & \
-                                 (idx <= pd.Timestamp(window.train_end))
-                    test_mask = (idx >= pd.Timestamp(window.test_start)) & \
-                                (idx <= pd.Timestamp(window.test_end))
+                    train_mask = (idx >= pd.Timestamp(window.train_start)) & (
+                        idx <= pd.Timestamp(window.train_end)
+                    )
+                    test_mask = (idx >= pd.Timestamp(window.test_start)) & (
+                        idx <= pd.Timestamp(window.test_end)
+                    )
 
                 train_data[symbol] = symbol_df[train_mask].copy()
                 test_data[symbol] = symbol_df[test_mask].copy()
 
             # Skip if insufficient data
             if any(len(df) < self.min_train_samples for df in train_data.values()):
-                self._logger.warning(f"Skipping window {window.window_id}: insufficient training data")
+                self._logger.warning(
+                    f"Skipping window {window.window_id}: insufficient training data"
+                )
                 continue
 
             if any(len(df) < self.min_test_samples for df in test_data.values()):
@@ -1718,7 +2062,11 @@ class WalkForwardValidator:
 
         total_return = (equity_values[-1] / equity_values[0] - 1) if equity_values[0] > 0 else 0
         volatility = float(np.std(returns) * np.sqrt(252 * 26)) if returns else 0  # 15-min bars
-        sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252 * 26)) if returns and np.std(returns) > 0 else 0
+        sharpe = (
+            float(np.mean(returns) / np.std(returns) * np.sqrt(252 * 26))
+            if returns and np.std(returns) > 0
+            else 0
+        )
 
         # Max drawdown
         peak = equity_values[0]
@@ -1754,17 +2102,27 @@ class WalkForwardValidator:
             "avg_oos_max_dd": np.mean([r.test_metrics.get("max_drawdown", 0) for r in results]),
             "avg_oos_win_rate": np.mean([r.test_metrics.get("win_rate", 0) for r in results]),
             "std_oos_sharpe": np.std([r.test_metrics.get("sharpe_ratio", 0) for r in results]),
-            "avg_is_oos_ratio": np.mean([r.is_oos_ratio for r in results if r.is_oos_ratio < float("inf")]),
-            "max_is_oos_ratio": max(r.is_oos_ratio for r in results if r.is_oos_ratio < float("inf")) if any(r.is_oos_ratio < float("inf") for r in results) else float("inf"),
-            "windows_positive": sum(1 for r in results if r.test_metrics.get("total_return", 0) > 0),
+            "avg_is_oos_ratio": np.mean(
+                [r.is_oos_ratio for r in results if r.is_oos_ratio < float("inf")]
+            ),
+            "max_is_oos_ratio": (
+                max(r.is_oos_ratio for r in results if r.is_oos_ratio < float("inf"))
+                if any(r.is_oos_ratio < float("inf") for r in results)
+                else float("inf")
+            ),
+            "windows_positive": sum(
+                1 for r in results if r.test_metrics.get("total_return", 0) > 0
+            ),
             "windows_total": len(results),
         }
 
         # IS (in-sample) metrics for comparison
-        oos_metrics.update({
-            "avg_is_return": np.mean([r.train_metrics.get("total_return", 0) for r in results]),
-            "avg_is_sharpe": np.mean([r.train_metrics.get("sharpe_ratio", 0) for r in results]),
-        })
+        oos_metrics.update(
+            {
+                "avg_is_return": np.mean([r.train_metrics.get("total_return", 0) for r in results]),
+                "avg_is_sharpe": np.mean([r.train_metrics.get("sharpe_ratio", 0) for r in results]),
+            }
+        )
 
         return oos_metrics
 

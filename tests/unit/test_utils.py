@@ -22,6 +22,8 @@ from quant_trading_system.core.utils import (
     generate_id,
     get_market_close_time,
     get_market_open_time,
+    get_market_session_bounds,
+    is_market_early_close,
     hash_string,
     is_market_open,
     memoize,
@@ -119,6 +121,27 @@ class TestTimeUtilities:
         close_time = get_market_close_time(date)
         assert close_time.hour == 16
         assert close_time.minute == 0
+
+    def test_is_market_early_close_day(self):
+        """Day after Thanksgiving should be marked early close."""
+        early_close_day = datetime(2024, 11, 29, 12, 0, 0, tzinfo=EASTERN)
+        assert is_market_early_close(early_close_day) is True
+
+    def test_is_market_open_respects_early_close(self):
+        """Market should be closed after 1:00 PM ET on early-close day."""
+        before_early_close = datetime(2024, 11, 29, 12, 30, 0, tzinfo=EASTERN)
+        after_early_close = datetime(2024, 11, 29, 14, 0, 0, tzinfo=EASTERN)
+        assert is_market_open(before_early_close) is True
+        assert is_market_open(after_early_close) is False
+
+    def test_get_market_session_bounds_early_close(self):
+        """Session bounds should return 1:00 PM close on early-close day."""
+        early_close_day = datetime(2024, 11, 29, 10, 0, 0, tzinfo=EASTERN)
+        session_open, session_close = get_market_session_bounds(early_close_day)
+        assert session_open.hour == 9
+        assert session_open.minute == 30
+        assert session_close.hour == 13
+        assert session_close.minute == 0
 
     def test_bars_to_timedelta(self):
         """Test converting bars to timedelta."""
@@ -247,6 +270,7 @@ class TestCaching:
 
     def test_memoize_clear_cache(self):
         """Test clearing memoized cache."""
+
         @memoize
         def func(x):
             return x * 2
@@ -314,6 +338,7 @@ class TestRetryLogic:
 
     def test_retry_all_attempts_fail(self):
         """Test retry when all attempts fail."""
+
         @retry(max_attempts=3, delay=0.01)
         def always_fails():
             raise RuntimeError("Always fails")
@@ -341,6 +366,7 @@ class TestAsyncRetry:
 
     def test_retry_async_success(self):
         """Test async retry with success."""
+
         async def run_test():
             attempts = [0]
 
@@ -355,6 +381,7 @@ class TestAsyncRetry:
 
     def test_retry_async_with_failures(self):
         """Test async retry with initial failures."""
+
         async def run_test():
             attempts = [0]
 
@@ -384,6 +411,7 @@ class TestPerformanceTiming:
 
     def test_timed_decorator(self):
         """Test timed decorator."""
+
         @timed
         def slow_function():
             time.sleep(0.05)
