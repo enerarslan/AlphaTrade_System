@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
+import { useShallow } from "zustand/react/shallow";
 import { CircuitBoard, Database, Hash, Play, Terminal } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,7 +34,24 @@ export default function PlatformPage() {
     fetchSystemCoverage,
     fetchJobCatalog,
     createJob,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      hasPermission: state.hasPermission,
+      health: state.health,
+      performance: state.performance,
+      tradingStatus: state.tradingStatus,
+      signals: state.signals,
+      modelStatuses: state.modelStatuses,
+      systemCoverage: state.systemCoverage,
+      jobCatalog: state.jobCatalog,
+      fetchHealth: state.fetchHealth,
+      fetchPerformance: state.fetchPerformance,
+      fetchTradingStatus: state.fetchTradingStatus,
+      fetchSignals: state.fetchSignals,
+      fetchModelStatuses: state.fetchModelStatuses,
+      fetchSystemCoverage: state.fetchSystemCoverage,
+      fetchJobCatalog: state.fetchJobCatalog,
+      createJob: state.createJob,
+    })));
 
   const [runCommand, setRunCommand] = useState("");
   const [runArgs, setRunArgs] = useState("");
@@ -48,6 +66,7 @@ export default function PlatformPage() {
     void fetchSystemCoverage();
     void fetchJobCatalog();
     const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void fetchHealth();
       void fetchPerformance();
       void fetchSignals();
@@ -233,3 +252,5 @@ export default function PlatformPage() {
     </motion.div>
   );
 }
+
+

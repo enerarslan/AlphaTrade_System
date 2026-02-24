@@ -16,13 +16,19 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useStore } from "@/lib/store";
+import { useShallow } from "zustand/react/shallow";
 
 type CmdItem = { label: string; icon: LucideIcon; action: () => void; group: string; keywords?: string };
 
 export default function CommandPalette() {
   const [open, setOpen] = useState(false);
   const navigate = useNavigate();
-  const { activateKillSwitch, stopTrading, startTrading, tradingStatus } = useStore();
+  const { activateKillSwitch, stopTrading, startTrading, tradingStatus } = useStore(useShallow((state) => ({
+      activateKillSwitch: state.activateKillSwitch,
+      stopTrading: state.stopTrading,
+      startTrading: state.startTrading,
+      tradingStatus: state.tradingStatus,
+    })));
 
   // Ctrl+K to toggle
   useEffect(() => {
@@ -146,3 +152,5 @@ export default function CommandPalette() {
     </AnimatePresence>
   );
 }
+
+

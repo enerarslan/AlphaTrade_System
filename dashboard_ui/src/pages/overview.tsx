@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
-import { Activity, AlertTriangle, Brain, BriefcaseBusiness, ShieldAlert, TrendingUp, Workflow } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
+import { Activity, AlertTriangle, Brain, BriefcaseBusiness, Newspaper, ShieldAlert, TrendingUp, Workflow } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SignalTape } from "@/components/live/SignalTape";
@@ -9,6 +10,11 @@ import EquityCurveChart from "@/components/charts/EquityCurveChart";
 import PnLBarChart from "@/components/charts/PnLBarChart";
 import MiniGauge from "@/components/ui/mini-gauge";
 import Sparkline from "@/components/ui/sparkline";
+import AnimatedCounter from "@/components/ui/AnimatedCounter";
+import SectorHeatmap from "@/components/live/SectorHeatmap";
+import WatchlistWidget from "@/components/live/WatchlistWidget";
+import MarketNewsFeed from "@/components/live/MarketNewsFeed";
+import PanelLayout from "@/components/layout/PanelLayout";
 
 const stagger = {
   hidden: { opacity: 0 },
@@ -22,6 +28,11 @@ const fadeUp = {
   hidden: { opacity: 0, y: 12 },
   show: { opacity: 1, y: 0, transition: { duration: 0.4, ease: "easeOut" as const } },
 } as const;
+
+function deterministicNoise(seed: number, i: number) {
+  const x = Math.sin((seed + i * 17.17) * 12.9898) * 43758.5453;
+  return x - Math.floor(x);
+}
 
 function GlowMetric({
   label,
@@ -47,7 +58,7 @@ function GlowMetric({
     amber: "text-amber-300",
   };
   return (
-    <div className={`rounded-xl border bg-white/[0.03] px-4 py-3 backdrop-blur-sm ${colors[accent]}`}>
+    <div className={`rounded-xl border bg-white/[0.03] px-4 py-3 backdrop-blur-sm transition-all hover:bg-white/[0.05] ${colors[accent]}`}>
       <div className="flex items-center justify-between">
         <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">{label}</p>
         {sparkData && sparkData.length > 1 && <Sparkline data={sparkData} width={48} height={16} />}
@@ -83,21 +94,72 @@ export default function OverviewPage() {
     systemCoverage,
     lastRefreshAt,
     positions,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      hasPermission: state.hasPermission,
+      fetchSnapshot: state.fetchSnapshot,
+      fetchSystemCoverage: state.fetchSystemCoverage,
+      portfolio: state.portfolio,
+      performance: state.performance,
+      riskMetrics: state.riskMetrics,
+      riskConcentration: state.riskConcentration,
+      riskCorrelation: state.riskCorrelation,
+      riskStress: state.riskStress,
+      tca: state.tca,
+      executionQuality: state.executionQuality,
+      ws: state.ws,
+      tradingStatus: state.tradingStatus,
+      alerts: state.alerts,
+      incidents: state.incidents,
+      jobs: state.jobs,
+      signals: state.signals,
+      modelStatuses: state.modelStatuses,
+      modelRegistry: state.modelRegistry,
+      modelDrift: state.modelDrift,
+      sloStatus: state.sloStatus,
+      systemCoverage: state.systemCoverage,
+      lastRefreshAt: state.lastRefreshAt,
+      positions: state.positions,
+    })));
 
   useEffect(() => {
-    void fetchSnapshot();
-    const snapshotTimer = setInterval(() => void fetchSnapshot(), 12000);
+    const visible = () => typeof document === "undefined" || document.visibilityState === "visible";
+
+    if (visible()) {
+      void fetchSnapshot();
+    }
+
+    const snapshotTimer = setInterval(() => {
+      if (!visible()) return;
+      void fetchSnapshot();
+    }, 30000);
     let coverageTimer: ReturnType<typeof setInterval> | undefined;
     if (hasPermission("read.basic")) {
-      void fetchSystemCoverage();
-      coverageTimer = setInterval(() => void fetchSystemCoverage(), 60000);
+      if (visible()) {
+        void fetchSystemCoverage();
+      }
+      coverageTimer = setInterval(() => {
+        if (!visible()) return;
+        void fetchSystemCoverage();
+      }, 60000);
     }
+
+    const onVisibilityChange = () => {
+      if (visible()) {
+        void fetchSnapshot();
+        if (hasPermission("read.basic")) {
+          void fetchSystemCoverage();
+        }
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
     return () => {
       clearInterval(snapshotTimer);
       if (coverageTimer) {
         clearInterval(coverageTimer);
       }
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [fetchSnapshot, fetchSystemCoverage, hasPermission]);
 
@@ -160,7 +222,9 @@ export default function OverviewPage() {
     const now = new Date();
     for (let i = 29; i >= 0; i--) {
       const date = new Date(now.getTime() - i * 86400_000);
-      const val = i === 0 ? dailyPnl : Math.round((Math.random() - 0.45) * Math.abs(dailyPnl) * 3);
+      const seed = Math.round(dailyPnl) || 1;
+      const rand = deterministicNoise(seed, i);
+      const val = i === 0 ? dailyPnl : Math.round((rand - 0.45) * Math.abs(dailyPnl) * 3);
       points.push({
         time: date.toISOString().slice(0, 10),
         value: val,
@@ -180,7 +244,7 @@ export default function OverviewPage() {
           <div>
             <p className="text-[10px] font-semibold uppercase tracking-[0.24em] text-cyan-500/70">AlphaTrade Mission Control</p>
             <h1 className="mt-2 text-3xl font-bold tracking-tight text-slate-100 sm:text-4xl">
-              Live Trading <span className="text-glow-cyan text-cyan-400">Cockpit</span>
+              Live Trading <span className="gradient-text">Cockpit</span>
             </h1>
             <p className="mt-2 max-w-3xl text-sm text-slate-400">
               Execution, risk, model governance, incidents, and infrastructure coverage in a single real-time command surface.
@@ -201,45 +265,93 @@ export default function OverviewPage() {
         </div>
 
         <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <GlowMetric label="Equity" value={`$${(portfolio?.equity ?? 0).toLocaleString()}`} accent="cyan" sparkData={equitySpark.slice(-20)} />
-          <GlowMetric
-            label="Daily PnL"
-            value={`${pnlPositive ? "+" : ""}$${dailyPnl.toLocaleString()}`}
-            accent={pnlPositive ? "emerald" : "rose"}
-            sparkData={pnlData.map((d) => d.value).slice(-20)}
-          />
-          <GlowMetric label="VaR 95" value={`$${(riskMetrics?.portfolio_var_95 ?? 0).toLocaleString()}`} accent="amber" />
-          <GlowMetric label="Refresh" value={lastRefreshAt ? new Date(lastRefreshAt).toLocaleTimeString() : "--"} accent="cyan" />
+          <div className="rounded-xl border border-cyan-500/20 bg-white/[0.03] px-4 py-3 backdrop-blur-sm shadow-[0_0_15px_rgba(6,182,212,0.08)]">
+            <div className="flex items-center justify-between">
+              <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Equity</p>
+              {equitySpark.length > 1 && <Sparkline data={equitySpark.slice(-20)} width={48} height={16} />}
+            </div>
+            <p className="mt-1 text-lg font-bold font-mono text-cyan-300">
+              <AnimatedCounter value={portfolio?.equity ?? 0} prefix="$" />
+            </p>
+          </div>
+          <div className={`rounded-xl border ${pnlPositive ? "border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.08)]" : "border-rose-500/20 shadow-[0_0_15px_rgba(244,63,94,0.08)]"} bg-white/[0.03] px-4 py-3 backdrop-blur-sm`}>
+            <div className="flex items-center justify-between">
+              <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Daily PnL</p>
+              <Sparkline data={pnlData.map((d) => d.value).slice(-20)} width={48} height={16} />
+            </div>
+            <p className={`mt-1 text-lg font-bold font-mono ${pnlPositive ? "text-emerald-300" : "text-rose-300"}`}>
+              {pnlPositive ? "+" : ""}<AnimatedCounter value={dailyPnl} prefix="$" />
+            </p>
+          </div>
+          <div className="rounded-xl border border-amber-500/20 bg-white/[0.03] px-4 py-3 backdrop-blur-sm shadow-[0_0_15px_rgba(245,158,11,0.08)]">
+            <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">VaR 95</p>
+            <p className="mt-1 text-lg font-bold font-mono text-amber-300">
+              <AnimatedCounter value={riskMetrics?.portfolio_var_95 ?? 0} prefix="$" />
+            </p>
+          </div>
+          <div className="rounded-xl border border-cyan-500/20 bg-white/[0.03] px-4 py-3 backdrop-blur-sm shadow-[0_0_15px_rgba(6,182,212,0.08)]">
+            <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Refresh</p>
+            <p className="mt-1 text-lg font-bold font-mono text-cyan-300">{lastRefreshAt ? new Date(lastRefreshAt).toLocaleTimeString() : "--"}</p>
+          </div>
         </div>
       </motion.section>
 
-      {/* Charts Row — Equity Curve + Daily PnL */}
-      <motion.section variants={fadeUp} className="grid gap-4 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-xl">
-              <TrendingUp size={18} className="text-cyan-400" />
-              Equity Curve
-            </CardTitle>
-            <CardDescription>Portfolio equity over time with TradingView professional charting.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <EquityCurveChart data={equityData} height={300} />
-          </CardContent>
-        </Card>
+      {/* ═══ Sector Performance Heatmap ═══ */}
+      <motion.section variants={fadeUp}>
+        <div className="mb-3 flex items-center gap-2">
+          <span className="inline-block h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.6)] pulse-dot" />
+          <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-emerald-400/80">Sector Performance</span>
+          <span className="text-[9px] text-slate-600">46 Instruments</span>
+        </div>
+        <SectorHeatmap />
+      </motion.section>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Activity size={18} className="text-emerald-400" />
-              Daily P&L
-            </CardTitle>
-            <CardDescription>Realized daily profit & loss histogram.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <PnLBarChart data={pnlData} height={300} />
-          </CardContent>
-        </Card>
+      {/* Charts Row — Equity Curve + Daily PnL */}
+      <motion.section variants={fadeUp}>
+        <PanelLayout
+          orientation="horizontal"
+          storageKey="overview-charts"
+          panels={[
+            {
+              id: "equity",
+              defaultSize: 65,
+              minSize: 35,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2 text-xl">
+                      <TrendingUp size={18} className="text-cyan-400" />
+                      Equity Curve
+                    </CardTitle>
+                    <CardDescription>Portfolio equity over time with TradingView professional charting.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <EquityCurveChart data={equityData} height={300} />
+                  </CardContent>
+                </Card>
+              ),
+            },
+            {
+              id: "pnl",
+              defaultSize: 35,
+              minSize: 25,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Activity size={18} className="text-emerald-400" />
+                      Daily P&L
+                    </CardTitle>
+                    <CardDescription>Realized daily profit & loss histogram.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <PnLBarChart data={pnlData} height={300} />
+                  </CardContent>
+                </Card>
+              ),
+            },
+          ]}
+        />
       </motion.section>
 
       {/* Signal Tape */}
@@ -257,6 +369,54 @@ export default function OverviewPage() {
           </CardContent>
         </Card>
       </motion.div>
+
+      {/* Watchlist + News — Side by Side */}
+      <motion.section variants={fadeUp}>
+        <PanelLayout
+          orientation="horizontal"
+          storageKey="overview-watchlist-news"
+          panels={[
+            {
+              id: "watchlist",
+              defaultSize: 40,
+              minSize: 25,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <TrendingUp size={18} className="text-emerald-400" />
+                      Stock Watchlist
+                    </CardTitle>
+                    <CardDescription>Alpha Vantage real-time quotes (AAPL, MSFT, GOOGL, AMZN, TSLA).</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <WatchlistWidget />
+                  </CardContent>
+                </Card>
+              ),
+            },
+            {
+              id: "news",
+              defaultSize: 60,
+              minSize: 30,
+              children: (
+                <Card className="h-full">
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Newspaper size={18} className="text-cyan-400" />
+                      Market News
+                    </CardTitle>
+                    <CardDescription>Live market news from Finnhub.</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <MarketNewsFeed limit={6} />
+                  </CardContent>
+                </Card>
+              ),
+            },
+          ]}
+        />
+      </motion.section>
 
       {/* Risk Gauges Row */}
       <motion.section variants={fadeUp}>
@@ -466,3 +626,5 @@ export default function OverviewPage() {
     </motion.div>
   );
 }
+
+

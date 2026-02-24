@@ -125,30 +125,3 @@ function PanelItem({
     </>
   );
 }
-
-/** Preset layouts for common page arrangements */
-export const PANEL_PRESETS = {
-  /** Two columns: 60/40 split */
-  twoColumn: (left: ReactNode, right: ReactNode, storageKey?: string) => (
-    <PanelLayout
-      orientation="horizontal"
-      storageKey={storageKey}
-      panels={[
-        { id: "left", defaultSize: 60, minSize: 30, children: left },
-        { id: "right", defaultSize: 40, minSize: 25, children: right },
-      ]}
-    />
-  ),
-
-  /** Stacked: top 60% / bottom 40% */
-  stacked: (top: ReactNode, bottom: ReactNode, storageKey?: string) => (
-    <PanelLayout
-      orientation="vertical"
-      storageKey={storageKey}
-      panels={[
-        { id: "top", defaultSize: 60, minSize: 25, children: top },
-        { id: "bottom", defaultSize: 40, minSize: 20, children: bottom },
-      ]}
-    />
-  ),
-};

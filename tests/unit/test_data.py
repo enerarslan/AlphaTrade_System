@@ -67,6 +67,88 @@ class TestDataLoader:
 
             assert found == test_file
 
+    def test_data_loader_handles_timezone_aware_filter_on_aware_source(self):
+        """Timezone-aware source data should filter cleanly with aware bounds."""
+        from quant_trading_system.data.loader import DataLoader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "AAPL.csv"
+            csv_path.write_text(
+                "timestamp,open,high,low,close,volume\n"
+                "2025-01-01T10:00:00+00:00,100,101,99,100.5,1000\n"
+                "2025-01-01T10:15:00+00:00,101,102,100,101.5,1200\n",
+                encoding="utf-8",
+            )
+
+            loader = DataLoader(tmpdir)
+            filtered = loader.load_symbol(
+                "AAPL",
+                start_date=datetime(2025, 1, 1, 10, 15, tzinfo=timezone.utc),
+                end_date=datetime(2025, 1, 1, 10, 15, tzinfo=timezone.utc),
+            )
+
+            assert len(filtered) == 1
+            assert filtered["timestamp"][0].tzinfo is not None
+
+    def test_data_loader_handles_timezone_aware_filter_on_naive_source(self):
+        """Naive source timestamps should be normalized and filter with aware bounds."""
+        from quant_trading_system.data.loader import DataLoader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "AAPL.csv"
+            csv_path.write_text(
+                "timestamp,open,high,low,close,volume\n"
+                "2025-01-01 10:00:00,100,101,99,100.5,1000\n"
+                "2025-01-01 10:15:00,101,102,100,101.5,1200\n",
+                encoding="utf-8",
+            )
+
+            loader = DataLoader(tmpdir)
+            filtered = loader.load_symbol(
+                "AAPL",
+                start_date=datetime(2025, 1, 1, 10, 15, tzinfo=timezone.utc),
+                end_date=datetime(2025, 1, 1, 10, 15, tzinfo=timezone.utc),
+            )
+
+            assert len(filtered) == 1
+            assert filtered["timestamp"][0].tzinfo is not None
+
+    def test_data_loader_selects_best_file_for_requested_range(self):
+        """When multiple files exist, loader should choose the one covering requested window."""
+        from quant_trading_system.data.loader import DataLoader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recent_path = Path(tmpdir) / "AAPL.csv"
+            recent_path.write_text(
+                "timestamp,open,high,low,close,volume\n"
+                "2025-01-01T10:00:00+00:00,200,201,199,200.5,1000\n"
+                "2025-01-01T10:15:00+00:00,201,202,200,201.5,1100\n",
+                encoding="utf-8",
+            )
+            history_path = Path(tmpdir) / "AAPL_15min.csv"
+            history_path.write_text(
+                "timestamp,open,high,low,close,volume\n"
+                "2021-01-04 09:30:00,130,131,129,130.5,5000\n"
+                "2021-01-04 09:45:00,131,132,130,131.5,5100\n",
+                encoding="utf-8",
+            )
+
+            loader = DataLoader(tmpdir)
+            selected = loader._find_data_file(
+                "AAPL",
+                start_date=datetime(2021, 1, 4, 9, 30, tzinfo=timezone.utc),
+                end_date=datetime(2021, 1, 4, 9, 45, tzinfo=timezone.utc),
+            )
+            filtered = loader.load_symbol(
+                "AAPL",
+                start_date=datetime(2021, 1, 4, 9, 30, tzinfo=timezone.utc),
+                end_date=datetime(2021, 1, 4, 9, 45, tzinfo=timezone.utc),
+            )
+
+            assert selected == history_path
+            assert len(filtered) == 2
+            assert filtered["timestamp"].min().year == 2021
+
     def test_data_loader_file_not_found(self):
         """Test handling of missing data files."""
         from quant_trading_system.core.exceptions import DataNotFoundError

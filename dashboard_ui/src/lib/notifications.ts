@@ -1,20 +1,6 @@
-import { Toaster, toast } from "sonner";
+import { toast } from "sonner";
 
-/** Mount this once at the root of the app (inside DashboardLayout). */
-export function NotificationToaster() {
-  return (
-    <Toaster
-      position="top-right"
-      theme="dark"
-      richColors
-      closeButton
-      offset={16}
-      gap={8}
-    />
-  );
-}
-
-type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
+export type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
 
 /** Push a trading notification. Called from WS alert handler. */
 export function pushNotification(

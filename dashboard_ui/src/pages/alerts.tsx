@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useShallow } from "zustand/react/shallow";
 import { Bell, CheckCircle, ShieldAlert, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -49,13 +50,23 @@ export default function AlertsPage() {
     fetchAlerts,
     acknowledgeAlert,
     resolveAlert,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      alerts: state.alerts,
+      user: state.user,
+      hasPermission: state.hasPermission,
+      fetchAlerts: state.fetchAlerts,
+      acknowledgeAlert: state.acknowledgeAlert,
+      resolveAlert: state.resolveAlert,
+    })));
 
   const canManageAlerts = hasPermission("control.alerts.manage");
 
   useEffect(() => {
     void fetchAlerts();
-    const timer = setInterval(() => void fetchAlerts(), 10000);
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      void fetchAlerts();
+    }, 10000);
     return () => clearInterval(timer);
   }, [fetchAlerts]);
 
@@ -187,3 +198,5 @@ export default function AlertsPage() {
     </motion.div>
   );
 }
+
+

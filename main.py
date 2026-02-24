@@ -562,6 +562,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Number of Monte Carlo simulations (default: 0 = disabled)",
     )
     backtest_parser.add_argument(
+        "--benchmark",
+        type=str,
+        default=None,
+        help="Optional benchmark symbol for relative performance metrics (e.g., SPY)",
+    )
+    backtest_parser.add_argument(
         "--output",
         type=Path,
         help="Output file for results (JSON/HTML)",

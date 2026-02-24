@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
+import { useShallow } from "zustand/react/shallow";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from "recharts";
 import { AlertTriangle, BarChart4, ShieldAlert, TrendingDown } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -41,7 +42,22 @@ export default function RiskPage() {
     fetchRiskStress,
     fetchRiskAttribution,
     fetchAlerts,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      riskMetrics: state.riskMetrics,
+      varData: state.varData,
+      riskConcentration: state.riskConcentration,
+      riskCorrelation: state.riskCorrelation,
+      riskStress: state.riskStress,
+      riskAttribution: state.riskAttribution,
+      alerts: state.alerts,
+      fetchRiskMetrics: state.fetchRiskMetrics,
+      fetchVar: state.fetchVar,
+      fetchRiskConcentration: state.fetchRiskConcentration,
+      fetchRiskCorrelation: state.fetchRiskCorrelation,
+      fetchRiskStress: state.fetchRiskStress,
+      fetchRiskAttribution: state.fetchRiskAttribution,
+      fetchAlerts: state.fetchAlerts,
+    })));
 
   useEffect(() => {
     void fetchRiskMetrics();
@@ -52,6 +68,7 @@ export default function RiskPage() {
     void fetchRiskAttribution();
     void fetchAlerts();
     const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void fetchRiskMetrics();
       void fetchAlerts();
     }, 15000);
@@ -426,3 +443,5 @@ export default function RiskPage() {
     </motion.div>
   );
 }
+
+

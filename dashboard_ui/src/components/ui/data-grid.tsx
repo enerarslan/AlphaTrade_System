@@ -41,6 +41,7 @@ export default function DataGrid<T>({
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
   const parentRef = useRef<HTMLDivElement>(null);
 
+  // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable({
     data,
     columns,

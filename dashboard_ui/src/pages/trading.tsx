@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
+import { useShallow } from "zustand/react/shallow";
 import { Activity, AlertOctagon, Gauge, Play, RefreshCcw, Square, Timer, Zap } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -89,7 +90,25 @@ export default function TradingPage() {
     restartTrading,
     activateKillSwitch,
     cancelJob,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      tradingStatus: state.tradingStatus,
+      tca: state.tca,
+      executionQuality: state.executionQuality,
+      orders: state.orders,
+      jobs: state.jobs,
+      mfaStatus: state.mfaStatus,
+      hasPermission: state.hasPermission,
+      fetchTradingStatus: state.fetchTradingStatus,
+      fetchTCA: state.fetchTCA,
+      fetchExecutionQuality: state.fetchExecutionQuality,
+      fetchOrders: state.fetchOrders,
+      fetchJobs: state.fetchJobs,
+      startTrading: state.startTrading,
+      stopTrading: state.stopTrading,
+      restartTrading: state.restartTrading,
+      activateKillSwitch: state.activateKillSwitch,
+      cancelJob: state.cancelJob,
+    })));
 
   const [mode, setMode] = useState<(typeof modeOptions)[number]>("paper");
   const [symbols, setSymbols] = useState("AAPL,MSFT");
@@ -104,6 +123,7 @@ export default function TradingPage() {
     void fetchOrders();
     void fetchJobs();
     const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void fetchTradingStatus();
       void fetchOrders();
       void fetchJobs();
@@ -334,3 +354,5 @@ export default function TradingPage() {
     </motion.div>
   );
 }
+
+

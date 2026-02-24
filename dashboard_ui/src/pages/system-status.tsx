@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from "react";
 import { motion } from "framer-motion";
+import { useShallow } from "zustand/react/shallow";
 import {
   AlertTriangle,
   BookOpen,
@@ -126,7 +127,29 @@ export default function SystemStatusPage() {
     cancelJob,
     executeRunbookAction,
     exportAuditTrail,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      health: state.health,
+      sloStatus: state.sloStatus,
+      jobs: state.jobs,
+      logs: state.logs,
+      auditTrail: state.auditTrail,
+      siemStatus: state.siemStatus,
+      incidents: state.incidents,
+      runbooks: state.runbooks,
+      hasPermission: state.hasPermission,
+      fetchHealth: state.fetchHealth,
+      fetchSloStatus: state.fetchSloStatus,
+      fetchJobs: state.fetchJobs,
+      fetchLogs: state.fetchLogs,
+      fetchAuditTrail: state.fetchAuditTrail,
+      fetchSiemStatus: state.fetchSiemStatus,
+      fetchIncidents: state.fetchIncidents,
+      fetchIncidentTimeline: state.fetchIncidentTimeline,
+      fetchRunbooks: state.fetchRunbooks,
+      cancelJob: state.cancelJob,
+      executeRunbookAction: state.executeRunbookAction,
+      exportAuditTrail: state.exportAuditTrail,
+    })));
 
   const canReadAudit = hasPermission("control.audit.read");
   const canManageAudit = hasPermission("control.audit.manage");
@@ -145,6 +168,7 @@ export default function SystemStatusPage() {
       void fetchSiemStatus();
     }
     const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void fetchHealth();
       void fetchJobs();
       void fetchLogs();
@@ -431,3 +455,5 @@ export default function SystemStatusPage() {
     </motion.div>
   );
 }
+
+

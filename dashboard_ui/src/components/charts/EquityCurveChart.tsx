@@ -1,12 +1,16 @@
-import { useEffect, useRef, useMemo, useState } from "react";
-import { createChart, ColorType, AreaSeries, type IChartApi, type Time } from "lightweight-charts";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  AreaSeries,
+  ColorType,
+  createChart,
+  type IChartApi,
+  type ISeriesApi,
+  type Time,
+} from "lightweight-charts";
 
 interface EquityCurveChartProps {
-  /** Array of { time: "YYYY-MM-DD" or epoch, value: number } data points */
   data: Array<{ time: string; value: number }>;
-  /** Height of the chart in pixels */
   height?: number;
-  /** Show time-range buttons */
   showToolbar?: boolean;
 }
 
@@ -16,15 +20,30 @@ function filterByRange(data: Array<{ time: string; value: number }>, range: stri
   if (range === "ALL" || data.length === 0) return data;
   const now = new Date();
   let cutoff: Date;
+
   switch (range) {
-    case "1D": cutoff = new Date(now.getTime() - 86400_000); break;
-    case "1W": cutoff = new Date(now.getTime() - 7 * 86400_000); break;
-    case "1M": cutoff = new Date(now.getTime() - 30 * 86400_000); break;
-    case "3M": cutoff = new Date(now.getTime() - 90 * 86400_000); break;
-    case "YTD": cutoff = new Date(now.getFullYear(), 0, 1); break;
-    case "1Y": cutoff = new Date(now.getTime() - 365 * 86400_000); break;
-    default: return data;
+    case "1D":
+      cutoff = new Date(now.getTime() - 86400_000);
+      break;
+    case "1W":
+      cutoff = new Date(now.getTime() - 7 * 86400_000);
+      break;
+    case "1M":
+      cutoff = new Date(now.getTime() - 30 * 86400_000);
+      break;
+    case "3M":
+      cutoff = new Date(now.getTime() - 90 * 86400_000);
+      break;
+    case "YTD":
+      cutoff = new Date(now.getFullYear(), 0, 1);
+      break;
+    case "1Y":
+      cutoff = new Date(now.getTime() - 365 * 86400_000);
+      break;
+    default:
+      return data;
   }
+
   const cutoffStr = cutoff.toISOString().slice(0, 10);
   return data.filter((d) => d.time >= cutoffStr);
 }
@@ -36,6 +55,7 @@ export default function EquityCurveChart({
 }: EquityCurveChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<ISeriesApi<"Area"> | null>(null);
   const [range, setRange] = useState<string>("ALL");
 
   const filteredData = useMemo(() => filterByRange(data, range), [data, range]);
@@ -74,20 +94,15 @@ export default function EquityCurveChart({
     });
 
     const areaSeries = chart.addSeries(AreaSeries, {
-      lineColor: isPositive ? "#34d399" : "#f87171",
-      topColor: isPositive ? "rgba(52,211,153,0.25)" : "rgba(248,113,113,0.25)",
-      bottomColor: isPositive ? "rgba(52,211,153,0.02)" : "rgba(248,113,113,0.02)",
+      lineColor: "#34d399",
+      topColor: "rgba(52,211,153,0.25)",
+      bottomColor: "rgba(52,211,153,0.02)",
       lineWidth: 2,
     });
 
-    areaSeries.setData(
-      filteredData.map((d) => ({ time: d.time as Time, value: d.value }))
-    );
-
-    chart.timeScale().fitContent();
     chartRef.current = chart;
+    seriesRef.current = areaSeries;
 
-    // Responsive resize
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         chart.applyOptions({ width: entry.contentRect.width });
@@ -99,8 +114,25 @@ export default function EquityCurveChart({
       ro.disconnect();
       chart.remove();
       chartRef.current = null;
+      seriesRef.current = null;
     };
-  }, [filteredData, height, isPositive]);
+  }, [height]);
+
+  useEffect(() => {
+    if (!seriesRef.current) return;
+
+    seriesRef.current.applyOptions({
+      lineColor: isPositive ? "#34d399" : "#f87171",
+      topColor: isPositive ? "rgba(52,211,153,0.25)" : "rgba(248,113,113,0.25)",
+      bottomColor: isPositive ? "rgba(52,211,153,0.02)" : "rgba(248,113,113,0.02)",
+    });
+
+    seriesRef.current.setData(
+      filteredData.map((point) => ({ time: point.time as Time, value: point.value })),
+    );
+
+    chartRef.current?.timeScale().fitContent();
+  }, [filteredData, isPositive]);
 
   return (
     <div>

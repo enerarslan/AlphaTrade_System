@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
+import { useShallow } from "zustand/react/shallow";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { Bot, FlaskConical, GitCompare, Layers, ShieldCheck, Sparkles } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -38,7 +39,22 @@ export default function ModelsPage() {
     fetchModelValidation,
     fetchChampionChallenger,
     promoteChampion,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      hasPermission: state.hasPermission,
+      modelStatuses: state.modelStatuses,
+      explainability: state.explainability,
+      modelRegistry: state.modelRegistry,
+      modelDrift: state.modelDrift,
+      modelValidation: state.modelValidation,
+      mfaStatus: state.mfaStatus,
+      fetchModelStatuses: state.fetchModelStatuses,
+      fetchExplainability: state.fetchExplainability,
+      fetchModelRegistry: state.fetchModelRegistry,
+      fetchModelDrift: state.fetchModelDrift,
+      fetchModelValidation: state.fetchModelValidation,
+      fetchChampionChallenger: state.fetchChampionChallenger,
+      promoteChampion: state.promoteChampion,
+    })));
 
   const [promoteName, setPromoteName] = useState("");
   const [promoteVersion, setPromoteVersion] = useState("");
@@ -54,7 +70,10 @@ export default function ModelsPage() {
     void fetchModelDrift();
     void fetchModelValidation();
     void fetchChampionChallenger();
-    const timer = setInterval(fetchModelStatuses, 30000);
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      void fetchModelStatuses();
+    }, 30000);
     return () => clearInterval(timer);
   }, [fetchModelStatuses, fetchExplainability, fetchModelRegistry, fetchModelDrift, fetchModelValidation, fetchChampionChallenger]);
 
@@ -288,3 +307,5 @@ export default function ModelsPage() {
     </motion.div>
   );
 }
+
+

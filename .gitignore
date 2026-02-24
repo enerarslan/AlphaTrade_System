@@ -110,3 +110,12 @@ Thumbs.db
 /AGENTS.md
 /CLAUDE.md
 
+# Local OpenClaw workspace guidance files
+/.openclaw/
+/BOOTSTRAP.md
+/HEARTBEAT.md
+/IDENTITY.md
+/SOUL.md
+/TOOLS.md
+/USER.md
+

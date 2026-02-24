@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
+import { useShallow } from "zustand/react/shallow";
 import { Globe, Key, Lock, Shield, ShieldCheck, UserCog } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,7 +40,28 @@ export default function SettingsPage() {
     rotateJwtSecret,
     resetKillSwitch,
     flushSiemQueue,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+      user: state.user,
+      role: state.role,
+      mfaStatus: state.mfaStatus,
+      mfaEnrollment: state.mfaEnrollment,
+      adminUsers: state.adminUsers,
+      securityStatus: state.securityStatus,
+      ssoStatus: state.ssoStatus,
+      siemStatus: state.siemStatus,
+      hasPermission: state.hasPermission,
+      fetchSsoStatus: state.fetchSsoStatus,
+      fetchAdminUsers: state.fetchAdminUsers,
+      fetchSecurityStatus: state.fetchSecurityStatus,
+      fetchSiemStatus: state.fetchSiemStatus,
+      initMfaEnrollment: state.initMfaEnrollment,
+      verifyMfaEnrollment: state.verifyMfaEnrollment,
+      disableMfaEnrollment: state.disableMfaEnrollment,
+      updateUserRole: state.updateUserRole,
+      rotateJwtSecret: state.rotateJwtSecret,
+      resetKillSwitch: state.resetKillSwitch,
+      flushSiemQueue: state.flushSiemQueue,
+    })));
 
   const [authorizedBy, setAuthorizedBy] = useState(user?.username ?? "operator");
   const [force, setForce] = useState(false);
@@ -65,17 +87,10 @@ export default function SettingsPage() {
     if (canReadAudit) void fetchSiemStatus();
   }, [canManageUsers, canRotateSecurity, canReadAudit, fetchSsoStatus, fetchAdminUsers, fetchSecurityStatus, fetchSiemStatus]);
 
-  useEffect(() => {
-    if (!targetUser && adminUsers.length > 0) {
-      setTargetUser(adminUsers[0].username);
-      const candidate = adminUsers[0].role as DashboardRole;
-      if (roleOptions.includes(candidate)) setTargetRole(candidate);
-    }
-  }, [adminUsers, targetUser]);
-
+  const effectiveTargetUser = targetUser || adminUsers[0]?.username || "";
   const selectedAdminUser = useMemo(
-    () => adminUsers.find((item) => item.username === targetUser),
-    [adminUsers, targetUser],
+    () => adminUsers.find((item) => item.username === effectiveTargetUser),
+    [adminUsers, effectiveTargetUser],
   );
 
   return (
@@ -191,7 +206,18 @@ export default function SettingsPage() {
             <CardContent className="space-y-3">
               <label className="block text-sm">
                 <span className="mb-1 block text-xs uppercase tracking-wider text-slate-500">User</span>
-                <select className="glass-select h-10 w-full" value={targetUser} onChange={(e) => setTargetUser(e.target.value)}>
+                <select
+                  className="glass-select h-10 w-full"
+                  value={effectiveTargetUser}
+                  onChange={(e) => {
+                    const nextUser = e.target.value;
+                    setTargetUser(nextUser);
+                    const candidate = adminUsers.find((item) => item.username === nextUser)?.role as DashboardRole | undefined;
+                    if (candidate && roleOptions.includes(candidate)) {
+                      setTargetRole(candidate);
+                    }
+                  }}
+                >
                   {adminUsers.map((item) => (
                     <option key={item.username} value={item.username}>{item.username}</option>
                   ))}
@@ -211,7 +237,7 @@ export default function SettingsPage() {
                   <input className="glass-input h-10 w-full font-mono" value={mfaCode} onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6-digit code" />
                 </label>
               )}
-              <Button variant="outline" onClick={() => void updateUserRole(targetUser, targetRole, "dashboard_admin_update", mfaCode || undefined)} disabled={!targetUser || (requiresMfa && mfaCode.length !== 6)}>
+              <Button variant="outline" onClick={() => void updateUserRole(effectiveTargetUser, targetRole, "dashboard_admin_update", mfaCode || undefined)} disabled={!effectiveTargetUser || (requiresMfa && mfaCode.length !== 6)}>
                 Update Role
               </Button>
               {selectedAdminUser && (
@@ -300,3 +326,5 @@ export default function SettingsPage() {
     </motion.div>
   );
 }
+
+

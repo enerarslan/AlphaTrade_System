@@ -876,6 +876,94 @@ class PerformanceAttributionService:
         self.risk = risk_attributor or RiskAttributor()
         self.trade = trade_attributor or TradeAttributor()
 
+    def compute_attribution(
+        self,
+        backtest_result: Any,
+        benchmark_returns: pd.Series | np.ndarray | list[float] | None = None,
+        benchmark_weights: pd.Series | dict[str, float] | None = None,
+        factor_returns: pd.DataFrame | None = None,
+    ) -> dict[str, Any]:
+        """Backward-compatible attribution entrypoint for BacktestState results."""
+        if backtest_result is None:
+            return {"error": "backtest_result_is_none"}
+
+        equity_curve = list(getattr(backtest_result, "equity_curve", []) or [])
+        if len(equity_curve) < 2:
+            return {"error": "insufficient_equity_curve"}
+
+        timestamps: list[pd.Timestamp] = []
+        equity_values: list[float] = []
+        for ts, equity in equity_curve:
+            timestamps.append(pd.Timestamp(ts))
+            equity_values.append(float(equity))
+
+        equity_series = pd.Series(equity_values, index=pd.DatetimeIndex(timestamps), dtype=float)
+        portfolio_returns = equity_series.pct_change().dropna()
+
+        # Build a lightweight portfolio-weight snapshot from final position values.
+        portfolio_weights = pd.Series(dtype=float)
+        final_equity = float(equity_values[-1]) if equity_values else 0.0
+        positions = getattr(backtest_result, "positions", {}) or {}
+        if final_equity > 0 and isinstance(positions, dict):
+            for symbol, position in positions.items():
+                market_value = getattr(position, "market_value", None)
+                if market_value is None:
+                    qty = float(getattr(position, "quantity", 0.0))
+                    px = float(getattr(position, "current_price", 0.0))
+                    market_value = qty * px
+                weight = float(market_value) / final_equity if final_equity else 0.0
+                portfolio_weights.loc[str(symbol)] = weight
+
+        normalized_benchmark_returns: pd.Series | None = None
+        if benchmark_returns is not None:
+            if isinstance(benchmark_returns, pd.Series):
+                normalized_benchmark_returns = benchmark_returns
+            else:
+                arr = np.asarray(benchmark_returns, dtype=float)
+                if arr.size > 0:
+                    idx = portfolio_returns.index[: arr.size]
+                    normalized_benchmark_returns = pd.Series(arr[: len(idx)], index=idx)
+
+        normalized_benchmark_weights: pd.Series | None = None
+        if benchmark_weights is not None:
+            if isinstance(benchmark_weights, pd.Series):
+                normalized_benchmark_weights = benchmark_weights
+            elif isinstance(benchmark_weights, dict):
+                normalized_benchmark_weights = pd.Series(benchmark_weights, dtype=float)
+
+        raw_trades = list(getattr(backtest_result, "trades", []) or [])
+        trade_dicts: list[dict[str, Any]] = []
+        for trade in raw_trades:
+            if isinstance(trade, dict):
+                trade_dicts.append(trade)
+            elif hasattr(trade, "to_dict"):
+                trade_dicts.append(trade.to_dict())
+
+        if portfolio_returns.empty:
+            return {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "summary": {"total_return": 0.0, "annualized_return": 0.0, "volatility": 0.0},
+                "trade_attribution": {
+                    "total_trades": len(trade_dicts),
+                    "trades": [],
+                    "summary": {"total_gross_pnl": 0.0, "total_net_pnl": 0.0},
+                },
+            }
+
+        period_start = portfolio_returns.index[0].to_pydatetime()
+        period_end = portfolio_returns.index[-1].to_pydatetime()
+
+        return self.generate_full_report(
+            portfolio_returns=portfolio_returns,
+            portfolio_weights=portfolio_weights,
+            benchmark_returns=normalized_benchmark_returns,
+            benchmark_weights=normalized_benchmark_weights,
+            factor_returns=factor_returns,
+            trades=trade_dicts,
+            period_start=period_start,
+            period_end=period_end,
+        )
+
     def generate_full_report(
         self,
         portfolio_returns: pd.Series,

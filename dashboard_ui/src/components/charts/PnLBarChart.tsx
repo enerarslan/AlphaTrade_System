@@ -1,5 +1,12 @@
 import { useEffect, useRef } from "react";
-import { createChart, ColorType, HistogramSeries, type IChartApi, type Time } from "lightweight-charts";
+import {
+  ColorType,
+  createChart,
+  HistogramSeries,
+  type IChartApi,
+  type ISeriesApi,
+  type Time,
+} from "lightweight-charts";
 
 interface PnLBarChartProps {
   data: Array<{ time: string; value: number }>;
@@ -9,6 +16,7 @@ interface PnLBarChartProps {
 export default function PnLBarChart({ data, height = 200 }: PnLBarChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -35,16 +43,8 @@ export default function PnLBarChart({ data, height = 200 }: PnLBarChartProps) {
       priceFormat: { type: "price", precision: 0, minMove: 1 },
     });
 
-    histSeries.setData(
-      data.map((d) => ({
-        time: d.time as Time,
-        value: d.value,
-        color: d.value >= 0 ? "rgba(52,211,153,0.8)" : "rgba(248,113,113,0.8)",
-      }))
-    );
-
-    chart.timeScale().fitContent();
     chartRef.current = chart;
+    seriesRef.current = histSeries;
 
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -57,8 +57,23 @@ export default function PnLBarChart({ data, height = 200 }: PnLBarChartProps) {
       ro.disconnect();
       chart.remove();
       chartRef.current = null;
+      seriesRef.current = null;
     };
-  }, [data, height]);
+  }, [height]);
+
+  useEffect(() => {
+    if (!seriesRef.current) return;
+
+    seriesRef.current.setData(
+      data.map((point) => ({
+        time: point.time as Time,
+        value: point.value,
+        color: point.value >= 0 ? "rgba(52,211,153,0.8)" : "rgba(248,113,113,0.8)",
+      })),
+    );
+
+    chartRef.current?.timeScale().fitContent();
+  }, [data]);
 
   return <div ref={containerRef} className="rounded-xl" />;
 }

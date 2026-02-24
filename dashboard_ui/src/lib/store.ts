@@ -629,6 +629,7 @@ function isStatus(error: unknown, status: number) {
 
 const reconnectTimers: Record<string, ReturnType<typeof setTimeout> | null> = {};
 const reconnectAttempts: Record<string, number> = {};
+let snapshotRefreshInFlight = false;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function connectSocket(channel: keyof WsState, onMessage: (payload: any) => void, setWs: (connected: boolean) => void) {
@@ -872,6 +873,10 @@ export const useStore = create<DashboardState>((set, get) => ({
   },
 
   fetchSnapshot: async () => {
+    if (snapshotRefreshInFlight) {
+      return;
+    }
+    snapshotRefreshInFlight = true;
     set({ isLoading: true, error: null });
     try {
       const tasks: Array<Promise<void>> = [
@@ -879,33 +884,21 @@ export const useStore = create<DashboardState>((set, get) => ({
         get().fetchPortfolio(),
         get().fetchPerformance(),
         get().fetchPositions(),
-        get().fetchOrders(),
         get().fetchSignals(),
         get().fetchModelStatuses(),
         get().fetchRiskMetrics(),
         get().fetchRiskConcentration(),
         get().fetchRiskCorrelation(),
         get().fetchRiskStress(),
-        get().fetchRiskAttribution(),
         get().fetchTCA(),
         get().fetchExecutionQuality(),
         get().fetchVar(),
-        get().fetchExplainability(),
         get().fetchModelRegistry(),
         get().fetchModelDrift(),
-        get().fetchModelValidation(),
-        get().fetchChampionChallenger(),
         get().fetchMfaStatus(),
-        get().fetchSecurityStatus(),
-        get().fetchSiemStatus(),
-        get().fetchAdminUsers(),
         get().fetchAlerts(),
-        get().fetchLogs(),
-        get().fetchAuditTrail(),
         get().fetchSloStatus(),
         get().fetchIncidents(),
-        get().fetchIncidentTimeline(),
-        get().fetchRunbooks(),
         get().fetchTradingStatus(),
         get().fetchJobs(),
       ];
@@ -915,6 +908,7 @@ export const useStore = create<DashboardState>((set, get) => ({
       set({ error: "Failed to refresh dashboard snapshot" });
     } finally {
       set({ isLoading: false });
+      snapshotRefreshInFlight = false;
     }
   },
 

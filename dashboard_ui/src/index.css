@@ -36,10 +36,10 @@
 
     --radius: 0.85rem;
 
-    --glow-cyan: 0 0 20px rgba(6, 182, 212, 0.3), 0 0 60px rgba(6, 182, 212, 0.1);
-    --glow-emerald: 0 0 20px rgba(16, 185, 129, 0.3), 0 0 60px rgba(16, 185, 129, 0.1);
-    --glow-rose: 0 0 20px rgba(244, 63, 94, 0.3), 0 0 60px rgba(244, 63, 94, 0.1);
-    --glow-amber: 0 0 20px rgba(245, 158, 11, 0.3), 0 0 60px rgba(245, 158, 11, 0.1);
+    --glow-cyan: 0 0 15px rgba(6, 182, 212, 0.2), 0 0 40px rgba(6, 182, 212, 0.06);
+    --glow-emerald: 0 0 15px rgba(16, 185, 129, 0.2), 0 0 40px rgba(16, 185, 129, 0.06);
+    --glow-rose: 0 0 15px rgba(244, 63, 94, 0.2), 0 0 40px rgba(244, 63, 94, 0.06);
+    --glow-amber: 0 0 15px rgba(245, 158, 11, 0.2), 0 0 40px rgba(245, 158, 11, 0.06);
   }
 
   * {
@@ -50,12 +50,8 @@
     @apply bg-background text-foreground antialiased;
     font-family: "Space Grotesk", "Segoe UI", sans-serif;
     min-height: 100vh;
-    background:
-      radial-gradient(ellipse at 15% 5%, rgba(6, 182, 212, 0.08) 0%, transparent 50%),
-      radial-gradient(ellipse at 85% 20%, rgba(16, 185, 129, 0.05) 0%, transparent 50%),
-      radial-gradient(ellipse at 50% 90%, rgba(99, 102, 241, 0.04) 0%, transparent 50%),
-      hsl(222, 47%, 6%);
-    background-attachment: fixed;
+    background: hsl(222, 47%, 5%);
+    overflow: hidden;
   }
 
   code,
@@ -63,86 +59,133 @@
     font-family: "IBM Plex Mono", monospace;
   }
 
-  /* Custom scrollbar */
+  /* Slim scrollbar */
   ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+    width: 4px;
+    height: 4px;
   }
   ::-webkit-scrollbar-track {
-    background: hsl(222, 40%, 9%);
+    background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: hsl(215, 25%, 22%);
-    border-radius: 3px;
+    background: rgba(148, 163, 184, 0.12);
+    border-radius: 2px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(215, 25%, 30%);
+    background: rgba(148, 163, 184, 0.25);
   }
 }
 
 @layer components {
+  /* === GLASSMORPHISM (perf-tuned: removed heavy backdrop-blur) === */
   .glass-panel {
-    @apply rounded-2xl border border-white/[0.07] bg-white/[0.03] shadow-lg backdrop-blur-xl;
+    @apply rounded-2xl border border-white/[0.08] bg-white/[0.03] shadow-lg;
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+      0 8px 32px rgba(0, 0, 0, 0.2);
   }
 
   .glass-card {
-    @apply rounded-xl border border-white/[0.08] bg-white/[0.04] backdrop-blur-md;
+    @apply rounded-xl border border-white/[0.08] bg-white/[0.04];
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.03) inset,
+      0 4px 20px rgba(0, 0, 0, 0.15);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .glass-card:hover {
+    border-color: rgba(6, 182, 212, 0.12);
+    box-shadow:
+      0 0 0 1px rgba(6, 182, 212, 0.05) inset,
+      0 6px 30px rgba(0, 0, 0, 0.2),
+      0 0 15px rgba(6, 182, 212, 0.04);
   }
 
   .glass-input {
-    @apply rounded-lg border border-white/[0.12] bg-white/[0.06] px-3 text-slate-200 placeholder-slate-500 backdrop-blur-sm transition-colors focus:border-cyan-500/50 focus:outline-none focus:ring-1 focus:ring-cyan-500/30;
+    @apply rounded-lg border border-white/[0.12] bg-white/[0.06] px-3 text-slate-200 placeholder-slate-500 transition-all;
+  }
+  .glass-input:focus {
+    @apply border-cyan-500/50 outline-none;
+    box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.12);
   }
 
   .glass-select {
-    @apply rounded-lg border border-white/[0.12] bg-white/[0.06] px-3 text-slate-200 backdrop-blur-sm transition-colors focus:border-cyan-500/50 focus:outline-none focus:ring-1 focus:ring-cyan-500/30;
+    @apply rounded-lg border border-white/[0.12] bg-white/[0.06] px-3 text-slate-200 transition-all;
     color-scheme: dark;
   }
-
+  .glass-select:focus {
+    @apply border-cyan-500/50 outline-none;
+    box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.12);
+  }
   .glass-select option {
     @apply bg-slate-900 text-slate-200;
+  }
+
+  /* === ANIMATED BORDER (uses CSS @property for GPU compositing) === */
+  .animated-border-card {
+    position: relative;
+    border-radius: 0.85rem;
+    overflow: hidden;
+  }
+  .animated-border-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1px;
+    border-radius: inherit;
+    background: conic-gradient(
+      from var(--border-angle, 0deg),
+      rgba(6, 182, 212, 0.25),
+      rgba(16, 185, 129, 0.08),
+      transparent 40%,
+      transparent 60%,
+      rgba(99, 102, 241, 0.08),
+      rgba(6, 182, 212, 0.25)
+    );
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    animation: rotateBorder 8s linear infinite;
+    will-change: --border-angle;
   }
 }
 
 @layer utilities {
-  .glow-cyan {
-    box-shadow: var(--glow-cyan);
-  }
-  .glow-emerald {
-    box-shadow: var(--glow-emerald);
-  }
-  .glow-rose {
-    box-shadow: var(--glow-rose);
-  }
-  .glow-amber {
-    box-shadow: var(--glow-amber);
+  .glow-cyan { box-shadow: var(--glow-cyan); }
+  .glow-emerald { box-shadow: var(--glow-emerald); }
+  .glow-rose { box-shadow: var(--glow-rose); }
+  .glow-amber { box-shadow: var(--glow-amber); }
+
+  .text-glow-cyan { text-shadow: 0 0 10px rgba(6, 182, 212, 0.4); }
+  .text-glow-emerald { text-shadow: 0 0 10px rgba(16, 185, 129, 0.4); }
+  .text-glow-rose { text-shadow: 0 0 10px rgba(244, 63, 94, 0.4); }
+
+  /* Gradient text */
+  .gradient-text {
+    background: linear-gradient(135deg, #06b6d4, #10b981, #6366f1);
+    background-size: 200% 200%;
+    animation: gradientShift 6s ease infinite;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
   }
 
-  .text-glow-cyan {
-    text-shadow: 0 0 12px rgba(6, 182, 212, 0.5);
-  }
-  .text-glow-emerald {
-    text-shadow: 0 0 12px rgba(16, 185, 129, 0.5);
-  }
-  .text-glow-rose {
-    text-shadow: 0 0 12px rgba(244, 63, 94, 0.5);
-  }
-
-  .panel-surface {
-    @apply glass-panel;
-  }
+  .panel-surface { @apply glass-panel; }
 
   .mission-gradient {
     background:
-      radial-gradient(ellipse at 15% 5%, rgba(6, 182, 212, 0.06) 0%, transparent 50%),
-      radial-gradient(ellipse at 85% 20%, rgba(16, 185, 129, 0.04) 0%, transparent 50%),
+      radial-gradient(ellipse at 15% 5%, rgba(6, 182, 212, 0.05) 0%, transparent 50%),
+      radial-gradient(ellipse at 85% 20%, rgba(16, 185, 129, 0.03) 0%, transparent 50%),
       hsl(222, 47%, 6%);
   }
 
   .mission-grid {
     background-image:
-      linear-gradient(rgba(148, 163, 184, 0.04) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(148, 163, 184, 0.04) 1px, transparent 1px);
-    background-size: 32px 32px;
+      linear-gradient(rgba(148, 163, 184, 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148, 163, 184, 0.025) 1px, transparent 1px);
+    background-size: 40px 40px;
+    /* Removed continuous gridMove animation — static grid is sufficient */
   }
 
   .status-ping::before {
@@ -150,8 +193,8 @@
     position: absolute;
     inset: -2px;
     border-radius: 9999px;
-    background: radial-gradient(circle, rgba(6, 182, 212, 0.35), transparent 65%);
-    animation: statusPulse 2.2s ease-in-out infinite;
+    background: radial-gradient(circle, rgba(6, 182, 212, 0.25), transparent 65%);
+    animation: statusPulse 3s ease-in-out infinite;
     z-index: -1;
   }
 
@@ -161,64 +204,102 @@
         -45deg,
         transparent,
         transparent 8px,
-        rgba(244, 63, 94, 0.04) 8px,
-        rgba(244, 63, 94, 0.04) 16px
+        rgba(244, 63, 94, 0.03) 8px,
+        rgba(244, 63, 94, 0.03) 16px
       );
-    border: 1px solid rgba(244, 63, 94, 0.2);
+    border: 1px solid rgba(244, 63, 94, 0.15);
   }
+
+  /* Pulse dot — simplified */
+  .pulse-dot {
+    position: relative;
+  }
+  .pulse-dot::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: 9999px;
+    background: inherit;
+    animation: pulseDot 2.5s ease-in-out infinite;
+    opacity: 0;
+  }
+
+  /* Scanline — only applied where explicitly needed */
+  .scanline {
+    position: relative;
+    overflow: hidden;
+  }
+  .scanline::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 50%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(6, 182, 212, 0.4), transparent);
+    animation: scanlineMove 6s ease-in-out infinite;
+  }
+}
+
+/* ═══ KEYFRAMES (all GPU-friendly transform/opacity only) ═══ */
+
+@keyframes rotateBorder {
+  from { --border-angle: 0deg; }
+  to { --border-angle: 360deg; }
+}
+
+@property --border-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes gradientShift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
 }
 
 @keyframes signalTape {
-  from {
-    transform: translateX(0);
-  }
-  to {
-    transform: translateX(-50%);
-  }
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
 }
 
 @keyframes statusPulse {
-  0%,
-  100% {
-    opacity: 0.35;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.85;
-    transform: scale(1.06);
-  }
+  0%, 100% { opacity: 0.25; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.04); }
+}
+
+@keyframes pulseDot {
+  0%, 100% { opacity: 0; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(1.8); }
+}
+
+@keyframes scanlineMove {
+  0% { left: -50%; }
+  100% { left: 150%; }
 }
 
 @keyframes fadeInUp {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes shimmer {
-  0% {
-    background-position: -200% 0;
-  }
-  100% {
-    background-position: 200% 0;
-  }
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
 }
 
 .animate-signal-tape {
-  animation: signalTape 28s linear infinite;
+  animation: signalTape 35s linear infinite;
+  will-change: transform;
 }
 
 .animate-fade-in-up {
-  animation: fadeInUp 0.5s ease-out forwards;
+  animation: fadeInUp 0.4s ease-out forwards;
 }
 
 .animate-shimmer {
-  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.04) 50%, transparent 100%);
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.03) 50%, transparent 100%);
   background-size: 200% 100%;
   animation: shimmer 3s ease-in-out infinite;
 }

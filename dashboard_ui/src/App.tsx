@@ -15,7 +15,7 @@ const SettingsPage = lazy(() => import("@/pages/settings"));
 const LoginPage = lazy(() => import("@/pages/login"));
 
 function GuardedRoute({ permission, children }: { permission: string; children: import("react").ReactElement }) {
-  const { role } = useStore();
+  const role = useStore((state) => state.role);
   if (!hasPermissionForRole(role, permission)) {
     return <Navigate to="/" replace />;
   }
@@ -31,7 +31,8 @@ function RouteFallback() {
 }
 
 function ProtectedApp() {
-  const { token, initialize } = useStore();
+  const token = useStore((state) => state.token);
+  const initialize = useStore((state) => state.initialize);
 
   useEffect(() => {
     void initialize();

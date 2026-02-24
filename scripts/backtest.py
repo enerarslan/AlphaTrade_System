@@ -323,6 +323,7 @@ class BacktestSession:
     execution_mode: str = "realistic"
     use_gpu: bool = False
     use_database: bool = True  # Load data from PostgreSQL + TimescaleDB
+    benchmark_symbol: str | None = None
 
     # Advanced options
     slippage_bps: float = 5.0
@@ -377,6 +378,7 @@ class BacktestRunner:
         self.data: dict[str, pd.DataFrame] = {}
         self.features: dict[str, pd.DataFrame] = {}
         self.signals: dict[str, pd.DataFrame] = {}
+        self.benchmark_data: Any | None = None
 
     def run(self) -> BacktestResult:
         """Execute the complete backtest workflow.
@@ -455,6 +457,44 @@ class BacktestRunner:
 
         if not self.data:
             raise ValueError("No data loaded for any symbol")
+
+        # Optional benchmark loading for relative performance metrics.
+        benchmark = (self.session.benchmark_symbol or "").strip().upper()
+        if benchmark and benchmark not in self.data:
+            try:
+                self.benchmark_data = self.session.data_loader.load_symbol(
+                    symbol=benchmark,
+                    start_date=self.session.start_date,
+                    end_date=self.session.end_date,
+                )
+                logger.info(f"Loaded benchmark data for {benchmark}")
+            except Exception as e:
+                logger.warning(f"Failed to load benchmark {benchmark}: {e}")
+
+    @staticmethod
+    def _extract_close_returns(df: Any) -> np.ndarray | None:
+        """Extract benchmark returns from close prices."""
+        try:
+            close_series = None
+            if hasattr(df, "columns") and "close" in df.columns:
+                close_series = df["close"]
+            elif hasattr(df, "columns") and "Close" in df.columns:
+                close_series = df["Close"]
+            if close_series is None:
+                return None
+
+            if hasattr(close_series, "to_numpy"):
+                closes = close_series.to_numpy()
+            else:
+                closes = np.asarray(close_series)
+
+            closes = np.asarray(closes, dtype=float)
+            if closes.size < 2:
+                return None
+            returns = pd.Series(closes).pct_change().dropna().to_numpy(dtype=float)
+            return returns if returns.size > 0 else None
+        except Exception:
+            return None
 
     def _compute_features(self) -> None:
         """Compute features for all symbols."""
@@ -630,10 +670,17 @@ class BacktestRunner:
     def _analyze_results(self, result: BacktestResult) -> dict[str, Any]:
         """Analyze backtest results comprehensively."""
         self.session.analyzer = PerformanceAnalyzer()
+        benchmark_returns = None
+        benchmark = (self.session.benchmark_symbol or "").strip().upper()
+        if benchmark:
+            if benchmark in self.data:
+                benchmark_returns = self._extract_close_returns(self.data[benchmark])
+            elif self.benchmark_data is not None:
+                benchmark_returns = self._extract_close_returns(self.benchmark_data)
 
         try:
             # Use the analyze method which generates a PerformanceReport
-            report = self.session.analyzer.analyze(result)
+            report = self.session.analyzer.analyze(result, benchmark_returns=benchmark_returns)
 
             # Extract metrics from report
             analysis = {
@@ -790,29 +837,34 @@ class BacktestRunner:
         """Run Monte Carlo simulations for confidence intervals."""
         logger.info(f"Running {self.session.monte_carlo_sims} Monte Carlo simulations")
 
-        # Get daily returns from result
-        if hasattr(result, 'equity_curve') and result.equity_curve is not None:
-            equity = result.equity_curve
-            returns = equity.pct_change().dropna()
+        if not hasattr(result, "equity_curve") or not result.equity_curve:
+            logger.warning("Skipping Monte Carlo: no equity curve available")
+            return
 
-            # Run simulations
-            simulated_finals = []
-            for _ in range(self.session.monte_carlo_sims):
-                # Shuffle returns
-                shuffled = returns.sample(frac=1, replace=True)
-                # Compute final equity
-                simulated_equity = float(self.session.initial_capital) * (1 + shuffled).cumprod()
-                simulated_finals.append(simulated_equity.iloc[-1])
+        timestamps = [ts for ts, _ in result.equity_curve]
+        equity_values = [float(equity) for _, equity in result.equity_curve]
+        equity_series = pd.Series(equity_values, index=pd.DatetimeIndex(timestamps), dtype=float)
+        returns = equity_series.pct_change().dropna()
+        if returns.empty:
+            logger.warning("Skipping Monte Carlo: insufficient return observations")
+            return
 
-            # Compute percentiles
-            percentiles = np.percentile(simulated_finals, [5, 25, 50, 75, 95])
+        # Bootstrap resampling of observed returns.
+        simulated_finals = []
+        return_values = returns.to_numpy(dtype=float)
+        for _ in range(self.session.monte_carlo_sims):
+            sampled = np.random.choice(return_values, size=return_values.size, replace=True)
+            simulated_equity = float(self.session.initial_capital) * np.cumprod(1.0 + sampled)
+            simulated_finals.append(float(simulated_equity[-1]))
 
-            print("\nMonte Carlo Analysis:")
-            print(f"  5th Percentile:    ${percentiles[0]:,.2f}")
-            print(f"  25th Percentile:   ${percentiles[1]:,.2f}")
-            print(f"  Median:            ${percentiles[2]:,.2f}")
-            print(f"  75th Percentile:   ${percentiles[3]:,.2f}")
-            print(f"  95th Percentile:   ${percentiles[4]:,.2f}")
+        percentiles = np.percentile(simulated_finals, [5, 25, 50, 75, 95])
+
+        print("\nMonte Carlo Analysis:")
+        print(f"  5th Percentile:    ${percentiles[0]:,.2f}")
+        print(f"  25th Percentile:   ${percentiles[1]:,.2f}")
+        print(f"  Median:            ${percentiles[2]:,.2f}")
+        print(f"  75th Percentile:   ${percentiles[3]:,.2f}")
+        print(f"  95th Percentile:   ${percentiles[4]:,.2f}")
 
     def save_results(self, output_path: Path) -> None:
         """Save backtest results to file.
@@ -904,7 +956,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         Exit code (0 for success)
     """
     # Setup logging
-    setup_logging(level=args.log_level, log_format=LogFormat.TEXT)
+    setup_logging(level=getattr(args, "log_level", "INFO"), log_format=LogFormat.TEXT)
 
     # Parse dates
     try:
@@ -932,6 +984,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         execution_mode=args.execution_mode,
         use_gpu=args.gpu,
         use_database=use_database,
+        benchmark_symbol=getattr(args, "benchmark", None),
         slippage_bps=args.slippage_bps,
         commission_bps=args.commission_bps,
         monte_carlo_sims=args.monte_carlo,
@@ -966,6 +1019,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--commission-bps", type=float, default=1.0)
     parser.add_argument("--monte-carlo", type=int, default=0)
+    parser.add_argument("--benchmark", type=str, default=None, help="Optional benchmark symbol (e.g., SPY)")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--log-level", default="INFO")
