@@ -783,8 +783,35 @@ class TradingEngine:
                 # P0 FIX: Pre-trade risk check with portfolio lock for atomicity
                 # FIX: Use check_all() instead of non-existent check_order()
                 with self._risk_checker.portfolio_lock:
+                    market_data: dict[str, Any] = {}
+                    latest_bar = self._latest_bars.get(request.symbol)
+                    if latest_bar is not None:
+                        bars_per_day = max(1, int(390 / max(self.config.bar_interval_minutes, 1)))
+                        adv_proxy = max(int(latest_bar.volume), int(latest_bar.volume) * bars_per_day)
+                        market_data["avg_daily_volume"] = adv_proxy
+                        market_data["avg_daily_dollar_volume"] = float(
+                            Decimal(str(adv_proxy)) * latest_bar.close
+                        )
+
+                    # Forward optional upstream liquidity hints if strategy populated metadata.
+                    for key in (
+                        "avg_daily_volume",
+                        "average_daily_volume",
+                        "adv",
+                        "avg_daily_dollar_volume",
+                        "average_daily_dollar_volume",
+                        "addv",
+                        "spread_bps",
+                        "bid_ask_spread_bps",
+                    ):
+                        if key in managed.request.metadata:
+                            market_data[key] = managed.request.metadata[key]
+
                     can_submit, risk_results = self._risk_limits_manager.pre_trade_check(
-                        managed.order, portfolio, current_price or Decimal("0")
+                        managed.order,
+                        portfolio,
+                        current_price or Decimal("0"),
+                        market_data=market_data or None,
                     )
 
                     # Check if any risk check failed

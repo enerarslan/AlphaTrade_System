@@ -62,6 +62,34 @@ class TestParseArgs:
             args = parse_args()
             assert args.initial_capital == 200000.0
 
+    def test_parse_replay_command(self):
+        """Test parsing deterministic replay command."""
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "replay",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+                "--symbols",
+                "AAPL",
+                "MSFT",
+                "--max-drawdown",
+                "0.15",
+                "--no-allow-short",
+            ],
+        ):
+            args = parse_args()
+            assert args.command == "replay"
+            assert args.start_date == "2024-01-01"
+            assert args.end_date == "2024-01-31"
+            assert args.symbols == ["AAPL", "MSFT"]
+            assert args.max_drawdown == pytest.approx(0.15)
+            assert args.allow_short is False
+
     def test_parse_dashboard_command(self):
         """Test parsing dashboard command."""
         with patch.object(sys, 'argv', ['main.py', 'dashboard']):

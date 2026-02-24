@@ -41,6 +41,17 @@ from quant_trading_system.backtest.optimizer import (
     StrategyOptimizer,
     WalkForwardOptimizer,
 )
+from quant_trading_system.backtest.replay import (
+    DeterministicReplayStrategy,
+    ReplayOutcome,
+    ReplayScenario,
+    ReplaySignalConfig,
+    ReplaySLOGates,
+    ReplaySuiteReport,
+    evaluate_replay_slo,
+    run_replay_scenario,
+    run_replay_suite,
+)
 from quant_trading_system.backtest.simulator import (
     BaseSlippageModel,
     BidAskSimulator,
@@ -113,4 +124,14 @@ __all__ = [
     "RandomSearchOptimizer",
     "StrategyOptimizer",
     "WalkForwardOptimizer",
+    # Replay
+    "DeterministicReplayStrategy",
+    "ReplayOutcome",
+    "ReplayScenario",
+    "ReplaySignalConfig",
+    "ReplaySLOGates",
+    "ReplaySuiteReport",
+    "evaluate_replay_slo",
+    "run_replay_scenario",
+    "run_replay_suite",
 ]

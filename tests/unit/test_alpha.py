@@ -242,6 +242,52 @@ class TestMomentumAlphas:
             assert signal.alpha_name == alpha.name
             assert -1 <= signal.value <= 1
 
+    def test_generate_signals_rejects_invalid_ohlcv(self, sample_ohlcv_df):
+        """Signal generation must fail fast on invalid OHLC relationships."""
+        from quant_trading_system.alpha.momentum_alphas import PriceMomentum
+
+        invalid_df = sample_ohlcv_df.with_columns(
+            pl.col("low").alias("high"),
+            pl.col("high").alias("low"),
+        )
+        alpha = PriceMomentum(lookback=20)
+
+        with pytest.raises(ValueError, match="Alpha validation failed"):
+            alpha.generate_signals(invalid_df, symbol="AAPL")
+
+    def test_alpha_registry_compute_all_isolates_failures(self, sample_ohlcv_df):
+        """One broken alpha must not stop the entire registry batch."""
+        from quant_trading_system.alpha.alpha_base import (
+            AlphaFactor,
+            AlphaHorizon,
+            AlphaRegistry,
+            AlphaType,
+        )
+        from quant_trading_system.alpha.momentum_alphas import PriceMomentum
+
+        class BrokenAlpha(AlphaFactor):
+            def __init__(self) -> None:
+                super().__init__(
+                    name="broken_alpha",
+                    alpha_type=AlphaType.ML_BASED,
+                    horizon=AlphaHorizon.SHORT,
+                    lookback=5,
+                )
+
+            def compute(self, df, features=None):
+                raise RuntimeError("intentional failure")
+
+            def get_params(self):
+                return {}
+
+        registry = AlphaRegistry()
+        registry.register(PriceMomentum(lookback=20))
+        registry.register(BrokenAlpha())
+
+        results = registry.compute_all(sample_ohlcv_df)
+        assert "price_momentum_20" in results
+        assert "broken_alpha" not in results
+
 
 class TestMeanReversionAlphas:
     """Tests for mean reversion alpha factors."""

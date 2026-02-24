@@ -120,7 +120,12 @@ from quant_trading_system.execution.order_manager import (
     OrderRequest,
     OrderPriority,
 )
-from quant_trading_system.execution.alpaca_client import AlpacaClient
+from quant_trading_system.execution.alpaca_client import AlpacaClient, TradingEnvironment
+from quant_trading_system.execution.failover import (
+    BrokerEndpoint,
+    BrokerFailoverPolicy,
+    FailoverBrokerClient,
+)
 from quant_trading_system.execution.tca import TCAManager, PreTradeCostEstimator
 
 # Trading Engine
@@ -163,7 +168,11 @@ from quant_trading_system.monitoring.logger import (
     get_logger,
     LogCategory,
 )
-from quant_trading_system.monitoring.metrics import get_metrics_collector
+from quant_trading_system.monitoring.metrics import get_metrics_collector, get_heartbeat_service
+from quant_trading_system.monitoring.health import (
+    SystemHealthChecker,
+    HealthStatus as CheckerHealthStatus,
+)
 from quant_trading_system.monitoring.alerting import (
     get_alert_manager,
     AlertType,
@@ -252,7 +261,11 @@ class TradingSession:
         self.tca_manager: Optional[TCAManager] = None
         self.staleness_detector: Optional[ModelStalenessDetector] = None
         self.ab_test_manager: Optional[ExperimentManager] = None
+        self.broker_client: Any | None = None
         self.metrics_collector = None
+        self.heartbeat_service = None
+        self.health_checker: Optional[SystemHealthChecker] = None
+        self._last_health_probe: Optional[datetime] = None
         self.alert_manager = None
         self.audit_logger = None
         self.redis_bridge: Optional[RedisEventBridge] = None
@@ -306,6 +319,19 @@ class TradingSession:
             self.metrics_collector = get_metrics_collector()
             self.alert_manager = get_alert_manager()
             self.audit_logger = create_audit_logger()
+            heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30"))
+            heartbeat_webhook = os.environ.get("HEARTBEAT_WEBHOOK_URL", "") or None
+            pagerduty_key = self.settings.alerts.pagerduty_service_key or None
+            self.heartbeat_service = get_heartbeat_service(
+                interval_seconds=heartbeat_interval,
+                pagerduty_routing_key=pagerduty_key,
+                custom_webhook_url=heartbeat_webhook,
+            )
+            await self.heartbeat_service.start()
+            self.heartbeat_service.update_component_health("monitoring", 1)
+            if self.redis_bridge is not None:
+                self.heartbeat_service.update_component_health("redis", 1)
+            self.health_checker = SystemHealthChecker()
 
             # 4. Setup tracing
             configure_tracing(
@@ -317,33 +343,109 @@ class TradingSession:
             logger.info("Initializing safety components...")
 
             # Kill Switch (P0 Safety)
+            kill_switch_store = None
+            try:
+                from quant_trading_system.database.connection import get_redis_manager
+
+                kill_switch_store = get_redis_manager(self.settings).client
+            except Exception as exc:
+                logger.warning(f"Kill switch persistent store unavailable, using in-memory state: {exc}")
+
             self.kill_switch = KillSwitch(
                 config=RiskLimitsConfig(
                     max_drawdown_pct=self.config.kill_switch_drawdown,
                     max_daily_loss_pct=self.config.max_daily_loss_pct,
                 ),
                 event_bus=self.event_bus,
+                state_store=kill_switch_store,
+                audit_logger=self.audit_logger,
             )
 
             # Pre-trade risk checker (P0 Safety)
             self.risk_checker = PreTradeRiskChecker(
                 config=RiskLimitsConfig(),
+                audit_logger=self.audit_logger,
             )
 
             # 6. Initialize execution components
             logger.info("Initializing execution components...")
 
-            # Alpaca client
-            alpaca_client = AlpacaClient(
+            # Primary broker client
+            environment = (
+                TradingEnvironment.PAPER
+                if self.mode != TradingMode.LIVE
+                else TradingEnvironment.LIVE
+            )
+            primary_client = AlpacaClient(
                 api_key=self.settings.alpaca.api_key,
                 api_secret=self.settings.alpaca.api_secret,
-                paper=self.mode != TradingMode.LIVE,
+                environment=environment,
             )
+            broker_client: Any = primary_client
+
+            # Optional broker failover orchestration (P2 institutional resilience)
+            enable_failover = os.environ.get("ENABLE_BROKER_FAILOVER", "false").lower() == "true"
+            if enable_failover:
+                secondary_api_key = os.environ.get("ALPACA_FAILOVER_API_KEY", "").strip()
+                secondary_api_secret = os.environ.get("ALPACA_FAILOVER_API_SECRET", "").strip()
+                if secondary_api_key and secondary_api_secret:
+                    secondary_paper = (
+                        os.environ.get("ALPACA_FAILOVER_PAPER_TRADING", "true").lower() == "true"
+                    )
+                    secondary_environment = (
+                        TradingEnvironment.PAPER
+                        if secondary_paper
+                        else TradingEnvironment.LIVE
+                    )
+                    secondary_client = AlpacaClient(
+                        api_key=secondary_api_key,
+                        api_secret=secondary_api_secret,
+                        environment=secondary_environment,
+                    )
+                    failover_policy = BrokerFailoverPolicy(
+                        max_consecutive_failures=int(
+                            os.environ.get("BROKER_FAILOVER_MAX_CONSECUTIVE_FAILURES", "3")
+                        ),
+                        recovery_cooldown_seconds=int(
+                            os.environ.get("BROKER_FAILOVER_RECOVERY_COOLDOWN_SECONDS", "120")
+                        ),
+                    )
+                    broker_client = FailoverBrokerClient(
+                        endpoints=[
+                            BrokerEndpoint(
+                                name="alpaca_primary",
+                                client=primary_client,
+                                priority=0,
+                                is_primary=True,
+                            ),
+                            BrokerEndpoint(
+                                name="alpaca_secondary",
+                                client=secondary_client,
+                                priority=1,
+                            ),
+                        ],
+                        policy=failover_policy,
+                        metrics_collector=self.metrics_collector,
+                        audit_logger=self.audit_logger,
+                    )
+                    logger.info(
+                        "Broker failover enabled with primary/secondary Alpaca endpoints"
+                    )
+                else:
+                    logger.warning(
+                        "ENABLE_BROKER_FAILOVER=true but secondary credentials are missing; "
+                        "running with primary broker only"
+                    )
+
+            self.broker_client = broker_client
+            self.heartbeat_service.update_component_health("broker", 1)
 
             # Order manager
             self.order_manager = OrderManager(
-                client=alpaca_client,
+                client=broker_client,
                 event_bus=self.event_bus,
+                kill_switch=self.kill_switch,
+                metrics_collector=self.metrics_collector,
             )
 
             # TCA manager
@@ -511,8 +613,9 @@ class TradingSession:
 
         # 2. Check broker connectivity
         try:
-            if self.order_manager:
-                account = await self.order_manager.client.get_account()
+            broker_client = self.broker_client or (self.order_manager.client if self.order_manager else None)
+            if broker_client:
+                account = await broker_client.get_account()
                 check_results.append(("broker", True, f"Connected, equity: ${account.equity}"))
         except Exception as e:
             logger.error(f"Broker connection failed: {e}")
@@ -546,8 +649,9 @@ class TradingSession:
 
         # 5. Position reconciliation
         try:
-            if self.order_manager:
-                positions = await self.order_manager.client.list_positions()
+            broker_client = self.broker_client or (self.order_manager.client if self.order_manager else None)
+            if broker_client:
+                positions = await broker_client.get_positions()
                 check_results.append(("positions", True, f"{len(positions)} open positions"))
         except Exception as e:
             check_results.append(("positions", False, str(e)))
@@ -607,6 +711,9 @@ class TradingSession:
         ))
 
         try:
+            if self.order_manager:
+                await self.order_manager.start()
+
             # Start trading engine
             await self.trading_engine.start()
 
@@ -662,7 +769,10 @@ class TradingSession:
                 # 4. Process trading engine
                 await self.trading_engine.process_tick()
 
-                # 5. Sleep before next iteration
+                # 5. Refresh heartbeat component health snapshots periodically
+                await self._refresh_health_snapshots()
+
+                # 6. Sleep before next iteration
                 await asyncio.sleep(1)  # 1 second tick
 
             except asyncio.CancelledError:
@@ -672,6 +782,54 @@ class TradingSession:
             except Exception as e:
                 logger.exception(f"Error in trading loop: {e}")
                 await asyncio.sleep(5)  # Back off on error
+
+    async def _refresh_health_snapshots(self) -> None:
+        """Propagate live component health into heartbeat service."""
+        if self.heartbeat_service is None or self.health_checker is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        if self._last_health_probe and (now - self._last_health_probe).total_seconds() < 30:
+            return
+
+        self._last_health_probe = now
+        checks = [
+            self.health_checker.check_database(),
+            self.health_checker.check_redis(),
+            self.health_checker.check_broker(),
+            self.health_checker.check_data_feed(),
+        ]
+
+        results = await asyncio.gather(*checks, return_exceptions=True)
+        component_names = ["database", "redis", "broker", "data_feed"]
+
+        for component, result in zip(component_names, results):
+            if isinstance(result, Exception):
+                logger.warning(f"Health probe failed for {component}: {result}")
+                self.heartbeat_service.update_component_health(component, -1)
+                continue
+            mapped = self._map_health_status(result.status)
+            self.heartbeat_service.update_component_health(component, mapped)
+
+        failover_client = self.broker_client
+        if failover_client and hasattr(failover_client, "get_failover_status"):
+            try:
+                status = failover_client.get_failover_status()
+                active = status.get("active_broker")
+                primary = status.get("primary_broker")
+                # If backup broker is active, surface as degraded broker health.
+                if active and primary and active != primary:
+                    self.heartbeat_service.update_component_health("broker", 0)
+            except Exception as exc:
+                logger.debug(f"Broker failover status unavailable: {exc}")
+
+    def _map_health_status(self, status: CheckerHealthStatus) -> int:
+        """Map health checker status enum to heartbeat status scale."""
+        if status == CheckerHealthStatus.HEALTHY:
+            return 1
+        if status == CheckerHealthStatus.DEGRADED:
+            return 0
+        return -1
 
     async def stop(self, reason: str = "Normal shutdown") -> None:
         """Stop the trading session gracefully.
@@ -691,6 +849,8 @@ class TradingSession:
             # Stop trading engine
             if self.trading_engine:
                 await self.trading_engine.stop(reason)
+            if self.order_manager:
+                await self.order_manager.stop()
 
             # Generate session summary
             await self._generate_session_summary()
@@ -747,8 +907,18 @@ class TradingSession:
             if self.vix_feed:
                 await self.vix_feed.close()
 
+            if self.broker_client and hasattr(self.broker_client, "disconnect"):
+                try:
+                    await self.broker_client.disconnect()
+                except Exception as exc:
+                    logger.warning(f"Broker disconnect during cleanup failed: {exc}")
+
             if self.redis_bridge:
                 await self.redis_bridge.stop()
+
+            if self.heartbeat_service:
+                self.heartbeat_service.update_component_health("monitoring", -1)
+                await self.heartbeat_service.stop()
 
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")

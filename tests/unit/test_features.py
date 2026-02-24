@@ -755,6 +755,32 @@ class TestFeaturePipeline:
         assert stats_after_config_change["misses"] == 2
         assert stats_after_config_change["size"] == 2
 
+    def test_cache_key_changes_with_universe_data(self, sample_ohlcv_df):
+        """Cross-sectional cache keys must vary when universe snapshot changes."""
+        from quant_trading_system.features.feature_pipeline import FeatureConfig, FeatureGroup, FeaturePipeline
+
+        pipeline = FeaturePipeline(
+            FeatureConfig(
+                groups=[FeatureGroup.CROSS_SECTIONAL],
+                use_optimized_pipeline=False,
+            )
+        )
+
+        universe_a = {
+            "MSFT": sample_ohlcv_df.with_columns(
+                (pl.col("close") * 1.00).alias("close")
+            )
+        }
+        universe_b = {
+            "MSFT": sample_ohlcv_df.with_columns(
+                (pl.col("close") * 1.01).alias("close")
+            )
+        }
+
+        key_a = pipeline._generate_cache_key(sample_ohlcv_df, "AAPL", universe_data=universe_a)
+        key_b = pipeline._generate_cache_key(sample_ohlcv_df, "AAPL", universe_data=universe_b)
+        assert key_a != key_b
+
     def test_feature_validator(self, sample_ohlcv_df):
         """Test feature validator."""
         from quant_trading_system.features.feature_pipeline import FeatureValidator

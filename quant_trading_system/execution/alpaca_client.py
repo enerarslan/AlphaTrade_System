@@ -934,6 +934,10 @@ class AlpacaClient:
         data = await self._request("GET", "/v2/positions")
         return [AlpacaPosition.from_alpaca(p) for p in data]
 
+    async def list_positions(self) -> list[AlpacaPosition]:
+        """Backward-compatible alias for callers expecting list_positions()."""
+        return await self.get_positions()
+
     async def get_position(self, symbol: str) -> AlpacaPosition | None:
         """Get position for a specific symbol.
 

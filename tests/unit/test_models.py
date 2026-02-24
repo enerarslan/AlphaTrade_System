@@ -609,6 +609,24 @@ class TestModelRegistry:
         loaded = registry.get_model("test_rf", model_class=RandomForestModel)
         assert loaded.is_fitted
 
+    def test_register_stores_extra_metadata(self, sample_regression_data, temp_model_dir):
+        """Registry should persist governance metadata with model versions."""
+        X, y = sample_regression_data
+        registry = ModelRegistry(temp_model_dir)
+
+        model = RandomForestModel(name="meta_rf", n_estimators=10)
+        model.fit(X, y)
+        version_id = registry.register(
+            model,
+            metrics={"r2": 0.90},
+            extra_metadata={"validation_gates": {"overall_passed": True}},
+        )
+
+        model_versions = registry.list_models("meta_rf")
+        matched = [m for m in model_versions if m["version_id"] == version_id]
+        assert len(matched) == 1
+        assert matched[0]["extra_metadata"]["validation_gates"]["overall_passed"] is True
+
     def test_list_models(self, sample_regression_data, temp_model_dir):
         """Test listing registered models."""
         X, y = sample_regression_data
@@ -1012,3 +1030,64 @@ class TestReinforcementLearning:
         predictions = agent.predict(features[:10])
         assert len(predictions) == 10
         assert all(-1 <= p <= 1 for p in predictions)
+
+
+class TestModelStalenessDetector:
+    """Tests for staleness/quarantine behavior."""
+
+    def test_auto_quarantine_on_negative_ic(self):
+        """Sustained negative IC should quarantine model automatically."""
+        from quant_trading_system.models.staleness_detector import (
+            ModelHealth,
+            ModelStalenessDetector,
+            StalenessConfig,
+            StalenessReason,
+        )
+
+        quarantines = []
+
+        def on_quarantine(model_id, reason):
+            quarantines.append((model_id, reason))
+
+        detector = ModelStalenessDetector(
+            config=StalenessConfig(
+                min_observations=10,
+                ic_lookback=30,
+                ic_smoothing_window=5,
+                min_ic_healthy=0.2,
+                min_ic_warning=0.05,
+                min_ic_stale=-0.01,
+                auto_quarantine=True,
+            ),
+            on_quarantine=on_quarantine,
+        )
+
+        health = ModelHealth.UNKNOWN
+        for i in range(1, 16):
+            health = detector.add_observation(
+                "model_a",
+                prediction=float(i),
+                actual_return=float(-i),
+            )
+
+        assert health == ModelHealth.STALE
+        assert detector.is_usable("model_a") is False
+        assert "model_a" in detector.get_stale_models()
+        assert len(quarantines) >= 1
+        assert quarantines[-1][1] in {StalenessReason.NEGATIVE_IC, StalenessReason.LOW_IC}
+
+    def test_release_quarantine_restores_usability(self):
+        """Manual release should move model to WARNING and make it usable."""
+        from quant_trading_system.models.staleness_detector import (
+            ModelHealth,
+            ModelStalenessDetector,
+        )
+
+        detector = ModelStalenessDetector()
+        detector.register_model("model_b")
+        detector.force_quarantine("model_b", reason="manual")
+
+        assert detector.is_usable("model_b") is False
+        detector.release_quarantine("model_b")
+        assert detector.is_usable("model_b") is True
+        assert detector.get_health("model_b").health == ModelHealth.WARNING

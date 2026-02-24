@@ -9,6 +9,7 @@ JPMorgan-Level Unified Command Line Interface
 This is the single entry point for all AlphaTrade operations:
   - trade     : Live/Paper trading with full risk management
   - backtest  : Historical strategy backtesting with realistic simulation
+  - replay    : Deterministic trading-day replay with SLO policy gates
   - train     : ML model training with purged cross-validation
   - data      : Data loading, preprocessing, and management
   - features  : Feature engineering and pipeline management
@@ -32,6 +33,7 @@ SAFETY FEATURES:
 USAGE:
   python main.py trade --mode paper --symbols AAPL MSFT GOOGL
   python main.py backtest --start 2024-01-01 --end 2024-06-30
+  python main.py replay --start 2024-01-01 --end 2024-01-15 --symbols AAPL MSFT
   python main.py train --model xgboost --symbols AAPL MSFT
   python main.py data load --source alpaca --symbols AAPL
   python main.py features compute --symbols AAPL --gpu
@@ -175,6 +177,25 @@ def cmd_backtest(args: argparse.Namespace) -> int:
 
     from scripts.backtest import run_backtest
     return run_backtest(args)
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """
+    Run deterministic trading-day replay with execution/risk SLO gates.
+
+    This command is designed for incident replay and capacity regression
+    checks using deterministic strategy behavior across historical bars.
+    """
+    if hasattr(args, "start_date"):
+        args.start = args.start_date
+    if hasattr(args, "end_date"):
+        args.end = args.end_date
+    if hasattr(args, "initial_capital"):
+        args.capital = args.initial_capital
+
+    from scripts.replay import run_replay
+
+    return run_replay(args)
 
 
 def cmd_train(args: argparse.Namespace) -> int:
@@ -589,6 +610,179 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Load data from CSV files instead of database",
     )
     backtest_parser.set_defaults(func=cmd_backtest)
+
+    # --------------------------------------------------------------------------
+    # REPLAY COMMAND
+    # --------------------------------------------------------------------------
+    replay_parser = subparsers.add_parser(
+        "replay",
+        help="Run deterministic trading-day replay",
+        description="Replay historical sessions and enforce execution/risk SLO gates.",
+    )
+    replay_parser.add_argument(
+        "--scenario-id",
+        type=str,
+        default="trading_day_replay",
+        help="Replay scenario identifier",
+    )
+    replay_parser.add_argument(
+        "--start", "--start-date", "-s",
+        dest="start_date",
+        type=str,
+        required=True,
+        help="Replay start date (YYYY-MM-DD)",
+    )
+    replay_parser.add_argument(
+        "--end", "--end-date", "-e",
+        dest="end_date",
+        type=str,
+        required=True,
+        help="Replay end date (YYYY-MM-DD)",
+    )
+    replay_parser.add_argument(
+        "--symbols",
+        nargs="+",
+        required=True,
+        help="Symbols to replay",
+    )
+    replay_parser.add_argument(
+        "--capital", "--initial-capital",
+        dest="initial_capital",
+        type=float,
+        default=100000.0,
+        help="Initial capital (default: 100000)",
+    )
+    replay_parser.add_argument(
+        "--execution-mode",
+        choices=["realistic", "optimistic", "pessimistic"],
+        default="realistic",
+        help="Execution simulation mode (default: realistic)",
+    )
+    replay_parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=5.0,
+        help="Slippage in basis points (default: 5)",
+    )
+    replay_parser.add_argument(
+        "--commission-bps",
+        type=float,
+        default=1.0,
+        help="Commission in basis points (default: 1)",
+    )
+    replay_parser.add_argument(
+        "--return-threshold-bps",
+        type=float,
+        default=5.0,
+        help="Minimum absolute return threshold for deterministic signal generation (default: 5)",
+    )
+    replay_parser.add_argument(
+        "--signal-confidence",
+        type=float,
+        default=0.75,
+        help="Minimum deterministic replay signal confidence (default: 0.75)",
+    )
+    replay_parser.add_argument(
+        "--signal-horizon",
+        type=int,
+        default=1,
+        help="Signal horizon in bars (default: 1)",
+    )
+    replay_parser.add_argument(
+        "--allow-short",
+        dest="allow_short",
+        action="store_true",
+        help="Enable short signals in deterministic replay (default: enabled)",
+    )
+    replay_parser.add_argument(
+        "--no-allow-short",
+        dest="allow_short",
+        action="store_false",
+        help="Disable short signals in deterministic replay",
+    )
+    replay_parser.set_defaults(allow_short=True)
+    replay_parser.add_argument(
+        "--max-drawdown",
+        type=float,
+        default=0.20,
+        help="Maximum allowed replay drawdown (default: 0.20)",
+    )
+    replay_parser.add_argument(
+        "--max-rejection-rate",
+        type=float,
+        default=0.20,
+        help="Maximum allowed order rejection rate (default: 0.20)",
+    )
+    replay_parser.add_argument(
+        "--max-avg-slippage-bps",
+        type=float,
+        default=35.0,
+        help="Maximum allowed average slippage in bps (default: 35)",
+    )
+    replay_parser.add_argument(
+        "--max-risk-escalations",
+        type=int,
+        default=0,
+        help="Maximum allowed risk escalation count (default: 0)",
+    )
+    replay_parser.add_argument(
+        "--max-escalation-latency-ms",
+        type=float,
+        default=2000.0,
+        help="Maximum allowed risk escalation latency in ms (default: 2000)",
+    )
+    replay_parser.add_argument(
+        "--min-orders-for-slo",
+        type=int,
+        default=1,
+        help="Minimum order count before execution SLO gates are evaluated (default: 1)",
+    )
+    replay_parser.add_argument(
+        "--no-fail-on-kill-switch",
+        action="store_true",
+        help="Do not fail replay when kill switch remains active at run end",
+    )
+    replay_parser.add_argument(
+        "--use-database",
+        action="store_true",
+        default=True,
+        help="Load data from PostgreSQL + TimescaleDB (default: True)",
+    )
+    replay_parser.add_argument(
+        "--no-database",
+        action="store_true",
+        help="Load data from CSV files instead of database",
+    )
+    replay_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data/raw"),
+        help="Data directory for file-based replay mode (default: data/raw)",
+    )
+    replay_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output file for replay result (JSON)",
+    )
+    replay_parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Replay output format (default: text)",
+    )
+    replay_parser.add_argument(
+        "--fail-on-slo-breach",
+        action="store_true",
+        default=True,
+        help="Return non-zero when replay SLO gates fail (default: True)",
+    )
+    replay_parser.add_argument(
+        "--no-fail-on-slo-breach",
+        dest="fail_on_slo_breach",
+        action="store_false",
+        help="Return zero exit code even if replay SLO gates fail",
+    )
+    replay_parser.set_defaults(func=cmd_replay)
 
     # --------------------------------------------------------------------------
     # TRAIN COMMAND

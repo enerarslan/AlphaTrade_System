@@ -11,6 +11,7 @@ Tests for:
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,7 +28,11 @@ from quant_trading_system.core.data_types import (
     Position,
     TimeInForce,
 )
-from quant_trading_system.core.exceptions import ExecutionError, OrderSubmissionError
+from quant_trading_system.core.exceptions import (
+    BrokerConnectionError,
+    ExecutionError,
+    OrderSubmissionError,
+)
 from quant_trading_system.core.events import EventBus
 from quant_trading_system.execution.alpaca_client import (
     AccountInfo,
@@ -42,6 +47,7 @@ from quant_trading_system.execution.alpaca_client import (
     create_market_order,
 )
 from quant_trading_system.execution.order_manager import (
+    IdempotencyKeyManager,
     ManagedOrder,
     OrderManager,
     OrderPriority,
@@ -60,6 +66,11 @@ from quant_trading_system.execution.execution_algo import (
     SliceOrder,
     TWAPAlgorithm,
     VWAPAlgorithm,
+)
+from quant_trading_system.execution.failover import (
+    BrokerEndpoint,
+    BrokerFailoverPolicy,
+    FailoverBrokerClient,
 )
 from quant_trading_system.execution.position_tracker import (
     CashState,
@@ -716,6 +727,182 @@ class TestReconciliationResult:
 
 
 # =============================================================================
+# Failover Broker Tests
+# =============================================================================
+
+class _FakeBroker:
+    """Minimal async broker fake for failover orchestration tests."""
+
+    def __init__(self) -> None:
+        self.submit_order = AsyncMock()
+        self.get_order = AsyncMock()
+        self.cancel_order = AsyncMock()
+        self.replace_order = AsyncMock()
+        self.get_orders = AsyncMock(return_value=[])
+        self.get_account = AsyncMock()
+        self.get_positions = AsyncMock(return_value=[])
+        self._trade_callbacks = []
+
+    def on_trade_update(self, callback):
+        self._trade_callbacks.append(callback)
+
+    def emit_trade_update(self, data: dict) -> None:
+        for callback in self._trade_callbacks:
+            callback(data)
+
+
+class TestFailoverBrokerClient:
+    """Tests for broker failover orchestration."""
+
+    @staticmethod
+    def _make_order(order_id: str, client_order_id: str) -> AlpacaOrder:
+        now = datetime.now(timezone.utc)
+        return AlpacaOrder(
+            order_id=order_id,
+            client_order_id=client_order_id,
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            time_in_force="day",
+            quantity=Decimal("10"),
+            filled_qty=Decimal("0"),
+            filled_avg_price=None,
+            limit_price=None,
+            stop_price=None,
+            status="new",
+            created_at=now,
+            updated_at=now,
+            submitted_at=now,
+            filled_at=None,
+            expired_at=None,
+            cancelled_at=None,
+            asset_class="us_equity",
+            order_class="simple",
+            extended_hours=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_failover_to_secondary_on_transient_submit_failure(self):
+        """Transient primary failure should route order to secondary broker."""
+        primary = _FakeBroker()
+        secondary = _FakeBroker()
+        submitted = self._make_order(order_id="sec-1", client_order_id="cid-1")
+
+        primary.submit_order.side_effect = BrokerConnectionError(
+            "primary unavailable",
+            broker="primary",
+        )
+        secondary.submit_order.return_value = submitted
+
+        client = FailoverBrokerClient(
+            endpoints=[
+                BrokerEndpoint(name="primary", client=primary, priority=0, is_primary=True),
+                BrokerEndpoint(name="secondary", client=secondary, priority=1),
+            ],
+            policy=BrokerFailoverPolicy(max_consecutive_failures=1, recovery_cooldown_seconds=60),
+        )
+
+        order = await client.submit_order(symbol="AAPL", client_order_id="cid-1")
+
+        assert order.order_id == "sec-1"
+        assert client.active_broker_name == "secondary"
+        secondary.submit_order.assert_awaited_once()
+        await client.cancel_order("sec-1")
+        secondary.cancel_order.assert_awaited_once_with("sec-1")
+
+    @pytest.mark.asyncio
+    async def test_non_transient_submission_error_does_not_failover(self):
+        """Business rule failures should be returned directly without failover."""
+        primary = _FakeBroker()
+        secondary = _FakeBroker()
+        primary.submit_order.side_effect = OrderSubmissionError("invalid order")
+
+        client = FailoverBrokerClient(
+            endpoints=[
+                BrokerEndpoint(name="primary", client=primary, priority=0, is_primary=True),
+                BrokerEndpoint(name="secondary", client=secondary, priority=1),
+            ],
+            policy=BrokerFailoverPolicy(max_consecutive_failures=1, recovery_cooldown_seconds=60),
+        )
+
+        with pytest.raises(OrderSubmissionError, match="invalid order"):
+            await client.submit_order(symbol="AAPL", client_order_id="cid-1")
+
+        secondary.submit_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_order_by_client_id_routes_to_original_broker(self):
+        """Mapped client order IDs should resolve to their originating broker."""
+        primary = _FakeBroker()
+        secondary = _FakeBroker()
+        submitted = self._make_order(order_id="sec-2", client_order_id="cid-2")
+
+        primary.submit_order.side_effect = BrokerConnectionError("primary down", broker="primary")
+        secondary.submit_order.return_value = submitted
+        secondary.get_order.return_value = submitted
+
+        client = FailoverBrokerClient(
+            endpoints=[
+                BrokerEndpoint(name="primary", client=primary, priority=0, is_primary=True),
+                BrokerEndpoint(name="secondary", client=secondary, priority=1),
+            ],
+            policy=BrokerFailoverPolicy(max_consecutive_failures=1, recovery_cooldown_seconds=60),
+        )
+
+        await client.submit_order(symbol="AAPL", client_order_id="cid-2")
+        fetched = await client.get_order("cid-2", by_client_id=True)
+
+        assert fetched.order_id == "sec-2"
+        secondary.get_order.assert_awaited_once_with("cid-2", by_client_id=True)
+        primary.get_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_trade_update_callback_populates_order_routing_map(self):
+        """Stream updates should backfill broker order routing for later actions."""
+        primary = _FakeBroker()
+        secondary = _FakeBroker()
+        client = FailoverBrokerClient(
+            endpoints=[
+                BrokerEndpoint(name="primary", client=primary, priority=0, is_primary=True),
+                BrokerEndpoint(name="secondary", client=secondary, priority=1),
+            ],
+        )
+
+        callback = MagicMock()
+        client.on_trade_update(callback)
+
+        secondary.emit_trade_update(
+            {
+                "event": "new",
+                "order": {"id": "stream-oid", "client_order_id": "stream-cid"},
+            }
+        )
+
+        callback.assert_called_once()
+        await client.cancel_order("stream-oid")
+        secondary.cancel_order.assert_awaited_once_with("stream-oid")
+
+    @pytest.mark.asyncio
+    async def test_all_brokers_down_raises_connection_error(self):
+        """All transient broker failures should surface as broker connectivity error."""
+        primary = _FakeBroker()
+        secondary = _FakeBroker()
+        primary.submit_order.side_effect = BrokerConnectionError("primary down", broker="primary")
+        secondary.submit_order.side_effect = BrokerConnectionError("secondary down", broker="secondary")
+
+        client = FailoverBrokerClient(
+            endpoints=[
+                BrokerEndpoint(name="primary", client=primary, priority=0, is_primary=True),
+                BrokerEndpoint(name="secondary", client=secondary, priority=1),
+            ],
+            policy=BrokerFailoverPolicy(max_consecutive_failures=1, recovery_cooldown_seconds=60),
+        )
+
+        with pytest.raises(BrokerConnectionError, match="All broker endpoints failed"):
+            await client.submit_order(symbol="AAPL", client_order_id="cid-down")
+
+
+# =============================================================================
 # Integration-style Tests
 # =============================================================================
 
@@ -842,3 +1029,137 @@ class TestOrderManagerIntegration:
         stats = manager.get_statistics()
         assert "total_orders" in stats
         assert "by_state" in stats
+
+    def test_idempotency_key_includes_price_and_bracket_fields(self):
+        """Distinct price intents must not collide in deduplication."""
+        idem = IdempotencyKeyManager()
+        created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        base_request = OrderRequest(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("100"),
+            stop_price=Decimal("95"),
+            take_profit_price=Decimal("110"),
+            stop_loss_price=Decimal("94"),
+            time_in_force=TimeInForce.DAY,
+            created_at=created_at,
+            strategy_id="alpha1",
+        )
+        changed_price_request = OrderRequest(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("101"),
+            stop_price=Decimal("95"),
+            take_profit_price=Decimal("110"),
+            stop_loss_price=Decimal("94"),
+            time_in_force=TimeInForce.DAY,
+            created_at=created_at,
+            strategy_id="alpha1",
+        )
+        changed_tif_request = OrderRequest(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("100"),
+            stop_price=Decimal("95"),
+            take_profit_price=Decimal("110"),
+            stop_loss_price=Decimal("94"),
+            time_in_force=TimeInForce.GTC,
+            created_at=created_at,
+            strategy_id="alpha1",
+        )
+
+        base_key = idem.generate_key(base_request)
+        price_key = idem.generate_key(changed_price_request)
+        tif_key = idem.generate_key(changed_tif_request)
+
+        assert base_key != price_key
+        assert base_key != tif_key
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_storm_updates_are_thread_safe(self):
+        """Concurrent partial-fill events should not corrupt managed order state."""
+        mock_client = MagicMock(spec=AlpacaClient)
+        mock_client.on_trade_update = MagicMock()
+        now = datetime.now(timezone.utc)
+        broker_order = AlpacaOrder(
+            order_id="storm-broker-1",
+            client_order_id="storm-client-1",
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            time_in_force="day",
+            quantity=Decimal("100"),
+            filled_qty=Decimal("0"),
+            filled_avg_price=None,
+            limit_price=None,
+            stop_price=None,
+            status="new",
+            created_at=now,
+            updated_at=now,
+            submitted_at=now,
+            filled_at=None,
+            expired_at=None,
+            cancelled_at=None,
+            asset_class="us_equity",
+            order_class="simple",
+            extended_hours=False,
+        )
+        mock_client.submit_order = AsyncMock(return_value=broker_order)
+
+        manager = OrderManager(client=mock_client)
+        request = OrderRequest(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("100"),
+            order_type=OrderType.MARKET,
+        )
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            buying_power=Decimal("100000"),
+        )
+        managed = manager.create_order(request=request, portfolio=portfolio, current_price=Decimal("100"))
+        await manager.submit_order(managed)
+
+        errors: list[Exception] = []
+
+        def send_partial_fill(seq: int) -> None:
+            try:
+                manager._handle_trade_update(
+                    {
+                        "event": "partial_fill",
+                        "order": {
+                            "id": "storm-broker-1",
+                            "client_order_id": managed.order.client_order_id,
+                            "symbol": "AAPL",
+                            "side": "buy",
+                            "type": "market",
+                            "time_in_force": "day",
+                            "qty": "100",
+                            "filled_qty": str(seq),
+                            "filled_avg_price": "100.0",
+                            "status": "partially_filled",
+                            "created_at": now.isoformat(),
+                            "updated_at": now.isoformat(),
+                        },
+                    }
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=send_partial_fill, args=(i,)) for i in range(1, 26)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert managed.state == OrderState.PARTIAL_FILLED
+        assert len(managed.fill_events) == 25

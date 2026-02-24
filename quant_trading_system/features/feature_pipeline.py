@@ -498,6 +498,7 @@ class FeaturePipeline:
         self,
         df: pl.DataFrame,
         symbol: str,
+        universe_data: dict[str, pl.DataFrame] | None = None,
     ) -> str:
         """Generate cache key from DataFrame characteristics.
 
@@ -553,8 +554,40 @@ class FeaturePipeline:
                 # Skip unstable columns from key fingerprinting.
                 continue
 
+        universe_fingerprint = self._fingerprint_universe_data(universe_data)
+        if universe_fingerprint:
+            key_parts.append(f"universe:{universe_fingerprint}")
+
         key_string = "|".join(key_parts)
         return hashlib.md5(key_string.encode()).hexdigest()
+
+    def _fingerprint_universe_data(
+        self,
+        universe_data: dict[str, pl.DataFrame] | None,
+    ) -> str:
+        """Build deterministic fingerprint for cross-sectional universe inputs."""
+        if not universe_data:
+            return ""
+
+        summary_parts: list[str] = []
+        for universe_symbol in sorted(universe_data.keys()):
+            df = universe_data[universe_symbol]
+            row_count = len(df)
+            columns = ",".join(sorted(df.columns))
+            part = f"{universe_symbol}:{row_count}:{columns}"
+
+            if row_count > 0:
+                if "timestamp" in df.columns:
+                    part += f":{df['timestamp'][0]}:{df['timestamp'][-1]}"
+                if "close" in df.columns:
+                    sample_idx = np.linspace(0, row_count - 1, num=min(5, row_count), dtype=int)
+                    sampled = df["close"].to_numpy().astype(np.float64)[sample_idx]
+                    sampled = np.nan_to_num(sampled, nan=0.0, posinf=0.0, neginf=0.0)
+                    part += ":" + ",".join(f"{value:.6f}" for value in sampled)
+
+            summary_parts.append(part)
+
+        return hashlib.md5("|".join(summary_parts).encode()).hexdigest()
 
     def _get_output_config_hash(self) -> str:
         """Return deterministic hash for config fields that affect feature outputs."""
@@ -606,7 +639,7 @@ class FeaturePipeline:
         # P1-H4 Enhancement: Check cache first
         cache_key = None
         if use_cache and self._feature_cache is not None:
-            cache_key = self._generate_cache_key(df, symbol)
+            cache_key = self._generate_cache_key(df, symbol, universe_data=universe_data)
             cached_result = self._feature_cache.get(cache_key)
             if cached_result is not None:
                 logger.debug(f"Cache hit for {symbol} (key={cache_key[:8]}...)")
@@ -984,13 +1017,23 @@ class FeaturePipeline:
 
     def _generate_version(self, features: dict[str, np.ndarray]) -> str:
         """Generate version hash for feature set."""
+        feature_stats: dict[str, dict[str, float]] = {}
+        for name, values in features.items():
+            valid_values = values[~np.isnan(values)]
+            if len(valid_values) == 0:
+                feature_stats[name] = {"mean": 0.0, "std": 0.0, "count": 0}
+                continue
+            feature_stats[name] = {
+                "mean": float(np.mean(valid_values)),
+                "std": float(np.std(valid_values, ddof=1)) if len(valid_values) > 1 else 0.0,
+                "count": int(len(valid_values)),
+            }
+
         content = json.dumps(
             {
                 "feature_names": sorted(features.keys()),
-                "config": {
-                    "groups": [g.value for g in self.config.groups],
-                    "normalization": self.config.normalization.value,
-                },
+                "output_config_hash": self._get_output_config_hash(),
+                "feature_stats": feature_stats,
             },
             sort_keys=True,
         )

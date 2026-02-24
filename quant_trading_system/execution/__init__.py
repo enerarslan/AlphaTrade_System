@@ -48,6 +48,12 @@ from quant_trading_system.execution.position_tracker import (
     SettlementStatus,
     TradeRecord,
 )
+from quant_trading_system.execution.failover import (
+    BrokerEndpoint,
+    BrokerFailoverPolicy,
+    BrokerRuntimeState,
+    FailoverBrokerClient,
+)
 from quant_trading_system.execution.tca import (
     BenchmarkType,
     CostBreakdown,
@@ -137,4 +143,9 @@ __all__ = [
     "TimeOfDayAdjuster",
     "AdaptiveMarketImpactModel",
     "create_market_impact_model",
+    # failover
+    "BrokerEndpoint",
+    "BrokerFailoverPolicy",
+    "BrokerRuntimeState",
+    "FailoverBrokerClient",
 ]

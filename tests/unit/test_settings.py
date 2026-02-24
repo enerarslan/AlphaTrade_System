@@ -99,9 +99,30 @@ class TestAlpacaSettings:
             api_key="test_key",
             api_secret="test_secret",
             paper_trading=False,
+            base_url="https://api.alpaca.markets",
         )
         assert settings.api_key == "test_key"
         assert settings.api_secret == "test_secret"
+
+    def test_live_mode_requires_credentials(self):
+        """Live trading config must reject empty credentials."""
+        with pytest.raises(ValueError, match="requires non-empty Alpaca API credentials"):
+            AlpacaSettings(
+                api_key="",
+                api_secret="",
+                paper_trading=False,
+                base_url="https://api.alpaca.markets",
+            )
+
+    def test_live_mode_rejects_paper_base_url(self):
+        """Live trading config must not point at paper endpoint."""
+        with pytest.raises(ValueError, match="points to paper endpoint"):
+            AlpacaSettings(
+                api_key="test_key",
+                api_secret="test_secret",
+                paper_trading=False,
+                base_url="https://paper-api.alpaca.markets",
+            )
 
 
 class TestRiskSettings:

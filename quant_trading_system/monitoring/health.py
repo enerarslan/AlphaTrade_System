@@ -313,10 +313,27 @@ class SystemHealthChecker:
         start = time.time()
 
         try:
-            from quant_trading_system.execution.alpaca_client import AlpacaClient
+            from quant_trading_system.execution.alpaca_client import AlpacaClient, TradingEnvironment
 
-            # Assuming AlpacaClient handles its own auth via settings
-            client = AlpacaClient()
+            alpaca_settings = self.settings.load_alpaca_config()
+            if not alpaca_settings.api_key or not alpaca_settings.api_secret:
+                return HealthCheckResult(
+                    component="broker",
+                    status=HealthStatus.UNHEALTHY,
+                    message="Broker credentials are missing",
+                    latency_ms=(time.time() - start) * 1000,
+                )
+
+            environment = (
+                TradingEnvironment.PAPER
+                if alpaca_settings.paper_trading
+                else TradingEnvironment.LIVE
+            )
+            client = AlpacaClient(
+                api_key=alpaca_settings.api_key,
+                api_secret=alpaca_settings.api_secret,
+                environment=environment,
+            )
             account = await client.get_account()
 
             latency = (time.time() - start) * 1000

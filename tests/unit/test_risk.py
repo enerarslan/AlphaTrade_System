@@ -4,8 +4,9 @@ Unit tests for the risk management module.
 Tests position sizing, portfolio optimization, risk monitoring, and limits.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import numpy as np
@@ -23,6 +24,7 @@ from quant_trading_system.core.data_types import (
 from quant_trading_system.core.events import EventBus
 from quant_trading_system.risk.limits import (
     CheckResult,
+    ConsecutiveLossCircuitBreaker,
     KillSwitch,
     KillSwitchReason,
     PreTradeRiskChecker,
@@ -737,6 +739,85 @@ class TestPreTradeRiskChecker:
         # 100 * 150 = 15000, which is 15% > 10%
         assert result.result == CheckResult.FAILED
 
+    def test_daily_trade_limit_blocks_when_reached(self, portfolio):
+        """Daily trade cap should hard-block additional orders."""
+        checker = PreTradeRiskChecker(
+            RiskLimitsConfig(max_daily_trades=1, max_daily_turnover_pct=1.0)
+        )
+        checker.record_trade(Decimal("1000"))
+        order = Order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.MARKET,
+        )
+
+        result = checker.check_daily_limits(order, portfolio, Decimal("100"))
+        assert result.result == CheckResult.FAILED
+        assert "Daily trade limit reached" in result.message
+
+    def test_daily_turnover_limit_blocks_when_exceeded(self, portfolio):
+        """Daily turnover cap should reject orders breaching limit."""
+        checker = PreTradeRiskChecker(
+            RiskLimitsConfig(max_daily_trades=100, max_daily_turnover_pct=0.01)
+        )
+        checker.record_trade(Decimal("900"))
+        order = Order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("2"),
+            order_type=OrderType.MARKET,
+        )
+
+        result = checker.check_daily_limits(order, portfolio, Decimal("100"))
+        assert result.result == CheckResult.FAILED
+        assert "Daily turnover limit would be exceeded" in result.message
+
+    def test_liquidity_limit_blocks_excess_participation(self):
+        """Order participation above ADV/ADDV thresholds must be rejected."""
+        checker = PreTradeRiskChecker(
+            RiskLimitsConfig(
+                max_order_participation_rate=0.05,
+                require_liquidity_data=True,
+            )
+        )
+        order = Order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("6000"),
+            order_type=OrderType.MARKET,
+        )
+
+        result = checker.check_liquidity(
+            order,
+            Decimal("10"),
+            market_data={
+                "avg_daily_volume": 100000,
+                "avg_daily_dollar_volume": 1000000,
+                "spread_bps": 5,
+            },
+        )
+
+        assert result.result == CheckResult.FAILED
+        assert "participation" in result.message.lower()
+
+    def test_liquidity_required_blocks_when_market_data_missing(self, portfolio):
+        """When configured, missing liquidity inputs should hard-fail pre-trade checks."""
+        checker = PreTradeRiskChecker(
+            RiskLimitsConfig(require_liquidity_data=True)
+        )
+        order = Order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.MARKET,
+        )
+
+        results = checker.check_all(order, portfolio, Decimal("100"), market_data=None)
+        liquidity_result = next(result for result in results if result.check_name == "liquidity")
+        assert liquidity_result.result == CheckResult.FAILED
+        assert "required" in liquidity_result.message.lower()
+
 
 class TestKillSwitch:
     """Tests for KillSwitch."""
@@ -774,6 +855,17 @@ class TestKillSwitch:
         assert state.is_active
         assert state.reason == KillSwitchReason.MANUAL_ACTIVATION
         assert kill_switch.is_active()
+
+    def test_state_persists_across_instances(self):
+        """Active kill switch must survive process restart via durable store."""
+        state_store: dict[str, str] = {}
+        first = KillSwitch(state_store=state_store, cooldown_minutes=0)
+        first.activate(KillSwitchReason.MANUAL_ACTIVATION, activated_by="test")
+        assert first.is_active()
+
+        restored = KillSwitch(state_store=state_store, cooldown_minutes=0)
+        assert restored.is_active()
+        assert restored.state.reason == KillSwitchReason.MANUAL_ACTIVATION
 
     def test_reset_with_cooldown(self, kill_switch):
         """Test kill switch reset respects cooldown period."""
@@ -815,7 +907,8 @@ class TestKillSwitch:
         condition has cleared, OR force=True with override_code.
         """
         # Create violation checker that confirms violation is cleared
-        violation_checker = lambda reason: (True, "Violation cleared for testing")
+        def violation_checker(reason):
+            return True, "Violation cleared for testing"
 
         kill_switch = KillSwitch(cooldown_minutes=0, violation_checker=violation_checker)
         kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION)
@@ -852,6 +945,60 @@ class TestKillSwitch:
         result = kill_switch.can_trade()
 
         assert result.result == CheckResult.FAILED
+
+    def test_kill_switch_emits_audit_events(self):
+        """Activation/reset should write tamper-evident audit entries."""
+        audit_logger = MagicMock()
+        def violation_checker(reason):
+            return True, "ok"
+
+        kill_switch = KillSwitch(
+            cooldown_minutes=0,
+            violation_checker=violation_checker,
+            audit_logger=audit_logger,
+        )
+
+        kill_switch.activate(KillSwitchReason.MANUAL_ACTIVATION, activated_by="tester")
+        ok, _ = kill_switch.reset("tester")
+
+        assert ok
+        audit_logger.log_kill_switch_activated.assert_called_once()
+        audit_logger.log_kill_switch_reset.assert_called_once()
+
+
+class TestConsecutiveLossCircuitBreaker:
+    """Tests for consecutive-loss trading halt logic."""
+
+    def test_halts_after_threshold_and_triggers_kill_switch(self):
+        """Circuit breaker should halt and activate kill switch at threshold."""
+        kill_switch = KillSwitch(cooldown_minutes=0)
+        breaker = ConsecutiveLossCircuitBreaker(
+            config=RiskLimitsConfig(max_consecutive_losses=3, consecutive_loss_cooldown_minutes=60),
+            kill_switch=kill_switch,
+        )
+
+        assert breaker.record_trade(Decimal("-10")) == (False, None)
+        assert breaker.record_trade(Decimal("-20")) == (False, None)
+        should_halt, reason = breaker.record_trade(Decimal("-30"))
+
+        assert should_halt is True
+        assert "Consecutive loss circuit breaker triggered" in reason
+        assert breaker.is_halted is True
+        assert kill_switch.is_active() is True
+
+    def test_cooldown_auto_reset_allows_trading(self):
+        """After cooldown, can_trade should auto-reset halted state."""
+        breaker = ConsecutiveLossCircuitBreaker(
+            config=RiskLimitsConfig(max_consecutive_losses=1, consecutive_loss_cooldown_minutes=1),
+        )
+        breaker.record_trade(Decimal("-10"))
+        assert breaker.is_halted is True
+
+        breaker._halted_at = breaker._halted_at - timedelta(minutes=2)  # type: ignore[operator]
+        can_trade, reason = breaker.can_trade()
+        assert can_trade is True
+        assert reason is None
+        assert breaker.is_halted is False
 
 
 class TestRiskLimitsManager:
@@ -897,3 +1044,37 @@ class TestRiskLimitsManager:
 
         assert result.result == CheckResult.FAILED
         assert manager.kill_switch.is_active()
+
+    def test_repeated_critical_breaches_activate_kill_switch(self, portfolio):
+        """Repeated critical pre-trade failures should escalate to kill switch activation."""
+        event_bus = MagicMock()
+        audit_logger = MagicMock()
+        manager = RiskLimitsManager(
+            config=RiskLimitsConfig(
+                max_daily_trades=0,
+                breach_escalation_threshold=2,
+                breach_escalation_window_minutes=60,
+                critical_breach_checks=["daily_limits"],
+            ),
+            event_bus=event_bus,
+            audit_logger=audit_logger,
+        )
+        order = Order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            quantity=Decimal("10"),
+            order_type=OrderType.MARKET,
+        )
+
+        first_passed, _ = manager.pre_trade_check(order, portfolio, Decimal("100"))
+        second_passed, second_results = manager.pre_trade_check(order, portfolio, Decimal("100"))
+
+        assert first_passed is False
+        assert second_passed is False
+        assert manager.kill_switch.is_active() is True
+        assert any(r.check_name == "kill_switch" and r.result == CheckResult.FAILED for r in second_results)
+        assert event_bus.publish.call_count >= 2
+        assert audit_logger.log_risk_limit_breach.call_count >= 2
+        playbook_metrics = manager.get_playbook_metrics()
+        assert playbook_metrics["escalation_count"] == 1
+        assert playbook_metrics["last_escalation_latency_ms"] is not None

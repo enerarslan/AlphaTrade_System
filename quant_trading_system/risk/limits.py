@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -119,6 +120,39 @@ class KillSwitchState:
         self.positions_closed = 0
         self.activated_by = None
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize state for durable storage."""
+        return {
+            "is_active": self.is_active,
+            "activated_at": self.activated_at.isoformat() if self.activated_at else None,
+            "reason": self.reason.value if self.reason else None,
+            "trigger_value": self.trigger_value,
+            "orders_cancelled": self.orders_cancelled,
+            "positions_closed": self.positions_closed,
+            "activated_by": self.activated_by,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "KillSwitchState":
+        """Deserialize state from durable storage."""
+        activated_at_raw = data.get("activated_at")
+        activated_at: datetime | None = None
+        if isinstance(activated_at_raw, str) and activated_at_raw:
+            activated_at = datetime.fromisoformat(activated_at_raw.replace("Z", "+00:00"))
+
+        reason_raw = data.get("reason")
+        reason = KillSwitchReason(reason_raw) if isinstance(reason_raw, str) and reason_raw else None
+
+        return cls(
+            is_active=bool(data.get("is_active", False)),
+            activated_at=activated_at,
+            reason=reason,
+            trigger_value=float(data["trigger_value"]) if data.get("trigger_value") is not None else None,
+            orders_cancelled=int(data.get("orders_cancelled", 0)),
+            positions_closed=int(data.get("positions_closed", 0)),
+            activated_by=data.get("activated_by"),
+        )
+
 
 class RiskLimitsConfig(BaseModel):
     """Configuration for risk limits."""
@@ -151,6 +185,45 @@ class RiskLimitsConfig(BaseModel):
     max_daily_turnover_pct: float = Field(default=1.0, ge=0, description="Max daily turnover")
     min_order_value: Decimal = Field(default=Decimal("100"), ge=0, description="Min order value")
     max_order_value: Decimal = Field(default=Decimal("50000"), ge=0, description="Max single order value")
+    max_order_participation_rate: float = Field(
+        default=0.05,
+        ge=0,
+        le=1.0,
+        description="Max order size as % of average daily volume/liquidity capacity",
+    )
+    max_bid_ask_spread_bps: float = Field(
+        default=30.0,
+        ge=0,
+        description="Max allowed bid-ask spread in bps before blocking order",
+    )
+    require_liquidity_data: bool = Field(
+        default=False,
+        description="Require liquidity inputs for pre-trade checks; hard-fail if missing",
+    )
+    breach_escalation_threshold: int = Field(
+        default=3,
+        ge=1,
+        description="Repeated critical limit breaches required to auto-trigger kill switch",
+    )
+    breach_escalation_window_minutes: int = Field(
+        default=15,
+        ge=1,
+        description="Time window for repeated critical breach escalation",
+    )
+    halt_on_repeated_critical_breaches: bool = Field(
+        default=True,
+        description="Auto-activate kill switch after repeated critical pre-trade breaches",
+    )
+    critical_breach_checks: list[str] = Field(
+        default_factory=lambda: [
+            "buying_power",
+            "position_limit",
+            "order_size",
+            "daily_limits",
+            "liquidity",
+        ],
+        description="Pre-trade failed checks considered critical for escalation logic",
+    )
 
     # MAJOR FIX: Consecutive loss circuit breaker
     max_consecutive_losses: int = Field(
@@ -363,13 +436,16 @@ class PreTradeRiskChecker:
     def __init__(
         self,
         config: RiskLimitsConfig | None = None,
+        audit_logger: Any | None = None,
     ) -> None:
         """Initialize pre-trade checker.
 
         Args:
             config: Risk limits configuration.
+            audit_logger: Optional audit logger for risk check decisions.
         """
         self.config = config or RiskLimitsConfig()
+        self._audit_logger = audit_logger
         # THREAD SAFETY: Use lock for daily counter operations
         self._lock = threading.RLock()
         # P0 FIX: Portfolio-level lock to serialize position limit checks
@@ -414,6 +490,7 @@ class PreTradeRiskChecker:
         order: Order,
         portfolio: Portfolio,
         current_price: Decimal,
+        market_data: dict[str, Any] | None = None,
     ) -> list[RiskCheckResult]:
         """Run all pre-trade checks.
 
@@ -440,10 +517,59 @@ class PreTradeRiskChecker:
                 self.check_blacklist(order),
                 self.check_trading_hours(),
                 self.check_order_size(order, current_price),
+                self.check_liquidity(order, current_price, market_data=market_data),
                 self.check_daily_limits(order, portfolio, current_price),
             ]
 
+        self._audit_risk_results(order, results, current_price)
         return results
+
+    def _audit_risk_results(
+        self,
+        order: Order,
+        results: list[RiskCheckResult],
+        current_price: Decimal,
+    ) -> None:
+        """Emit tamper-evident audit records for risk checks (best effort)."""
+        if self._audit_logger is None:
+            return
+
+        order_id = str(order.order_id)
+        base_details = {
+            "symbol": order.symbol,
+            "side": order.side.value,
+            "quantity": float(order.quantity),
+            "current_price": float(current_price),
+        }
+
+        for result in results:
+            passed = result.result != CheckResult.FAILED
+            try:
+                self._audit_logger.log_risk_check(
+                    check_name=result.check_name,
+                    passed=passed,
+                    details={
+                        **base_details,
+                        "result": result.result.value,
+                        "message": result.message,
+                        "details": result.details,
+                    },
+                    order_id=order_id,
+                )
+                if result.result == CheckResult.FAILED:
+                    self._audit_logger.log_risk_limit_breach(
+                        limit_name=result.check_name,
+                        current_value=1.0,
+                        limit_value=0.0,
+                        action_taken="order_rejected",
+                        order_id=order_id,
+                        details=result.details,
+                        reason=result.message,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to audit risk check '{result.check_name}' for {order_id}: {exc}"
+                )
 
     def check_buying_power(
         self,
@@ -709,6 +835,116 @@ class PreTradeRiskChecker:
             check_name="order_size",
             result=CheckResult.PASSED,
             message="Order size within limits",
+        )
+
+    def check_liquidity(
+        self,
+        order: Order,
+        current_price: Decimal,
+        market_data: dict[str, Any] | None = None,
+    ) -> RiskCheckResult:
+        """Check liquidity guardrails for market impact control.
+
+        Expected market_data keys (any subset):
+        - avg_daily_volume / average_daily_volume / adv
+        - avg_daily_dollar_volume / average_daily_dollar_volume / addv
+        - spread_bps / bid_ask_spread_bps
+        """
+        if market_data is None:
+            if self.config.require_liquidity_data:
+                return RiskCheckResult(
+                    check_name="liquidity",
+                    result=CheckResult.FAILED,
+                    message="Liquidity data required but missing",
+                )
+            return RiskCheckResult(
+                check_name="liquidity",
+                result=CheckResult.WARNING,
+                message="Liquidity check skipped - market data unavailable",
+            )
+
+        def _to_decimal(value: Any) -> Decimal | None:
+            if value is None:
+                return None
+            try:
+                return Decimal(str(value))
+            except Exception:
+                return None
+
+        adv_shares = (
+            _to_decimal(market_data.get("avg_daily_volume"))
+            or _to_decimal(market_data.get("average_daily_volume"))
+            or _to_decimal(market_data.get("adv"))
+        )
+        adv_dollars = (
+            _to_decimal(market_data.get("avg_daily_dollar_volume"))
+            or _to_decimal(market_data.get("average_daily_dollar_volume"))
+            or _to_decimal(market_data.get("addv"))
+        )
+        spread_bps_value = (
+            _to_decimal(market_data.get("spread_bps"))
+            or _to_decimal(market_data.get("bid_ask_spread_bps"))
+        )
+
+        if adv_dollars is None and adv_shares is not None and current_price > 0:
+            adv_dollars = adv_shares * current_price
+
+        if self.config.require_liquidity_data and adv_shares is None and adv_dollars is None:
+            return RiskCheckResult(
+                check_name="liquidity",
+                result=CheckResult.FAILED,
+                message="Liquidity data required but ADV/ADDV metrics are missing",
+            )
+
+        order_value = order.quantity * current_price
+        max_participation = Decimal(str(self.config.max_order_participation_rate))
+        details: dict[str, Any] = {
+            "order_quantity": float(order.quantity),
+            "order_value": float(order_value),
+            "max_participation_rate": float(max_participation),
+        }
+        failures: list[str] = []
+
+        if adv_shares is not None and adv_shares > 0:
+            max_quantity = adv_shares * max_participation
+            details["avg_daily_volume"] = float(adv_shares)
+            details["max_quantity"] = float(max_quantity)
+            if order.quantity > max_quantity:
+                failures.append("Order participation exceeds max ADV participation")
+
+        if adv_dollars is not None and adv_dollars > 0:
+            max_notional = adv_dollars * max_participation
+            details["avg_daily_dollar_volume"] = float(adv_dollars)
+            details["max_notional"] = float(max_notional)
+            if order_value > max_notional:
+                failures.append("Order notional exceeds max ADDV participation")
+
+        if spread_bps_value is not None:
+            details["spread_bps"] = float(spread_bps_value)
+            details["max_spread_bps"] = self.config.max_bid_ask_spread_bps
+            if float(spread_bps_value) > self.config.max_bid_ask_spread_bps:
+                failures.append("Bid-ask spread exceeds liquidity threshold")
+
+        if failures:
+            return RiskCheckResult(
+                check_name="liquidity",
+                result=CheckResult.FAILED,
+                message="; ".join(failures),
+                details=details,
+            )
+
+        if adv_shares is None and adv_dollars is None and spread_bps_value is None:
+            return RiskCheckResult(
+                check_name="liquidity",
+                result=CheckResult.WARNING,
+                message="Liquidity metrics unavailable - check treated as soft warning",
+            )
+
+        return RiskCheckResult(
+            check_name="liquidity",
+            result=CheckResult.PASSED,
+            message="Liquidity within configured thresholds",
+            details=details,
         )
 
     def check_daily_limits(
@@ -1014,6 +1250,9 @@ class KillSwitch:
         close_positions_callback: Callable[[], int] | None = None,
         cooldown_minutes: int | None = None,
         violation_checker: Callable[[KillSwitchReason], tuple[bool, str]] | None = None,
+        state_store: Any | None = None,
+        state_store_key: str = "risk:kill_switch_state",
+        audit_logger: Any | None = None,
     ) -> None:
         """Initialize kill switch.
 
@@ -1026,6 +1265,10 @@ class KillSwitch:
             violation_checker: CRITICAL FIX - Callback to verify violation condition has cleared.
                               Takes KillSwitchReason, returns (is_cleared, message).
                               Reset is blocked if violation is still active.
+            state_store: Optional persistent key/value store (e.g., Redis client) to
+                persist kill switch state across process restarts.
+            state_store_key: Storage key used in state_store.
+            audit_logger: Optional audit logger for tamper-evident risk events.
         """
         self.config = config or RiskLimitsConfig()
         self.event_bus = event_bus
@@ -1038,6 +1281,10 @@ class KillSwitch:
         self._cooldown_minutes = cooldown_minutes if cooldown_minutes is not None else self.COOLDOWN_MINUTES
         # CRITICAL FIX: Violation checker to verify condition has cleared before reset
         self._violation_checker = violation_checker
+        self._state_store = state_store
+        self._state_store_key = state_store_key
+        self._audit_logger = audit_logger
+        self._load_state_from_store()
 
     def check_conditions(
         self,
@@ -1141,6 +1388,18 @@ class KillSwitch:
                 )
                 self.event_bus.publish(event)
 
+            self._persist_state()
+            if self._audit_logger is not None:
+                try:
+                    self._audit_logger.log_kill_switch_activated(
+                        reason=reason.value,
+                        triggered_by=activated_by,
+                        trigger_value=trigger_value,
+                        orders_cancelled=self.state.orders_cancelled,
+                        positions_closed=self.state.positions_closed,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to audit kill switch activation: {exc}")
             return self.state
 
     def manual_activate(self, activated_by: str = "manual") -> KillSwitchState:
@@ -1360,6 +1619,17 @@ class KillSwitch:
                 )
                 self.event_bus.publish(event)
 
+            self._persist_state()
+            if self._audit_logger is not None:
+                try:
+                    self._audit_logger.log_kill_switch_reset(
+                        reset_by=authorized_by,
+                        authorization_code=override_code if force else None,
+                        force_override=force,
+                        active_duration_seconds=active_duration.total_seconds() if active_duration else None,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to audit kill switch reset: {exc}")
             return True, "Kill switch reset successfully"
 
     def is_active(self) -> bool:
@@ -1397,6 +1667,53 @@ class KillSwitch:
                 message="Trading allowed",
             )
 
+    def _persist_state(self) -> None:
+        """Persist kill switch state to an external store (best effort)."""
+        if self._state_store is None:
+            return
+
+        try:
+            payload = json.dumps(self.state.to_dict(), sort_keys=True)
+            if hasattr(self._state_store, "set"):
+                self._state_store.set(self._state_store_key, payload)
+            elif isinstance(self._state_store, dict):
+                self._state_store[self._state_store_key] = payload
+        except Exception as exc:
+            logger.warning(f"Failed to persist kill switch state: {exc}")
+
+    def _load_state_from_store(self) -> None:
+        """Load persisted kill switch state on startup (best effort)."""
+        if self._state_store is None:
+            return
+
+        try:
+            raw: Any = None
+            if hasattr(self._state_store, "get"):
+                raw = self._state_store.get(self._state_store_key)
+            elif isinstance(self._state_store, dict):
+                raw = self._state_store.get(self._state_store_key)
+
+            if not raw:
+                return
+
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            if isinstance(raw, str):
+                loaded = json.loads(raw)
+            elif isinstance(raw, dict):
+                loaded = raw
+            else:
+                return
+
+            self.state = KillSwitchState.from_dict(loaded)
+            if self.state.is_active:
+                logger.warning(
+                    "Restored active kill switch state from persistent store. "
+                    "Trading remains halted until explicit reset."
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to restore kill switch state: {exc}")
+
 
 class RiskLimitsManager:
     """Central manager for all risk limit checks."""
@@ -1405,26 +1722,35 @@ class RiskLimitsManager:
         self,
         config: RiskLimitsConfig | None = None,
         event_bus: EventBus | None = None,
+        audit_logger: Any | None = None,
     ) -> None:
         """Initialize risk limits manager.
 
         Args:
             config: Risk limits configuration.
             event_bus: Event bus for publishing events.
+            audit_logger: Optional audit logger for risk decisions.
         """
         self.config = config or RiskLimitsConfig()
         self.event_bus = event_bus
+        self.audit_logger = audit_logger
 
-        self.pre_trade = PreTradeRiskChecker(config)
+        self.pre_trade = PreTradeRiskChecker(config, audit_logger=audit_logger)
         self.intra_trade = IntraTradeMonitor()
         self.post_trade = PostTradeValidator()
-        self.kill_switch = KillSwitch(config, event_bus)
+        self.kill_switch = KillSwitch(config, event_bus, audit_logger=audit_logger)
+        self._breach_lock = threading.RLock()
+        self._critical_breach_history: list[tuple[datetime, str]] = []
+        self._escalation_count: int = 0
+        self._last_escalation_at: datetime | None = None
+        self._last_escalation_latency_ms: float | None = None
 
     def pre_trade_check(
         self,
         order: Order,
         portfolio: Portfolio,
         current_price: Decimal,
+        market_data: dict[str, Any] | None = None,
     ) -> tuple[bool, list[RiskCheckResult]]:
         """Run all pre-trade checks.
 
@@ -1442,12 +1768,185 @@ class RiskLimitsManager:
             return False, [kill_switch_result]
 
         # Run all pre-trade checks
-        results = self.pre_trade.check_all(order, portfolio, current_price)
+        results = self.pre_trade.check_all(order, portfolio, current_price, market_data=market_data)
+        self._handle_limit_breach_actions(order, results)
 
         # Check if any failed
         all_passed = all(r.result != CheckResult.FAILED for r in results)
+        if self.kill_switch.is_active():
+            all_passed = False
+            if not any(r.check_name == "kill_switch" and not r.passed for r in results):
+                results.append(
+                    RiskCheckResult(
+                        check_name="kill_switch",
+                        result=CheckResult.FAILED,
+                        message="Trading halted due to repeated critical risk-limit breaches",
+                    )
+                )
 
         return all_passed, results
+
+    def _handle_limit_breach_actions(
+        self,
+        order: Order,
+        results: list[RiskCheckResult],
+    ) -> None:
+        """Apply playbook actions for failed pre-trade checks."""
+        failed_results = [result for result in results if result.result == CheckResult.FAILED]
+        if not failed_results:
+            return
+
+        for result in failed_results:
+            self._publish_limit_breach_event(order, result)
+            self._audit_limit_breach(order, result)
+
+            if (
+                self.config.halt_on_repeated_critical_breaches
+                and result.check_name in {name.lower() for name in self.config.critical_breach_checks}
+            ):
+                breach_count = self._record_critical_breach(result.check_name)
+                if (
+                    breach_count >= self.config.breach_escalation_threshold
+                    and not self.kill_switch.is_active()
+                ):
+                    with self._breach_lock:
+                        first_breach_at = (
+                            self._critical_breach_history[0][0]
+                            if self._critical_breach_history
+                            else datetime.now(timezone.utc)
+                        )
+                    activated_at = datetime.now(timezone.utc)
+                    escalation_latency_ms = (
+                        activated_at - first_breach_at
+                    ).total_seconds() * 1000
+                    self.kill_switch.activate(
+                        reason=KillSwitchReason.LIMIT_BREACH,
+                        trigger_value=float(breach_count),
+                        activated_by=f"risk_limit_escalation:{result.check_name}",
+                        flatten_positions=False,
+                    )
+                    with self._breach_lock:
+                        self._escalation_count += 1
+                        self._last_escalation_at = activated_at
+                        self._last_escalation_latency_ms = escalation_latency_ms
+                    logger.critical(
+                        "Kill switch activated after repeated critical breaches: "
+                        f"check={result.check_name}, count={breach_count}, "
+                        f"window_minutes={self.config.breach_escalation_window_minutes}, "
+                        f"latency_ms={escalation_latency_ms:.2f}"
+                    )
+
+    def _record_critical_breach(self, check_name: str) -> int:
+        """Record a critical breach and return recent breach count in configured window."""
+        now = datetime.now(timezone.utc)
+        window = timedelta(minutes=self.config.breach_escalation_window_minutes)
+        with self._breach_lock:
+            self._critical_breach_history = [
+                entry
+                for entry in self._critical_breach_history
+                if now - entry[0] <= window
+            ]
+            self._critical_breach_history.append((now, check_name))
+            return len(self._critical_breach_history)
+
+    def _publish_limit_breach_event(self, order: Order, result: RiskCheckResult) -> None:
+        """Publish limit breach event to event bus (best effort)."""
+        if self.event_bus is None:
+            return
+        try:
+            event = create_risk_event(
+                event_type=EventType.LIMIT_BREACH,
+                risk_data={
+                    "check_name": result.check_name,
+                    "message": result.message,
+                    "details": result.details,
+                    "symbol": order.symbol,
+                    "order_id": str(order.order_id),
+                },
+                source="RiskLimitsManager",
+            )
+            self.event_bus.publish(event)
+        except Exception as exc:
+            logger.warning(f"Failed to publish limit breach event: {exc}")
+
+    def _audit_limit_breach(self, order: Order, result: RiskCheckResult) -> None:
+        """Write tamper-evident audit entry for failed risk checks (best effort)."""
+        if self.audit_logger is None:
+            return
+
+        def _extract_float(source: dict[str, Any], keys: tuple[str, ...]) -> float:
+            for key in keys:
+                value = source.get(key)
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+            return 0.0
+
+        details = result.details if isinstance(result.details, dict) else {}
+        current_value = _extract_float(
+            details,
+            (
+                "order_value",
+                "current_turnover",
+                "trades_today",
+                "participation_rate",
+                "spread_bps",
+                "total_value",
+                "required",
+            ),
+        )
+        limit_value = _extract_float(
+            details,
+            (
+                "max_value",
+                "max_turnover",
+                "max_trades",
+                "max_participation_rate",
+                "max_spread_bps",
+                "threshold",
+                "available",
+            ),
+        )
+
+        try:
+            self.audit_logger.log_risk_limit_breach(
+                limit_name=result.check_name,
+                current_value=current_value,
+                limit_value=limit_value,
+                action_taken="order_rejected",
+                order_id=str(order.order_id),
+                symbol=order.symbol,
+                reason=result.message,
+                details=details,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to audit risk breach '{result.check_name}' "
+                f"for order {order.order_id}: {exc}"
+            )
+
+    def get_playbook_metrics(self) -> dict[str, Any]:
+        """Return operational metrics for risk-breach playbook behavior."""
+        window = timedelta(minutes=self.config.breach_escalation_window_minutes)
+        now = datetime.now(timezone.utc)
+        with self._breach_lock:
+            recent = [
+                entry for entry in self._critical_breach_history
+                if now - entry[0] <= window
+            ]
+            return {
+                "critical_breaches_recent": len(recent),
+                "critical_breaches_total_window_minutes": self.config.breach_escalation_window_minutes,
+                "escalation_count": self._escalation_count,
+                "last_escalation_at": (
+                    self._last_escalation_at.isoformat() if self._last_escalation_at else None
+                ),
+                "last_escalation_latency_ms": self._last_escalation_latency_ms,
+                "kill_switch_active": self.kill_switch.is_active(),
+            }
 
     def on_order_submitted(self, order: Order, expected_price: Decimal) -> None:
         """Handle order submission for monitoring.

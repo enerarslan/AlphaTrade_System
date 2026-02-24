@@ -1289,7 +1289,16 @@ class BacktestEngine:
             signal_id=signal.signal_id,
         )
 
-        can_submit, risk_results = self._evaluate_pre_trade_risk(order, bar.close)
+        adv_proxy = max(int(self.config.avg_daily_volume), int(bar.volume))
+        market_data = {
+            "avg_daily_volume": adv_proxy,
+            "avg_daily_dollar_volume": float(Decimal(str(adv_proxy)) * bar.close),
+        }
+        can_submit, risk_results = self._evaluate_pre_trade_risk(
+            order,
+            bar.close,
+            market_data=market_data,
+        )
         if not can_submit:
             failures = [r.message for r in risk_results if r.result == CheckResult.FAILED]
             if failures:
@@ -1310,11 +1319,15 @@ class BacktestEngine:
         self,
         order: Order,
         current_price: Decimal,
+        market_data: dict[str, Any] | None = None,
     ) -> tuple[bool, list[RiskCheckResult]]:
         """Run pre-trade checks with controlled short-sale handling."""
         portfolio = self._get_portfolio()
         can_submit, results = self._risk_limits_manager.pre_trade_check(
-            order, portfolio, current_price
+            order,
+            portfolio,
+            current_price,
+            market_data=market_data,
         )
         if can_submit:
             return True, results
@@ -1354,6 +1367,21 @@ class BacktestEngine:
             rejection_rate = 0.0
 
         return avg_slippage_bps, rejection_rate
+
+    def get_execution_slo_snapshot(self) -> dict[str, Any]:
+        """Expose execution/risk SLO telemetry for replay and operations gates."""
+        avg_slippage_bps, rejection_rate = self._execution_quality_metrics()
+        playbook_metrics = self._risk_limits_manager.get_playbook_metrics()
+        return {
+            "orders_submitted": self._orders_submitted_total,
+            "orders_rejected": self._orders_rejected_total,
+            "rejection_rate": rejection_rate,
+            "avg_slippage_bps": avg_slippage_bps,
+            "orders_filled": self._state.orders_filled if self._state is not None else 0,
+            "trades_closed": len(self._state.trades) if self._state is not None else 0,
+            "bars_processed": self._state.bars_processed if self._state is not None else 0,
+            "risk_playbook": playbook_metrics,
+        }
 
     def _record_execution_quality(self, fill_result: FillResult) -> None:
         """Record execution quality statistics from a fill."""

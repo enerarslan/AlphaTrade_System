@@ -182,7 +182,7 @@ class DataLoader:
             Dictionary mapping symbol to DataFrame
         """
         results = {}
-        errors = []
+        errors: list[str] = []
 
         for symbol in symbols:
             try:
@@ -670,7 +670,8 @@ class DataLoader:
         Raises:
             DataValidationError: If validation fails
         """
-        errors = []
+        warnings_list: list[str] = []
+        critical_errors: list[str] = []
 
         # Check required columns
         required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
@@ -687,12 +688,12 @@ class DataLoader:
         # Check for duplicates
         if df["timestamp"].n_unique() != len(df):
             dup_count = len(df) - df["timestamp"].n_unique()
-            errors.append(f"Found {dup_count} duplicate timestamps")
+            warnings_list.append(f"Found {dup_count} duplicate timestamps")
             df = df.unique(subset=["timestamp"], keep="last")
 
         # Check timestamp ordering
         if not df["timestamp"].is_sorted():
-            errors.append("Timestamps not sorted - sorting now")
+            warnings_list.append("Timestamps not sorted - sorting now")
             df = df.sort("timestamp")
 
         # Validate OHLC relationships
@@ -704,19 +705,21 @@ class DataLoader:
             (pl.col("high") < pl.col("close"))
         )
         if len(invalid_ohlc) > 0:
-            errors.append(f"Found {len(invalid_ohlc)} bars with invalid OHLC relationships")
+            critical_errors.append(
+                f"Found {len(invalid_ohlc)} bars with invalid OHLC relationships"
+            )
 
         # Validate volume
         negative_volume = df.filter(pl.col("volume") < 0)
         if len(negative_volume) > 0:
-            errors.append(f"Found {len(negative_volume)} bars with negative volume")
+            critical_errors.append(f"Found {len(negative_volume)} bars with negative volume")
 
         # Validate prices (no negative prices)
         price_cols = ["open", "high", "low", "close"]
         for col in price_cols:
             negative = df.filter(pl.col(col) < 0)
             if len(negative) > 0:
-                errors.append(f"Found {len(negative)} bars with negative {col} price")
+                critical_errors.append(f"Found {len(negative)} bars with negative {col} price")
 
         # Check for large gaps
         if len(df) > 1:
@@ -728,7 +731,9 @@ class DataLoader:
                 if diff > expected_interval * DataValidationRules.MAX_GAP_BARS:
                     gap_count += 1
             if gap_count > 0:
-                errors.append(f"Found {gap_count} large gaps (> {DataValidationRules.MAX_GAP_BARS} bars)")
+                warnings_list.append(
+                    f"Found {gap_count} large gaps (> {DataValidationRules.MAX_GAP_BARS} bars)"
+                )
 
         # Check coverage
         if len(df) > 0:
@@ -737,13 +742,21 @@ class DataLoader:
                 expected_bars = date_range * 26  # ~26 bars per day for 15-min
                 coverage = (len(df) / expected_bars) * 100 if expected_bars > 0 else 100
                 if coverage < DataValidationRules.MIN_COVERAGE_PCT:
-                    errors.append(
+                    critical_errors.append(
                         f"Data coverage ({coverage:.1f}%) below minimum ({DataValidationRules.MIN_COVERAGE_PCT}%)"
                     )
 
-        # Log warnings but don't fail
-        for error in errors:
-            logger.warning(f"Data validation warning for {symbol}: {error}")
+        # Warn on auto-remediated anomalies
+        for warning in warnings_list:
+            logger.warning(f"Data validation warning for {symbol}: {warning}")
+
+        # Hard fail on critical anomalies so bad data cannot reach live trading.
+        if critical_errors:
+            for error in critical_errors:
+                logger.error(f"Data validation critical for {symbol}: {error}")
+            raise DataValidationError(
+                f"Critical data validation failed for {symbol}: {'; '.join(critical_errors)}"
+            )
 
         return df
 

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import UUID, uuid4
 
 from quant_trading_system.core.data_types import (
@@ -50,6 +50,10 @@ from quant_trading_system.execution.alpaca_client import (
     AlpacaOrder,
     OrderClass,
 )
+
+if TYPE_CHECKING:
+    from quant_trading_system.database.connection import DatabaseManager
+    from quant_trading_system.database.repository import OrderRepository
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +281,8 @@ class IdempotencyKeyManager:
     - Side
     - Quantity
     - Order type
+    - Limit/stop/bracket prices
+    - Time-in-force
     - Client timestamp (rounded to 100ms windows)
 
     Keys expire after 24 hours to allow legitimate re-submissions.
@@ -345,6 +351,12 @@ class IdempotencyKeyManager:
             request.side.value,
             str(request.quantity),
             request.order_type.value,
+            str(request.limit_price) if request.limit_price is not None else "none",
+            str(request.stop_price) if request.stop_price is not None else "none",
+            str(request.take_profit_price) if request.take_profit_price is not None else "none",
+            str(request.stop_loss_price) if request.stop_loss_price is not None else "none",
+            request.time_in_force.value,
+            "ext" if request.extended_hours else "reg",
             str(ts_rounded),
             request.strategy_id or "default",
         ]
@@ -575,6 +587,10 @@ class OrderManager:
         router: SmartOrderRouter | None = None,
         idempotency_manager: IdempotencyKeyManager | None = None,
         redis_client: Any | None = None,
+        db_manager: "DatabaseManager | None" = None,
+        order_repository: "OrderRepository | None" = None,
+        persist_orders: bool = True,
+        metrics_collector: Any | None = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
         order_timeout_minutes: int | None = None,
@@ -591,6 +607,10 @@ class OrderManager:
             idempotency_manager: P1-H3 Enhancement - Idempotency key manager.
                                 If None and enable_idempotency=True, creates default.
             redis_client: Redis client for idempotency key storage.
+            db_manager: Optional database manager for durable order lifecycle storage.
+            order_repository: Optional order repository override.
+            persist_orders: Persist lifecycle transitions to DB and hydrate on startup.
+            metrics_collector: Optional metrics collector for execution observability.
             max_retries: Maximum retry attempts.
             retry_delay: Base delay between retries.
             order_timeout_minutes: MAJOR FIX - Auto-cancel orders older than this.
@@ -606,6 +626,7 @@ class OrderManager:
         self.kill_switch = kill_switch or KillSwitch()
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.metrics_collector = metrics_collector
         # MAJOR FIX: Order timeout for auto-cancel of stale orders
         self.order_timeout_minutes = (
             order_timeout_minutes if order_timeout_minutes is not None
@@ -620,6 +641,23 @@ class OrderManager:
             )
         else:
             self.idempotency_manager = None
+
+        # Durable order lifecycle persistence (best effort).
+        self._db_manager: "DatabaseManager | None" = db_manager
+        self._order_repository: "OrderRepository | None" = order_repository
+        self._persist_orders = persist_orders
+        if self._persist_orders and (self._db_manager is None or self._order_repository is None):
+            try:
+                from quant_trading_system.database.connection import get_db_manager
+                from quant_trading_system.database.repository import OrderRepository
+
+                self._db_manager = self._db_manager or get_db_manager()
+                self._order_repository = self._order_repository or OrderRepository(self._db_manager)
+            except Exception as exc:
+                logger.warning(
+                    f"Order persistence disabled (database unavailable): {exc}"
+                )
+                self._persist_orders = False
 
         # Order tracking
         self._orders: dict[UUID, ManagedOrder] = {}
@@ -653,6 +691,7 @@ class OrderManager:
 
     async def start(self) -> None:
         """Start order monitoring."""
+        self._hydrate_open_orders()
         self._running = True
         self._monitor_task = asyncio.create_task(self._monitor_orders())
         logger.info("OrderManager started")
@@ -667,6 +706,10 @@ class OrderManager:
             except asyncio.CancelledError:
                 pass
         logger.info("OrderManager stopped")
+
+    async def close(self) -> None:
+        """Compatibility close method used by session cleanup paths."""
+        await self.stop()
 
     def create_order(
         self,
@@ -762,6 +805,7 @@ class OrderManager:
             if self.idempotency_manager and idempotency_key:
                 self.idempotency_manager.register_key(idempotency_key, order.order_id)
 
+        self._persist_order_state(managed, event_type="created")
         logger.info(f"Created order {order.order_id}: {request.symbol} {request.side.value} {request.quantity}")
 
         return managed
@@ -813,6 +857,12 @@ class OrderManager:
                 managed.state = OrderState.REJECTED
                 managed.error_message = f"Kill switch active: {reason}"
                 self._publish_order_event(EventType.ORDER_REJECTED, managed)
+                self._persist_order_state(managed, event_type="rejected_kill_switch")
+                self._record_metric(
+                    "record_order_rejected",
+                    managed.order.symbol,
+                    "kill_switch",
+                )
                 raise OrderSubmissionError(
                     f"Order rejected: Kill switch is active ({reason})",
                     order_id=str(managed.order.order_id),
@@ -856,6 +906,22 @@ class OrderManager:
 
             # Publish event
             self._publish_order_event(EventType.ORDER_SUBMITTED, managed)
+            self._persist_order_state(managed, event_type="submitted")
+            self._record_metric(
+                "record_order_submitted",
+                managed.order.symbol,
+                managed.order.side.value,
+                managed.order.order_type.value,
+            )
+            if managed.submission_time is not None:
+                submit_to_ack_ms = (
+                    datetime.now(timezone.utc) - managed.submission_time
+                ).total_seconds() * 1000
+                self._record_metric(
+                    "record_order_lifecycle_latency",
+                    "submit_to_ack",
+                    submit_to_ack_ms,
+                )
 
             logger.info(f"Submitted order {managed.order.order_id} -> broker {broker_order.order_id}")
 
@@ -865,6 +931,12 @@ class OrderManager:
             managed.state = OrderState.REJECTED
             managed.error_message = "Insufficient funds"
             self._publish_order_event(EventType.ORDER_REJECTED, managed)
+            self._persist_order_state(managed, event_type="rejected")
+            self._record_metric(
+                "record_order_rejected",
+                managed.order.symbol,
+                "insufficient_funds",
+            )
             raise
         except OrderSubmissionError as e:
             managed.retry_count += 1
@@ -872,11 +944,23 @@ class OrderManager:
                 managed.state = OrderState.FAILED
                 managed.error_message = str(e)
                 self._publish_order_event(EventType.ORDER_REJECTED, managed)
+            self._persist_order_state(managed, event_type="submission_error")
+            self._record_metric(
+                "record_order_rejected",
+                managed.order.symbol,
+                "submission_error",
+            )
             raise
         except Exception as e:
             managed.state = OrderState.FAILED
             managed.error_message = str(e)
             self._publish_order_event(EventType.ORDER_REJECTED, managed)
+            self._persist_order_state(managed, event_type="failed")
+            self._record_metric(
+                "record_order_rejected",
+                managed.order.symbol,
+                "submission_exception",
+            )
             raise OrderSubmissionError(
                 f"Order submission failed: {e}",
                 order_id=str(managed.order.order_id),
@@ -917,6 +1001,7 @@ class OrderManager:
             managed.last_update = datetime.now(timezone.utc)
 
             self._publish_order_event(EventType.ORDER_CANCELLED, managed)
+            self._persist_order_state(managed, event_type="cancelled")
 
             logger.info(f"Cancelled order {order_id}")
 
@@ -1032,6 +1117,7 @@ class OrderManager:
             with self._sync_lock:
                 self._broker_id_map[new_broker_order.order_id] = managed.order.order_id
 
+            self._persist_order_state(managed, event_type="modified")
             logger.info(f"Modified order {order_id}")
 
             return managed
@@ -1143,8 +1229,19 @@ class OrderManager:
         managed.state = OrderState.FILLED
         managed.fill_time = datetime.now(timezone.utc)
         managed.fill_events.append(data)
+        managed.last_update = datetime.now(timezone.utc)
 
         self._publish_order_event(EventType.ORDER_FILLED, managed)
+        self._persist_order_state(managed, event_type="filled")
+        self._record_metric(
+            "record_order_filled",
+            managed.order.symbol,
+            managed.order.side.value,
+        )
+        if managed.submission_time and managed.fill_time:
+            fill_latency = (managed.fill_time - managed.submission_time).total_seconds()
+            self._record_metric("record_order_latency", managed.order.symbol, fill_latency)
+            self._record_metric("record_order_lifecycle_latency", "ack_to_fill", fill_latency * 1000)
 
         # Invoke callbacks
         for callback in self._fill_callbacks:
@@ -1163,8 +1260,10 @@ class OrderManager:
         """Handle partial fill event."""
         managed.state = OrderState.PARTIAL_FILLED
         managed.fill_events.append(data)
+        managed.last_update = datetime.now(timezone.utc)
 
         self._publish_order_event(EventType.ORDER_PARTIAL, managed)
+        self._persist_order_state(managed, event_type="partial_fill")
 
         logger.info(
             f"Order {managed.order.order_id} partial fill: "
@@ -1174,15 +1273,24 @@ class OrderManager:
     def _handle_cancellation(self, managed: ManagedOrder) -> None:
         """Handle order cancellation event."""
         managed.state = OrderState.CANCELLED
+        managed.last_update = datetime.now(timezone.utc)
         self._publish_order_event(EventType.ORDER_CANCELLED, managed)
+        self._persist_order_state(managed, event_type="cancelled")
         logger.info(f"Order {managed.order.order_id} cancelled")
 
     def _handle_rejection(self, managed: ManagedOrder, data: dict[str, Any]) -> None:
         """Handle order rejection event."""
         managed.state = OrderState.REJECTED
         managed.error_message = data.get("message", "Order rejected")
+        managed.last_update = datetime.now(timezone.utc)
 
         self._publish_order_event(EventType.ORDER_REJECTED, managed)
+        self._persist_order_state(managed, event_type="rejected")
+        self._record_metric(
+            "record_order_rejected",
+            managed.order.symbol,
+            "broker_rejected",
+        )
 
         # Invoke callbacks
         for callback in self._rejection_callbacks:
@@ -1196,7 +1304,9 @@ class OrderManager:
     def _handle_expiration(self, managed: ManagedOrder) -> None:
         """Handle order expiration event."""
         managed.state = OrderState.EXPIRED
+        managed.last_update = datetime.now(timezone.utc)
         self._publish_order_event(EventType.ORDER_EXPIRED, managed)
+        self._persist_order_state(managed, event_type="expired")
         logger.info(f"Order {managed.order.order_id} expired")
 
     async def _monitor_orders(self) -> None:
@@ -1319,6 +1429,263 @@ class OrderManager:
                    f"{len(report['state_mismatches'])} mismatches")
 
         return report
+
+    def _record_metric(self, method_name: str, *args: Any) -> None:
+        """Best-effort metric recording without coupling execution to monitoring health."""
+        if self.metrics_collector is None:
+            return
+        recorder = getattr(self.metrics_collector, method_name, None)
+        if recorder is None:
+            return
+        try:
+            recorder(*args)
+        except Exception as exc:
+            logger.debug(f"Metrics recording failed ({method_name}): {exc}")
+
+    def _persist_order_state(self, managed: ManagedOrder, event_type: str) -> None:
+        """Persist order lifecycle state to DB (best effort)."""
+        if not self._persist_orders or self._db_manager is None or self._order_repository is None:
+            return
+
+        payload = {
+            "order_id": str(managed.order.order_id),
+            "client_order_id": managed.order.client_order_id,
+            "broker_order_id": managed.order.broker_order_id,
+            "symbol": managed.order.symbol,
+            "side": managed.order.side.value,
+            "order_type": managed.order.order_type.value,
+            "quantity": managed.order.quantity,
+            "limit_price": managed.order.limit_price,
+            "stop_price": managed.order.stop_price,
+            "time_in_force": managed.order.time_in_force.value,
+            "status": managed.order.status.value,
+            "filled_qty": managed.order.filled_qty,
+            "filled_avg_price": managed.order.filled_avg_price,
+            "filled_at": managed.fill_time,
+            "strategy_name": managed.request.strategy_id or None,
+            "signal_id": str(managed.order.signal_id) if managed.order.signal_id else None,
+            "order_metadata": self._to_json_safe({
+                "event": event_type,
+                "persisted_at": datetime.now(timezone.utc).isoformat(),
+                "state": managed.state.value,
+                "managed": {
+                    "retry_count": managed.retry_count,
+                    "error_message": managed.error_message,
+                    "submission_time": (
+                        managed.submission_time.isoformat() if managed.submission_time else None
+                    ),
+                    "fill_time": managed.fill_time.isoformat() if managed.fill_time else None,
+                    "last_update": managed.last_update.isoformat(),
+                    "fill_events": managed.fill_events,
+                },
+                "request": {
+                    "request_id": str(managed.request.request_id),
+                    "strategy_id": managed.request.strategy_id,
+                    "priority": managed.request.priority.value,
+                    "extended_hours": managed.request.extended_hours,
+                    "take_profit_price": (
+                        str(managed.request.take_profit_price)
+                        if managed.request.take_profit_price is not None
+                        else None
+                    ),
+                    "stop_loss_price": (
+                        str(managed.request.stop_loss_price)
+                        if managed.request.stop_loss_price is not None
+                        else None
+                    ),
+                    "notes": managed.request.notes,
+                    "metadata": managed.request.metadata,
+                    "created_at": managed.request.created_at.isoformat(),
+                },
+            }),
+        }
+
+        try:
+            with self._db_manager.session() as session:
+                existing = self._order_repository.get_by_client_id(
+                    session,
+                    managed.order.client_order_id,
+                )
+                if existing is None:
+                    self._order_repository.create(session, **payload)
+                else:
+                    self._order_repository.update(session, existing, **payload)
+        except Exception as exc:
+            logger.warning(f"Failed to persist order {managed.order.order_id}: {exc}")
+
+    def _hydrate_open_orders(self) -> None:
+        """Hydrate open orders from persistent storage after restart."""
+        if not self._persist_orders or self._db_manager is None or self._order_repository is None:
+            return
+
+        try:
+            with self._db_manager.session() as session:
+                open_records = self._order_repository.get_open_orders(session)
+
+            if not open_records:
+                return
+
+            restored = 0
+            with self._sync_lock:
+                for record in open_records:
+                    try:
+                        order_id = UUID(str(record.order_id))
+                        if order_id in self._orders:
+                            continue
+
+                        order_status = OrderStatus(str(record.status).upper())
+                        order = Order(
+                            order_id=order_id,
+                            client_order_id=record.client_order_id,
+                            broker_order_id=record.broker_order_id,
+                            symbol=record.symbol,
+                            side=OrderSide(str(record.side).upper()),
+                            order_type=OrderType(str(record.order_type).upper()),
+                            quantity=Decimal(str(record.quantity)),
+                            limit_price=Decimal(str(record.limit_price)) if record.limit_price is not None else None,
+                            stop_price=Decimal(str(record.stop_price)) if record.stop_price is not None else None,
+                            time_in_force=TimeInForce(str(record.time_in_force).upper()),
+                            status=order_status,
+                            filled_qty=Decimal(str(record.filled_qty)) if record.filled_qty is not None else Decimal("0"),
+                            filled_avg_price=(
+                                Decimal(str(record.filled_avg_price))
+                                if record.filled_avg_price is not None
+                                else None
+                            ),
+                            created_at=record.created_at or datetime.now(timezone.utc),
+                            updated_at=record.updated_at or datetime.now(timezone.utc),
+                            signal_id=UUID(str(record.signal_id)) if getattr(record, "signal_id", None) else None,
+                        )
+
+                        metadata = record.order_metadata if isinstance(record.order_metadata, dict) else {}
+                        request_payload = metadata.get("request", {})
+                        request = OrderRequest(
+                            request_id=UUID(request_payload["request_id"])
+                            if isinstance(request_payload.get("request_id"), str)
+                            else uuid4(),
+                            symbol=order.symbol,
+                            side=order.side,
+                            quantity=order.quantity,
+                            order_type=order.order_type,
+                            limit_price=order.limit_price,
+                            stop_price=order.stop_price,
+                            time_in_force=order.time_in_force,
+                            signal_id=order.signal_id,
+                            strategy_id=request_payload.get("strategy_id", "") or (record.strategy_name or ""),
+                            priority=self._parse_priority(
+                                request_payload.get("priority", OrderPriority.NORMAL.value)
+                            ),
+                            extended_hours=bool(request_payload.get("extended_hours", False)),
+                            take_profit_price=(
+                                Decimal(str(request_payload["take_profit_price"]))
+                                if request_payload.get("take_profit_price") is not None
+                                else None
+                            ),
+                            stop_loss_price=(
+                                Decimal(str(request_payload["stop_loss_price"]))
+                                if request_payload.get("stop_loss_price") is not None
+                                else None
+                            ),
+                            notes=str(request_payload.get("notes", "")),
+                            created_at=(
+                                datetime.fromisoformat(request_payload["created_at"])
+                                if isinstance(request_payload.get("created_at"), str)
+                                else order.created_at
+                            ),
+                            metadata=request_payload.get("metadata", {})
+                            if isinstance(request_payload.get("metadata", {}), dict)
+                            else {},
+                        )
+
+                        managed_meta = metadata.get("managed", {})
+                        persisted_state = metadata.get("state")
+                        managed = ManagedOrder(
+                            order=order,
+                            request=request,
+                            state=(
+                                OrderState(str(persisted_state))
+                                if isinstance(persisted_state, str)
+                                and persisted_state in {state.value for state in OrderState}
+                                else self._status_to_state(order.status)
+                            ),
+                            submission_time=(
+                                datetime.fromisoformat(managed_meta["submission_time"])
+                                if isinstance(managed_meta.get("submission_time"), str)
+                                else None
+                            ),
+                            fill_time=(
+                                datetime.fromisoformat(managed_meta["fill_time"])
+                                if isinstance(managed_meta.get("fill_time"), str)
+                                else None
+                            ),
+                            last_update=(
+                                datetime.fromisoformat(managed_meta["last_update"])
+                                if isinstance(managed_meta.get("last_update"), str)
+                                else datetime.now(timezone.utc)
+                            ),
+                            retry_count=int(managed_meta.get("retry_count", 0)),
+                            error_message=managed_meta.get("error_message"),
+                            fill_events=managed_meta.get("fill_events", [])
+                            if isinstance(managed_meta.get("fill_events", []), list)
+                            else [],
+                        )
+
+                        self._orders[order.order_id] = managed
+                        self._client_id_map[order.client_order_id] = order.order_id
+                        if order.broker_order_id:
+                            self._broker_id_map[order.broker_order_id] = order.order_id
+                        restored += 1
+                    except Exception as parse_exc:
+                        logger.warning(
+                            f"Failed to hydrate order record {getattr(record, 'order_id', 'unknown')}: "
+                            f"{parse_exc}"
+                        )
+
+            if restored > 0:
+                logger.info(f"Hydrated {restored} open orders from persistent storage")
+        except Exception as exc:
+            logger.warning(f"Order hydration skipped due to persistence error: {exc}")
+
+    def _status_to_state(self, status: OrderStatus) -> OrderState:
+        """Map external order status to internal lifecycle state."""
+        mapping = {
+            OrderStatus.PENDING: OrderState.PENDING,
+            OrderStatus.SUBMITTED: OrderState.SUBMITTED,
+            OrderStatus.ACCEPTED: OrderState.ACCEPTED,
+            OrderStatus.PARTIAL_FILLED: OrderState.PARTIAL_FILLED,
+            OrderStatus.FILLED: OrderState.FILLED,
+            OrderStatus.REJECTED: OrderState.REJECTED,
+            OrderStatus.CANCELLED: OrderState.CANCELLED,
+            OrderStatus.EXPIRED: OrderState.EXPIRED,
+        }
+        return mapping.get(status, OrderState.CREATED)
+
+    def _parse_priority(self, value: Any) -> OrderPriority:
+        """Parse persisted priority value safely."""
+        if isinstance(value, OrderPriority):
+            return value
+        try:
+            return OrderPriority(int(value))
+        except Exception:
+            return OrderPriority.NORMAL
+
+    def _to_json_safe(self, value: Any) -> Any:
+        """Convert nested objects to JSON-safe primitives for DB metadata storage."""
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, UUID):
+            return str(value)
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {str(k): self._to_json_safe(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._to_json_safe(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._to_json_safe(item) for item in value]
+        return value
 
     def _publish_order_event(self, event_type: EventType, managed: ManagedOrder) -> None:
         """Publish order event to event bus."""

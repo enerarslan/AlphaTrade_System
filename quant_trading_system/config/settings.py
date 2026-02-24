@@ -109,6 +109,22 @@ class AlpacaSettings(BaseModel):
         """Ensure paper trading uses paper API."""
         return v
 
+    @model_validator(mode="after")
+    def validate_live_trading_guardrails(self) -> "AlpacaSettings":
+        """Block unsafe live-trading configuration."""
+        if not self.paper_trading:
+            if not self.api_key or not self.api_secret:
+                raise ValueError(
+                    "Live trading requires non-empty Alpaca API credentials "
+                    "(api_key and api_secret)."
+                )
+            if "paper-api" in self.base_url.lower():
+                raise ValueError(
+                    "Live trading is enabled but base_url points to paper endpoint. "
+                    "Use https://api.alpaca.markets for live mode."
+                )
+        return self
+
     @classmethod
     def from_env(cls) -> "AlpacaSettings":
         """Create settings from environment variables (SECURE method).

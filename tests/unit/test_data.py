@@ -187,6 +187,23 @@ class TestDataLoader:
             assert "close" in result.columns
             assert "volume" in result.columns
 
+    def test_data_loader_blocks_critical_invalid_ohlc(self):
+        """Critical OHLC violations must fail hard before downstream usage."""
+        from quant_trading_system.core.exceptions import DataValidationError
+        from quant_trading_system.data.loader import DataLoader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "AAPL.csv"
+            csv_path.write_text(
+                "timestamp,open,high,low,close,volume\n"
+                "2025-01-01T10:00:00+00:00,100,99,101,100.5,1000\n",
+                encoding="utf-8",
+            )
+
+            loader = DataLoader(tmpdir, validate=True)
+            with pytest.raises(DataValidationError, match="Critical data validation failed"):
+                loader.load_symbol("AAPL")
+
 
 class TestParquetDataStore:
     """Tests for ParquetDataStore class."""

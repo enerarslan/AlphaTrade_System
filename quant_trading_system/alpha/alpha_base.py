@@ -11,11 +11,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import logging
 from typing import Any
 from uuid import UUID, uuid4
 
 import numpy as np
 import polars as pl
+
+logger = logging.getLogger(__name__)
 
 
 class AlphaType(str, Enum):
@@ -213,6 +216,8 @@ class AlphaFactor(ABC):
         Returns:
             List of AlphaSignal objects
         """
+        self.validate_or_raise(df, features)
+
         # Compute raw alpha values
         raw_alpha = self.compute(df, features)
 
@@ -790,9 +795,14 @@ class AlphaRegistry:
         features: dict[str, np.ndarray] | None = None,
     ) -> dict[str, np.ndarray]:
         """Compute all registered alphas."""
-        return {
-            name: alpha.compute(df, features) for name, alpha in self._alphas.items()
-        }
+        results: dict[str, np.ndarray] = {}
+        for name, alpha in self._alphas.items():
+            try:
+                alpha.validate_or_raise(df, features)
+                results[name] = alpha.compute(df, features)
+            except Exception as exc:
+                logger.error(f"Alpha compute failed for '{name}', continuing batch: {exc}")
+        return results
 
     def evaluate_all(
         self,
@@ -802,9 +812,13 @@ class AlphaRegistry:
         """Evaluate all registered alphas."""
         metrics = {}
         for name, alpha in self._alphas.items():
-            alpha_metrics = alpha.evaluate(df, forward_returns)
-            metrics[name] = alpha_metrics
-            self._metrics[name].append(alpha_metrics)
+            try:
+                alpha.validate_or_raise(df)
+                alpha_metrics = alpha.evaluate(df, forward_returns)
+                metrics[name] = alpha_metrics
+                self._metrics[name].append(alpha_metrics)
+            except Exception as exc:
+                logger.error(f"Alpha evaluate failed for '{name}', continuing batch: {exc}")
         return metrics
 
     def get_top_alphas(

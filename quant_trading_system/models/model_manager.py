@@ -204,6 +204,7 @@ class ModelRegistry:
         metrics: dict[str, float] | None = None,
         tags: list[str] | None = None,
         description: str = "",
+        extra_metadata: dict[str, Any] | None = None,
     ) -> str:
         """
         Register a model version.
@@ -213,6 +214,7 @@ class ModelRegistry:
             metrics: Performance metrics
             tags: Tags for categorization
             description: Model description
+            extra_metadata: Additional metadata for governance/audit.
 
         Returns:
             Unique version ID
@@ -240,6 +242,7 @@ class ModelRegistry:
             "description": description,
             "is_active": True,
             "path": str(model_dir),
+            "extra_metadata": extra_metadata or {},
         }
 
         # Update registry
@@ -1527,6 +1530,8 @@ class ModelManager:
         assumed_cost_bps: float = 5.0,
         turnover_penalty_bps: float = 0.0,
         annualization_factor: float = 252.0,
+        enforce_validation_gates: bool = True,
+        validation_gates_strict: bool = True,
     ) -> tuple[TradingModel, dict[str, float]]:
         """
         Optimize hyperparameters and train final model.
@@ -1560,6 +1565,8 @@ class ModelManager:
             assumed_cost_bps: Assumed transaction costs in basis points.
             turnover_penalty_bps: Additional turnover penalty in basis points.
             annualization_factor: Annualization factor for Sharpe metrics.
+            enforce_validation_gates: Run institutional validation gates on holdout metrics.
+            validation_gates_strict: If True, block model registration on gate failure.
 
         Returns:
             Tuple of (trained model, holdout test metrics)
@@ -1677,11 +1684,46 @@ class ModelManager:
             logger.info("Model passed overfitting validation checks")
             holdout_metrics["overfitting_detected"] = False
 
+        validation_report = None
+        if enforce_validation_gates:
+            from quant_trading_system.core.exceptions import ModelValidationError
+            from quant_trading_system.models.validation_gates import ModelValidationGates
+
+            gates = ModelValidationGates()
+            gate_holdout_metrics = holdout_metrics.copy()
+            gate_holdout_metrics.setdefault("n_samples", float(len(y_holdout)))
+            gate_is_metrics = {"sharpe_ratio": float(optimizer.best_score)}
+
+            validation_report = gates.validate(
+                model_name=model.name,
+                model_version=model.version,
+                holdout_metrics=gate_holdout_metrics,
+                is_metrics=gate_is_metrics,
+            )
+
+            holdout_metrics["validation_gates_passed"] = float(validation_report.overall_passed)
+            holdout_metrics["validation_critical_failures"] = float(validation_report.critical_failures)
+            holdout_metrics["validation_warning_failures"] = float(validation_report.warning_failures)
+
+            if not validation_report.overall_passed and validation_gates_strict:
+                failed_gates = [r.gate_name for r in validation_report.gate_results if not r.passed]
+                raise ModelValidationError(
+                    f"Model failed validation gates: {failed_gates}",
+                    model_name=model.name,
+                    validation_type="validation_gates",
+                    failed_gates=failed_gates,
+                )
+
         # Register if requested
         if register:
             tags = ["optimized", "holdout_validated"]
             if not is_acceptable:
                 tags.append("overfitting_warning")
+            if validation_report is not None:
+                if validation_report.overall_passed:
+                    tags.append("validation_gates_passed")
+                else:
+                    tags.append("validation_gates_failed")
 
             self.registry.register(
                 model,
@@ -1692,6 +1734,9 @@ class ModelManager:
                 },
                 tags=tags,
                 description=f"Optimized with {optimization_method} search, holdout validated, IS/OOS ratio: {is_oos_ratio:.2f}",
+                extra_metadata={
+                    "validation_gates": validation_report.to_dict() if validation_report else {},
+                },
             )
 
         return model, holdout_metrics
