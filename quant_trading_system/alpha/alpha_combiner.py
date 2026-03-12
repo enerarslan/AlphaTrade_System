@@ -20,6 +20,30 @@ from scipy import stats
 from .alpha_base import AlphaFactor, AlphaSignal, AlphaType, AlphaHorizon
 
 
+def _align_alpha_with_forward_returns(
+    alpha_values: np.ndarray,
+    returns: np.ndarray,
+    return_lag: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Align alpha and return arrays with an explicit lag convention."""
+    alpha_arr = np.asarray(alpha_values, dtype=float).reshape(-1)
+    returns_arr = np.asarray(returns, dtype=float).reshape(-1)
+    lag = max(0, int(return_lag))
+
+    if lag > 0 and alpha_arr.size > lag and returns_arr.size > lag:
+        aligned_alpha = alpha_arr[:-lag]
+        aligned_returns = returns_arr[lag:]
+    else:
+        aligned_alpha = alpha_arr
+        aligned_returns = returns_arr
+
+    min_len = min(int(aligned_alpha.size), int(aligned_returns.size))
+    if min_len <= 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    return aligned_alpha[-min_len:], aligned_returns[-min_len:]
+
+
 class WeightingMethod(str, Enum):
     """Alpha weighting method enumeration."""
 
@@ -49,6 +73,13 @@ class OrthogonalizationMethod(str, Enum):
     GRAM_SCHMIDT = "gram_schmidt"
     DECORRELATE = "decorrelate"
     NONE = "none"
+
+
+class WeightUpdateMode(str, Enum):
+    """OOS weight update mode."""
+
+    EXPANDING = "expanding"
+    ROLLING = "rolling"
 
 
 @dataclass
@@ -91,6 +122,11 @@ class CombinerConfig:
     lookback_window: int = 60
     ic_lookback: int = 20
     vol_lookback: int = 20
+    return_lag: int = 1
+    oos_update_mode: WeightUpdateMode = WeightUpdateMode.EXPANDING
+    oos_update_window: int = 252
+    oos_update_blend: float = 0.5
+    oos_min_observations: int = 30
 
     # Optimization settings
     turnover_penalty: float = 0.1
@@ -109,7 +145,22 @@ class CombinerConfig:
             "min_weight": self.min_weight,
             "sum_to_one": self.sum_to_one,
             "lookback_window": self.lookback_window,
+            "return_lag": self.return_lag,
+            "oos_update_mode": self.oos_update_mode.value,
+            "oos_update_window": self.oos_update_window,
+            "oos_update_blend": self.oos_update_blend,
+            "oos_min_observations": self.oos_min_observations,
         }
+
+    def __post_init__(self) -> None:
+        if self.return_lag < 0:
+            raise ValueError("return_lag must be non-negative")
+        if self.oos_update_window <= 0:
+            raise ValueError("oos_update_window must be positive")
+        if self.oos_min_observations <= 0:
+            raise ValueError("oos_min_observations must be positive")
+        if not (0.0 <= self.oos_update_blend <= 1.0):
+            raise ValueError("oos_update_blend must be in [0, 1]")
 
 
 class AlphaWeighter(ABC):
@@ -188,16 +239,11 @@ class ICWeighter(AlphaWeighter):
 
         ics = {}
         for name, values in alpha_values.items():
-            # CRITICAL FIX: Align alpha values with FORWARD returns
-            # Alpha at time t should predict returns at time t+lag
-            # So we use alpha[:-lag] vs returns[lag:]
-            lag = self.return_lag
-            if lag > 0 and len(values) > lag and len(returns) > lag:
-                lagged_alpha = values[:-lag]
-                forward_returns = returns[lag:]
-            else:
-                lagged_alpha = values
-                forward_returns = returns
+            lagged_alpha, forward_returns = _align_alpha_with_forward_returns(
+                values,
+                returns,
+                self.return_lag,
+            )
 
             # Compute rank IC
             valid_mask = ~(np.isnan(lagged_alpha) | np.isnan(forward_returns))
@@ -267,16 +313,11 @@ class SharpeWeighter(AlphaWeighter):
 
         sharpes = {}
         for name, values in alpha_values.items():
-            # MAJOR FIX: Align alpha values with FORWARD returns
-            # Alpha at time t should predict returns from t to t+lag
-            # So we use alpha[:-lag] vs returns[lag:]
-            lag = self.return_lag
-            if lag > 0 and len(values) > lag and len(returns) > lag:
-                lagged_alpha = values[:-lag]
-                forward_returns = returns[lag:]
-            else:
-                lagged_alpha = values
-                forward_returns = returns
+            lagged_alpha, forward_returns = _align_alpha_with_forward_returns(
+                values,
+                returns,
+                self.return_lag,
+            )
 
             # Compute alpha returns (signal * forward returns)
             min_len = min(len(lagged_alpha), len(forward_returns))
@@ -357,6 +398,7 @@ class OptimizedWeighter(AlphaWeighter):
         max_weight: float = 0.5,
         min_weight: float = 0.0,
         turnover_penalty: float = 0.1,
+        return_lag: int = 1,
     ):
         """
         Initialize optimized weighter.
@@ -366,11 +408,13 @@ class OptimizedWeighter(AlphaWeighter):
             max_weight: Maximum weight per alpha
             min_weight: Minimum weight per alpha
             turnover_penalty: Penalty for weight turnover
+            return_lag: Number of periods to lag returns for alignment.
         """
         self.lookback = lookback
         self.max_weight = max_weight
         self.min_weight = min_weight
         self.turnover_penalty = turnover_penalty
+        self.return_lag = max(0, int(return_lag))
         self._previous_weights: dict[str, float] | None = None
 
     def compute_weights(
@@ -389,14 +433,35 @@ class OptimizedWeighter(AlphaWeighter):
         if n_alphas == 0:
             return {}
 
-        # Build alpha matrix
-        min_len = min(len(v) for v in alpha_values.values())
-        min_len = min(min_len, len(returns), self.lookback)
+        # Build aligned alpha matrix with lag-safe return alignment.
+        aligned_alpha: dict[str, np.ndarray] = {}
+        aligned_returns: dict[str, np.ndarray] = {}
+        for name in alpha_names:
+            a, r = _align_alpha_with_forward_returns(
+                alpha_values[name],
+                returns,
+                self.return_lag,
+            )
+            if a.size == 0 or r.size == 0:
+                continue
+            aligned_alpha[name] = a
+            aligned_returns[name] = r
 
-        alpha_matrix = np.column_stack(
-            [alpha_values[name][-min_len:] for name in alpha_names]
+        if len(aligned_alpha) < 1:
+            return EqualWeighter().compute_weights(alpha_values)
+
+        min_len = min(
+            min(len(v) for v in aligned_alpha.values()),
+            self.lookback,
         )
-        returns_slice = returns[-min_len:]
+        if min_len <= 0:
+            return EqualWeighter().compute_weights(alpha_values)
+
+        alpha_names = list(aligned_alpha.keys())
+        n_alphas = len(alpha_names)
+        alpha_matrix = np.column_stack([aligned_alpha[name][-min_len:] for name in alpha_names])
+        reference_name = alpha_names[0]
+        returns_slice = aligned_returns[reference_name][-min_len:]
 
         # Handle NaNs
         valid_mask = ~np.any(np.isnan(alpha_matrix), axis=1) & ~np.isnan(returns_slice)
@@ -496,14 +561,11 @@ class RankWeighter(AlphaWeighter):
         # Compute ICs
         ics = {}
         for name, values in alpha_values.items():
-            # MAJOR FIX: Align alpha values with FORWARD returns
-            lag = self.return_lag
-            if lag > 0 and len(values) > lag and len(returns) > lag:
-                lagged_alpha = values[:-lag]
-                forward_returns = returns[lag:]
-            else:
-                lagged_alpha = values
-                forward_returns = returns
+            lagged_alpha, forward_returns = _align_alpha_with_forward_returns(
+                values,
+                returns,
+                self.return_lag,
+            )
 
             valid_mask = ~(np.isnan(lagged_alpha) | np.isnan(forward_returns))
             if np.sum(valid_mask) < self.lookback:
@@ -575,14 +637,11 @@ class DecayWeighter(AlphaWeighter):
         weighted_ics = {}
 
         for name, values in alpha_values.items():
-            # MAJOR FIX: Align alpha values with FORWARD returns
-            lag = self.return_lag
-            if lag > 0 and len(values) > lag and len(returns) > lag:
-                lagged_alpha = values[:-lag]
-                forward_returns = returns[lag:]
-            else:
-                lagged_alpha = values
-                forward_returns = returns
+            lagged_alpha, forward_returns = _align_alpha_with_forward_returns(
+                values,
+                returns,
+                self.return_lag,
+            )
 
             valid_mask = ~(np.isnan(lagged_alpha) | np.isnan(forward_returns))
             n_valid = np.sum(valid_mask)
@@ -895,6 +954,9 @@ class AlphaCombiner:
         # State
         self._weights: dict[str, float] = {}
         self._alpha_values: dict[str, np.ndarray] = {}
+        self._oos_alpha_history: dict[str, np.ndarray] = {}
+        self._oos_returns_history: np.ndarray = np.array([], dtype=float)
+        self._weight_history: list[dict[str, float]] = []
         self._is_fitted = False
 
     def _create_weighter(self) -> AlphaWeighter:
@@ -904,9 +966,9 @@ class AlphaCombiner:
         if method == WeightingMethod.EQUAL:
             return EqualWeighter()
         elif method == WeightingMethod.IC_WEIGHTED:
-            return ICWeighter(self.config.ic_lookback)
+            return ICWeighter(self.config.ic_lookback, return_lag=self.config.return_lag)
         elif method == WeightingMethod.SHARPE_WEIGHTED:
-            return SharpeWeighter(self.config.lookback_window)
+            return SharpeWeighter(self.config.lookback_window, return_lag=self.config.return_lag)
         elif method == WeightingMethod.INVERSE_VOLATILITY:
             return InverseVolatilityWeighter(self.config.vol_lookback)
         elif method == WeightingMethod.OPTIMIZED:
@@ -915,13 +977,15 @@ class AlphaCombiner:
                 self.config.max_weight,
                 self.config.min_weight,
                 self.config.turnover_penalty,
+                self.config.return_lag,
             )
         elif method == WeightingMethod.RANK_WEIGHTED:
-            return RankWeighter(self.config.ic_lookback)
+            return RankWeighter(self.config.ic_lookback, return_lag=self.config.return_lag)
         elif method == WeightingMethod.DECAY_WEIGHTED:
             return DecayWeighter(
                 self.config.lookback_window,
                 self.config.decay_halflife,
+                self.config.return_lag,
             )
         else:
             return EqualWeighter()
@@ -955,6 +1019,8 @@ class AlphaCombiner:
             del self._weights[name]
         if name in self._alpha_values:
             del self._alpha_values[name]
+        if name in self._oos_alpha_history:
+            del self._oos_alpha_history[name]
         return self
 
     def fit(
@@ -998,8 +1064,96 @@ class AlphaCombiner:
             alpha_matrix = np.column_stack(list(self._alpha_values.values()))
             self._orthogonalizer.fit(alpha_matrix)
 
+        self._oos_alpha_history = {}
+        self._oos_returns_history = np.array([], dtype=float)
+        self._weight_history = [self._weights.copy()]
         self._is_fitted = True
         return self
+
+    def _append_oos_history(
+        self,
+        alpha_values: dict[str, np.ndarray],
+        returns: np.ndarray,
+        update_mode: WeightUpdateMode,
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        """Append incoming OOS observations to update history."""
+        if not alpha_values:
+            return {}, np.array([], dtype=float)
+
+        min_len = min(min(len(v) for v in alpha_values.values()), len(returns))
+        if min_len <= 0:
+            return self._oos_alpha_history, self._oos_returns_history
+
+        batch_alpha = {name: np.asarray(values[-min_len:], dtype=float) for name, values in alpha_values.items()}
+        batch_returns = np.asarray(returns[-min_len:], dtype=float)
+
+        if not self._oos_alpha_history:
+            self._oos_alpha_history = {name: values.copy() for name, values in batch_alpha.items()}
+            self._oos_returns_history = batch_returns.copy()
+        else:
+            for name, values in batch_alpha.items():
+                previous = self._oos_alpha_history.get(name, np.array([], dtype=float))
+                self._oos_alpha_history[name] = np.concatenate([previous, values]).astype(float)
+            self._oos_returns_history = np.concatenate([self._oos_returns_history, batch_returns]).astype(float)
+
+        if update_mode == WeightUpdateMode.ROLLING:
+            window = int(self.config.oos_update_window)
+            self._oos_returns_history = self._oos_returns_history[-window:]
+            for name in list(self._oos_alpha_history.keys()):
+                self._oos_alpha_history[name] = self._oos_alpha_history[name][-window:]
+
+        return self._oos_alpha_history, self._oos_returns_history
+
+    def update_weights_oos(
+        self,
+        df: pl.DataFrame,
+        returns: np.ndarray,
+        features: dict[str, np.ndarray] | None = None,
+        update_mode: WeightUpdateMode | None = None,
+    ) -> dict[str, float]:
+        """
+        Update weights from out-of-sample observations.
+
+        Supports expanding or rolling windows and blends updated weights with
+        previous production weights to reduce regime-switch instability.
+        """
+        if not self.alphas:
+            return {}
+
+        mode = update_mode or self.config.oos_update_mode
+        if isinstance(mode, str):
+            mode = WeightUpdateMode(mode)
+
+        alpha_values: dict[str, np.ndarray] = {}
+        for alpha in self.alphas:
+            alpha_values[alpha.name] = alpha.compute(df, features)
+
+        history_alpha, history_returns = self._append_oos_history(
+            alpha_values=alpha_values,
+            returns=np.asarray(returns, dtype=float),
+            update_mode=mode,
+        )
+        if len(history_returns) < int(self.config.oos_min_observations):
+            return self._weights.copy()
+
+        updated_weights = self._weighter.compute_weights(history_alpha, history_returns)
+        updated_weights = self._apply_weight_constraints(updated_weights)
+
+        if self._weights:
+            blend = float(np.clip(self.config.oos_update_blend, 0.0, 1.0))
+            all_names = {alpha.name for alpha in self.alphas}
+            blended = {}
+            for name in all_names:
+                prev_w = float(self._weights.get(name, 0.0))
+                new_w = float(updated_weights.get(name, 0.0))
+                blended[name] = blend * prev_w + (1.0 - blend) * new_w
+            updated_weights = self._apply_weight_constraints(blended)
+
+        self._weights = updated_weights
+        self._alpha_values = alpha_values
+        self._weight_history.append(self._weights.copy())
+        self._is_fitted = True
+        return self._weights.copy()
 
     def _apply_weight_constraints(
         self,
@@ -1090,6 +1244,14 @@ class AlphaCombiner:
         """Get current alpha weights."""
         return self._weights.copy()
 
+    def get_weight_history(self) -> list[dict[str, float]]:
+        """Get chronological history of fitted and OOS-updated weights."""
+        return [snapshot.copy() for snapshot in self._weight_history]
+
+    def get_oos_observation_count(self) -> int:
+        """Get number of OOS observations currently retained for updates."""
+        return int(len(self._oos_returns_history))
+
     def get_weight_info(self) -> list[AlphaWeight]:
         """Get detailed weight information for each alpha."""
         info = []
@@ -1126,6 +1288,7 @@ class AlphaCombiner:
     def get_alpha_stats(
         self,
         returns: np.ndarray | None = None,
+        return_lag: int | None = None,
     ) -> dict[str, dict[str, float]]:
         """
         Get statistics for each alpha.
@@ -1149,13 +1312,19 @@ class AlphaCombiner:
                 "weight": self._weights.get(name, 0.0),
             }
 
-            # Add IC if returns provided
+            # Add lag-safe IC if returns provided
             if returns is not None:
-                valid_mask = ~(np.isnan(values) | np.isnan(returns))
+                lag = self.config.return_lag if return_lag is None else max(0, int(return_lag))
+                aligned_alpha, aligned_returns = _align_alpha_with_forward_returns(
+                    values,
+                    returns,
+                    lag,
+                )
+                valid_mask = ~(np.isnan(aligned_alpha) | np.isnan(aligned_returns))
                 if np.sum(valid_mask) >= 10:
                     ic, p_value = stats.spearmanr(
-                        values[valid_mask],
-                        returns[valid_mask],
+                        aligned_alpha[valid_mask],
+                        aligned_returns[valid_mask],
                     )
                     alpha_stats["ic"] = float(ic) if not np.isnan(ic) else 0.0
                     alpha_stats["ic_pvalue"] = float(p_value) if not np.isnan(p_value) else 1.0
@@ -1233,6 +1402,11 @@ def create_combiner(
     neutralize: NeutralizationMethod = NeutralizationMethod.MARKET,
     orthogonalize: OrthogonalizationMethod = OrthogonalizationMethod.NONE,
     max_weight: float = 0.5,
+    return_lag: int = 1,
+    oos_update_mode: WeightUpdateMode = WeightUpdateMode.EXPANDING,
+    oos_update_window: int = 252,
+    oos_update_blend: float = 0.5,
+    oos_min_observations: int = 30,
 ) -> AlphaCombiner:
     """
     Factory function to create a configured AlphaCombiner.
@@ -1243,6 +1417,11 @@ def create_combiner(
         neutralize: Neutralization method
         orthogonalize: Orthogonalization method
         max_weight: Maximum weight per alpha
+        return_lag: Return lag used for alpha/return alignment
+        oos_update_mode: OOS weight update mode (expanding/rolling)
+        oos_update_window: OOS rolling window size when mode=rolling
+        oos_update_blend: Blend ratio between previous and new OOS weights
+        oos_min_observations: Minimum OOS rows required for update
 
     Returns:
         Configured AlphaCombiner instance
@@ -1252,6 +1431,11 @@ def create_combiner(
         neutralization_method=neutralize,
         orthogonalization_method=orthogonalize,
         max_weight=max_weight,
+        return_lag=return_lag,
+        oos_update_mode=oos_update_mode,
+        oos_update_window=oos_update_window,
+        oos_update_blend=oos_update_blend,
+        oos_min_observations=oos_min_observations,
     )
 
     return AlphaCombiner(alphas, config)

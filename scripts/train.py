@@ -70,11 +70,13 @@ from quant_trading_system.models.training_lineage import (
 from quant_trading_system.models.statistical_validation import (
     calculate_deflated_sharpe_ratio,
     calculate_probability_of_backtest_overfitting,
+    calculate_white_reality_check,
 )
 from quant_trading_system.models.target_engineering import (
     TargetEngineeringConfig,
     generate_targets,
 )
+from quant_trading_system.models.trading_costs import TradingCostModel
 
 # Configure logging
 logging.basicConfig(
@@ -100,6 +102,9 @@ warnings.filterwarnings(
 SUPPORTED_MODELS = [
     "xgboost",
     "lightgbm",
+    "lightgbm_ranker",
+    "xgboost_regressor",
+    "lightgbm_regressor",
     "random_forest",
     "elastic_net",
     "lstm",
@@ -107,6 +112,9 @@ SUPPORTED_MODELS = [
     "tcn",
     "ensemble",
 ]
+LIGHTGBM_FAMILY_MODELS = {"lightgbm", "lightgbm_ranker", "lightgbm_regressor"}
+RANKING_MODELS = {"lightgbm_ranker"}
+REGRESSION_MODELS = {"xgboost_regressor", "lightgbm_regressor"}
 
 MANDATORY_MODEL_TECH_STACK = {
     "postgresql_data": True,
@@ -208,8 +216,22 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
     except Exception:
         return {}
 
-    if model_type in {"xgboost", "lightgbm", "random_forest", "elastic_net"}:
+    if model_type in {
+        "xgboost",
+        "lightgbm",
+        "lightgbm_ranker",
+        "xgboost_regressor",
+        "lightgbm_regressor",
+        "random_forest",
+        "elastic_net",
+    }:
         section = all_cfg.get(model_type, {})
+        if not section and model_type == "lightgbm_ranker":
+            section = all_cfg.get("lightgbm", {})
+        if not section and model_type == "xgboost_regressor":
+            section = all_cfg.get("xgboost", {})
+        if not section and model_type == "lightgbm_regressor":
+            section = all_cfg.get("lightgbm", {})
         params = dict(section.get("classifier", {}))
     elif model_type in {"lstm", "transformer", "tcn"}:
         params = dict(all_cfg.get(model_type, {}))
@@ -227,10 +249,10 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
     ):
         params.pop(key, None)
 
-    if model_type == "xgboost" and use_gpu:
+    if model_type in {"xgboost", "xgboost_regressor"} and use_gpu:
         params["tree_method"] = "hist"
         params["device"] = "cuda"
-    elif model_type == "lightgbm" and use_gpu:
+    elif model_type in LIGHTGBM_FAMILY_MODELS and use_gpu:
         params["device_type"] = "gpu"
 
     # Harmonize YAML keys with model constructor names.
@@ -286,7 +308,7 @@ def _verify_gpu_stack(model_list: list[str]) -> None:
         # Validate tensor ops on device for deep learning stack.
         _ = torch.randn((16, 8), device="cuda")
 
-    if {"xgboost", "ensemble"}.intersection(model_list):
+    if {"xgboost", "xgboost_regressor", "ensemble"}.intersection(model_list):
         try:
             import xgboost as xgb
 
@@ -305,7 +327,7 @@ def _verify_gpu_stack(model_list: list[str]) -> None:
                 "XGBoost GPU backend validation failed. Verify CUDA-enabled XGBoost installation."
             ) from exc
 
-    if {"lightgbm", "ensemble"}.intersection(model_list):
+    if {"lightgbm", "lightgbm_ranker", "lightgbm_regressor", "ensemble"}.intersection(model_list):
         try:
             import lightgbm as lgb
 
@@ -333,7 +355,7 @@ class TrainingConfig:
     """Complete training configuration."""
 
     # Model selection
-    model_type: str = "xgboost"  # xgboost, lightgbm, random_forest, elastic_net, lstm, transformer, tcn, ensemble
+    model_type: str = "xgboost"  # xgboost, lightgbm, lightgbm_ranker, xgboost_regressor, lightgbm_regressor, random_forest, elastic_net, lstm, transformer, tcn, ensemble
     model_name: str = ""  # Custom name for the model
 
     # Data configuration
@@ -395,6 +417,8 @@ class TrainingConfig:
     min_deflated_sharpe: float = 0.10
     max_deflated_sharpe_pvalue: float = 0.10
     max_pbo: float = 0.45
+    min_white_reality_stat: float = 0.0
+    max_white_reality_pvalue: float = 0.10
     min_holdout_sharpe: float = 0.0
     min_holdout_regime_sharpe: float = -0.10
     max_holdout_drawdown: float = 0.35
@@ -512,7 +536,11 @@ class TrainingConfig:
         )
         self.nested_outer_stability_min_trials = max(3, int(self.nested_outer_stability_min_trials))
         self.primary_horizon_sweep = sorted(
-            {int(h) for h in self.primary_horizon_sweep if isinstance(h, (int, float, np.integer, np.floating)) and int(h) > 0}
+            {
+                int(h)
+                for h in self.primary_horizon_sweep
+                if isinstance(h, (int, float, np.integer, np.floating)) and int(h) > 0
+            }
         )
         self.meta_label_min_confidence = float(np.clip(float(self.meta_label_min_confidence), 0.45, 0.95))
         self.meta_label_dynamic_threshold = bool(self.meta_label_dynamic_threshold)
@@ -562,6 +590,14 @@ class TrainingConfig:
         self.feature_groups = [str(g).strip().lower() for g in self.feature_groups if str(g).strip()]
         if not self.feature_groups:
             self.feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
+
+    def to_trading_cost_model(self) -> TradingCostModel:
+        """Build canonical execution cost model from training configuration."""
+        return TradingCostModel(
+            spread_bps=float(self.label_spread_bps),
+            slippage_bps=float(self.label_slippage_bps),
+            impact_bps=float(self.label_impact_bps),
+        )
 
 
 # ============================================================================
@@ -821,6 +857,7 @@ class ModelTrainer:
         _raise_floor("min_holdout_symbol_coverage", 0.65)
         _raise_floor("min_holdout_symbol_p25_sharpe", -0.05)
         _tighten_ceiling("max_pbo", 0.35)
+        _tighten_ceiling("max_white_reality_pvalue", 0.08)
         _tighten_ceiling("max_holdout_drawdown", 0.30)
         _tighten_ceiling("max_symbol_concentration_hhi", 0.55)
         _tighten_ceiling("max_holdout_symbol_underwater_ratio", 0.45)
@@ -1401,6 +1438,41 @@ class ModelTrainer:
         if not horizons:
             horizons = [int(self.config.primary_label_horizon)]
         return max(1, max(horizons))
+
+    def _is_ranker_model(self) -> bool:
+        """Return True when current model type uses ranking objective/training."""
+        return str(self.config.model_type).strip().lower() in RANKING_MODELS
+
+    def _is_regression_model(self) -> bool:
+        """Return True when current model type predicts continuous returns."""
+        return str(self.config.model_type).strip().lower() in REGRESSION_MODELS
+
+    def _requires_binary_class_support(self) -> bool:
+        """Return True when fold training requires both binary classes present."""
+        return not self._is_regression_model()
+
+    def _is_lightgbm_family_model(self) -> bool:
+        """Return True for lightgbm classifier/ranker variants."""
+        return str(self.config.model_type).strip().lower() in LIGHTGBM_FAMILY_MODELS
+
+    @staticmethod
+    def _build_ranking_groups(timestamps: np.ndarray | list[Any] | None) -> np.ndarray:
+        """Build contiguous query-group sizes for ranker training."""
+        if timestamps is None:
+            return np.array([], dtype=int)
+        ts = pd.to_datetime(np.asarray(timestamps), utc=True, errors="coerce")
+        if len(ts) == 0:
+            return np.array([], dtype=int)
+        if np.asarray(pd.isna(ts)).any():
+            return np.array([len(ts)], dtype=int)
+        ts_arr = np.asarray(ts, dtype="datetime64[ns]")
+        change_points = np.flatnonzero(ts_arr[1:] != ts_arr[:-1]) + 1
+        boundaries = np.concatenate(([0], change_points, [len(ts_arr)]))
+        groups = np.diff(boundaries).astype(int)
+        groups = groups[groups > 0]
+        if int(np.sum(groups)) != len(ts_arr):
+            return np.array([len(ts_arr)], dtype=int)
+        return groups
 
     def _primary_horizon(self) -> int:
         """Return configured primary horizon used for horizon-specific policies."""
@@ -2094,7 +2166,8 @@ class ModelTrainer:
         if labeled_frame.empty:
             raise ValueError("Target engineering produced zero valid labels.")
         labeled_frame["label"] = pd.to_numeric(labeled_frame["label"], errors="coerce").astype(int)
-        labeled_frame = labeled_frame.dropna(subset=["timestamp"]).reset_index(drop=True)
+        labeled_frame = labeled_frame.dropna(subset=["timestamp"])
+        labeled_frame = labeled_frame.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
         if "regime" not in labeled_frame.columns:
             labeled_frame["regime"] = "normal_range"
 
@@ -2126,19 +2199,57 @@ class ModelTrainer:
         holdout_frame = labeled_frame.loc[holdout_mask].reset_index(drop=True)
         dev_weights = sample_weights[dev_mask]
         holdout_weights = sample_weights[holdout_mask]
+        primary_forward_col = f"forward_return_h{primary_horizon}"
+        target_mode = "classification_label"
+        if self._is_regression_model():
+            target_mode = "return_regression"
+            if "triple_barrier_net_return" in dev_frame.columns:
+                dev_target = pd.to_numeric(
+                    dev_frame["triple_barrier_net_return"],
+                    errors="coerce",
+                )
+                holdout_target = (
+                    pd.to_numeric(holdout_frame["triple_barrier_net_return"], errors="coerce")
+                    if "triple_barrier_net_return" in holdout_frame.columns
+                    else pd.Series(dtype=float)
+                )
+                target_mode = "triple_barrier_net_return"
+            elif primary_forward_col in dev_frame.columns:
+                dev_target = pd.to_numeric(dev_frame[primary_forward_col], errors="coerce")
+                holdout_target = (
+                    pd.to_numeric(holdout_frame[primary_forward_col], errors="coerce")
+                    if primary_forward_col in holdout_frame.columns
+                    else pd.Series(dtype=float)
+                )
+                target_mode = primary_forward_col
+            else:
+                raise ValueError(
+                    "Regression challenger requires return target column "
+                    "(triple_barrier_net_return or primary forward return)."
+                )
 
-        self.labels = dev_frame["label"]
-        if int(self.labels.nunique(dropna=True)) < 2:
-            pos_rate = float(np.mean(pd.to_numeric(self.labels, errors="coerce").fillna(0.0)))
-            raise ValueError(
-                "Label generation produced a single class in development set "
-                f"(pos_rate={pos_rate:.2%}). Adjust label horizons/thresholds before training."
-            )
+            dev_target = dev_target.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            dev_target = dev_target.clip(lower=-0.50, upper=0.50).astype(float)
+            self.labels = dev_target.reset_index(drop=True)
+            if len(self.labels) < 50:
+                raise ValueError("Regression target produced insufficient development samples.")
+            self.training_metrics["target_mode"] = target_mode
+            self.training_metrics["target_mean"] = float(np.mean(self.labels))
+            self.training_metrics["target_std"] = float(np.std(self.labels))
+        else:
+            self.labels = dev_frame["label"].astype(int)
+            if int(self.labels.nunique(dropna=True)) < 2:
+                pos_rate = float(np.mean(pd.to_numeric(self.labels, errors="coerce").fillna(0.0)))
+                raise ValueError(
+                    "Label generation produced a single class in development set "
+                    f"(pos_rate={pos_rate:.2%}). Adjust label horizons/thresholds before training."
+                )
+            self.training_metrics["target_mode"] = target_mode
+
         self.timestamps = dev_frame["timestamp"].to_numpy()
         self.row_symbols = dev_frame["symbol"].astype(str).to_numpy()
         self.regimes = dev_frame["regime"].astype(str).to_numpy()
         self.close_prices = dev_frame["close"].reset_index(drop=True)
-        primary_forward_col = f"forward_return_h{primary_horizon}"
         if primary_forward_col in dev_frame.columns:
             self.primary_forward_returns = np.nan_to_num(
                 pd.to_numeric(dev_frame[primary_forward_col], errors="coerce").to_numpy(dtype=float),
@@ -2167,7 +2278,20 @@ class ModelTrainer:
         self.holdout_primary_forward_returns = None
         self.holdout_cost_aware_event_returns = None
         if not holdout_frame.empty:
-            self.holdout_labels = holdout_frame["label"].astype(int).reset_index(drop=True)
+            if self._is_regression_model():
+                if "triple_barrier_net_return" in holdout_frame.columns:
+                    holdout_target = pd.to_numeric(
+                        holdout_frame["triple_barrier_net_return"],
+                        errors="coerce",
+                    )
+                elif primary_forward_col in holdout_frame.columns:
+                    holdout_target = pd.to_numeric(holdout_frame[primary_forward_col], errors="coerce")
+                else:
+                    holdout_target = pd.Series(np.zeros(len(holdout_frame), dtype=float))
+                holdout_target = holdout_target.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                self.holdout_labels = holdout_target.clip(lower=-0.50, upper=0.50).astype(float).reset_index(drop=True)
+            else:
+                self.holdout_labels = holdout_frame["label"].astype(int).reset_index(drop=True)
             self.holdout_timestamps = holdout_frame["timestamp"].to_numpy()
             self.holdout_symbols = holdout_frame["symbol"].astype(str).to_numpy()
             self.holdout_regimes = holdout_frame["regime"].astype(str).to_numpy()
@@ -2226,13 +2350,24 @@ class ModelTrainer:
         self.feature_names = feature_cols
         self._apply_model_priors()
 
-        self.logger.info(
-            f"Created {len(self.labels)} development labels "
-            f"(pos: {int(self.labels.sum())}, neg: {int(len(self.labels) - self.labels.sum())}) "
-            f"| holdout={int(np.sum(holdout_mask))} "
-            f"| pos_rate={self.training_metrics['label_positive_rate']:.2%} "
-            f"| drift_abs={self.training_metrics['label_drift_abs']:.2%}"
-        )
+        if self._is_regression_model():
+            self.logger.info(
+                "Created %d development regression targets "
+                "(mean=%.6f, std=%.6f) | holdout=%d | target_mode=%s",
+                len(self.labels),
+                float(self.training_metrics.get("target_mean", 0.0)),
+                float(self.training_metrics.get("target_std", 0.0)),
+                int(np.sum(holdout_mask)),
+                str(self.training_metrics.get("target_mode", "return_regression")),
+            )
+        else:
+            self.logger.info(
+                f"Created {len(self.labels)} development labels "
+                f"(pos: {int(self.labels.sum())}, neg: {int(len(self.labels) - self.labels.sum())}) "
+                f"| holdout={int(np.sum(holdout_mask))} "
+                f"| pos_rate={self.training_metrics['label_positive_rate']:.2%} "
+                f"| drift_abs={self.training_metrics['label_drift_abs']:.2%}"
+            )
         self._build_training_snapshot_manifest()
 
     def _validate_symbol_timestamp_ordering(self) -> None:
@@ -2337,7 +2472,7 @@ class ModelTrainer:
 
     def _apply_model_priors(self) -> None:
         """Apply model-family priors that depend on prepared feature schema."""
-        if self.config.model_type != "lightgbm":
+        if not self._is_lightgbm_family_model():
             return
         if not self.config.lightgbm_use_monotonic_constraints:
             self.config.model_params.pop("monotone_constraints", None)
@@ -2554,12 +2689,22 @@ class ModelTrainer:
                 for fold_idx, (train_idx, test_idx) in enumerate(splits):
                     X_train, X_test = X[train_idx], X[test_idx]
                     y_train, y_test = y[train_idx], y[test_idx]
-                    if not self._has_binary_class_support(y_train):
+                    if self._requires_binary_class_support() and not self._has_binary_class_support(y_train):
                         continue
                     fold_params = self._prepare_params_for_train_size(params, len(train_idx))
                     fold_params = self._augment_params_for_train_labels(fold_params, y_train)
                     model = self._create_model(params=fold_params)
                     w_train = weights[train_idx] if weights is not None else None
+                    train_ts = (
+                        np.asarray(self.timestamps[train_idx], dtype="datetime64[ns]")
+                        if self.timestamps is not None and len(self.timestamps) == len(y)
+                        else None
+                    )
+                    test_ts = (
+                        np.asarray(self.timestamps[test_idx], dtype="datetime64[ns]")
+                        if self.timestamps is not None and len(self.timestamps) == len(y)
+                        else None
+                    )
                     self._fit_model(
                         model=model,
                         X_train=X_train,
@@ -2567,6 +2712,8 @@ class ModelTrainer:
                         X_val=X_test,
                         y_val=y_test,
                         sample_weights=w_train,
+                        train_timestamps=train_ts,
+                        val_timestamps=test_ts,
                     )
 
                     y_pred = np.asarray(model.predict(X_test))
@@ -2808,7 +2955,7 @@ class ModelTrainer:
             y_outer_train = y[outer_train_idx]
             X_outer_test = X[outer_test_idx]
             y_outer_test = y[outer_test_idx]
-            if not self._has_binary_class_support(y_outer_train):
+            if self._requires_binary_class_support() and not self._has_binary_class_support(y_outer_train):
                 self.logger.warning(
                     "Outer fold %s: training labels contain a single class; fold skipped.",
                     outer_fold,
@@ -2905,7 +3052,7 @@ class ModelTrainer:
                         X_val = _X_outer_train[inner_val_idx]
                         y_train = _y_outer_train[inner_train_idx]
                         y_val = _y_outer_train[inner_val_idx]
-                        if not self._has_binary_class_support(y_train):
+                        if self._requires_binary_class_support() and not self._has_binary_class_support(y_train):
                             continue
                         fold_params = self._prepare_params_for_train_size(
                             params, len(inner_train_idx)
@@ -2924,6 +3071,16 @@ class ModelTrainer:
                             X_val=X_val,
                             y_val=y_val,
                             sample_weights=w_train,
+                            train_timestamps=(
+                                np.asarray(_ts_outer_train[inner_train_idx], dtype="datetime64[ns]")
+                                if _ts_outer_train is not None
+                                else None
+                            ),
+                            val_timestamps=(
+                                np.asarray(_ts_outer_train[inner_val_idx], dtype="datetime64[ns]")
+                                if _ts_outer_train is not None
+                                else None
+                            ),
                         )
 
                         y_pred = np.asarray(model.predict(X_val))
@@ -3117,6 +3274,8 @@ class ModelTrainer:
                     X_val=X_outer_test,
                     y_val=y_outer_test,
                     sample_weights=w_outer_train,
+                    train_timestamps=ts_outer_train,
+                    val_timestamps=ts_outer_test,
                 )
             except Exception as exc:
                 self.logger.warning(
@@ -3333,7 +3492,7 @@ class ModelTrainer:
                 "max_depth": [3, 5, 7],
                 "learning_rate": [0.01, 0.1, 0.3],
             }
-        elif self.config.model_type == "lightgbm":
+        elif self._is_lightgbm_family_model():
             param_grid = {
                 "n_estimators": [100, 300, 500],
                 "max_depth": [3, 5, 7],
@@ -3377,7 +3536,7 @@ class ModelTrainer:
 
     def _get_optuna_search_space(self, min_train_size: int | None = None):
         """Return model-specific Optuna search space function."""
-        if self.config.model_type == "xgboost":
+        if self.config.model_type in {"xgboost", "xgboost_regressor"}:
             effective_train = max(128, int(min_train_size if min_train_size is not None else 1024))
             estimators_low = max(180, min(320, int(np.ceil(float(effective_train) * 0.28))))
             estimators_high = max(360, min(760, int(np.ceil(float(effective_train) * 0.95))))
@@ -3385,7 +3544,7 @@ class ModelTrainer:
                 estimators_high = estimators_low + 40
             max_depth_high = 6 if effective_train <= 1200 else 7
             min_child_high = max(6, min(10, int(np.ceil(np.sqrt(float(effective_train)) * 0.24))))
-            return lambda trial: {
+            base_space = lambda trial: {
                 "n_estimators": trial.suggest_int("n_estimators", estimators_low, estimators_high),
                 "max_depth": trial.suggest_int("max_depth", 3, max_depth_high),
                 "learning_rate": trial.suggest_float("learning_rate", 0.012, 0.08, log=True),
@@ -3395,18 +3554,23 @@ class ModelTrainer:
                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 2.5, log=True),
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.3, 4.0, log=True),
                 "gamma": trial.suggest_float("gamma", 0.0, 1.25),
-                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.9, 3.0, log=True),
-                "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 1.5),
             }
+            if self.config.model_type == "xgboost":
+                return lambda trial: {
+                    **base_space(trial),
+                    "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.9, 3.0, log=True),
+                    "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 1.5),
+                }
+            return base_space
 
-        if self.config.model_type == "lightgbm":
+        if self._is_lightgbm_family_model():
             effective_train = max(128, int(min_train_size if min_train_size is not None else 1024))
             leaf_floor = max(30, int(np.ceil(float(effective_train) * 0.06)))
             leaf_ceiling = max(leaf_floor, min(220, int(np.ceil(float(effective_train) * 0.24))))
             num_leaves_high = max(24, min(48, int(np.ceil(float(effective_train) * 0.12))))
             estimators_high = max(260, min(520, int(np.ceil(float(effective_train) * 0.60))))
 
-            return lambda trial: {
+            base_space = lambda trial: {
                 "n_estimators": trial.suggest_int("n_estimators", 180, estimators_high),
                 "max_depth": trial.suggest_int("max_depth", 3, 6),
                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.05, log=True),
@@ -3418,9 +3582,14 @@ class ModelTrainer:
                 "lambda_l1": trial.suggest_float("lambda_l1", 0.05, 8.0, log=True),
                 "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 10.0, log=True),
                 "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.03, 0.35),
-                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.95, 1.15),
                 "max_bin": trial.suggest_int("max_bin", 127, 191),
             }
+            if self.config.model_type in {"lightgbm", "lightgbm_ranker"}:
+                return lambda trial: {
+                    **base_space(trial),
+                    "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.95, 1.15),
+                }
+            return base_space
 
         if self.config.model_type == "random_forest":
             return lambda trial: {
@@ -3496,7 +3665,7 @@ class ModelTrainer:
         """Adjust sequence model params for current CV fold size."""
         adjusted = dict(params)
 
-        if self.config.model_type == "lightgbm":
+        if self._is_lightgbm_family_model():
             leaf_floor = max(20, int(max(1, train_size) * 0.05))
             existing_leaf = int(adjusted.get("min_data_in_leaf", adjusted.get("min_child_samples", 20)))
             effective_leaf = max(existing_leaf, leaf_floor)
@@ -3525,9 +3694,10 @@ class ModelTrainer:
             adjusted["bagging_freq"] = max(1, int(adjusted.get("bagging_freq", 1)))
             adjusted["lambda_l1"] = max(0.10, float(adjusted.get("lambda_l1", 0.10)))
             adjusted["lambda_l2"] = max(1.00, float(adjusted.get("lambda_l2", 1.00)))
-            adjusted["scale_pos_weight"] = float(
-                np.clip(float(adjusted.get("scale_pos_weight", 1.0)), 0.90, 1.30)
-            )
+            if self.config.model_type in {"lightgbm", "lightgbm_ranker"}:
+                adjusted["scale_pos_weight"] = float(
+                    np.clip(float(adjusted.get("scale_pos_weight", 1.0)), 0.90, 1.30)
+                )
 
         if self.config.model_type not in {"lstm", "transformer", "tcn"}:
             return adjusted
@@ -3689,7 +3859,7 @@ class ModelTrainer:
         p = params if isinstance(params, dict) else {}
         penalty = 0.0
 
-        if mt == "xgboost":
+        if mt in {"xgboost", "xgboost_regressor"}:
             max_depth = float(p.get("max_depth", 5))
             n_estimators = float(p.get("n_estimators", 400))
             learning_rate = float(p.get("learning_rate", 0.05))
@@ -3707,7 +3877,7 @@ class ModelTrainer:
             penalty += 0.05 * max(0.0, (scale_pos_weight - 2.2) / 0.8)
             return float(max(0.0, penalty))
 
-        if mt == "lightgbm":
+        if mt in LIGHTGBM_FAMILY_MODELS:
             num_leaves = float(p.get("num_leaves", 24))
             max_depth = float(p.get("max_depth", 5))
             learning_rate = float(p.get("learning_rate", 0.03))
@@ -3920,6 +4090,7 @@ class ModelTrainer:
 
         labels_arr: np.ndarray | None = None
         label_positive_rate: float | None = None
+        regression_mode = self._is_regression_model()
         if train_labels is not None:
             candidate_labels = np.asarray(train_labels, dtype=float).reshape(-1)
             if candidate_labels.size == raw_values.size:
@@ -3927,12 +4098,21 @@ class ModelTrainer:
             elif candidate_labels.size != values.size:
                 candidate_labels = np.array([], dtype=float)
             if candidate_labels.size == values.size:
-                labels_arr = np.clip(
-                    np.nan_to_num(candidate_labels, nan=0.5, posinf=1.0, neginf=0.0),
-                    0.0,
-                    1.0,
-                )
-                label_positive_rate = float(np.mean(labels_arr >= 0.5))
+                if regression_mode:
+                    labels_arr = np.nan_to_num(
+                        candidate_labels,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                    label_positive_rate = float(np.mean(labels_arr > 0.0))
+                else:
+                    labels_arr = np.clip(
+                        np.nan_to_num(candidate_labels, nan=0.5, posinf=1.0, neginf=0.0),
+                        0.0,
+                        1.0,
+                    )
+                    label_positive_rate = float(np.mean(labels_arr >= 0.5))
 
         returns_arr: np.ndarray | None = None
         if train_returns is not None:
@@ -3955,7 +4135,7 @@ class ModelTrainer:
                 regimes_arr = candidate_regimes
 
         if labels_arr is not None and labels_arr.size >= 40:
-            y_bin = (labels_arr >= 0.5).astype(int)
+            y_bin = (labels_arr > 0.0).astype(int) if regression_mode else (labels_arr >= 0.5).astype(int)
             pos_rate = float(np.mean(y_bin))
             mean_proba = float(np.mean(values))
             long_tail_prior = float(
@@ -4305,12 +4485,22 @@ class ModelTrainer:
         for train_idx, test_idx in self._generate_cv_splits(X, y):
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
-            if not self._has_binary_class_support(y_train):
+            if self._requires_binary_class_support() and not self._has_binary_class_support(y_train):
                 continue
             fold_params = self._prepare_params_for_train_size(params, len(train_idx))
             fold_params = self._augment_params_for_train_labels(fold_params, y_train)
             model = self._create_model(params=fold_params)
             w_train = weights[train_idx] if weights is not None else None
+            train_ts = (
+                np.asarray(self.timestamps[train_idx], dtype="datetime64[ns]")
+                if self.timestamps is not None and len(self.timestamps) == len(y)
+                else None
+            )
+            test_ts = (
+                np.asarray(self.timestamps[test_idx], dtype="datetime64[ns]")
+                if self.timestamps is not None and len(self.timestamps) == len(y)
+                else None
+            )
             self._fit_model(
                 model=model,
                 X_train=X_train,
@@ -4318,6 +4508,8 @@ class ModelTrainer:
                 X_val=X_test,
                 y_val=y_test,
                 sample_weights=w_train,
+                train_timestamps=train_ts,
+                val_timestamps=test_ts,
             )
 
             y_pred = np.asarray(model.predict(X_test))
@@ -4417,7 +4609,7 @@ class ModelTrainer:
 
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
-            if not self._has_binary_class_support(y_train):
+            if self._requires_binary_class_support() and not self._has_binary_class_support(y_train):
                 self.logger.warning(
                     f"Fold {fold_idx + 1}: training labels contain a single class, skipping fold"
                 )
@@ -4437,6 +4629,16 @@ class ModelTrainer:
                 X_val=X_test,
                 y_val=y_test,
                 sample_weights=w_train,
+                train_timestamps=(
+                    np.asarray(self.timestamps[train_idx], dtype="datetime64[ns]")
+                    if self.timestamps is not None and len(self.timestamps) == len(y)
+                    else None
+                ),
+                val_timestamps=(
+                    np.asarray(self.timestamps[test_idx], dtype="datetime64[ns]")
+                    if self.timestamps is not None and len(self.timestamps) == len(y)
+                    else None
+                ),
             )
 
             # Evaluate
@@ -4673,12 +4875,36 @@ class ModelTrainer:
             params.setdefault("eval_metric", "logloss")
             return XGBClassifier(**params)
 
+        elif self.config.model_type == "xgboost_regressor":
+            from xgboost import XGBRegressor
+            if self.config.use_gpu:
+                params.setdefault("tree_method", "hist")
+                params.setdefault("device", "cuda")
+            params.setdefault("eval_metric", "rmse")
+            return XGBRegressor(**params)
+
         elif self.config.model_type == "lightgbm":
             from lightgbm import LGBMClassifier
             params.setdefault("verbose", -1)
             if self.config.use_gpu:
                 params.setdefault("device_type", "gpu")
             return LGBMClassifier(**params)
+
+        elif self.config.model_type == "lightgbm_ranker":
+            from lightgbm import LGBMRanker
+            params.setdefault("verbose", -1)
+            params.setdefault("objective", "lambdarank")
+            params.setdefault("metric", "ndcg")
+            if self.config.use_gpu:
+                params.setdefault("device_type", "gpu")
+            return LGBMRanker(**params)
+
+        elif self.config.model_type == "lightgbm_regressor":
+            from lightgbm import LGBMRegressor
+            params.setdefault("verbose", -1)
+            if self.config.use_gpu:
+                params.setdefault("device_type", "gpu")
+            return LGBMRegressor(**params)
 
         elif self.config.model_type == "random_forest":
             from sklearn.ensemble import RandomForestClassifier
@@ -4713,6 +4939,15 @@ class ModelTrainer:
                     **model_params,
                 )
 
+            elif self.config.model_type == "xgboost_regressor":
+                from quant_trading_system.models.classical_ml import XGBoostModel
+                from quant_trading_system.models.base import ModelType
+                return XGBoostModel(
+                    model_type=ModelType.REGRESSOR,
+                    use_gpu=self.config.use_gpu,
+                    **model_params,
+                )
+
             elif self.config.model_type == "lightgbm":
                 from quant_trading_system.models.classical_ml import LightGBMModel
                 from quant_trading_system.models.base import ModelType
@@ -4721,6 +4956,25 @@ class ModelTrainer:
                     use_gpu=self.config.use_gpu,
                     **model_params,
                 )
+
+            elif self.config.model_type == "lightgbm_regressor":
+                from quant_trading_system.models.classical_ml import LightGBMModel
+                from quant_trading_system.models.base import ModelType
+                return LightGBMModel(
+                    model_type=ModelType.REGRESSOR,
+                    use_gpu=self.config.use_gpu,
+                    **model_params,
+                )
+
+            elif self.config.model_type == "lightgbm_ranker":
+                from lightgbm import LGBMRanker
+
+                model_params.setdefault("verbose", -1)
+                model_params.setdefault("objective", "lambdarank")
+                model_params.setdefault("metric", "ndcg")
+                if self.config.use_gpu:
+                    model_params.setdefault("device_type", "gpu")
+                return LGBMRanker(**model_params)
 
             elif self.config.model_type == "random_forest":
                 from quant_trading_system.models.classical_ml import RandomForestModel
@@ -4788,10 +5042,25 @@ class ModelTrainer:
         X_val: np.ndarray,
         y_val: np.ndarray,
         sample_weights: np.ndarray | None = None,
+        train_timestamps: np.ndarray | None = None,
+        val_timestamps: np.ndarray | None = None,
     ) -> None:
         """Fit model with best-effort support for sample weights and validation sets."""
         if self.config.model_type in ["lstm", "transformer", "tcn"]:
             self._train_deep_learning_model(model, X_train, y_train, X_val, y_val)
+            return
+
+        if self._is_ranker_model():
+            self._fit_ranker_model(
+                model=model,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                sample_weights=sample_weights,
+                train_timestamps=train_timestamps,
+                val_timestamps=val_timestamps,
+            )
             return
 
         model_module = str(getattr(model.__class__, "__module__", ""))
@@ -4839,6 +5108,77 @@ class ModelTrainer:
             raise last_error
         model.fit(X_train, y_train)
 
+    def _fit_ranker_model(
+        self,
+        model: Any,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        sample_weights: np.ndarray | None = None,
+        train_timestamps: np.ndarray | None = None,
+        val_timestamps: np.ndarray | None = None,
+    ) -> None:
+        """Fit learning-to-rank models with timestamp query grouping."""
+        if train_timestamps is None:
+            raise ValueError("Ranker training requires train_timestamps for query grouping.")
+
+        train_group = self._build_ranking_groups(train_timestamps)
+        if train_group.size == 0:
+            train_group = np.array([int(len(X_train))], dtype=int)
+        if int(np.sum(train_group)) != int(len(X_train)):
+            train_group = np.array([int(len(X_train))], dtype=int)
+
+        use_eval = (
+            X_val is not None
+            and y_val is not None
+            and len(X_val) > 0
+            and val_timestamps is not None
+            and len(val_timestamps) == len(X_val)
+        )
+        eval_group = (
+            self._build_ranking_groups(val_timestamps) if use_eval else np.array([], dtype=int)
+        )
+        if use_eval and eval_group.size == 0:
+            use_eval = False
+
+        candidate_calls: list[dict[str, Any]] = []
+        if use_eval and sample_weights is not None:
+            candidate_calls.append(
+                {
+                    "group": train_group,
+                    "sample_weight": sample_weights,
+                    "eval_set": [(X_val, y_val)],
+                    "eval_group": [eval_group],
+                    "eval_at": [1, 3, 5, 10],
+                }
+            )
+        if sample_weights is not None:
+            candidate_calls.append({"group": train_group, "sample_weight": sample_weights})
+        if use_eval:
+            candidate_calls.append(
+                {
+                    "group": train_group,
+                    "eval_set": [(X_val, y_val)],
+                    "eval_group": [eval_group],
+                    "eval_at": [1, 3, 5, 10],
+                }
+            )
+        candidate_calls.append({"group": train_group})
+
+        last_error: Exception | None = None
+        for kwargs in candidate_calls:
+            try:
+                model.fit(X_train, y_train, **kwargs)
+                return
+            except (TypeError, ValueError) as exc:
+                last_error = exc
+                continue
+
+        if last_error is not None:
+            raise last_error
+        model.fit(X_train, y_train, group=train_group)
+
     def _train_deep_learning_model(
         self, model, X_train, y_train, X_val, y_val
     ) -> None:
@@ -4863,6 +5203,11 @@ class ModelTrainer:
 
     def _get_predictions_proba(self, model, X) -> np.ndarray:
         """Get prediction probabilities from model."""
+        if self._is_ranker_model():
+            raw_scores = np.asarray(model.predict(X), dtype=float).reshape(-1)
+            clipped = np.clip(raw_scores, -20.0, 20.0)
+            return (1.0 / (1.0 + np.exp(-clipped))).astype(float)
+
         try:
             if hasattr(model, "predict_proba"):
                 proba = model.predict_proba(X)
@@ -4968,12 +5313,16 @@ class ModelTrainer:
                 if aligned_symbols is not None and len(aligned_symbols) == len(sort_idx):
                     aligned_symbols = aligned_symbols[sort_idx]
 
-        y_pred_binary = (
-            (y_pred >= 0.5).astype(int) if not np.array_equal(y_pred, y_pred.astype(int)) else y_pred
-        )
-        y_true_binary = (
-            (y_true >= 0.5).astype(int) if not np.array_equal(y_true, y_true.astype(int)) else y_true
-        )
+        if self._is_regression_model():
+            y_pred_binary = (y_proba >= 0.5).astype(int)
+            y_true_binary = (y_true > 0.0).astype(int)
+        else:
+            y_pred_binary = (
+                (y_pred >= 0.5).astype(int) if not np.array_equal(y_pred, y_pred.astype(int)) else y_pred
+            )
+            y_true_binary = (
+                (y_true >= 0.5).astype(int) if not np.array_equal(y_true, y_true.astype(int)) else y_true
+            )
 
         metrics = {
             "accuracy": float(accuracy_score(y_true_binary, y_pred_binary)),
@@ -5561,14 +5910,13 @@ class ModelTrainer:
             raw_alpha = positions * realized_returns
         else:
             # Conservative fallback when realized returns are unavailable.
-            y_direction = np.where(y_true >= 0.5, 1.0, -1.0)
+            if self._is_regression_model():
+                y_direction = np.where(y_true > 0.0, 1.0, -1.0)
+            else:
+                y_direction = np.where(y_true >= 0.5, 1.0, -1.0)
             raw_alpha = positions * y_direction * np.abs(y_proba - 0.5)
 
-        trading_cost_rate = max(
-            0.0005,
-            float(self.config.label_spread_bps + self.config.label_slippage_bps + self.config.label_impact_bps)
-            / 10000.0,
-        )
+        trading_cost_rate = max(0.0005, float(self.config.to_trading_cost_model().execution_cost_rate))
         trading_cost = turnover_series * trading_cost_rate
         net_returns = np.nan_to_num(
             (raw_alpha - trading_cost).astype(float),
@@ -5865,6 +6213,35 @@ class ModelTrainer:
         sample_weights: np.ndarray | None,
     ) -> None:
         """Fit final production model on full dataset with robust kwargs handling."""
+        full_timestamps = (
+            np.asarray(self.timestamps, dtype="datetime64[ns]")
+            if self.timestamps is not None and len(self.timestamps) == len(X)
+            else None
+        )
+        if self._is_ranker_model():
+            if len(X) < 8:
+                split_idx = max(2, len(X) - 2)
+                gap = 0
+            else:
+                gap = max(1, int(self.config.purge_pct * 100))
+                val_size = max(2, min(int(0.15 * len(X)), 512))
+                split_idx = max(2, len(X) - val_size - gap)
+                if split_idx >= len(X) - 1:
+                    split_idx = max(2, len(X) - 2)
+                    gap = 0
+            train_weights = sample_weights[:split_idx] if sample_weights is not None else None
+            self._fit_model(
+                model=model,
+                X_train=X[:split_idx],
+                y_train=y[:split_idx],
+                X_val=X[split_idx + gap:],
+                y_val=y[split_idx + gap:],
+                sample_weights=train_weights,
+                train_timestamps=(full_timestamps[:split_idx] if full_timestamps is not None else None),
+                val_timestamps=(full_timestamps[split_idx + gap:] if full_timestamps is not None else None),
+            )
+            return
+
         model_module = str(getattr(model.__class__, "__module__", ""))
         fit_feature_names: list[str] = []
         if model_module.startswith("quant_trading_system.models"):
@@ -5915,6 +6292,8 @@ class ModelTrainer:
             X_val=X[split_idx + gap:],
             y_val=y[split_idx + gap:],
             sample_weights=train_weights,
+            train_timestamps=(full_timestamps[:split_idx] if full_timestamps is not None else None),
+            val_timestamps=(full_timestamps[split_idx + gap:] if full_timestamps is not None else None),
         )
 
     def _fit_final_model_full_data(self) -> None:
@@ -6393,6 +6772,24 @@ class ModelTrainer:
                 effective_pbo_metric,
                 effective_max_pbo,
             ),
+            "min_white_reality_stat": (
+                self.training_metrics.get("white_reality_stat", self.config.min_white_reality_stat)
+                >= self.config.min_white_reality_stat,
+                self.training_metrics.get("white_reality_stat", self.config.min_white_reality_stat),
+                self.config.min_white_reality_stat,
+            ),
+            "max_white_reality_pvalue": (
+                self.training_metrics.get(
+                    "white_reality_pvalue",
+                    self.config.max_white_reality_pvalue,
+                )
+                <= self.config.max_white_reality_pvalue,
+                self.training_metrics.get(
+                    "white_reality_pvalue",
+                    self.config.max_white_reality_pvalue,
+                ),
+                self.config.max_white_reality_pvalue,
+            ),
             "min_holdout_sharpe": (
                 (effective_holdout_sharpe >= self.config.min_holdout_sharpe)
                 if holdout_available
@@ -6501,7 +6898,6 @@ class ModelTrainer:
         }
 
         normalized_gates: dict[str, tuple[bool, float, float]] = {}
-        all_passed = True
         for gate_name, (passed, actual, threshold) in gates.items():
             passed_bool = bool(passed)
             actual_value = float(actual)
@@ -6512,12 +6908,72 @@ class ModelTrainer:
             self.logger.info(
                 f"  {gate_name}: {status} (actual={actual_value:.4f}, threshold={threshold_value:.4f})"
             )
-            if not passed_bool:
-                all_passed = False
+
+        layer_definitions: dict[str, tuple[str, ...]] = {
+            "model_utility": (
+                "min_sharpe_ratio",
+                "min_accuracy",
+                "min_win_rate",
+                "risk_adjusted_positive",
+                "min_deflated_sharpe",
+                "max_deflated_sharpe_pvalue",
+                "max_pbo",
+                "min_white_reality_stat",
+                "max_white_reality_pvalue",
+                "min_holdout_sharpe",
+                "holdout_sharpe_consistency",
+                "nested_walk_forward_trace",
+                "objective_breakdown_present",
+            ),
+            "execution_robustness": (
+                "max_drawdown",
+                "max_holdout_drawdown",
+                "min_trades",
+                "max_regime_shift",
+                "max_symbol_concentration_hhi",
+                "min_holdout_regime_sharpe",
+            ),
+            "cross_symbol_robustness": (
+                "min_holdout_symbol_coverage",
+                "min_holdout_symbol_p25_sharpe",
+                "max_holdout_symbol_underwater_ratio",
+                "oof_prediction_coverage",
+            ),
+        }
+
+        layer_results: dict[str, dict[str, Any]] = {}
+        for layer_name, layer_gates in layer_definitions.items():
+            failed_gates = [
+                gate_name
+                for gate_name in layer_gates
+                if gate_name in normalized_gates and not normalized_gates[gate_name][0]
+            ]
+            passed = len(failed_gates) == 0
+            layer_results[layer_name] = {
+                "passed": bool(passed),
+                "failed_gate_count": int(len(failed_gates)),
+                "failed_gates": failed_gates,
+                "gate_count": int(len(layer_gates)),
+            }
+            self.training_metrics[f"layer_{layer_name}_passed"] = 1.0 if passed else 0.0
+            self.logger.info(
+                "  layer:%s: %s (failed=%s)",
+                layer_name,
+                "PASS" if passed else "FAIL",
+                ",".join(failed_gates) if failed_gates else "none",
+            )
+
+        all_gates_passed = all(gate_tuple[0] for gate_tuple in normalized_gates.values())
+        all_layers_passed = all(layer_payload["passed"] for layer_payload in layer_results.values())
+        all_passed = bool(all_gates_passed and all_layers_passed)
+        self.training_metrics["validation_layer_all_passed"] = 1.0 if all_layers_passed else 0.0
 
         self.validation_results = {
             "gates": normalized_gates,
+            "layers": layer_results,
             "all_passed": bool(all_passed),
+            "all_gates_passed": bool(all_gates_passed),
+            "all_layers_passed": bool(all_layers_passed),
         }
 
         return all_passed
@@ -6546,6 +7002,18 @@ class ModelTrainer:
                     "passed": bool(passed),
                     "actual": float(actual),
                     "threshold": float(threshold),
+                }
+        layer_summary: dict[str, dict[str, Any]] = {}
+        layers = self.validation_results.get("layers", {})
+        if isinstance(layers, dict):
+            for layer_name, layer_payload in layers.items():
+                if not isinstance(layer_payload, dict):
+                    continue
+                layer_summary[str(layer_name)] = {
+                    "passed": bool(layer_payload.get("passed", False)),
+                    "failed_gate_count": int(layer_payload.get("failed_gate_count", 0)),
+                    "failed_gates": list(layer_payload.get("failed_gates", [])),
+                    "gate_count": int(layer_payload.get("gate_count", 0)),
                 }
 
         return {
@@ -6589,6 +7057,8 @@ class ModelTrainer:
                     self.training_metrics.get("deflated_sharpe_p_value", 1.0)
                 ),
                 "pbo": float(self.training_metrics.get("pbo", 1.0)),
+                "white_reality_stat": float(self.training_metrics.get("white_reality_stat", 0.0)),
+                "white_reality_pvalue": float(self.training_metrics.get("white_reality_pvalue", 1.0)),
             },
             "data": {
                 "development_rows": int(self.training_metrics.get("development_rows", 0)),
@@ -6603,21 +7073,45 @@ class ModelTrainer:
                 "regime_distribution_holdout": holdout_regime_mix,
             },
             "gates": gate_summary,
+            "gate_layers": layer_summary,
             "top_features": top_features,
         }
 
     def _build_deployment_plan(self, passed_validation: bool) -> dict[str, Any]:
         """Build champion/challenger canary rollout and runtime risk guardrails."""
-        total_cost_bps = float(
-            self.config.label_spread_bps + self.config.label_slippage_bps + self.config.label_impact_bps
-        )
+        total_cost_bps = float(self.config.to_trading_cost_model().execution_cost_bps)
+        layer_payload = self.validation_results.get("layers", {})
+        if isinstance(layer_payload, dict):
+            layers = {
+                str(layer_name): {
+                    "passed": bool(layer_state.get("passed", False)),
+                    "failed_gates": list(layer_state.get("failed_gates", [])),
+                    "failed_gate_count": int(layer_state.get("failed_gate_count", 0)),
+                }
+                for layer_name, layer_state in layer_payload.items()
+                if isinstance(layer_state, dict)
+            }
+        else:
+            layers = {}
+        all_layers_passed = bool(layers) and all(layer.get("passed", False) for layer in layers.values())
+        effective_ready = bool(passed_validation and (all_layers_passed or not layers))
+
         return {
             "schema_version": "1.0.0",
-            "ready_for_production": bool(passed_validation),
+            "ready_for_production": effective_ready,
             "promotion_strategy": {
                 "mode": "champion_challenger_canary",
                 "champion_retention_if_fail": True,
                 "challenger_activation_requires_all_gates": True,
+                "challenger_activation_requires_layers": [
+                    "model_utility",
+                    "execution_robustness",
+                    "cross_symbol_robustness",
+                ],
+            },
+            "promotion_layers": {
+                "all_layers_passed": bool(all_layers_passed),
+                "layers": layers,
             },
             "canary_rollout": [
                 {"phase": 1, "capital_fraction": 0.05, "min_trades": 50},
@@ -6759,6 +7253,26 @@ class ModelTrainer:
             int(getattr(self.config, "n_trials", 1)),
             len(self.cv_results) if self.cv_results else 1,
             1,
+        )
+        bootstrap_reps = int(np.clip(max(400, n_trials * 30), 400, 3000))
+        block_size = int(np.clip(np.sqrt(float(max(returns.size, 1))), 3.0, 32.0))
+        white_stat, white_p_value, white_interpretation = calculate_white_reality_check(
+            returns=returns,
+            n_bootstrap=bootstrap_reps,
+            block_size=block_size,
+            random_seed=int(self.config.seed),
+            annualization_factor=252.0,
+        )
+        self.training_metrics["white_reality_stat"] = float(white_stat)
+        self.training_metrics["white_reality_pvalue"] = float(white_p_value)
+        self.training_metrics["white_reality_interpretation"] = str(white_interpretation)
+        self.training_metrics["white_reality_bootstrap_reps"] = float(bootstrap_reps)
+        self.training_metrics["white_reality_block_size"] = float(block_size)
+        self.logger.info(
+            "White Reality Check: stat=%.4f p=%.4f (%s)",
+            float(white_stat),
+            float(white_p_value),
+            str(white_interpretation),
         )
 
         if self.config.correction_method == "deflated_sharpe":
@@ -7005,7 +7519,14 @@ class ModelTrainer:
                 except Exception as exc:
                     self.logger.warning(f"Could not switch model to CPU for SHAP: {exc}")
 
-            if self.config.model_type in ["xgboost", "lightgbm", "random_forest"]:
+            if self.config.model_type in [
+                "xgboost",
+                "lightgbm",
+                "lightgbm_ranker",
+                "xgboost_regressor",
+                "lightgbm_regressor",
+                "random_forest",
+            ]:
                 explainer = shap.TreeExplainer(model_for_shap)
             else:
                 def _predict_for_shap(x: np.ndarray) -> np.ndarray:
@@ -7046,7 +7567,14 @@ class ModelTrainer:
                     background
                 )
 
-            if self.config.model_type in ["xgboost", "lightgbm", "random_forest"]:
+            if self.config.model_type in [
+                "xgboost",
+                "lightgbm",
+                "lightgbm_ranker",
+                "xgboost_regressor",
+                "lightgbm_regressor",
+                "random_forest",
+            ]:
                 self.shap_values = explainer.shap_values(X_sample)
             else:
                 kernel_nsamples = min(256, max(64, X_sample.shape[1] * 2))
@@ -7256,6 +7784,9 @@ class ModelTrainer:
                 "deflated_sharpe_p_value": self.training_metrics.get("deflated_sharpe_p_value"),
                 "pbo": self.training_metrics.get("pbo"),
                 "pbo_interpretation": self.training_metrics.get("pbo_interpretation"),
+                "white_reality_stat": self.training_metrics.get("white_reality_stat"),
+                "white_reality_pvalue": self.training_metrics.get("white_reality_pvalue"),
+                "white_reality_interpretation": self.training_metrics.get("white_reality_interpretation"),
             },
             "promotion_thresholds": {
                 "min_sharpe_ratio": self.config.min_sharpe_ratio,
@@ -7274,6 +7805,8 @@ class ModelTrainer:
                 "min_deflated_sharpe": self.config.min_deflated_sharpe,
                 "max_deflated_sharpe_pvalue": self.config.max_deflated_sharpe_pvalue,
                 "max_pbo": self.config.max_pbo,
+                "min_white_reality_stat": self.config.min_white_reality_stat,
+                "max_white_reality_pvalue": self.config.max_white_reality_pvalue,
             },
             "replay_manifest_path": str(replay_manifest_path) if replay_manifest_path else None,
         }
@@ -7485,6 +8018,24 @@ def _metric_as_float(metrics: dict[str, Any], key: str, default: float = 0.0) ->
     return float(np.nan_to_num(casted, nan=default, posinf=default, neginf=default))
 
 
+def _extract_validation_layer_states(payload: dict[str, Any]) -> dict[str, bool]:
+    """Extract normalized layer pass/fail states from result payload."""
+    if not isinstance(payload, dict):
+        return {}
+    validation_results = payload.get("validation_results", {})
+    if not isinstance(validation_results, dict):
+        validation_results = {}
+    raw_layers = validation_results.get("layers", {})
+    if not isinstance(raw_layers, dict):
+        raw_layers = {}
+    layer_states: dict[str, bool] = {}
+    for layer_name in ("model_utility", "execution_robustness", "cross_symbol_robustness"):
+        layer_payload = raw_layers.get(layer_name, {})
+        if isinstance(layer_payload, dict):
+            layer_states[layer_name] = bool(layer_payload.get("passed", False))
+    return layer_states
+
+
 def _governance_score(result: dict[str, Any]) -> float:
     """Composite score used for benchmark ranking and champion selection."""
     metrics = result.get("training_metrics", {})
@@ -7500,10 +8051,16 @@ def _governance_score(result: dict[str, Any]) -> float:
         _metric_as_float(metrics, "holdout_sharpe", 0.0),
     ) * 0.35
     score += _metric_as_float(metrics, "deflated_sharpe", _metric_as_float(metrics, "mean_sharpe", 0.0)) * 0.4
+    score += _metric_as_float(metrics, "white_reality_stat", 0.0) * 0.15
     score -= _metric_as_float(metrics, "holdout_max_drawdown", _metric_as_float(metrics, "mean_max_drawdown", 1.0)) * 0.75
     score -= _metric_as_float(metrics, "mean_symbol_concentration_hhi", 0.0) * 0.35
     score -= _metric_as_float(metrics, "holdout_symbol_concentration_hhi", 0.0) * 0.20
     score -= _metric_as_float(metrics, "pbo", 1.0) * 0.25
+    score -= _metric_as_float(metrics, "white_reality_pvalue", 1.0) * 0.30
+    layer_states = _extract_validation_layer_states(result)
+    if layer_states:
+        layer_failures = sum(1 for passed in layer_states.values() if not passed)
+        score -= float(layer_failures) * 1.5
     if not bool(result.get("success", False)):
         score -= 5.0
     return float(score)
@@ -7516,6 +8073,17 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
         metrics = result.get("training_metrics", {})
         if not isinstance(metrics, dict):
             metrics = {}
+        layer_states = _extract_validation_layer_states(result)
+        deployment_plan = result.get("deployment_plan", {})
+        if not isinstance(deployment_plan, dict):
+            deployment_plan = {}
+        all_layers_passed = (
+            all(layer_states.values()) if layer_states else bool(result.get("success", False))
+        )
+        ready_for_production = bool(
+            deployment_plan.get("ready_for_production", False)
+            and all_layers_passed
+        )
         raw_primary_horizon = result.get("primary_label_horizon", metrics.get("primary_label_horizon", 0))
         try:
             primary_horizon = int(float(raw_primary_horizon))
@@ -7534,9 +8102,20 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
                 "deflated_sharpe": _metric_as_float(metrics, "deflated_sharpe", 0.0),
                 "deflated_sharpe_p_value": _metric_as_float(metrics, "deflated_sharpe_p_value", 1.0),
                 "pbo": _metric_as_float(metrics, "pbo", 1.0),
+                "white_reality_stat": _metric_as_float(metrics, "white_reality_stat", 0.0),
+                "white_reality_pvalue": _metric_as_float(metrics, "white_reality_pvalue", 1.0),
                 "holdout_sharpe": _metric_as_float(metrics, "holdout_sharpe", 0.0),
                 "holdout_max_drawdown": _metric_as_float(metrics, "holdout_max_drawdown", 1.0),
                 "holdout_regime_shift": _metric_as_float(metrics, "holdout_regime_shift", 0.0),
+                "layer_model_utility_pass": 1.0 if layer_states.get("model_utility", False) else 0.0,
+                "layer_execution_robustness_pass": (
+                    1.0 if layer_states.get("execution_robustness", False) else 0.0
+                ),
+                "layer_cross_symbol_robustness_pass": (
+                    1.0 if layer_states.get("cross_symbol_robustness", False) else 0.0
+                ),
+                "layer_all_passed": 1.0 if all_layers_passed else 0.0,
+                "ready_for_production": 1.0 if ready_for_production else 0.0,
                 "holdout_worst_regime_sharpe": _metric_as_float(
                     metrics, "holdout_worst_regime_sharpe", 0.0
                 ),
@@ -7552,7 +8131,8 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
                 "model_path": str(result.get("model_path") or ""),
                 "promotion_package_path": str(result.get("promotion_package_path") or ""),
                 "replay_manifest_path": str(result.get("replay_manifest_path") or ""),
-                "deployment_plan": result.get("deployment_plan", {}),
+                "validation_layers": layer_states,
+                "deployment_plan": deployment_plan,
             }
         )
 
@@ -7582,10 +8162,72 @@ def _persist_training_matrix_report(
 
     flat_rows = []
     for row in rows:
-        flat_row = {k: v for k, v in row.items() if k != "deployment_plan"}
+        flat_row = {
+            k: v
+            for k, v in row.items()
+            if k not in {"deployment_plan", "validation_layers"}
+        }
         flat_rows.append(flat_row)
     pd.DataFrame(flat_rows).to_csv(csv_path, index=False)
     return json_path, csv_path
+
+
+def _row_is_promotion_ready(row: dict[str, Any]) -> bool:
+    """Return True when a benchmark row is eligible for promotion."""
+    if not bool(row.get("success", False)):
+        return False
+    if not str(row.get("registry_version_id", "")).strip():
+        return False
+    if not str(row.get("promotion_package_path", "")).strip():
+        return False
+    deployment_plan = row.get("deployment_plan", {})
+    if not isinstance(deployment_plan, dict):
+        return False
+    if not bool(deployment_plan.get("ready_for_production", False)):
+        return False
+    layers = row.get("validation_layers", {})
+    if isinstance(layers, dict) and layers:
+        if not all(bool(v) for v in layers.values()):
+            return False
+    return True
+
+
+def _build_horizon_leaderboards(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build per-horizon leaderboard with champion/challenger candidates."""
+    horizon_groups: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            horizon = int(float(row.get("primary_label_horizon", 0)))
+        except (TypeError, ValueError):
+            horizon = 0
+        horizon_groups.setdefault(max(horizon, 0), []).append(row)
+
+    payload: dict[str, dict[str, Any]] = {}
+    for horizon, group_rows in sorted(horizon_groups.items(), key=lambda kv: kv[0]):
+        sorted_rows = sorted(
+            group_rows,
+            key=lambda item: float(item.get("governance_score", -1e9)),
+            reverse=True,
+        )
+        eligible = [row for row in sorted_rows if _row_is_promotion_ready(row)]
+        champion = eligible[0] if eligible else None
+        challenger = eligible[1] if len(eligible) > 1 else None
+        payload[str(horizon)] = {
+            "eligible_count": int(len(eligible)),
+            "champion": champion,
+            "challenger": challenger,
+            "top_rows": [
+                {
+                    "model_type": str(row.get("model_type", "")),
+                    "run_id": str(row.get("run_id", "")),
+                    "governance_score": float(row.get("governance_score", -1e9)),
+                    "registry_version_id": str(row.get("registry_version_id", "")),
+                    "ready_for_production": bool(_row_is_promotion_ready(row)),
+                }
+                for row in sorted_rows[:8]
+            ],
+        }
+    return payload
 
 
 def _auto_select_champion_and_challenger(
@@ -7597,16 +8239,8 @@ def _auto_select_champion_and_challenger(
     models_root = Path(output_dir)
     current_entries = load_registry_entries(registry_root)
 
-    eligible = [
-        row for row in rows
-        if bool(row.get("success", False))
-        and str(row.get("registry_version_id", "")).strip()
-        and str(row.get("promotion_package_path", "")).strip()
-        and bool(
-            isinstance(row.get("deployment_plan"), dict)
-            and row.get("deployment_plan", {}).get("ready_for_production", False)
-        )
-    ]
+    eligible = [row for row in rows if _row_is_promotion_ready(row)]
+    horizon_leaderboards = _build_horizon_leaderboards(rows)
 
     champion = eligible[0] if eligible else None
     challenger = eligible[1] if len(eligible) > 1 else None
@@ -7647,10 +8281,13 @@ def _auto_select_champion_and_challenger(
         "canary_plan_path": str(canary_plan_path) if canary_plan_path else None,
         "champion": champion,
         "challenger": challenger,
+        "horizon_leaderboards": horizon_leaderboards,
         "eligible_count": len(eligible),
         "registry_entries_seen": len(current_entries),
         "selection_policy": {
             "requires_validation_pass": True,
+            "requires_layered_promotion_gates": True,
+            "horizon_specific_leaderboards": True,
             "ranking_key": "governance_score",
             "fallback": "retain_existing_if_no_eligible",
         },
@@ -7715,6 +8352,9 @@ def run_training(args: argparse.Namespace) -> int:
         model_list = [
             "xgboost",
             "lightgbm",
+            "lightgbm_ranker",
+            "xgboost_regressor",
+            "lightgbm_regressor",
             "random_forest",
             "elastic_net",
             "lstm",
@@ -7997,6 +8637,18 @@ def run_training(args: argparse.Namespace) -> int:
                     )
                 ),
                 max_pbo=float(_cfg_value("max_pbo", getattr(args, "max_pbo", 0.45))),
+                min_white_reality_stat=float(
+                    _cfg_value(
+                        "min_white_reality_stat",
+                        getattr(args, "min_white_reality_stat", 0.0),
+                    )
+                ),
+                max_white_reality_pvalue=float(
+                    _cfg_value(
+                        "max_white_reality_pvalue",
+                        getattr(args, "max_white_reality_pvalue", 0.10),
+                    )
+                ),
                 min_holdout_sharpe=float(
                     _cfg_value(
                         "min_holdout_sharpe",
@@ -8446,6 +9098,9 @@ def run_training(args: argparse.Namespace) -> int:
                         "mean_sharpe": float(champion_payload.get("mean_sharpe", 0.0)),
                         "holdout_sharpe": float(champion_payload.get("holdout_sharpe", 0.0)),
                         "pbo": float(champion_payload.get("pbo", 1.0)),
+                        "white_reality_pvalue": float(
+                            champion_payload.get("white_reality_pvalue", 1.0)
+                        ),
                     }
                     audit_logger.log_model_deployed(
                         model_name=str(champion_payload.get("model_type", "")),
@@ -8768,6 +9423,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-deflated-sharpe", type=float, default=0.10)
     parser.add_argument("--max-deflated-sharpe-pvalue", type=float, default=0.10)
     parser.add_argument("--max-pbo", type=float, default=0.45)
+    parser.add_argument("--min-white-reality-stat", type=float, default=0.0)
+    parser.add_argument("--max-white-reality-pvalue", type=float, default=0.10)
     parser.add_argument("--output-dir", type=Path, default=Path("models"))
     return parser
 

@@ -177,3 +177,73 @@ def calculate_probability_of_backtest_overfitting(
 
     result = (pbo, interpretation)
     return (*result, diagnostics) if return_diagnostics else result
+
+
+def calculate_white_reality_check(
+    returns: np.ndarray,
+    n_bootstrap: int = 1000,
+    block_size: int = 10,
+    random_seed: int = 42,
+    annualization_factor: float = 252.0,
+) -> tuple[float, float, str]:
+    """
+    Estimate a White Reality Check style p-value via block bootstrap.
+
+    The null hypothesis is no predictive edge after data-snooping adjustment.
+    Returns a tuple of:
+      (studentized_statistic, p_value, interpretation)
+    """
+    arr = np.asarray(returns, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+    n = int(arr.size)
+    if n < 20:
+        return 0.0, 0.5, "Insufficient data for White Reality Check"
+
+    obs_std = float(np.std(arr, ddof=1)) if n > 1 else 0.0
+    if obs_std <= 1e-12:
+        return 0.0, 0.5, "Near-zero variance for White Reality Check"
+    obs_mean = float(np.mean(arr))
+    obs_stat = float(np.sqrt(float(n)) * obs_mean / obs_std)
+
+    centered = arr - obs_mean
+    block = int(max(2, min(int(block_size), n)))
+    reps = int(max(200, min(int(n_bootstrap), 5000)))
+    rng = np.random.default_rng(random_seed)
+
+    bootstrap_stats: list[float] = []
+    max_start = max(1, n - block + 1)
+    while len(bootstrap_stats) < reps:
+        sample = np.zeros(n, dtype=float)
+        pos = 0
+        while pos < n:
+            start = int(rng.integers(0, max_start))
+            chunk = centered[start:start + block]
+            if chunk.size <= 0:
+                break
+            take = min(chunk.size, n - pos)
+            sample[pos:pos + take] = chunk[:take]
+            pos += take
+        bs_std = float(np.std(sample, ddof=1)) if n > 1 else 0.0
+        if bs_std <= 1e-12:
+            continue
+        bs_stat = float(np.sqrt(float(n)) * float(np.mean(sample)) / bs_std)
+        bootstrap_stats.append(bs_stat)
+
+    if not bootstrap_stats:
+        return obs_stat, 0.5, "Could not generate bootstrap distribution"
+
+    bootstrap_arr = np.asarray(bootstrap_stats, dtype=float)
+    p_value = float(np.mean(bootstrap_arr >= obs_stat))
+    p_value = float(np.clip(p_value, 0.0, 1.0))
+
+    annualized_edge = float(obs_mean * float(annualization_factor))
+    if p_value <= 0.05 and annualized_edge > 0.0:
+        interpretation = "Strong edge after White Reality Check"
+    elif p_value <= 0.10 and annualized_edge > 0.0:
+        interpretation = "Moderate edge after White Reality Check"
+    elif annualized_edge <= 0.0:
+        interpretation = "No positive edge after White Reality Check"
+    else:
+        interpretation = "Weak evidence after White Reality Check"
+
+    return float(obs_stat), p_value, interpretation

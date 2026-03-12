@@ -7,6 +7,7 @@ import numpy as np
 from quant_trading_system.models.statistical_validation import (
     calculate_deflated_sharpe_ratio,
     calculate_probability_of_backtest_overfitting,
+    calculate_white_reality_check,
 )
 
 
@@ -48,3 +49,28 @@ def test_calculate_probability_of_backtest_overfitting_diagnostics_in_range() ->
     assert diagnostics["pbo_ci_lower_95"] <= pbo <= diagnostics["pbo_ci_upper_95"]
     assert 0.0 <= diagnostics["pbo_reliability"] <= 1.0
     assert diagnostics["pbo_combinations_used"] > 0.0
+
+
+def test_calculate_white_reality_check_returns_finite_values() -> None:
+    rng = np.random.default_rng(123)
+    returns = rng.normal(0.0005, 0.01, size=700)
+
+    stat, p_value, interpretation = calculate_white_reality_check(
+        returns=returns,
+        n_bootstrap=600,
+        block_size=8,
+        random_seed=123,
+    )
+
+    assert np.isfinite(stat)
+    assert 0.0 <= p_value <= 1.0
+    assert interpretation != ""
+
+
+def test_calculate_white_reality_check_handles_short_series() -> None:
+    short_returns = np.array([0.001, -0.001, 0.0005], dtype=float)
+    stat, p_value, interpretation = calculate_white_reality_check(short_returns)
+
+    assert stat == 0.0
+    assert 0.0 <= p_value <= 1.0
+    assert "Insufficient data" in interpretation

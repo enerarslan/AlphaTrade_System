@@ -13,9 +13,11 @@ from quant_trading_system.backtest.replay import (
     ReplaySLOGates,
     ReplayScenario,
     ReplaySignalConfig,
+    evaluate_replay_slo,
     run_replay_scenario,
     run_replay_suite,
 )
+from quant_trading_system.models.trading_costs import TradingCostModel
 
 
 def _ohlcv(prices: list[float]) -> pd.DataFrame:
@@ -71,6 +73,7 @@ def test_replay_scenario_passes_lenient_slo_gates():
     assert outcome.bars_processed > 0
     assert outcome.execution_slo["orders_submitted"] > 0
     assert "risk_playbook" in outcome.execution_slo
+    assert outcome.execution_slo["expected_execution_cost_bps"] == pytest.approx(1.5)
 
 
 def test_replay_scenario_fails_drawdown_gate_when_shorting_disabled():
@@ -130,3 +133,25 @@ def test_replay_suite_aggregates_scenario_status():
     payload = report.to_dict()
     assert payload["passed"] is True
     assert payload["total_scenarios"] == 1
+
+
+def test_evaluate_replay_slo_flags_cost_ratio_violation():
+    violations = evaluate_replay_slo(
+        execution_slo={
+            "orders_submitted": 12,
+            "rejection_rate": 0.0,
+            "avg_slippage_bps": 45.0,
+            "risk_playbook": {},
+        },
+        max_drawdown=0.01,
+        slo_gates=ReplaySLOGates(
+            max_drawdown=0.20,
+            max_rejection_rate=1.0,
+            max_avg_slippage_bps=500.0,
+            max_cost_vs_expected_ratio=1.5,
+            min_orders_for_gate=1,
+        ),
+        cost_model=TradingCostModel(spread_bps=5.0, slippage_bps=5.0, impact_bps=0.0),
+    )
+
+    assert any("execution_cost_ratio=" in violation for violation in violations)

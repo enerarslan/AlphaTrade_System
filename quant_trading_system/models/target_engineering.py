@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from quant_trading_system.models.meta_labeling import TripleBarrierLabeler
+from quant_trading_system.models.trading_costs import TradingCostModel
 
 
 @dataclass
@@ -52,6 +53,14 @@ class TargetEngineeringConfig:
             raise ValueError("max_abs_forward_return must be positive")
         if self.signal_volatility_floor_mult < 0.0:
             raise ValueError("signal_volatility_floor_mult must be non-negative")
+
+    def to_cost_model(self) -> TradingCostModel:
+        """Build canonical trading cost model from label configuration."""
+        return TradingCostModel(
+            spread_bps=float(self.spread_bps),
+            slippage_bps=float(self.slippage_bps),
+            impact_bps=float(self.impact_bps),
+        )
 
 
 @dataclass
@@ -126,6 +135,7 @@ def generate_targets(
     work = work.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     if work.empty:
         raise ValueError("No valid rows available for target engineering.")
+    cost_model = config.to_cost_model()
 
     labeler = TripleBarrierLabeler(
         profit_taking=config.profit_taking_threshold,
@@ -151,7 +161,7 @@ def generate_targets(
             sdf[f"forward_return_h{horizon}"] = close.pct_change(horizon).shift(-horizon)
 
         primary_forward = sdf[f"forward_return_h{config.primary_horizon}"]
-        total_cost = (config.spread_bps + config.slippage_bps + config.impact_bps) / 10000.0
+        total_cost = float(cost_model.execution_cost_rate)
         min_signal_abs_return = max(
             config.min_signal_abs_return_bps / 10000.0,
             total_cost * 1.25,
@@ -286,9 +296,10 @@ def generate_targets(
         "neutral_filtered_count": int(total_neutral_filtered),
         "forward_outlier_filtered_count": int(total_forward_outlier_filtered),
         "cost_assumptions_bps": {
-            "spread": float(config.spread_bps),
-            "slippage": float(config.slippage_bps),
-            "impact": float(config.impact_bps),
+            "spread": float(cost_model.spread_bps),
+            "slippage": float(cost_model.slippage_bps),
+            "impact": float(cost_model.impact_bps),
+            "execution_total": float(cost_model.execution_cost_bps),
             "edge_cost_buffer": float(config.edge_cost_buffer_bps),
         },
         "horizons": [int(h) for h in config.horizons],

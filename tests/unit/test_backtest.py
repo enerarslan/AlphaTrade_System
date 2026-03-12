@@ -886,6 +886,124 @@ class TestStrategyOptimizerSelection:
         assert audit.get("reason") == "data_handler_missing_dict_dataset"
         assert validator.called is False
 
+    def test_optimize_preserves_backtest_execution_settings(self, monkeypatch):
+        """Window backtests should inherit execution settings from base config."""
+        captured_configs = []
+
+        class _DummyStrategy(Strategy):
+            def generate_signals(self, data_handler, portfolio):
+                return []
+
+        class _FakeEngine:
+            def __init__(self, data_handler, strategy, config):
+                captured_configs.append(config)
+
+            def run(self):
+                return object()
+
+        class _FakeHandler:
+            pass
+
+        monkeypatch.setattr("quant_trading_system.backtest.optimizer.BacktestEngine", _FakeEngine)
+        monkeypatch.setattr(
+            "quant_trading_system.backtest.optimizer.StrategyOptimizer._get_objective_value",
+            lambda self, state: 1.0,
+        )
+
+        base_config = BacktestConfig(
+            initial_capital=Decimal("250000"),
+            execution_mode=ExecutionMode.PESSIMISTIC,
+            commission_bps=17.0,
+            slippage_bps=23.0,
+            use_market_simulator=False,
+            simulate_partial_fills=False,
+            simulate_latency=False,
+            fill_at="next_close",
+        )
+        optimizer = StrategyOptimizer(
+            strategy_factory=lambda params: _DummyStrategy(),
+            param_spaces=[ParameterSpace("x", "continuous", 0.0, 1.0)],
+            walk_forward=WalkForwardOptimizer(
+                train_period_days=30,
+                test_period_days=10,
+                step_days=10,
+                purge_days=0,
+            ),
+            backtest_config=base_config,
+            enable_walk_forward_audit=False,
+        )
+
+        optimizer.optimize(
+            data_handler_factory=lambda _s, _e: _FakeHandler(),
+            start_date=datetime(2024, 1, 1),
+            end_date=datetime(2024, 4, 30),
+            n_iterations=1,
+        )
+
+        assert captured_configs, "Expected optimizer to construct backtest configs per window."
+        assert all(cfg.execution_mode == ExecutionMode.PESSIMISTIC for cfg in captured_configs)
+        assert all(cfg.commission_bps == pytest.approx(17.0) for cfg in captured_configs)
+        assert all(cfg.slippage_bps == pytest.approx(23.0) for cfg in captured_configs)
+        assert all(cfg.use_market_simulator is False for cfg in captured_configs)
+        assert all(cfg.simulate_partial_fills is False for cfg in captured_configs)
+        assert all(cfg.simulate_latency is False for cfg in captured_configs)
+        assert all(cfg.fill_at == "next_close" for cfg in captured_configs)
+
+    def test_objective_value_applies_cost_regularization(self):
+        """Higher configured execution costs should reduce objective score."""
+        class _DummyStrategy(Strategy):
+            def generate_signals(self, data_handler, portfolio):
+                return []
+
+        dates = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(20)]
+        equity_curve = [(dt, 100000.0 + (i * 120.0)) for i, dt in enumerate(dates)]
+        trades = [
+            Trade(
+                symbol="AAPL",
+                entry_time=dates[i],
+                exit_time=dates[i + 1],
+                side=OrderSide.BUY,
+                quantity=Decimal("1000"),
+                entry_price=Decimal("100"),
+                exit_price=Decimal("101"),
+                pnl=Decimal("1000"),
+                pnl_pct=0.01,
+                commission=Decimal("10"),
+                slippage=Decimal("5"),
+                holding_period_bars=1,
+            )
+            for i in range(10)
+        ]
+        state = BacktestState(
+            timestamp=dates[-1],
+            equity=Decimal("102000"),
+            cash=Decimal("2000"),
+            positions={},
+            pending_orders=[],
+            equity_curve=equity_curve,
+            trades=trades,
+        )
+
+        low_cost_optimizer = StrategyOptimizer(
+            strategy_factory=lambda params: _DummyStrategy(),
+            param_spaces=[ParameterSpace("x", "continuous", 0.0, 1.0)],
+            backtest_config=BacktestConfig(commission_bps=1.0, slippage_bps=1.0),
+            objective="sharpe",
+            enable_walk_forward_audit=False,
+        )
+        high_cost_optimizer = StrategyOptimizer(
+            strategy_factory=lambda params: _DummyStrategy(),
+            param_spaces=[ParameterSpace("x", "continuous", 0.0, 1.0)],
+            backtest_config=BacktestConfig(commission_bps=40.0, slippage_bps=40.0),
+            objective="sharpe",
+            enable_walk_forward_audit=False,
+        )
+
+        low_score = low_cost_optimizer._get_objective_value(state)
+        high_score = high_cost_optimizer._get_objective_value(state)
+
+        assert high_score < low_score
+
 
 class TestParameterSpace:
     """Tests for ParameterSpace."""

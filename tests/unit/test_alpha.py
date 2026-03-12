@@ -527,6 +527,32 @@ class TestAlphaCombiner:
 
         assert len(weights) == len(sample_alphas)
 
+    def test_optimized_weighter_uses_lagged_alignment(self):
+        """OptimizedWeighter should follow the same lag convention as other weighters."""
+        from quant_trading_system.alpha.alpha_combiner import OptimizedWeighter
+
+        pattern = np.array([1.0, -1.0] * 60, dtype=float)
+        magnitude = np.linspace(0.3, 1.7, pattern.size, dtype=float)
+        rng = np.random.default_rng(0)
+        alpha_values = {
+            "aligned_with_lagged_returns": -pattern + rng.normal(0.0, 0.05, pattern.size),
+            "misaligned_with_lagged_returns": pattern,
+            "neutral_alpha": rng.normal(0.0, 1.0, pattern.size),
+        }
+        returns = pattern * magnitude
+
+        weighter = OptimizedWeighter(
+            lookback=80,
+            max_weight=1.0,
+            min_weight=0.0,
+            turnover_penalty=0.0,
+            return_lag=1,
+        )
+        weights = weighter.compute_weights(alpha_values, returns)
+
+        assert weights["aligned_with_lagged_returns"] > 0.8
+        assert weights["misaligned_with_lagged_returns"] < 0.2
+
     def test_inverse_volatility_weighter(self, sample_ohlcv_df, sample_alphas):
         """Test InverseVolatilityWeighter."""
         from quant_trading_system.alpha.alpha_combiner import InverseVolatilityWeighter
@@ -562,6 +588,63 @@ class TestAlphaCombiner:
         # Should be bounded [-1, 1]
         valid_values = combined[~np.isnan(combined)]
         assert np.all(valid_values >= -1) and np.all(valid_values <= 1)
+
+    def test_alpha_combiner_oos_weight_update_expanding(self, sample_ohlcv_df, sample_alphas, forward_returns):
+        """OOS expanding updates should accumulate observations and update history."""
+        from quant_trading_system.alpha.alpha_combiner import (
+            AlphaCombiner,
+            CombinerConfig,
+            WeightUpdateMode,
+            WeightingMethod,
+        )
+
+        config = CombinerConfig(
+            weighting_method=WeightingMethod.IC_WEIGHTED,
+            return_lag=1,
+            oos_update_mode=WeightUpdateMode.EXPANDING,
+            oos_min_observations=10,
+            oos_update_blend=0.0,
+        )
+        combiner = AlphaCombiner(sample_alphas, config)
+        combiner.fit(sample_ohlcv_df[:80], forward_returns[:80])
+
+        combiner.update_weights_oos(sample_ohlcv_df[80:120], forward_returns[80:120])
+        combiner.update_weights_oos(sample_ohlcv_df[120:150], forward_returns[120:150])
+
+        assert combiner.get_oos_observation_count() == 70
+        assert len(combiner.get_weight_history()) >= 3
+        assert np.isclose(sum(combiner.get_weights().values()), 1.0, atol=1e-2)
+
+    def test_alpha_combiner_oos_weight_update_rolling_caps_history(
+        self,
+        sample_ohlcv_df,
+        sample_alphas,
+        forward_returns,
+    ):
+        """OOS rolling updates should keep only the configured trailing window."""
+        from quant_trading_system.alpha.alpha_combiner import (
+            AlphaCombiner,
+            CombinerConfig,
+            WeightUpdateMode,
+            WeightingMethod,
+        )
+
+        config = CombinerConfig(
+            weighting_method=WeightingMethod.SHARPE_WEIGHTED,
+            return_lag=1,
+            oos_update_mode=WeightUpdateMode.ROLLING,
+            oos_update_window=50,
+            oos_min_observations=10,
+            oos_update_blend=0.0,
+        )
+        combiner = AlphaCombiner(sample_alphas, config)
+        combiner.fit(sample_ohlcv_df[:80], forward_returns[:80])
+
+        combiner.update_weights_oos(sample_ohlcv_df[80:120], forward_returns[80:120])
+        combiner.update_weights_oos(sample_ohlcv_df[120:180], forward_returns[120:180])
+
+        assert combiner.get_oos_observation_count() == 50
+        assert np.isclose(sum(combiner.get_weights().values()), 1.0, atol=1e-2)
 
     def test_combiner_weights(self, sample_ohlcv_df, sample_alphas, forward_returns):
         """Test AlphaCombiner weight retrieval."""
@@ -658,6 +741,25 @@ class TestAlphaCombiner:
             assert "mean" in alpha_stats
             assert "std" in alpha_stats
             assert "weight" in alpha_stats
+
+    def test_alpha_stats_ic_uses_lagged_alignment(self):
+        """IC statistics should use configured lag to avoid same-bar leakage."""
+        from quant_trading_system.alpha.alpha_combiner import AlphaCombiner, CombinerConfig
+
+        pattern = np.array([1.0, -1.0] * 30, dtype=float)
+        returns = pattern.copy()
+        config = CombinerConfig(return_lag=1)
+        combiner = AlphaCombiner(alphas=[], config=config)
+        combiner._alpha_values = {
+            "alpha_a": pattern,
+            "alpha_b": -pattern,
+        }
+        combiner._weights = {"alpha_a": 0.5, "alpha_b": 0.5}
+
+        stats = combiner.get_alpha_stats(returns=returns)
+
+        assert stats["alpha_a"]["ic"] < 0.0
+        assert stats["alpha_b"]["ic"] > 0.0
 
     def test_correlation_matrix(self, sample_ohlcv_df, sample_alphas, forward_returns):
         """Test correlation matrix computation."""

@@ -28,6 +28,7 @@ from quant_trading_system.models.model_manager import (
     SplitMethod,
     TimeSeriesSplitter,
 )
+from quant_trading_system.models.trading_costs import TradingCostModel
 
 
 # Fixtures
@@ -116,6 +117,52 @@ class DummyStatefulFitModel(TradingModel):
     def predict(self, X):
         X_arr = np.asarray(X)
         return np.full(X_arr.shape[0], float(self.fit_calls), dtype=float)
+
+    def get_feature_importance(self):
+        return {}
+
+
+class DummyClassifierModel(TradingModel):
+    """Classifier stub for objective compatibility tests."""
+
+    def __init__(self, name: str = "dummy_classifier", threshold: float = 0.0) -> None:
+        super().__init__(name=name, model_type=ModelType.CLASSIFIER, threshold=threshold)
+        self.threshold = float(threshold)
+
+    def fit(self, X, y, **kwargs):
+        self._is_fitted = True
+        return self
+
+    def predict(self, X):
+        X_arr = np.asarray(X)
+        return (X_arr[:, 0] > self.threshold).astype(int)
+
+    def predict_proba(self, X):
+        preds = self.predict(X).astype(float)
+        return np.column_stack([1.0 - preds, preds])
+
+    def get_feature_importance(self):
+        return {}
+
+
+class DummyWeightTrackingModel(TradingModel):
+    """Regressor stub that records sample_weights propagation."""
+
+    fit_sample_weight_lengths: list[int] = []
+
+    def __init__(self, name: str = "dummy_weight", bias: float = 0.0) -> None:
+        super().__init__(name=name, model_type=ModelType.REGRESSOR, bias=bias)
+        self.bias = float(bias)
+
+    def fit(self, X, y, validation_data=None, sample_weights=None, **kwargs):
+        length = len(sample_weights) if sample_weights is not None else -1
+        DummyWeightTrackingModel.fit_sample_weight_lengths.append(int(length))
+        self._is_fitted = True
+        return self
+
+    def predict(self, X):
+        X_arr = np.asarray(X)
+        return np.full(X_arr.shape[0], self.bias, dtype=float)
 
     def get_feature_importance(self):
         return {}
@@ -533,6 +580,75 @@ class TestHyperparameterOptimizer:
 
         assert best1 == best2
 
+    def test_trading_metric_rejects_binary_targets(self, sample_classification_data):
+        """Sharpe objective must not run on binary labels."""
+        X, y = sample_classification_data
+        splitter = TimeSeriesSplitter(method=SplitMethod.WALK_FORWARD, n_splits=2)
+
+        optimizer = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space={"bias": [0.0]},
+            metric="sharpe_ratio",
+            n_trials=1,
+            method="random",
+            random_state=1,
+        )
+
+        with pytest.raises(ValueError, match="Trading metrics"):
+            optimizer.optimize(X, y.astype(float), splitter)
+
+    def test_classification_metric_requires_classifier(self, sample_classification_data):
+        """Classification metrics should fail fast for regressor models."""
+        X, y = sample_classification_data
+        splitter = TimeSeriesSplitter(method=SplitMethod.WALK_FORWARD, n_splits=2)
+
+        optimizer = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space={"bias": [0.0]},
+            metric="accuracy",
+            n_trials=1,
+            method="random",
+            random_state=1,
+        )
+
+        with pytest.raises(ValueError, match="requires classifier"):
+            optimizer.optimize(X, y.astype(float), splitter)
+
+    def test_cost_model_matches_legacy_assumed_cost_inputs(self):
+        """Canonical cost model should match legacy assumed_cost+turnover inputs."""
+        y_true = np.array([0.0, 0.015, -0.01, 0.005, -0.02], dtype=float)
+        y_pred = np.array([1.0, -1.0, 1.0, -1.0, 1.0], dtype=float)
+
+        legacy = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space={"bias": [0.0]},
+            metric="sharpe_ratio",
+            n_trials=1,
+            method="random",
+            random_state=7,
+            assumed_cost_bps=50.0,
+            turnover_penalty_bps=10.0,
+        )
+        canonical = HyperparameterOptimizer(
+            model_class=DummyConstantModel,
+            param_space={"bias": [0.0]},
+            metric="sharpe_ratio",
+            n_trials=1,
+            method="random",
+            random_state=7,
+            cost_model=TradingCostModel(
+                spread_bps=20.0,
+                slippage_bps=30.0,
+                impact_bps=0.0,
+                turnover_penalty_bps=10.0,
+            ),
+        )
+
+        legacy_score = legacy._default_score(y_true, y_pred)
+        canonical_score = canonical._default_score(y_true, y_pred)
+
+        assert canonical_score == pytest.approx(legacy_score, rel=1e-10, abs=1e-12)
+
 
 class TestModelManagerInstitutionalValidation:
     """Tests for institutional nested validation workflow."""
@@ -581,6 +697,132 @@ class TestModelManagerInstitutionalValidation:
         mse_values = result["mse_values"]
         assert len(mse_values) == 3
         assert all(np.isclose(value, 1.0) for value in mse_values)
+
+    def test_train_model_propagates_sample_weights(self, temp_model_dir):
+        """train_model should pass training-window sample weights to fit()."""
+        DummyWeightTrackingModel.fit_sample_weight_lengths = []
+        X = np.random.randn(120, 4)
+        y = np.random.randn(120)
+        weights = np.linspace(0.5, 1.5, 120)
+
+        manager = ModelManager(registry_path=temp_model_dir)
+        model = DummyWeightTrackingModel()
+
+        manager.train_model(
+            model=model,
+            X=X,
+            y=y,
+            validation_split=0.2,
+            gap=5,
+            sample_weights=weights,
+        )
+
+        # split_idx = 120 - int(120*0.2) - 5 = 91
+        assert DummyWeightTrackingModel.fit_sample_weight_lengths[-1] == 91
+
+    def test_cross_validate_propagates_sample_weights(self, temp_model_dir):
+        """Cross-validation should pass fold sample weights to fit()."""
+        DummyWeightTrackingModel.fit_sample_weight_lengths = []
+        X = np.random.randn(120, 4)
+        y = np.random.randn(120)
+        weights = np.linspace(0.5, 1.5, 120)
+
+        manager = ModelManager(registry_path=temp_model_dir)
+        model = DummyWeightTrackingModel()
+
+        manager.cross_validate(
+            model=model,
+            X=X,
+            y=y,
+            cv_method=SplitMethod.EXPANDING_WINDOW,
+            n_splits=3,
+            metrics=["mse"],
+            gap=0,
+            sample_weights=weights,
+        )
+
+        assert len(DummyWeightTrackingModel.fit_sample_weight_lengths) == 3
+        assert all(length > 0 for length in DummyWeightTrackingModel.fit_sample_weight_lengths)
+
+    def test_optimize_and_train_uses_effective_horizon_gap_and_sample_weights(
+        self, temp_model_dir, monkeypatch
+    ):
+        """optimize_and_train should enforce gap>=horizon and pass train weights."""
+        X = np.random.randn(200, 5)
+        y = np.random.randn(200)
+        weights = np.linspace(0.8, 1.2, 200)
+        captured: dict[str, int] = {}
+        DummyWeightTrackingModel.fit_sample_weight_lengths = []
+        manager = ModelManager(registry_path=temp_model_dir)
+
+        class _DummySplitter:
+            def split(self, X, y):
+                n = len(X)
+                boundary = int(n * 0.7)
+                yield np.arange(0, boundary), np.arange(boundary, n)
+
+        def fake_create_purged_cv(cv_type, n_splits, purge_gap, embargo_pct, prediction_horizon):
+            captured["purge_gap"] = int(purge_gap)
+            captured["prediction_horizon"] = int(prediction_horizon)
+            return _DummySplitter()
+
+        def fake_optimize(self, X, y, cv_splitter, scoring_func=None, sample_weights=None):
+            self.best_score = 0.0
+            captured["optimizer_weight_len"] = len(sample_weights) if sample_weights is not None else -1
+            return {"bias": 0.0}
+
+        monkeypatch.setattr(
+            "quant_trading_system.models.model_manager.create_purged_cv",
+            fake_create_purged_cv,
+        )
+        monkeypatch.setattr(HyperparameterOptimizer, "optimize", fake_optimize)
+
+        manager.optimize_and_train(
+            model_class=DummyWeightTrackingModel,
+            X=X,
+            y=y,
+            param_space={"bias": [0.0]},
+            n_trials=1,
+            optimization_method="random",
+            cv_method=SplitMethod.PURGED_KFOLD,
+            optimization_metric="mse",
+            register=False,
+            holdout_fraction=0.20,
+            gap=2,
+            prediction_horizon=7,
+            sample_weights=weights,
+            reject_overfitted=False,
+            enforce_validation_gates=False,
+        )
+
+        # holdout_size=40, effective_gap=max(2,7)=7 -> train_val_end=153
+        assert captured["prediction_horizon"] == 7
+        assert captured["purge_gap"] == 7
+        assert captured["optimizer_weight_len"] == 153
+        assert 153 in DummyWeightTrackingModel.fit_sample_weight_lengths
+
+    def test_holdout_metrics_apply_turnover_penalty_bps(self, temp_model_dir):
+        """Holdout Sharpe should degrade when turnover penalty increases."""
+        manager = ModelManager(registry_path=temp_model_dir)
+        y_true = np.array([0.0, 0.02, -0.01, 0.015, -0.02, 0.01], dtype=float)
+        y_pred = np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0], dtype=float)
+
+        baseline = manager._calculate_holdout_metrics(
+            y_true,
+            y_pred,
+            ModelType.REGRESSOR,
+            assumed_cost_bps=10.0,
+            turnover_penalty_bps=0.0,
+        )
+        penalized = manager._calculate_holdout_metrics(
+            y_true,
+            y_pred,
+            ModelType.REGRESSOR,
+            assumed_cost_bps=10.0,
+            turnover_penalty_bps=50.0,
+        )
+
+        assert penalized["sharpe_ratio"] < baseline["sharpe_ratio"]
 
 
 class TestModelRegistry:

@@ -555,6 +555,7 @@ class BacktestEngine:
         self._orders_submitted_total: int = 0
         self._orders_rejected_total: int = 0
         self._recent_slippage_bps: deque[float] = deque(maxlen=250)
+        self._deferred_fill_results: dict[str, FillResult] = {}
 
         # Callbacks
         self._on_bar_callbacks: list[Callable] = []
@@ -615,6 +616,7 @@ class BacktestEngine:
             return 0
         cancelled = len(self._state.pending_orders)
         self._state.pending_orders.clear()
+        self._deferred_fill_results.clear()
         return cancelled
 
     def _infer_intraday_data(self) -> bool:
@@ -712,6 +714,7 @@ class BacktestEngine:
         self._orders_submitted_total = 0
         self._orders_rejected_total = 0
         self._recent_slippage_bps.clear()
+        self._deferred_fill_results.clear()
 
         # Reset data handler if supported
         if hasattr(self.data_handler, "reset"):
@@ -819,16 +822,32 @@ class BacktestEngine:
         """Process pending orders for a symbol."""
         orders_to_remove = []
 
-        for i, order in enumerate(self._state.pending_orders):
+        # Process a stable snapshot so newly appended partial remainders are
+        # never re-processed in the same bar.
+        for i, order in list(enumerate(self._state.pending_orders)):
             if order.symbol != symbol:
+                continue
+
+            order_key = str(order.order_id)
+            deferred_fill = self._deferred_fill_results.get(order_key)
+            if deferred_fill is not None:
+                if bar.timestamp >= deferred_fill.timestamp:
+                    self._fill_order_with_result(order, deferred_fill, deferred_fill.timestamp)
+                    orders_to_remove.append(i)
+                    self._deferred_fill_results.pop(order_key, None)
                 continue
 
             # JPMORGAN FIX: Use MarketSimulator for realistic execution
             if self.market_simulator is not None and symbol in self._market_conditions:
                 fill_result = self._simulate_order_execution(order, symbol, bar)
                 if fill_result is not None:
-                    self._fill_order_with_result(order, fill_result, bar.timestamp)
-                    orders_to_remove.append(i)
+                    if self.config.simulate_latency and fill_result.timestamp > bar.timestamp:
+                        # Execution happened between bars; settle on the first bar
+                        # whose timestamp catches up with execution time.
+                        self._deferred_fill_results[order_key] = fill_result
+                    else:
+                        self._fill_order_with_result(order, fill_result, fill_result.timestamp)
+                        orders_to_remove.append(i)
             else:
                 # Fallback to simple execution
                 fill_price = self._get_fill_price(bar)
@@ -849,7 +868,8 @@ class BacktestEngine:
 
         # Remove filled orders
         for i in sorted(orders_to_remove, reverse=True):
-            self._state.pending_orders.pop(i)
+            removed = self._state.pending_orders.pop(i)
+            self._deferred_fill_results.pop(str(removed.order_id), None)
 
     def _simulate_order_execution(
         self,
@@ -904,6 +924,10 @@ class BacktestEngine:
             self._orders_rejected_total += 1
             self._enforce_execution_quality_gate()
             return None
+
+        if not self.config.simulate_latency:
+            fill_result.latency_ms = 0.0
+            fill_result.timestamp = bar.timestamp
 
         return fill_result
 
@@ -1118,6 +1142,8 @@ class BacktestEngine:
                 order_type=order.order_type,
                 quantity=fill_result.partial_remaining,
                 signal_id=order.signal_id,
+                created_at=fill_time,
+                updated_at=fill_time,
             )
             self._risk_limits_manager.on_order_submitted(remaining_order, fill_price)
             self._state.pending_orders.append(remaining_order)
@@ -1287,6 +1313,8 @@ class BacktestEngine:
             order_type=OrderType.MARKET,
             quantity=quantity,
             signal_id=signal.signal_id,
+            created_at=bar.timestamp,
+            updated_at=bar.timestamp,
         )
 
         adv_proxy = max(int(self.config.avg_daily_volume), int(bar.volume))

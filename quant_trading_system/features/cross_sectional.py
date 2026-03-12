@@ -68,7 +68,7 @@ class CrossSectionalFeature(ABC):
         other_df: pl.DataFrame,
         other_col: str,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Align two series by timestamp when available, else by common prefix length."""
+        """Align two series by timestamp when available, else by common suffix length."""
         base = base_df[base_col].to_numpy().astype(np.float64)
         other = other_df[other_col].to_numpy().astype(np.float64)
 
@@ -92,7 +92,12 @@ class CrossSectionalFeature(ABC):
                 pass
 
         min_len = min(len(base), len(other))
-        return base[:min_len], other[:min_len]
+        return base[-min_len:], other[-min_len:]
+
+    @staticmethod
+    def _nan_array(length: int) -> np.ndarray:
+        """Create an NaN-filled feature array of target length."""
+        return np.full(int(length), np.nan, dtype=np.float64)
 
     @staticmethod
     def _window_returns(close: np.ndarray, window: int) -> np.ndarray:
@@ -147,16 +152,22 @@ class CrossSectionalFeature(ABC):
                 series = pd.Series(arr, index=pd.DatetimeIndex(other_ts))
                 series = series[~series.index.isna()]
                 series = series[~series.index.duplicated(keep="last")]
-                aligned = series.reindex(pd.DatetimeIndex(base_ts)).to_numpy(dtype=np.float64)
+                series = series.sort_index()
+                aligned = series.reindex(
+                    pd.DatetimeIndex(base_ts),
+                    method="ffill",
+                ).to_numpy(dtype=np.float64)
                 if aligned.shape[0] == base_len:
                     return aligned
             except Exception:
                 pass
 
         if arr.size >= base_len:
-            return arr[:base_len]
+            return arr[-base_len:]
+        if arr.size == 0:
+            return np.full(base_len, np.nan, dtype=np.float64)
         padded = np.full(base_len, np.nan, dtype=np.float64)
-        padded[: arr.size] = arr
+        padded[-arr.size:] = arr
         return padded
 
     def _aligned_column(
@@ -204,9 +215,8 @@ class RelativeStrength(CrossSectionalFeature):
             benchmark = None
 
         if benchmark is None:
-            # Return zeros if no benchmark
             for window in self.windows:
-                results[f"rs_vs_benchmark_{window}"] = np.zeros(len(close))
+                results[f"rs_vs_benchmark_{window}"] = self._nan_array(len(close))
             return results
 
         # Compute relative strength for each window (vectorized for large universes)
@@ -269,7 +279,7 @@ class BetaToMarket(CrossSectionalFeature):
 
         if benchmark is None:
             for window in self.windows:
-                results[f"beta_{window}"] = np.ones(len(close))
+                results[f"beta_{window}"] = self._nan_array(len(close))
             return results
 
         # Compute returns
@@ -321,7 +331,7 @@ class RelativeVolume(CrossSectionalFeature):
             bench_vol = None
 
         if bench_vol is None:
-            results[f"rel_volume_{self.window}"] = np.ones(len(volume))
+            results[f"rel_volume_{self.window}"] = self._nan_array(len(volume))
             return results
 
         # Compute rolling relative volume (vectorized)
@@ -368,9 +378,8 @@ class PercentileRank(CrossSectionalFeature):
         results = {}
 
         if universe_data is None or len(universe_data) < 2:
-            # Return 50th percentile if no universe data
             for window in self.windows:
-                results[f"return_percentile_{window}"] = np.full(len(close), 0.5)
+                results[f"return_percentile_{window}"] = self._nan_array(len(close))
             return results
 
         # Compute percentile rank
@@ -387,7 +396,7 @@ class PercentileRank(CrossSectionalFeature):
                 all_returns.append(self._align_to_base(df, symbol_df, sym_ret))
 
             if not all_returns:
-                results[f"return_percentile_{window}"] = np.full(len(close), 0.5)
+                results[f"return_percentile_{window}"] = self._nan_array(len(close))
                 continue
 
             for i in range(window, len(close)):
@@ -426,7 +435,7 @@ class ZScoreVsUniverse(CrossSectionalFeature):
 
         if universe_data is None or len(universe_data) < 2:
             for window in self.windows:
-                results[f"zscore_universe_{window}"] = np.zeros(len(close))
+                results[f"zscore_universe_{window}"] = self._nan_array(len(close))
             return results
 
         # Compute returns for main symbol
@@ -452,7 +461,7 @@ class ZScoreVsUniverse(CrossSectionalFeature):
             all_returns = universe_returns[window]
 
             if not all_returns:
-                results[f"zscore_universe_{window}"] = np.zeros(len(close))
+                results[f"zscore_universe_{window}"] = self._nan_array(len(close))
                 continue
 
             for i in range(window, len(close)):
@@ -493,7 +502,7 @@ class DistanceFromMedian(CrossSectionalFeature):
 
         if universe_data is None or len(universe_data) < 2:
             for window in self.windows:
-                results[f"dist_median_{window}"] = np.zeros(len(close))
+                results[f"dist_median_{window}"] = self._nan_array(len(close))
             return results
 
         # Compute returns
@@ -518,7 +527,7 @@ class DistanceFromMedian(CrossSectionalFeature):
             all_returns = universe_returns[window]
 
             if not all_returns:
-                results[f"dist_median_{window}"] = np.zeros(len(close))
+                results[f"dist_median_{window}"] = self._nan_array(len(close))
                 continue
 
             for i in range(window, len(close)):
@@ -557,8 +566,8 @@ class OutlierScore(CrossSectionalFeature):
         results = {}
 
         if universe_data is None or len(universe_data) < 2:
-            results["outlier_score"] = np.zeros(len(close))
-            results["is_outlier"] = np.zeros(len(close))
+            results["outlier_score"] = self._nan_array(len(close))
+            results["is_outlier"] = self._nan_array(len(close))
             return results
 
         # Use ZScoreVsUniverse internally
@@ -567,7 +576,9 @@ class OutlierScore(CrossSectionalFeature):
 
         zscore = zscore_results[f"zscore_universe_{self.window}"]
         outlier_score = np.abs(zscore)
-        is_outlier = np.where(outlier_score > self.threshold, 1, 0)
+        is_outlier = self._nan_array(len(close))
+        valid = np.isfinite(outlier_score)
+        is_outlier[valid] = (outlier_score[valid] > self.threshold).astype(float)
 
         results["outlier_score"] = outlier_score
         results["is_outlier"] = is_outlier
@@ -624,7 +635,7 @@ class RollingCorrelation(CrossSectionalFeature):
 
             results[f"corr_benchmark_{self.window}"] = corr_benchmark
         else:
-            results[f"corr_benchmark_{self.window}"] = np.zeros(len(close))
+            results[f"corr_benchmark_{self.window}"] = self._nan_array(len(close))
 
         # Correlation with VIX if available
         if universe_data and "VIX" in universe_data:
@@ -668,7 +679,10 @@ class CorrelationChange(CrossSectionalFeature):
         corr_feature = RollingCorrelation(window=self.window)
         corr_results = corr_feature.compute(df, universe_data)
 
-        corr = corr_results.get(f"corr_benchmark_{self.window}", np.zeros(len(close)))
+        corr = corr_results.get(
+            f"corr_benchmark_{self.window}",
+            self._nan_array(len(close)),
+        )
 
         # Compute change in correlation
         corr_change = np.full(len(close), np.nan)
@@ -711,8 +725,8 @@ class FactorLoadings(CrossSectionalFeature):
 
         if universe_data is None or len(universe_data) < self.n_factors:
             for i in range(self.n_factors):
-                results[f"factor_loading_{i + 1}"] = np.zeros(len(close))
-            results["idiosyncratic_vol"] = np.zeros(len(close))
+                results[f"factor_loading_{i + 1}"] = self._nan_array(len(close))
+            results["idiosyncratic_vol"] = self._nan_array(len(close))
             return results
 
         # Compute returns for universe and align to main symbol timeline
@@ -726,8 +740,8 @@ class FactorLoadings(CrossSectionalFeature):
 
         if len(all_returns) < self.n_factors:
             for i in range(self.n_factors):
-                results[f"factor_loading_{i + 1}"] = np.zeros(len(close))
-            results["idiosyncratic_vol"] = np.zeros(len(close))
+                results[f"factor_loading_{i + 1}"] = self._nan_array(len(close))
+            results["idiosyncratic_vol"] = self._nan_array(len(close))
             return results
 
         main_ret = self._log_returns(close)
@@ -875,7 +889,7 @@ class CorrelationCentrality(CrossSectionalFeature):
         results = {}
 
         if universe_data is None or len(universe_data) < 3:
-            results["corr_centrality"] = np.zeros(len(close))
+            results["corr_centrality"] = self._nan_array(len(close))
             return results
 
         # Compute returns for all symbols
@@ -890,7 +904,7 @@ class CorrelationCentrality(CrossSectionalFeature):
         main_ret = self._log_returns(close)
 
         if len(all_returns) < 2:
-            results["corr_centrality"] = np.zeros(len(close))
+            results["corr_centrality"] = self._nan_array(len(close))
             return results
 
         centrality = np.full(len(close), np.nan)
@@ -953,11 +967,72 @@ class CrossSectionalFeatureCalculator:
         features = calculator.compute_all(df, universe_data)
     """
 
-    def __init__(self, include_all: bool = True):
+    def __init__(
+        self,
+        include_all: bool = True,
+        robust_normalize: bool = True,
+    ):
         self.features: list[CrossSectionalFeature] = []
+        self.robust_normalize = bool(robust_normalize)
 
         if include_all:
             self._add_default_features()
+
+    @staticmethod
+    def _sanitize_output(values: np.ndarray, expected_length: int) -> np.ndarray:
+        """Ensure a valid float64 feature array aligned to base length."""
+        if expected_length <= 0:
+            return np.array([], dtype=np.float64)
+
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if arr.size >= expected_length:
+            arr = arr[-expected_length:]
+        elif arr.size == 0:
+            arr = np.full(expected_length, np.nan, dtype=np.float64)
+        else:
+            padded = np.full(expected_length, np.nan, dtype=np.float64)
+            padded[-arr.size:] = arr
+            arr = padded
+
+        arr[~np.isfinite(arr)] = np.nan
+        return arr
+
+    @staticmethod
+    def _is_binary_feature(values: np.ndarray) -> bool:
+        """Detect binary outputs (e.g., indicator flags)."""
+        valid = values[np.isfinite(values)]
+        if valid.size == 0:
+            return False
+        unique = np.unique(valid)
+        return bool(unique.size <= 2 and np.all(np.isin(unique, [0.0, 1.0])))
+
+    def _normalize_output(self, values: np.ndarray) -> np.ndarray:
+        """Robustly normalize heavy-tailed continuous feature outputs."""
+        arr = values.copy()
+        valid = arr[np.isfinite(arr)]
+        if valid.size < 20 or self._is_binary_feature(arr):
+            return arr
+
+        # Preserve naturally bounded ratio/probability style features.
+        min_valid = float(np.min(valid))
+        max_valid = float(np.max(valid))
+        if 0.0 <= min_valid and max_valid <= 1.0:
+            return arr
+
+        lower, upper = np.percentile(valid, [1, 99])
+        clipped = np.clip(arr, lower, upper)
+        clipped_valid = clipped[np.isfinite(clipped)]
+        if clipped_valid.size < 20:
+            return clipped
+
+        median = np.median(clipped_valid)
+        q75, q25 = np.percentile(clipped_valid, [75, 25])
+        iqr = q75 - q25
+        if iqr <= 1e-12:
+            return clipped
+
+        normalized = (clipped - median) / iqr
+        return np.clip(normalized, -10.0, 10.0)
 
     def _add_default_features(self) -> None:
         """Add all default cross-sectional features."""
@@ -1004,11 +1079,16 @@ class CrossSectionalFeatureCalculator:
         universe_data: dict[str, pl.DataFrame] | None = None,
     ) -> dict[str, np.ndarray]:
         """Compute all features and return combined results."""
-        results = {}
+        results: dict[str, np.ndarray] = {}
+        expected_length = len(df)
         for feature in self.features:
             try:
                 feature_results = feature.compute(df, universe_data)
-                results.update(feature_results)
+                for name, values in feature_results.items():
+                    sanitized = self._sanitize_output(values, expected_length)
+                    if self.robust_normalize:
+                        sanitized = self._normalize_output(sanitized)
+                    results[name] = sanitized
             except ValueError:
                 # Skip features that can't be computed
                 continue

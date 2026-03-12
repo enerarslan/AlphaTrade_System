@@ -22,6 +22,31 @@ import numpy as np
 from quant_trading_system.core.reproducibility import child_seed, set_global_seed
 from quant_trading_system.models.base import ModelType, TradingModel
 from quant_trading_system.models.purged_cv import create_purged_cv
+from quant_trading_system.models.trading_costs import TradingCostModel
+
+TRADING_OPTIMIZATION_METRICS = {"sharpe", "sharpe_ratio", "win_rate", "profit_factor"}
+REGRESSION_OPTIMIZATION_METRICS = {"mse", "neg_mse", "mae", "r2"}
+CLASSIFICATION_OPTIMIZATION_METRICS = {"accuracy", "f1", "precision", "recall", "log_loss", "brier"}
+PROBABILITY_OPTIMIZATION_METRICS = {"log_loss", "brier"}
+
+
+def _normalize_prediction_horizon(prediction_horizon: int) -> int:
+    """Normalize prediction horizon to a valid positive integer."""
+    return max(1, int(prediction_horizon))
+
+
+def _resolve_cost_model(
+    cost_model: TradingCostModel | None,
+    assumed_cost_bps: float,
+    turnover_penalty_bps: float = 0.0,
+) -> TradingCostModel:
+    """Resolve canonical cost model from explicit model or legacy bps inputs."""
+    if cost_model is not None:
+        return cost_model
+    return TradingCostModel.from_assumed_costs(
+        assumed_cost_bps=float(assumed_cost_bps),
+        turnover_penalty_bps=float(turnover_penalty_bps),
+    )
 
 
 class SplitMethod(str, Enum):
@@ -763,6 +788,7 @@ class HyperparameterOptimizer:
         assumed_cost_bps: float = 5.0,
         turnover_penalty_bps: float = 0.0,
         annualization_factor: float = 252.0,
+        cost_model: TradingCostModel | None = None,
     ):
         """
         Initialize optimizer.
@@ -784,8 +810,13 @@ class HyperparameterOptimizer:
         self.n_trials = n_trials
         self.method = method
         self.random_state = random_state
-        self.assumed_cost_bps = assumed_cost_bps
-        self.turnover_penalty_bps = turnover_penalty_bps
+        self.cost_model = _resolve_cost_model(
+            cost_model=cost_model,
+            assumed_cost_bps=assumed_cost_bps,
+            turnover_penalty_bps=turnover_penalty_bps,
+        )
+        self.assumed_cost_bps = float(self.cost_model.execution_cost_bps)
+        self.turnover_penalty_bps = float(self.cost_model.turnover_penalty_bps)
         self.annualization_factor = annualization_factor
 
         self.best_params: dict[str, Any] = {}
@@ -799,6 +830,7 @@ class HyperparameterOptimizer:
         y: np.ndarray,
         cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """
         Run hyperparameter optimization.
@@ -815,11 +847,29 @@ class HyperparameterOptimizer:
         set_global_seed(self.random_state, deterministic_torch=False)
 
         if self.method == "grid":
-            return self._grid_search(X, y, cv_splitter, scoring_func)
+            return self._grid_search(
+                X,
+                y,
+                cv_splitter,
+                scoring_func,
+                sample_weights=sample_weights,
+            )
         elif self.method == "random":
-            return self._random_search(X, y, cv_splitter, scoring_func)
+            return self._random_search(
+                X,
+                y,
+                cv_splitter,
+                scoring_func,
+                sample_weights=sample_weights,
+            )
         elif self.method == "bayesian":
-            return self._bayesian_search(X, y, cv_splitter, scoring_func)
+            return self._bayesian_search(
+                X,
+                y,
+                cv_splitter,
+                scoring_func,
+                sample_weights=sample_weights,
+            )
         else:
             raise ValueError(f"Unknown optimization method: {self.method}")
 
@@ -830,6 +880,7 @@ class HyperparameterOptimizer:
         y: np.ndarray,
         cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> float:
         """Evaluate a parameter combination using cross-validation."""
         scores = []
@@ -837,22 +888,82 @@ class HyperparameterOptimizer:
         for train_idx, test_idx in cv_splitter.split(X, y):
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
+            w_train = sample_weights[train_idx] if sample_weights is not None else None
 
             # Create and train model
             model = self.model_class(**params)
-            model.fit(X_train, y_train)
+            self._validate_metric_model_compatibility(model.model_type, y_train)
+            model.fit(X_train, y_train, sample_weights=w_train)
 
             # Evaluate
             predictions = model.predict(X_test)
+            probabilities: np.ndarray | None = None
+            metric = self.metric.lower()
+            if metric in PROBABILITY_OPTIMIZATION_METRICS and hasattr(model, "predict_proba"):
+                try:
+                    probabilities = np.asarray(model.predict_proba(X_test), dtype=float)
+                except Exception:
+                    probabilities = None
 
             if scoring_func is not None:
                 score = scoring_func(y_test, predictions)
             else:
-                score = self._default_score(y_test, predictions)
+                score = self._default_score(
+                    y_test,
+                    predictions,
+                    y_prob=probabilities,
+                    model_type=model.model_type,
+                )
 
             scores.append(score)
 
         return np.mean(scores)
+
+    @staticmethod
+    def _is_binary_target(y: np.ndarray) -> bool:
+        """Return True when target values represent binary classes."""
+        arr = np.asarray(y, dtype=float).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return False
+        unique = np.unique(arr)
+        if unique.size > 2:
+            return False
+        return bool(np.all(np.isin(unique, [0.0, 1.0])))
+
+    def _validate_metric_model_compatibility(
+        self,
+        model_type: ModelType,
+        y_train: np.ndarray,
+    ) -> None:
+        """
+        Enforce objective/target compatibility to prevent synthetic profitability.
+
+        Trading metrics are only valid for return-like regression targets.
+        """
+        metric = self.metric.lower()
+        is_binary_target = self._is_binary_target(y_train)
+
+        if metric in TRADING_OPTIMIZATION_METRICS:
+            if model_type != ModelType.REGRESSOR or is_binary_target:
+                raise ValueError(
+                    "Trading metrics (sharpe/win_rate/profit_factor) require "
+                    "regression models with return-like continuous targets. "
+                    "Use classification metrics for binary labels."
+                )
+            return
+
+        if metric in CLASSIFICATION_OPTIMIZATION_METRICS and model_type != ModelType.CLASSIFIER:
+            raise ValueError(
+                f"Metric '{self.metric}' requires classifier models. "
+                f"Received model_type={model_type.value}."
+            )
+
+        if metric in REGRESSION_OPTIMIZATION_METRICS and model_type != ModelType.REGRESSOR:
+            raise ValueError(
+                f"Metric '{self.metric}' requires regressor models. "
+                f"Received model_type={model_type.value}."
+            )
 
     def _sample_param(
         self,
@@ -893,17 +1004,25 @@ class HyperparameterOptimizer:
 
         # Turnover includes entries, flips, and exits.
         turnover = np.abs(np.diff(np.concatenate([[0.0], signals])))
-        total_cost_bps = self.assumed_cost_bps + self.turnover_penalty_bps
-        costs = turnover * (total_cost_bps / 10000.0)
-
-        return gross_returns - costs
+        return self.cost_model.apply_turnover_costs(gross_returns, turnover)
 
     def _default_score(
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
+        y_prob: np.ndarray | None = None,
+        model_type: ModelType | None = None,
     ) -> float:
         """Default optimization score aligned with selected metric."""
+        from sklearn.metrics import (
+            accuracy_score,
+            brier_score_loss,
+            f1_score,
+            log_loss,
+            precision_score,
+            recall_score,
+        )
+
         metric = self.metric.lower()
 
         if metric in ("mse", "neg_mse"):
@@ -915,6 +1034,30 @@ class HyperparameterOptimizer:
             if y_var <= 1e-12:
                 return 0.0
             return float(1 - np.mean((y_true - y_pred) ** 2) / y_var)
+        if metric == "accuracy":
+            return float(accuracy_score(y_true, y_pred))
+        if metric == "f1":
+            return float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+        if metric == "precision":
+            return float(precision_score(y_true, y_pred, average="weighted", zero_division=0))
+        if metric == "recall":
+            return float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
+        if metric == "log_loss":
+            if y_prob is None:
+                return float("-inf")
+            if y_prob.ndim == 2 and y_prob.shape[1] > 1:
+                clipped = np.clip(y_prob[:, 1], 1e-6, 1 - 1e-6)
+            else:
+                clipped = np.clip(np.asarray(y_prob).reshape(-1), 1e-6, 1 - 1e-6)
+            return -float(log_loss(y_true, clipped))
+        if metric == "brier":
+            if y_prob is None:
+                return float("-inf")
+            if y_prob.ndim == 2 and y_prob.shape[1] > 1:
+                probs = np.clip(y_prob[:, 1], 0.0, 1.0)
+            else:
+                probs = np.clip(np.asarray(y_prob).reshape(-1), 0.0, 1.0)
+            return -float(brier_score_loss(y_true, probs))
 
         # Trading metrics: simulate directional strategy returns.
         simulated_returns = self._simulate_net_returns(y_true, y_pred)
@@ -946,6 +1089,7 @@ class HyperparameterOptimizer:
         y: np.ndarray,
         cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """Random search optimization."""
         for _ in range(self.n_trials):
@@ -956,7 +1100,16 @@ class HyperparameterOptimizer:
 
             # Evaluate
             try:
-                score = self._evaluate_params(params, X, y, cv_splitter, scoring_func)
+                score = self._evaluate_params(
+                    params,
+                    X,
+                    y,
+                    cv_splitter,
+                    scoring_func,
+                    sample_weights=sample_weights,
+                )
+            except ValueError:
+                raise
             except Exception:
                 score = float("-inf")
 
@@ -974,6 +1127,7 @@ class HyperparameterOptimizer:
         y: np.ndarray,
         cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """Grid search optimization."""
         from itertools import product
@@ -1000,7 +1154,16 @@ class HyperparameterOptimizer:
             params = dict(zip(param_names, values))
 
             try:
-                score = self._evaluate_params(params, X, y, cv_splitter, scoring_func)
+                score = self._evaluate_params(
+                    params,
+                    X,
+                    y,
+                    cv_splitter,
+                    scoring_func,
+                    sample_weights=sample_weights,
+                )
+            except ValueError:
+                raise
             except Exception:
                 score = float("-inf")
 
@@ -1018,6 +1181,7 @@ class HyperparameterOptimizer:
         y: np.ndarray,
         cv_splitter: Any,
         scoring_func: Callable[[np.ndarray, np.ndarray], float] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> dict[str, Any]:
         """Bayesian optimization using optuna."""
         try:
@@ -1025,7 +1189,13 @@ class HyperparameterOptimizer:
             optuna.logging.set_verbosity(optuna.logging.WARNING)
         except ImportError:
             # Fall back to random search
-            return self._random_search(X, y, cv_splitter, scoring_func)
+            return self._random_search(
+                X,
+                y,
+                cv_splitter,
+                scoring_func,
+                sample_weights=sample_weights,
+            )
 
         def objective(trial: optuna.Trial) -> float:
             params = {}
@@ -1046,7 +1216,16 @@ class HyperparameterOptimizer:
                         params[param_name] = param_config.get("default")
 
             try:
-                score = self._evaluate_params(params, X, y, cv_splitter, scoring_func)
+                score = self._evaluate_params(
+                    params,
+                    X,
+                    y,
+                    cv_splitter,
+                    scoring_func,
+                    sample_weights=sample_weights,
+                )
+            except ValueError:
+                raise
             except Exception:
                 return float("-inf")
 
@@ -1114,6 +1293,7 @@ class ModelManager:
         timestamps: np.ndarray | None = None,
         validate_leakage: bool = True,
         strict_leakage_check: bool = True,
+        sample_weights: np.ndarray | None = None,
         **kwargs: Any,
     ) -> TradingModel:
         """
@@ -1148,6 +1328,8 @@ class ModelManager:
         logger = logging.getLogger(__name__)
 
         n_samples = len(X)
+        if sample_weights is not None and len(sample_weights) != n_samples:
+            raise ValueError("sample_weights length must match X/y length in train_model.")
 
         # MAJOR FIX: Run future leak validation before training
         if validate_leakage:
@@ -1183,6 +1365,7 @@ class ModelManager:
         # Validation data: [split_idx + gap, n_samples)
         X_train = X[:split_idx]
         y_train = y[:split_idx]
+        w_train = sample_weights[:split_idx] if sample_weights is not None else None
         X_val = X[split_idx + gap:]
         y_val = y[split_idx + gap:]
 
@@ -1191,7 +1374,13 @@ class ModelManager:
             f"total={n_samples}"
         )
 
-        model.fit(X_train, y_train, validation_data=(X_val, y_val), **kwargs)
+        model.fit(
+            X_train,
+            y_train,
+            validation_data=(X_val, y_val),
+            sample_weights=w_train,
+            **kwargs,
+        )
 
         return model
 
@@ -1207,7 +1396,10 @@ class ModelManager:
         embargo_pct: float = 0.01,
         prediction_horizon: int = 1,
         assumed_cost_bps: float = 5.0,
+        turnover_penalty_bps: float = 0.0,
         annualization_factor: float = 252.0,
+        sample_weights: np.ndarray | None = None,
+        cost_model: TradingCostModel | None = None,
     ) -> dict[str, Any]:
         """
         Perform cross-validation.
@@ -1223,26 +1415,37 @@ class ModelManager:
         Returns:
             Dictionary of metric results
         """
+        normalized_horizon = _normalize_prediction_horizon(prediction_horizon)
+        effective_gap = max(int(gap), normalized_horizon)
+        if sample_weights is not None and len(sample_weights) != len(y):
+            raise ValueError(
+                "sample_weights length must match y length for cross-validation."
+            )
+
         if cv_method == SplitMethod.PURGED_KFOLD:
             splitter = create_purged_cv(
                 cv_type="purged_kfold",
                 n_splits=n_splits,
-                purge_gap=gap,
+                purge_gap=effective_gap,
                 embargo_pct=embargo_pct,
-                prediction_horizon=prediction_horizon,
+                prediction_horizon=normalized_horizon,
             )
             splits = list(splitter.split(X, y))
         elif cv_method == SplitMethod.WALK_FORWARD:
             splitter = create_purged_cv(
                 cv_type="walk_forward",
                 n_splits=n_splits,
-                purge_gap=gap,
+                purge_gap=effective_gap,
                 embargo_pct=embargo_pct,
-                prediction_horizon=prediction_horizon,
+                prediction_horizon=normalized_horizon,
             )
             splits = list(splitter.split(X, y))
         else:
-            splitter = TimeSeriesSplitter(method=cv_method, n_splits=n_splits, gap=gap)
+            splitter = TimeSeriesSplitter(
+                method=cv_method,
+                n_splits=n_splits,
+                gap=effective_gap,
+            )
             splits = splitter.split(X, y)
 
         if metrics is None:
@@ -1280,10 +1483,11 @@ class ModelManager:
         for train_idx, test_idx in splits:
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
+            w_train = sample_weights[train_idx] if sample_weights is not None else None
 
             # Train a fresh instance per fold to avoid model state leakage.
             fold_model = _instantiate_fresh_model(model)
-            fold_model.fit(X_train, y_train)
+            fold_model.fit(X_train, y_train, sample_weights=w_train)
             predictions = fold_model.predict(X_test)
 
             # Calculate metrics
@@ -1293,7 +1497,9 @@ class ModelManager:
                 metrics,
                 fold_model.model_type,
                 assumed_cost_bps=assumed_cost_bps,
+                turnover_penalty_bps=turnover_penalty_bps,
                 annualization_factor=annualization_factor,
+                cost_model=cost_model,
             )
             for metric, value in fold_metrics.items():
                 results[metric].append(value)
@@ -1327,27 +1533,45 @@ class ModelManager:
         assumed_cost_bps: float = 5.0,
         turnover_penalty_bps: float = 0.0,
         annualization_factor: float = 26 * 252,
+        sample_weights: np.ndarray | None = None,
+        cost_model: TradingCostModel | None = None,
     ) -> dict[str, Any]:
         """Run institutional nested CV with inner optimization and outer OOS scoring."""
+
+        normalized_horizon = _normalize_prediction_horizon(prediction_horizon)
+        effective_gap = max(int(gap), normalized_horizon)
+        resolved_cost_model = _resolve_cost_model(
+            cost_model=cost_model,
+            assumed_cost_bps=assumed_cost_bps,
+            turnover_penalty_bps=turnover_penalty_bps,
+        )
+        if sample_weights is not None and len(sample_weights) != len(y):
+            raise ValueError(
+                "sample_weights length must match y length for nested cross-validation."
+            )
 
         def _build_splitter(method: SplitMethod, n_splits: int) -> Any:
             if method == SplitMethod.PURGED_KFOLD:
                 return create_purged_cv(
                     cv_type="purged_kfold",
                     n_splits=n_splits,
-                    purge_gap=gap,
+                    purge_gap=effective_gap,
                     embargo_pct=embargo_pct,
-                    prediction_horizon=prediction_horizon,
+                    prediction_horizon=normalized_horizon,
                 )
             if method == SplitMethod.WALK_FORWARD:
                 return create_purged_cv(
                     cv_type="walk_forward",
                     n_splits=n_splits,
-                    purge_gap=gap,
+                    purge_gap=effective_gap,
                     embargo_pct=embargo_pct,
-                    prediction_horizon=prediction_horizon,
+                    prediction_horizon=normalized_horizon,
                 )
-            return TimeSeriesSplitter(method=method, n_splits=n_splits, gap=gap)
+            return TimeSeriesSplitter(
+                method=method,
+                n_splits=n_splits,
+                gap=effective_gap,
+            )
 
         set_global_seed(random_state, deterministic_torch=False)
         outer_splitter = _build_splitter(outer_method, outer_splits)
@@ -1360,6 +1584,7 @@ class ModelManager:
         for fold_idx, (train_idx, test_idx) in enumerate(outer_pairs):
             X_train, y_train = X[train_idx], y[train_idx]
             X_test, y_test = X[test_idx], y[test_idx]
+            w_train = sample_weights[train_idx] if sample_weights is not None else None
 
             fold_seed = child_seed(random_state, fold_idx + 1)
             inner_splitter = _build_splitter(inner_method, inner_splits)
@@ -1373,11 +1598,17 @@ class ModelManager:
                 assumed_cost_bps=assumed_cost_bps,
                 turnover_penalty_bps=turnover_penalty_bps,
                 annualization_factor=annualization_factor,
+                cost_model=resolved_cost_model,
             )
 
-            best_params = optimizer.optimize(X_train, y_train, inner_splitter)
+            best_params = optimizer.optimize(
+                X_train,
+                y_train,
+                inner_splitter,
+                sample_weights=w_train,
+            )
             model = model_class(**best_params) if best_params else model_class()
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train, sample_weights=w_train)
             y_pred = model.predict(X_test)
 
             holdout_metrics = self._calculate_holdout_metrics(
@@ -1385,7 +1616,9 @@ class ModelManager:
                 y_pred,
                 model.model_type,
                 assumed_cost_bps=assumed_cost_bps,
+                turnover_penalty_bps=turnover_penalty_bps,
                 annualization_factor=annualization_factor,
+                cost_model=resolved_cost_model,
             )
 
             fold_results.append(
@@ -1447,7 +1680,9 @@ class ModelManager:
         metrics: list[str],
         model_type: ModelType,
         assumed_cost_bps: float = 5.0,
+        turnover_penalty_bps: float = 0.0,
         annualization_factor: float = 252.0,
+        cost_model: TradingCostModel | None = None,
     ) -> dict[str, float]:
         """Calculate specified metrics."""
         from sklearn.metrics import (
@@ -1459,13 +1694,17 @@ class ModelManager:
         )
 
         results = {}
+        resolved_cost_model = _resolve_cost_model(
+            cost_model=cost_model,
+            assumed_cost_bps=assumed_cost_bps,
+            turnover_penalty_bps=turnover_penalty_bps,
+        )
         trading_returns: np.ndarray | None = None
         if model_type == ModelType.REGRESSOR and len(y_true) > 1:
             signals = np.sign(y_pred[:-1])
             gross_returns = signals * y_true[1:]
             turnover = np.abs(np.diff(np.concatenate([[0.0], signals])))
-            costs = turnover * (assumed_cost_bps / 10000.0)
-            trading_returns = gross_returns - costs
+            trading_returns = resolved_cost_model.apply_turnover_costs(gross_returns, turnover)
 
         for metric in metrics:
             if metric == "mse":
@@ -1532,6 +1771,9 @@ class ModelManager:
         annualization_factor: float = 252.0,
         enforce_validation_gates: bool = True,
         validation_gates_strict: bool = True,
+        prediction_horizon: int = 1,
+        sample_weights: np.ndarray | None = None,
+        cost_model: TradingCostModel | None = None,
     ) -> tuple[TradingModel, dict[str, float]]:
         """
         Optimize hyperparameters and train final model.
@@ -1579,26 +1821,42 @@ class ModelManager:
         set_global_seed(random_state, deterministic_torch=False)
 
         n_samples = len(X)
+        resolved_cost_model = _resolve_cost_model(
+            cost_model=cost_model,
+            assumed_cost_bps=assumed_cost_bps,
+            turnover_penalty_bps=turnover_penalty_bps,
+        )
+        normalized_horizon = _normalize_prediction_horizon(prediction_horizon)
+        effective_gap = max(int(gap), normalized_horizon)
+        if sample_weights is not None and len(sample_weights) != len(y):
+            raise ValueError(
+                "sample_weights length must match y length for optimize_and_train."
+            )
 
         # CRITICAL: Create holdout test set BEFORE optimization
         holdout_size = int(n_samples * holdout_fraction)
-        train_val_end = n_samples - holdout_size - gap
+        train_val_end = n_samples - holdout_size - effective_gap
 
         if train_val_end < n_samples * 0.5:
             raise ValueError(
-                f"holdout_fraction={holdout_fraction} and gap={gap} leave too little "
+                f"holdout_fraction={holdout_fraction} and gap={effective_gap} leave too little "
                 f"data for optimization. Reduce holdout_fraction or gap."
             )
 
         # Split data
         X_train_val = X[:train_val_end]
         y_train_val = y[:train_val_end]
-        X_holdout = X[train_val_end + gap:]
-        y_holdout = y[train_val_end + gap:]
+        w_train_val = sample_weights[:train_val_end] if sample_weights is not None else None
+        X_holdout = X[train_val_end + effective_gap:]
+        y_holdout = y[train_val_end + effective_gap:]
 
         logger.info(
-            f"JPMORGAN DATA SPLIT: train_val={len(X_train_val)}, gap={gap}, "
-            f"holdout={len(X_holdout)}, total={n_samples}"
+            "JPMORGAN DATA SPLIT: train_val=%d, gap=%d, holdout=%d, total=%d, horizon=%d",
+            len(X_train_val),
+            effective_gap,
+            len(X_holdout),
+            n_samples,
+            normalized_horizon,
         )
 
         # Optimize on train+val data only
@@ -1612,34 +1870,44 @@ class ModelManager:
             assumed_cost_bps=assumed_cost_bps,
             turnover_penalty_bps=turnover_penalty_bps,
             annualization_factor=annualization_factor,
+            cost_model=resolved_cost_model,
         )
 
         if cv_method == SplitMethod.PURGED_KFOLD:
             cv_splitter = create_purged_cv(
                 cv_type="purged_kfold",
                 n_splits=5,
-                purge_gap=gap,
+                purge_gap=effective_gap,
                 embargo_pct=0.01,
-                prediction_horizon=1,
+                prediction_horizon=normalized_horizon,
             )
         elif cv_method == SplitMethod.WALK_FORWARD:
             cv_splitter = create_purged_cv(
                 cv_type="walk_forward",
                 n_splits=5,
-                purge_gap=gap,
+                purge_gap=effective_gap,
                 embargo_pct=0.01,
-                prediction_horizon=1,
+                prediction_horizon=normalized_horizon,
             )
         else:
-            cv_splitter = TimeSeriesSplitter(method=cv_method, n_splits=5, gap=gap)
-        best_params = optimizer.optimize(X_train_val, y_train_val, cv_splitter)
+            cv_splitter = TimeSeriesSplitter(
+                method=cv_method,
+                n_splits=5,
+                gap=effective_gap,
+            )
+        best_params = optimizer.optimize(
+            X_train_val,
+            y_train_val,
+            cv_splitter,
+            sample_weights=w_train_val,
+        )
 
         logger.info(f"Best hyperparameters: {best_params}")
         logger.info(f"CV optimization score (in-sample): {optimizer.best_score:.4f}")
 
         # Train final model on train+val data ONLY (not holdout)
         model = model_class(**best_params)
-        model.fit(X_train_val, y_train_val)
+        model.fit(X_train_val, y_train_val, sample_weights=w_train_val)
 
         # Evaluate on holdout test set for unbiased performance estimate
         holdout_predictions = model.predict(X_holdout)
@@ -1648,7 +1916,9 @@ class ModelManager:
             holdout_predictions,
             model.model_type,
             assumed_cost_bps=assumed_cost_bps,
+            turnover_penalty_bps=turnover_penalty_bps,
             annualization_factor=annualization_factor,
+            cost_model=resolved_cost_model,
         )
 
         logger.info(f"Holdout test metrics (out-of-sample): {holdout_metrics}")
@@ -1747,7 +2017,9 @@ class ModelManager:
         y_pred: np.ndarray,
         model_type: "ModelType",
         assumed_cost_bps: float = 5.0,
+        turnover_penalty_bps: float = 0.0,
         annualization_factor: float = 26 * 252,
+        cost_model: TradingCostModel | None = None,
     ) -> dict[str, float]:
         """
         JPMORGAN FIX: Calculate comprehensive metrics on holdout test set.
@@ -1763,6 +2035,11 @@ class ModelManager:
         )
 
         metrics = {}
+        resolved_cost_model = _resolve_cost_model(
+            cost_model=cost_model,
+            assumed_cost_bps=assumed_cost_bps,
+            turnover_penalty_bps=turnover_penalty_bps,
+        )
 
         if model_type == ModelType.REGRESSOR:
             metrics["mse"] = float(mean_squared_error(y_true, y_pred))
@@ -1784,8 +2061,10 @@ class ModelManager:
                 signals = np.sign(y_pred[:-1])
                 gross_returns = signals * y_true[1:]
                 turnover = np.abs(np.diff(np.concatenate([[0.0], signals])))
-                costs = turnover * (assumed_cost_bps / 10000)
-                simulated_returns = gross_returns - costs
+                simulated_returns = resolved_cost_model.apply_turnover_costs(
+                    gross_returns,
+                    turnover,
+                )
 
                 if len(simulated_returns) > 0 and np.std(simulated_returns) > 1e-10:
                     # Sharpe ratio (annualized assuming 15-min bars, ~26 bars/day, 252 days/year)

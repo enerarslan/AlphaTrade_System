@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterator
 
@@ -29,6 +29,7 @@ from quant_trading_system.backtest.engine import (
     WalkForwardReport,
     WalkForwardValidator,
 )
+from quant_trading_system.models.trading_costs import TradingCostModel
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +517,8 @@ class StrategyOptimizer:
         objective: str = "sharpe",  # 'sharpe', 'sortino', 'return', 'calmar'
         walk_forward_validator: WalkForwardValidator | None = None,
         enable_walk_forward_audit: bool = True,
+        cost_model: TradingCostModel | None = None,
+        cost_regularization_scale: float = 1.0,
     ) -> None:
         """Initialize strategy optimizer.
 
@@ -535,23 +538,66 @@ class StrategyOptimizer:
         self.objective = objective
         self.walk_forward_validator = walk_forward_validator or WalkForwardValidator()
         self.enable_walk_forward_audit = bool(enable_walk_forward_audit)
+        self.cost_model = cost_model or TradingCostModel(
+            spread_bps=float(self.backtest_config.commission_bps),
+            slippage_bps=float(self.backtest_config.slippage_bps),
+            impact_bps=0.0,
+        )
+        self.cost_regularization_scale = max(0.0, float(cost_regularization_scale))
         self._analyzer = PerformanceAnalyzer()
+
+    @staticmethod
+    def _estimate_turnover_per_bar(backtest_state: BacktestState) -> float:
+        """Estimate average turnover per bar from closed trades."""
+        n_bars = max(1, len(backtest_state.equity_curve) - 1)
+        if n_bars <= 0 or not backtest_state.trades:
+            return 0.0
+
+        avg_equity = float(np.mean([point[1] for point in backtest_state.equity_curve])) if backtest_state.equity_curve else 0.0
+        if avg_equity <= 1e-9:
+            return 0.0
+
+        total_notional = 0.0
+        for trade in backtest_state.trades:
+            total_notional += abs(float(trade.entry_price) * float(trade.quantity))
+
+        return float(total_notional / avg_equity / n_bars)
+
+    def _cost_regularization(self, backtest_state: BacktestState) -> float:
+        """Compute cost-aware regularization term for objective scoring."""
+        if self.cost_regularization_scale <= 0:
+            return 0.0
+        turnover_per_bar = self._estimate_turnover_per_bar(backtest_state)
+        return float(turnover_per_bar * self.cost_model.total_cost_rate * self.cost_regularization_scale)
+
+    def _build_period_config(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> BacktestConfig:
+        """Clone base backtest config for a specific period without dropping settings."""
+        return replace(
+            self.backtest_config,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
     def _get_objective_value(self, backtest_state: BacktestState) -> float:
         """Calculate objective value from backtest results."""
         try:
             report = self._analyzer.analyze(backtest_state)
+            cost_penalty = self._cost_regularization(backtest_state)
 
             if self.objective == "sharpe":
-                return report.risk_adjusted_metrics.sharpe_ratio
+                return report.risk_adjusted_metrics.sharpe_ratio - (cost_penalty * np.sqrt(252.0))
             elif self.objective == "sortino":
-                return report.risk_adjusted_metrics.sortino_ratio
+                return report.risk_adjusted_metrics.sortino_ratio - (cost_penalty * np.sqrt(252.0))
             elif self.objective == "return":
-                return report.return_metrics.annualized_return
+                return report.return_metrics.annualized_return - cost_penalty
             elif self.objective == "calmar":
-                return report.risk_adjusted_metrics.calmar_ratio
+                return report.risk_adjusted_metrics.calmar_ratio - (cost_penalty * np.sqrt(252.0))
             else:
-                return report.risk_adjusted_metrics.sharpe_ratio
+                return report.risk_adjusted_metrics.sharpe_ratio - (cost_penalty * np.sqrt(252.0))
         except Exception as e:
             logger.warning(f"Error calculating objective: {e}")
             return float("-inf")
@@ -670,11 +716,7 @@ class StrategyOptimizer:
             report = self.walk_forward_validator.run_validation(
                 data=dataset,
                 strategy_factory=lambda _train_df: self.strategy_factory(best_params),
-                config=BacktestConfig(
-                    initial_capital=self.backtest_config.initial_capital,
-                    start_date=start_date,
-                    end_date=end_date,
-                ),
+                config=self._build_period_config(start_date, end_date),
             )
             return self._build_walk_forward_metadata(report)
         except Exception as exc:
@@ -720,11 +762,7 @@ class StrategyOptimizer:
             def objective_fn(params: dict[str, Any]) -> float:
                 try:
                     strategy = self.strategy_factory(params)
-                    config = BacktestConfig(
-                        initial_capital=self.backtest_config.initial_capital,
-                        start_date=window.train_start,
-                        end_date=window.train_end,
-                    )
+                    config = self._build_period_config(window.train_start, window.train_end)
                     data_handler = data_handler_factory(window.train_start, window.train_end)
                     engine = BacktestEngine(data_handler, strategy, config)
                     state = engine.run()
@@ -753,11 +791,7 @@ class StrategyOptimizer:
             # Evaluate on test period
             try:
                 strategy = self.strategy_factory(best_params)
-                config = BacktestConfig(
-                    initial_capital=self.backtest_config.initial_capital,
-                    start_date=window.test_start,
-                    end_date=window.test_end,
-                )
+                config = self._build_period_config(window.test_start, window.test_end)
                 data_handler = data_handler_factory(window.test_start, window.test_end)
                 engine = BacktestEngine(data_handler, strategy, config)
                 state = engine.run()

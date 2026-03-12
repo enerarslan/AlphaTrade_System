@@ -490,8 +490,8 @@ class TestCrossSectionalFeatures:
         result = rs.compute(sample_ohlcv_df)
 
         assert isinstance(result, dict)
-        # Returns zeros when no benchmark available, which is expected
         assert "rs_vs_benchmark_20" in result
+        assert np.isnan(result["rs_vs_benchmark_20"]).all()
 
     def test_percentile_rank(self, multi_asset_data, sample_ohlcv_df):
         """Test percentile rank computation."""
@@ -503,8 +503,9 @@ class TestCrossSectionalFeatures:
         result = pr.compute(sample_ohlcv_df)
 
         assert isinstance(result, dict)
-        # Returns 50th percentile when no universe data available
         assert "return_percentile_5" in result or "return_percentile_20" in result
+        key = "return_percentile_5" if "return_percentile_5" in result else "return_percentile_20"
+        assert np.isnan(result[key]).all()
 
     def test_zscore_vs_universe(self, multi_asset_data, sample_ohlcv_df):
         """Test Z-score vs universe computation."""
@@ -516,8 +517,9 @@ class TestCrossSectionalFeatures:
         result = zscore.compute(sample_ohlcv_df)
 
         assert isinstance(result, dict)
-        # Returns zeros when no universe data available
         assert "zscore_universe_5" in result or "zscore_universe_20" in result
+        key = "zscore_universe_5" if "zscore_universe_5" in result else "zscore_universe_20"
+        assert np.isnan(result[key]).all()
 
     def test_zscore_uses_timestamp_alignment_not_row_index(self):
         """Z-score should respect timestamp alignment for universe returns."""
@@ -601,6 +603,42 @@ class TestCrossSectionalFeatures:
         # Early window has no true overlap; alignment should keep it NaN.
         assert np.isnan(centrality[4])
         assert np.isfinite(centrality).sum() > 0
+
+    def test_cross_sectional_calculator_preserves_bounded_percentile_features(self):
+        """Robust normalization should not distort naturally bounded [0,1] features."""
+        from quant_trading_system.features.cross_sectional import (
+            CrossSectionalFeatureCalculator,
+            PercentileRank,
+        )
+
+        base_ts = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(12)]
+        base_df = pl.DataFrame(
+            {
+                "timestamp": base_ts,
+                "close": np.linspace(100.0, 112.0, 12),
+            }
+        )
+        u1 = pl.DataFrame(
+            {
+                "timestamp": base_ts,
+                "close": np.linspace(80.0, 92.0, 12),
+            }
+        )
+        u2 = pl.DataFrame(
+            {
+                "timestamp": base_ts,
+                "close": np.linspace(120.0, 132.0, 12),
+            }
+        )
+
+        calc = CrossSectionalFeatureCalculator(include_all=False, robust_normalize=True)
+        calc.add_feature(PercentileRank(windows=[1]))
+        result = calc.compute_all(base_df, {"U1": u1, "U2": u2})
+        vals = result["return_percentile_1"]
+        valid = vals[np.isfinite(vals)]
+
+        assert valid.size > 0
+        assert np.all(valid >= 0.0) and np.all(valid <= 1.0)
 
 
 class TestFeaturePipeline:

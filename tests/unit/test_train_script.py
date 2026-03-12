@@ -97,6 +97,8 @@ def _base_args(**overrides):
         "min_deflated_sharpe": 0.10,
         "max_deflated_sharpe_pvalue": 0.10,
         "max_pbo": 0.45,
+        "min_white_reality_stat": 0.0,
+        "max_white_reality_pvalue": 0.10,
         "disable_lightgbm_monotonic_constraints": False,
     }
     args.update(overrides)
@@ -349,6 +351,9 @@ def test_run_training_all_dispatch(monkeypatch):
     assert trained == [
         "xgboost",
         "lightgbm",
+        "lightgbm_ranker",
+        "xgboost_regressor",
+        "lightgbm_regressor",
         "random_forest",
         "elastic_net",
         "lstm",
@@ -1574,6 +1579,27 @@ def test_build_parser_supports_horizon_sweep_and_meta_threshold_flags():
     assert args.disable_meta_dynamic_threshold is True
 
 
+def test_build_parser_supports_white_reality_gate_flags():
+    parser = train_script.build_parser()
+    args = parser.parse_args(["--min-white-reality-stat", "0.05", "--max-white-reality-pvalue", "0.08"])
+    assert args.min_white_reality_stat == pytest.approx(0.05)
+    assert args.max_white_reality_pvalue == pytest.approx(0.08)
+
+
+def test_build_parser_accepts_lightgbm_ranker_model_choice():
+    parser = train_script.build_parser()
+    args = parser.parse_args(["--model", "lightgbm_ranker"])
+    assert args.model == "lightgbm_ranker"
+
+
+def test_build_parser_accepts_return_regressor_model_choices():
+    parser = train_script.build_parser()
+    args_xgb = parser.parse_args(["--model", "xgboost_regressor"])
+    args_lgb = parser.parse_args(["--model", "lightgbm_regressor"])
+    assert args_xgb.model == "xgboost_regressor"
+    assert args_lgb.model == "lightgbm_regressor"
+
+
 def test_build_training_matrix_ranks_by_governance_score():
     rows = train_script._build_training_matrix(
         [
@@ -1613,6 +1639,94 @@ def test_build_training_matrix_ranks_by_governance_score():
     assert rows[0]["governance_score"] > rows[1]["governance_score"]
 
 
+def test_training_config_normalizes_limits_and_exports_cost_model():
+    cfg = train_script.TrainingConfig(
+        model_type="xgboost",
+        feature_reuse_min_coverage=2.5,
+        execution_turnover_cap=2.0,
+        primary_horizon_sweep=[-1, 5, 0, 3],
+        label_spread_bps=1.5,
+        label_slippage_bps=2.0,
+        label_impact_bps=3.5,
+    )
+
+    assert cfg.feature_reuse_min_coverage == pytest.approx(0.95)
+    assert cfg.execution_turnover_cap == pytest.approx(1.0)
+    assert cfg.primary_horizon_sweep == [3, 5]
+    assert cfg.to_trading_cost_model().execution_cost_bps == pytest.approx(7.0)
+
+
+def test_build_ranking_groups_segments_by_timestamp():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    timestamps = np.array(
+        [
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:01:00",
+            "2024-01-01T10:02:00",
+            "2024-01-01T10:02:00",
+            "2024-01-01T10:02:00",
+        ],
+        dtype="datetime64[ns]",
+    )
+    groups = trainer._build_ranking_groups(timestamps)
+    assert groups.tolist() == [2, 1, 3]
+
+
+def test_horizon_leaderboards_assign_per_horizon_candidates():
+    rows = [
+        {
+            "model_type": "lightgbm_ranker",
+            "primary_label_horizon": 5,
+            "success": True,
+            "governance_score": 0.91,
+            "registry_version_id": "v5a",
+            "promotion_package_path": "pkg5a.json",
+            "deployment_plan": {"ready_for_production": True},
+            "validation_layers": {
+                "model_utility": True,
+                "execution_robustness": True,
+                "cross_symbol_robustness": True,
+            },
+            "run_id": "lightgbm_ranker_h5",
+        },
+        {
+            "model_type": "xgboost",
+            "primary_label_horizon": 20,
+            "success": True,
+            "governance_score": 0.88,
+            "registry_version_id": "v20a",
+            "promotion_package_path": "pkg20a.json",
+            "deployment_plan": {"ready_for_production": True},
+            "validation_layers": {
+                "model_utility": True,
+                "execution_robustness": True,
+                "cross_symbol_robustness": True,
+            },
+            "run_id": "xgboost_h20",
+        },
+        {
+            "model_type": "random_forest",
+            "primary_label_horizon": 5,
+            "success": True,
+            "governance_score": 0.70,
+            "registry_version_id": "v5b",
+            "promotion_package_path": "pkg5b.json",
+            "deployment_plan": {"ready_for_production": True},
+            "validation_layers": {
+                "model_utility": True,
+                "execution_robustness": True,
+                "cross_symbol_robustness": True,
+            },
+            "run_id": "rf_h5",
+        },
+    ]
+
+    leaderboards = train_script._build_horizon_leaderboards(rows)
+    assert leaderboards["5"]["champion"]["model_type"] == "lightgbm_ranker"
+    assert leaderboards["20"]["champion"]["model_type"] == "xgboost"
+
+
 def test_auto_select_champion_and_challenger_promotes_best(tmp_path):
     first = register_training_model_version(
         registry_root=tmp_path / "registry",
@@ -1636,6 +1750,7 @@ def test_auto_select_champion_and_challenger_promotes_best(tmp_path):
     rows = [
         {
             "model_type": "lightgbm",
+            "primary_label_horizon": 5,
             "success": True,
             "governance_score": 0.8,
             "registry_version_id": second["version_id"],
@@ -1644,14 +1759,25 @@ def test_auto_select_champion_and_challenger_promotes_best(tmp_path):
                 "ready_for_production": True,
                 "canary_rollout": [{"phase": 1, "capital_fraction": 0.05}],
             },
+            "validation_layers": {
+                "model_utility": True,
+                "execution_robustness": True,
+                "cross_symbol_robustness": True,
+            },
         },
         {
             "model_type": "xgboost",
+            "primary_label_horizon": 20,
             "success": True,
             "governance_score": 0.5,
             "registry_version_id": first["version_id"],
             "promotion_package_path": "models/promotion_packages/xgb_a.json",
             "deployment_plan": {"ready_for_production": True},
+            "validation_layers": {
+                "model_utility": True,
+                "execution_robustness": True,
+                "cross_symbol_robustness": True,
+            },
         },
     ]
 
@@ -1659,6 +1785,8 @@ def test_auto_select_champion_and_challenger_promotes_best(tmp_path):
 
     assert snapshot["promoted"] is True
     assert snapshot["champion"]["model_type"] == "lightgbm"
+    assert "horizon_leaderboards" in snapshot
+    assert snapshot["horizon_leaderboards"]["5"]["champion"]["model_type"] == "lightgbm"
     assert (tmp_path / "active_model.json").exists()
     assert (tmp_path / "champion_challenger_snapshot.json").exists()
     assert (tmp_path / "canary_rollout_plan.json").exists()
@@ -1712,6 +1840,8 @@ def test_multiple_testing_correction_adds_deflated_sharpe_and_pbo_metrics():
     assert "deflated_sharpe_p_value" in trainer.training_metrics
     assert "pbo" in trainer.training_metrics
     assert "pbo_interpretation" in trainer.training_metrics
+    assert "white_reality_stat" in trainer.training_metrics
+    assert "white_reality_pvalue" in trainer.training_metrics
 
 
 def test_multiple_testing_correction_sets_effective_pbo_gate_and_source():
@@ -1782,6 +1912,47 @@ def test_effective_pbo_threshold_tightens_with_holdout_gap():
     assert tightened < relaxed
 
 
+def test_validate_model_records_three_layer_gate_failures():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.70,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 40.0,
+        "mean_test_size": 80.0,
+        "mean_risk_adjusted_score": 0.30,
+        "mean_regime_shift": 0.10,
+        "mean_symbol_concentration_hhi": 0.20,
+        "holdout_rows": 280.0,
+        "holdout_sharpe": 0.20,
+        "holdout_worst_regime_sharpe": 0.05,
+        "holdout_max_drawdown": 0.12,
+        "holdout_symbol_coverage_ratio": 0.80,
+        "holdout_symbol_sharpe_p25": 0.00,
+        "holdout_symbol_underwater_ratio": 0.20,
+        "deflated_sharpe": 0.80,
+        "deflated_sharpe_p_value": 0.20,
+        "pbo": 0.20,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["layers"]["model_utility"]["passed"] is False
+    assert trainer.validation_results["layers"]["execution_robustness"]["passed"] is True
+    assert trainer.validation_results["layers"]["cross_symbol_robustness"]["passed"] is True
+    assert trainer.validation_results["all_layers_passed"] is False
+
+
 def test_validate_model_fails_when_pbo_gate_breaches():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -1803,6 +1974,38 @@ def test_validate_model_fails_when_pbo_gate_breaches():
     passed = trainer._validate_model()
     assert passed is False
     assert trainer.validation_results["gates"]["max_pbo"][0] is False
+
+
+def test_validate_model_fails_when_white_reality_gate_breaches():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            max_white_reality_pvalue=0.10,
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 20.0,
+        "mean_test_size": 50.0,
+        "mean_risk_adjusted_score": 0.25,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.20,
+        "white_reality_stat": 0.1,
+        "white_reality_pvalue": 0.35,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["gates"]["max_white_reality_pvalue"][0] is False
 
 
 def test_validate_model_uses_effective_pbo_gate_override():

@@ -22,6 +22,7 @@ from quant_trading_system.backtest.engine import (
     Strategy,
 )
 from quant_trading_system.core.data_types import Direction, TradeSignal
+from quant_trading_system.models.trading_costs import TradingCostModel
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class ReplaySLOGates:
     max_escalation_latency_ms: float = 2_000.0
     min_orders_for_gate: int = 1
     fail_on_kill_switch_active: bool = True
+    max_cost_vs_expected_ratio: float = 2.5
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,14 @@ class ReplayScenario:
     allow_short: bool = True
     signal: ReplaySignalConfig = field(default_factory=ReplaySignalConfig)
     backtest_overrides: dict[str, Any] = field(default_factory=dict)
+
+    def to_trading_cost_model(self) -> TradingCostModel:
+        """Build canonical execution cost assumptions for replay validation."""
+        return TradingCostModel(
+            spread_bps=float(self.commission_bps),
+            slippage_bps=float(self.slippage_bps),
+            impact_bps=0.0,
+        )
 
 
 @dataclass(frozen=True)
@@ -222,7 +232,9 @@ def run_replay_scenario(
     started_at = datetime.now(timezone.utc)
     state = engine.run()
     completed_at = datetime.now(timezone.utc)
-    execution_slo = engine.get_execution_slo_snapshot()
+    cost_model = scenario.to_trading_cost_model()
+    execution_slo = dict(engine.get_execution_slo_snapshot())
+    execution_slo["expected_execution_cost_bps"] = float(cost_model.execution_cost_bps)
 
     max_drawdown = _compute_max_drawdown(state.equity_curve)
     total_return = _compute_total_return(state.equity_curve)
@@ -230,6 +242,7 @@ def run_replay_scenario(
         execution_slo=execution_slo,
         max_drawdown=max_drawdown,
         slo_gates=slo_gates or ReplaySLOGates(),
+        cost_model=cost_model,
     )
 
     return ReplayOutcome(
@@ -250,6 +263,7 @@ def evaluate_replay_slo(
     execution_slo: dict[str, Any],
     max_drawdown: float,
     slo_gates: ReplaySLOGates,
+    cost_model: TradingCostModel | None = None,
 ) -> list[str]:
     """Evaluate replay against configured SLO gates and return violations."""
     violations: list[str] = []
@@ -273,6 +287,15 @@ def evaluate_replay_slo(
                 "avg_slippage_bps="
                 f"{avg_slippage_bps:.4f} > allowed={slo_gates.max_avg_slippage_bps:.4f}"
             )
+        if cost_model is not None:
+            expected_cost_bps = max(1e-9, float(cost_model.execution_cost_bps))
+            realized_to_expected = avg_slippage_bps / expected_cost_bps
+            if realized_to_expected > float(slo_gates.max_cost_vs_expected_ratio):
+                violations.append(
+                    "execution_cost_ratio="
+                    f"{realized_to_expected:.4f} > allowed={slo_gates.max_cost_vs_expected_ratio:.4f} "
+                    f"(avg={avg_slippage_bps:.4f}bps expected={expected_cost_bps:.4f}bps)"
+                )
 
     risk_playbook = execution_slo.get("risk_playbook", {})
     if isinstance(risk_playbook, dict):

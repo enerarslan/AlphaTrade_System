@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
 
 import pandas as pd
@@ -249,3 +250,116 @@ def test_backtest_engine_dynamic_capacity_multiplier_reduces_size_after_poor_exe
 
     cap = engine._get_liquidity_cap_quantity(bar_volume=1_000, avg_daily_volume=1_000_000)
     assert cap < Decimal("50")  # 100 * 0.5 base * degraded factor
+
+
+def test_backtest_engine_defers_latency_fills_until_eligible_bar():
+    class DelayedFillSimulator:
+        def simulate_execution(self, order, conditions):
+            return FillResult(
+                fill_type=FillType.FULL,
+                fill_price=conditions.price,
+                fill_quantity=order.quantity,
+                slippage=Decimal("0"),
+                market_impact=Decimal("0"),
+                commission=Decimal("0"),
+                latency_ms=86_400_000.0,
+                timestamp=conditions.timestamp + timedelta(days=1),
+            )
+
+    handler = _sample_handler()
+    engine = BacktestEngine(
+        data_handler=handler,
+        strategy=NoSignalStrategy(),
+        config=BacktestConfig(use_market_simulator=True, simulate_latency=True),
+        market_simulator=DelayedFillSimulator(),
+    )
+    engine._initialize()
+
+    assert handler.update_bars() is True
+    first_bar = handler.get_current_bar("AAPL")
+    assert first_bar is not None
+    engine._update_position_prices("AAPL", first_bar)
+    engine._process_signal(
+        TradeSignal(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            strength=1.0,
+            confidence=1.0,
+            horizon=1,
+            model_source="unit_test",
+        )
+    )
+    engine._process_pending_orders("AAPL", first_bar)
+    assert engine._state.orders_filled == 0
+    assert len(engine._state.pending_orders) == 1
+
+    assert handler.update_bars() is True
+    second_bar = handler.get_current_bar("AAPL")
+    assert second_bar is not None
+    engine._update_position_prices("AAPL", second_bar)
+    engine._process_pending_orders("AAPL", second_bar)
+    assert engine._state.orders_filled == 1
+    assert len(engine._state.pending_orders) == 0
+
+
+def test_backtest_engine_partial_remainder_not_reprocessed_same_bar():
+    class OnePartialThenFullSimulator:
+        def __init__(self):
+            self.calls = 0
+
+        def simulate_execution(self, order, conditions):
+            self.calls += 1
+            if self.calls == 1:
+                partial_qty = order.quantity / Decimal("2")
+                return FillResult(
+                    fill_type=FillType.PARTIAL,
+                    fill_price=conditions.price,
+                    fill_quantity=partial_qty,
+                    slippage=Decimal("0"),
+                    market_impact=Decimal("0"),
+                    commission=Decimal("0"),
+                    latency_ms=0.0,
+                    timestamp=conditions.timestamp,
+                    partial_remaining=order.quantity - partial_qty,
+                )
+            return FillResult(
+                fill_type=FillType.FULL,
+                fill_price=conditions.price,
+                fill_quantity=order.quantity,
+                slippage=Decimal("0"),
+                market_impact=Decimal("0"),
+                commission=Decimal("0"),
+                latency_ms=0.0,
+                timestamp=conditions.timestamp,
+            )
+
+    simulator = OnePartialThenFullSimulator()
+    handler = _sample_handler()
+    engine = BacktestEngine(
+        data_handler=handler,
+        strategy=NoSignalStrategy(),
+        config=BacktestConfig(use_market_simulator=True, simulate_latency=False),
+        market_simulator=simulator,
+    )
+    engine._initialize()
+
+    assert handler.update_bars() is True
+    bar = handler.get_current_bar("AAPL")
+    assert bar is not None
+    engine._update_position_prices("AAPL", bar)
+    engine._process_signal(
+        TradeSignal(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            strength=1.0,
+            confidence=1.0,
+            horizon=1,
+            model_source="unit_test",
+        )
+    )
+    engine._process_pending_orders("AAPL", bar)
+
+    # New remainder must stay pending and not get filled in this same pass.
+    assert simulator.calls == 1
+    assert engine._state.orders_filled == 1
+    assert len(engine._state.pending_orders) == 1

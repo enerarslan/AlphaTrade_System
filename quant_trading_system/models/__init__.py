@@ -69,6 +69,7 @@ from quant_trading_system.models.rl_meta_learning import (
     RLMetaConfig,
     create_meta_learning_agent,
 )
+from quant_trading_system.models.trading_costs import TradingCostModel
 
 __all__ = [
     # Base classes
@@ -127,4 +128,5 @@ __all__ = [
     "HierarchicalRLController",
     "MetaLearningAgent",
     "create_meta_learning_agent",
+    "TradingCostModel",
 ]
