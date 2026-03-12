@@ -33,6 +33,7 @@ sys.path.insert(0, str(project_root))
 import polars as pl
 
 from quant_trading_system.data.db_loader import get_db_loader, DatabaseDataLoader
+from quant_trading_system.data.timeframe import infer_symbol_and_timeframe, normalize_timeframe
 from quant_trading_system.database.connection import get_db_manager
 
 logging.basicConfig(
@@ -42,40 +43,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def find_csv_files(data_dir: Path) -> list[tuple[str, Path]]:
+def find_csv_files(data_dir: Path) -> list[tuple[str, str, Path]]:
     """
     Find all CSV files in the data directory.
 
     Returns:
-        List of (symbol, file_path) tuples.
+        List of (symbol, timeframe, file_path) tuples.
     """
     files = []
 
     # Check for CSV files in main directory
     for csv_file in data_dir.glob("*.csv"):
-        symbol = csv_file.stem.upper()
-        # Remove common suffixes
-        for suffix in ["_15MIN", "_15Min", "_1D", "_DAILY"]:
-            if symbol.endswith(suffix):
-                symbol = symbol[:-len(suffix)]
-                break
-        files.append((symbol, csv_file))
+        symbol, timeframe = infer_symbol_and_timeframe(csv_file)
+        files.append((symbol, normalize_timeframe(timeframe), csv_file))
 
     # Check subdirectories
     for subdir in data_dir.iterdir():
         if subdir.is_dir():
             for csv_file in subdir.glob("*.csv"):
-                symbol = csv_file.stem.upper()
-                for suffix in ["_15MIN", "_15Min", "_1D", "_DAILY"]:
-                    if symbol.endswith(suffix):
-                        symbol = symbol[:-len(suffix)]
-                        break
-                files.append((symbol, csv_file))
+                symbol, timeframe = infer_symbol_and_timeframe(csv_file)
+                files.append((symbol, normalize_timeframe(timeframe), csv_file))
 
     return files
 
 
-def verify_migration(symbol: str, csv_path: Path, db_loader: DatabaseDataLoader) -> bool:
+def verify_migration(
+    symbol: str,
+    timeframe: str,
+    csv_path: Path,
+    db_loader: DatabaseDataLoader,
+) -> bool:
     """
     Verify that migration was successful for a symbol.
 
@@ -93,21 +90,21 @@ def verify_migration(symbol: str, csv_path: Path, db_loader: DatabaseDataLoader)
         csv_count = len(csv_df)
 
         # Load from database
-        db_df = db_loader.load_symbol(symbol)
+        db_df = db_loader.load_symbol(symbol, timeframe=timeframe)
         db_count = len(db_df)
 
         if csv_count == db_count:
-            logger.info(f"Verification PASSED for {symbol}: {db_count} rows")
+            logger.info(f"Verification PASSED for {symbol} ({timeframe}): {db_count} rows")
             return True
         else:
             logger.warning(
-                f"Verification WARNING for {symbol}: "
+                f"Verification WARNING for {symbol} ({timeframe}): "
                 f"CSV has {csv_count} rows, DB has {db_count} rows"
             )
             return False
 
     except Exception as e:
-        logger.error(f"Verification FAILED for {symbol}: {e}")
+        logger.error(f"Verification FAILED for {symbol} ({timeframe}): {e}")
         return False
 
 
@@ -141,32 +138,33 @@ def migrate_csv_to_postgres(
     # Filter by symbols if specified
     if symbols:
         symbols_upper = [s.upper() for s in symbols]
-        csv_files = [(s, p) for s, p in csv_files if s in symbols_upper]
+        csv_files = [(s, tf, p) for s, tf, p in csv_files if s in symbols_upper]
         logger.info(f"Filtered to {len(csv_files)} files for specified symbols")
 
-    for symbol, csv_path in csv_files:
+    for symbol, timeframe, csv_path in csv_files:
         try:
-            logger.info(f"Migrating {symbol} from {csv_path}...")
+            logger.info(f"Migrating {symbol} ({timeframe}) from {csv_path}...")
 
             rows = db_loader.load_csv_to_database(
                 csv_path,
                 symbol=symbol,
+                timeframe=timeframe,
                 batch_size=batch_size,
                 validate=True,
                 source_timezone=source_timezone,
                 resume=resume,
             )
 
-            results[symbol] = rows
-            logger.info(f"Migrated {rows} rows for {symbol}")
+            results[f"{symbol}:{timeframe}"] = rows
+            logger.info(f"Migrated {rows} rows for {symbol} ({timeframe})")
 
             # Verify if requested
             if verify:
-                verify_migration(symbol, csv_path, db_loader)
+                verify_migration(symbol, timeframe, csv_path, db_loader)
 
         except Exception as e:
-            logger.error(f"Failed to migrate {symbol}: {e}")
-            results[symbol] = -1
+            logger.error(f"Failed to migrate {symbol} ({timeframe}): {e}")
+            results[f"{symbol}:{timeframe}"] = -1
 
     return results
 

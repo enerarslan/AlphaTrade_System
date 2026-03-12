@@ -82,6 +82,7 @@ from quant_trading_system.core.system_integrator import (
     SystemIntegratorConfig,
     create_system_integrator,
 )
+from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
 
 # Data
 from quant_trading_system.data.loader import DataLoader
@@ -222,10 +223,24 @@ class SignalBasedStrategy(Strategy):
             signal_threshold: Minimum absolute signal value to generate trade.
             signal_column: Column name containing signal values.
         """
-        self.signals = signals
+        self.signals: dict[str, pd.DataFrame] = {}
         self.signal_threshold = signal_threshold
         self.signal_column = signal_column
-        self._current_indices: dict[str, int] = {s: 0 for s in signals.keys()}
+        for raw_symbol, frame in signals.items():
+            symbol = str(raw_symbol).strip().upper()
+            signal_df = frame.copy()
+            if "timestamp" in signal_df.columns:
+                signal_df["timestamp"] = pd.to_datetime(signal_df["timestamp"], utc=True, errors="coerce")
+                signal_df = signal_df.dropna(subset=["timestamp"]).drop_duplicates(
+                    subset=["timestamp"],
+                    keep="last",
+                )
+                signal_df = signal_df.sort_values("timestamp").set_index("timestamp")
+            else:
+                signal_df.index = pd.to_datetime(signal_df.index, utc=True, errors="coerce")
+                signal_df = signal_df[~signal_df.index.isna()]
+                signal_df = signal_df[~signal_df.index.duplicated(keep="last")].sort_index()
+            self.signals[symbol] = signal_df
 
     def generate_signals(
         self,
@@ -243,7 +258,13 @@ class SignalBasedStrategy(Strategy):
         """
         trade_signals = []
 
-        for symbol in data_handler.get_symbols():
+        current_symbols = (
+            data_handler.get_updated_symbols()
+            if hasattr(data_handler, "get_updated_symbols")
+            else data_handler.get_symbols()
+        )
+
+        for symbol in current_symbols:
             if symbol not in self.signals:
                 continue
 
@@ -253,13 +274,18 @@ class SignalBasedStrategy(Strategy):
 
             # Get signal for current timestamp
             signal_df = self.signals[symbol]
-            idx = self._current_indices.get(symbol, 0)
-
-            if idx >= len(signal_df):
+            bar_timestamp = pd.Timestamp(bar.timestamp)
+            if bar_timestamp.tzinfo is None:
+                bar_timestamp = bar_timestamp.tz_localize("UTC")
+            else:
+                bar_timestamp = bar_timestamp.tz_convert("UTC")
+            if bar_timestamp not in signal_df.index:
                 continue
 
-            signal_value = signal_df.iloc[idx][self.signal_column]
-            self._current_indices[symbol] = idx + 1
+            signal_row = signal_df.loc[bar_timestamp]
+            if isinstance(signal_row, pd.DataFrame):
+                signal_row = signal_row.iloc[-1]
+            signal_value = float(signal_row[self.signal_column])
 
             # Skip if signal is too weak
             if abs(signal_value) < self.signal_threshold:
@@ -322,6 +348,7 @@ class BacktestSession:
     strategy_name: str = "momentum"
     execution_mode: str = "realistic"
     use_gpu: bool = False
+    timeframe: str = DEFAULT_TIMEFRAME
     use_database: bool = True  # Load data from PostgreSQL + TimescaleDB
     benchmark_symbol: str | None = None
 
@@ -346,6 +373,7 @@ class BacktestSession:
 
     def __post_init__(self):
         """Initialize session components."""
+        self.timeframe = normalize_timeframe(self.timeframe)
         logger.info(
             f"BacktestSession initialized: {self.session_id}",
             extra={
@@ -433,9 +461,11 @@ class BacktestRunner:
 
     def _load_data(self) -> None:
         """Load historical data for all symbols."""
+        if not self.session.use_database:
+            raise RuntimeError("Institutional backtests require PostgreSQL + Redis. CSV mode is disabled.")
         self.session.data_loader = DataLoader(
             data_dir=Path("data/raw"),
-            use_database=self.session.use_database,
+            use_database=True,
         )
 
         for symbol in self.session.symbols:
@@ -444,6 +474,7 @@ class BacktestRunner:
                     symbol=symbol,
                     start_date=self.session.start_date,
                     end_date=self.session.end_date,
+                    timeframe=self.session.timeframe,
                 )
 
                 if df is not None and len(df) > 0:
@@ -466,6 +497,7 @@ class BacktestRunner:
                     symbol=benchmark,
                     start_date=self.session.start_date,
                     end_date=self.session.end_date,
+                    timeframe=self.session.timeframe,
                 )
                 logger.info(f"Loaded benchmark data for {benchmark}")
             except Exception as e:
@@ -946,6 +978,16 @@ class BacktestRunner:
 # MAIN ENTRY POINT
 # ==============================================================================
 
+def _verify_backtest_infra() -> None:
+    """Fail-fast institutional infrastructure check for backtests."""
+    from quant_trading_system.database.connection import get_db_manager, get_redis_manager
+
+    if not get_db_manager().health_check():
+        raise RuntimeError("PostgreSQL health check failed. Backtests require PostgreSQL.")
+    if not get_redis_manager().health_check():
+        raise RuntimeError("Redis health check failed. Backtests require Redis.")
+
+
 def run_backtest(args: argparse.Namespace) -> int:
     """Main entry point for backtest command.
 
@@ -971,8 +1013,17 @@ def run_backtest(args: argparse.Namespace) -> int:
         logger.error(f"End date ({args.end}) must be after start date ({args.start})")
         return 1
 
-    # Determine database usage (--no-database overrides --use-database)
-    use_database = getattr(args, "use_database", True) and not getattr(args, "no_database", False)
+    if not bool(getattr(args, "use_database", True)) or bool(getattr(args, "no_database", False)):
+        logger.error("Institutional backtests require PostgreSQL + Redis. CSV mode is disabled.")
+        return 1
+
+    try:
+        _verify_backtest_infra()
+    except Exception as exc:
+        logger.error(str(exc))
+        return 1
+
+    timeframe = normalize_timeframe(getattr(args, "timeframe", DEFAULT_TIMEFRAME))
 
     # Create session
     session = BacktestSession(
@@ -983,7 +1034,8 @@ def run_backtest(args: argparse.Namespace) -> int:
         strategy_name=args.strategy,
         execution_mode=args.execution_mode,
         use_gpu=args.gpu,
-        use_database=use_database,
+        timeframe=timeframe,
+        use_database=True,
         benchmark_symbol=getattr(args, "benchmark", None),
         slippage_bps=args.slippage_bps,
         commission_bps=args.commission_bps,
@@ -1022,6 +1074,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark", type=str, default=None, help="Optional benchmark symbol (e.g., SPY)")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)
+    parser.add_argument("--use-database", action="store_true", default=True)
+    parser.add_argument("--no-database", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser
 

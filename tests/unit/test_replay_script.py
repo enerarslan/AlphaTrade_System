@@ -32,9 +32,9 @@ def _args(tmp_path: Path, **overrides):
         "max_escalation_latency_ms": 2000.0,
         "min_orders_for_slo": 1,
         "no_fail_on_kill_switch": False,
+        "timeframe": "15Min",
         "use_database": True,
-        "no_database": True,
-        "data_dir": Path("data/raw"),
+        "no_database": False,
         "output": tmp_path / "replay_result.json",
         "format": "json",
         "fail_on_slo_breach": True,
@@ -59,6 +59,7 @@ def _outcome(passed: bool) -> ReplayOutcome:
 
 
 def test_run_replay_returns_zero_and_writes_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(replay_script, "_verify_replay_infra", lambda: None)
     monkeypatch.setattr(replay_script, "_load_replay_data", lambda **_: {"AAPL": object()})
     monkeypatch.setattr(replay_script, "run_replay_scenario", lambda **_: _outcome(True))
 
@@ -72,6 +73,7 @@ def test_run_replay_returns_zero_and_writes_output(monkeypatch, tmp_path):
 
 
 def test_run_replay_returns_two_when_slo_breach(monkeypatch, tmp_path):
+    monkeypatch.setattr(replay_script, "_verify_replay_infra", lambda: None)
     monkeypatch.setattr(replay_script, "_load_replay_data", lambda **_: {"AAPL": object()})
     monkeypatch.setattr(replay_script, "run_replay_scenario", lambda **_: _outcome(False))
 

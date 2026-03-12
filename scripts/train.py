@@ -77,6 +77,7 @@ from quant_trading_system.models.target_engineering import (
     generate_targets,
 )
 from quant_trading_system.models.trading_costs import TradingCostModel
+from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
 
 # Configure logging
 logging.basicConfig(
@@ -290,22 +291,30 @@ def _verify_institutional_infra() -> None:
         raise RuntimeError("Redis health check failed. Institutional training requires Redis.")
 
 
-def _verify_gpu_stack(model_list: list[str]) -> None:
-    """Fail-fast GPU validation for institutional training mode."""
+def _verify_gpu_stack(model_list: list[str]) -> bool:
+    """Return whether GPU acceleration is usable for the requested sweep."""
+    deep_models = {"lstm", "transformer", "tcn"}
+    requires_torch = bool(deep_models.intersection(model_list))
+
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for GPU preflight checks in institutional mode.") from exc
+        if requires_torch:
+            raise RuntimeError("PyTorch is required to train deep models.") from exc
+        logger.info("PyTorch not installed; falling back to CPU-compatible training backends.")
+        return False
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU not detected. Institutional training requires NVIDIA CUDA GPU.")
+        if requires_torch:
+            raise RuntimeError("CUDA GPU not detected. Deep learning models require PyTorch CUDA.")
+        logger.info("CUDA not available; training will run on CPU-compatible backends.")
+        return False
 
     gpu_name = torch.cuda.get_device_name(0)
     logger.info(f"CUDA GPU detected: {gpu_name}")
 
-    deep_models = {"lstm", "transformer", "tcn"}
-    if deep_models.intersection(model_list):
-        # Validate tensor ops on device for deep learning stack.
+    # Validate tensor ops on device for deep learning stack.
+    if requires_torch:
         _ = torch.randn((16, 8), device="cuda")
 
     if {"xgboost", "xgboost_regressor", "ensemble"}.intersection(model_list):
@@ -322,10 +331,9 @@ def _verify_gpu_stack(model_list: list[str]) -> None:
                 eval_metric="logloss",
             )
             probe.fit(X, y)
-        except Exception as exc:
-            raise RuntimeError(
-                "XGBoost GPU backend validation failed. Verify CUDA-enabled XGBoost installation."
-            ) from exc
+        except Exception:
+            logger.warning("XGBoost GPU backend unavailable; falling back to CPU parameters.")
+            return False
 
     if {"lightgbm", "lightgbm_ranker", "lightgbm_regressor", "ensemble"}.intersection(model_list):
         try:
@@ -340,10 +348,11 @@ def _verify_gpu_stack(model_list: list[str]) -> None:
                 verbosity=-1,
             )
             probe.fit(X, y)
-        except Exception as exc:
-            raise RuntimeError(
-                "LightGBM GPU backend validation failed. Install a GPU-enabled LightGBM build."
-            ) from exc
+        except Exception:
+            logger.warning("LightGBM GPU backend unavailable; falling back to CPU parameters.")
+            return False
+
+    return True
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -362,6 +371,7 @@ class TrainingConfig:
     symbols: list[str] = field(default_factory=list)
     start_date: str = ""
     end_date: str = ""
+    timeframe: str = DEFAULT_TIMEFRAME
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
@@ -487,12 +497,14 @@ class TrainingConfig:
         default_factory=lambda: ["technical", "statistical", "microstructure", "cross_sectional"]
     )
     enable_cross_sectional: bool = True
+    cross_sectional_user_locked: bool = False
     max_cross_sectional_symbols: int = 20
     max_cross_sectional_rows: int = 250000
     allow_feature_group_fallback: bool = False
     feature_materialization_batch_rows: int = 5000
     feature_reuse_min_coverage: float = 0.20
     persist_features_to_postgres: bool = True
+    feature_set_id: str = "default"
     windows_force_fallback_features: bool = False
     holdout_pct: float = 0.15
     dynamic_no_trade_band: bool = True
@@ -513,6 +525,9 @@ class TrainingConfig:
         self.max_cross_sectional_symbols = max(2, int(self.max_cross_sectional_symbols))
         self.max_cross_sectional_rows = max(10_000, int(self.max_cross_sectional_rows))
         self.feature_reuse_min_coverage = min(max(float(self.feature_reuse_min_coverage), 0.01), 0.95)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.cross_sectional_user_locked = bool(self.cross_sectional_user_locked)
+        self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
         self.data_max_abs_return = max(float(self.data_max_abs_return), 0.05)
         self.min_trades = max(1, int(self.min_trades))
         self.objective_weight_trade_activity = max(
@@ -880,7 +895,9 @@ class ModelTrainer:
                 float(target_max_rows),
             )
 
-        if not bool(self.config.enable_cross_sectional):
+        if not bool(self.config.enable_cross_sectional) and not bool(
+            self.config.cross_sectional_user_locked
+        ):
             self.config.enable_cross_sectional = True
             updates["enable_cross_sectional"] = (0.0, 1.0)
 
@@ -1127,6 +1144,7 @@ class ModelTrainer:
 
         db_manager = get_db_manager()
         symbols = [s.strip().upper() for s in self.config.symbols if s.strip()]
+        timeframe = normalize_timeframe(self.config.timeframe)
         if not self.config.use_redis_cache:
             raise RuntimeError(
                 "Institutional training mode requires Redis cache layer. "
@@ -1141,7 +1159,7 @@ class ModelTrainer:
             session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
             session.execute(text("SET LOCAL statement_timeout = '120000ms'"))
             if not symbols:
-                cache_key = "train:ohlcv_symbols"
+                cache_key = f"train:ohlcv_symbols:{timeframe}"
                 cached_symbols: list[str] = []
                 if redis_mgr is not None:
                     cached_raw = redis_mgr.get(cache_key)
@@ -1154,7 +1172,17 @@ class ModelTrainer:
                 if cached_symbols:
                     symbols = cached_symbols
                 else:
-                    result = session.execute(text("SELECT DISTINCT symbol FROM ohlcv_bars ORDER BY symbol"))
+                    result = session.execute(
+                        text(
+                            """
+                            SELECT DISTINCT symbol
+                            FROM ohlcv_bars
+                            WHERE timeframe = :timeframe
+                            ORDER BY symbol
+                            """
+                        ),
+                        {"timeframe": timeframe},
+                    )
                     symbols = [row[0] for row in result.fetchall()]
                     if redis_mgr is not None and symbols:
                         redis_mgr.set(cache_key, json.dumps(symbols), expire_seconds=300)
@@ -1162,7 +1190,7 @@ class ModelTrainer:
             if not symbols:
                 raise ValueError("No symbols found in ohlcv_bars")
 
-            self.logger.info(f"Loading {len(symbols)} symbols from PostgreSQL")
+            self.logger.info(f"Loading {len(symbols)} symbols from PostgreSQL ({timeframe})")
 
             query = text(
                 """
@@ -1176,6 +1204,7 @@ class ModelTrainer:
                     CAST(volume AS BIGINT) AS volume
                 FROM ohlcv_bars
                 WHERE symbol = :symbol
+                  AND timeframe = :timeframe
                   AND (:start_date IS NULL OR timestamp >= :start_date)
                   AND (:end_date IS NULL OR timestamp <= :end_date)
                 ORDER BY timestamp
@@ -1192,6 +1221,7 @@ class ModelTrainer:
                         query,
                         {
                             "symbol": symbol,
+                            "timeframe": timeframe,
                             "start_date": start_date,
                             "end_date": end_date,
                         },
@@ -1214,55 +1244,14 @@ class ModelTrainer:
             self.data = pd.concat(dfs, ignore_index=True)
             self.logger.info(
                 f"Loaded {len(self.data)} rows from PostgreSQL for "
-                f"{self.data['symbol'].nunique()} symbols"
+                f"{self.data['symbol'].nunique()} symbols ({timeframe})"
             )
 
     def _load_data_fallback(self) -> None:
-        """Fallback data loading from CSV files."""
-        data_dir = PROJECT_ROOT / "data" / "raw"
-
-        if not data_dir.exists():
-            raise FileNotFoundError(f"Data directory not found: {data_dir}")
-
-        dfs = []
-        requested_symbols = {s.strip().upper() for s in self.config.symbols if s.strip()}
-
-        for csv_file in sorted(data_dir.glob("*.csv")):
-            file_symbol = csv_file.stem.upper()
-            base_symbol = self._extract_base_symbol(file_symbol)
-
-            if requested_symbols and file_symbol not in requested_symbols and base_symbol not in requested_symbols:
-                continue
-
-            try:
-                df = pd.read_csv(csv_file)
-                if "timestamp" in df.columns:
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-                elif "date" in df.columns:
-                    df["timestamp"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-                    df = df.drop(columns=["date"])
-                else:
-                    self.logger.warning(f"{csv_file.name}: missing timestamp/date column")
-                    continue
-
-                required_cols = ["open", "high", "low", "close", "volume", "timestamp"]
-                missing = [col for col in required_cols if col not in df.columns]
-                if missing:
-                    self.logger.warning(f"{csv_file.name}: missing required columns {missing}")
-                    continue
-
-                if self.config.start_date:
-                    start_ts = pd.to_datetime(self.config.start_date, utc=True)
-                    df = df[df["timestamp"] >= start_ts]
-                if self.config.end_date:
-                    end_ts = pd.to_datetime(self.config.end_date, utc=True)
-                    df = df[df["timestamp"] <= end_ts]
-
-                df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-                df["symbol"] = base_symbol
-                dfs.append(df)
-            except Exception as e:
-                self.logger.warning(f"Failed to load {csv_file}: {e}")
+        """CSV fallback is forbidden in institutional mode."""
+        raise RuntimeError(
+            "Institutional training mode requires PostgreSQL + Redis. CSV fallback is disabled."
+        )
 
         if not dfs:
             raise ValueError("No data loaded")
@@ -1617,20 +1606,23 @@ class ModelTrainer:
         end_date: pd.Timestamp | None,
     ) -> str:
         """Build deterministic cache key for reusable PostgreSQL feature matrices."""
+        feature_set_id = self._resolve_feature_set_id(symbols)
         symbol_part = ",".join(sorted(symbols))
         groups_part = ",".join(sorted(self.config.feature_groups))
         cross_sectional_part = "1" if self.config.enable_cross_sectional else "0"
         start_part = start_date.isoformat() if start_date is not None else "none"
         end_part = end_date.isoformat() if end_date is not None else "none"
         return (
-            "train:features:schema:v1:"
+            "train:features:schema:v2:"
             f"{symbol_part}:{start_part}:{end_part}:"
-            f"{groups_part}:{cross_sectional_part}:{self.feature_pipeline_fingerprint}"
+            f"{self.config.timeframe}:{feature_set_id}:{groups_part}:"
+            f"{cross_sectional_part}:{self.feature_pipeline_fingerprint}"
         )
 
     def _build_feature_schema_metadata(
         self,
         feature_names: list[str],
+        feature_set_id: str,
     ) -> dict[str, Any]:
         """Serialize feature schema metadata used for deterministic cache reuse."""
         return {
@@ -1638,8 +1630,40 @@ class ModelTrainer:
             "feature_names": sorted(str(name) for name in feature_names),
             "feature_groups": sorted(str(name) for name in self.config.feature_groups),
             "enable_cross_sectional": bool(self.config.enable_cross_sectional),
+            "timeframe": self.config.timeframe,
+            "feature_set_id": feature_set_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _resolve_feature_set_id(self, symbols: list[str] | None = None) -> str:
+        """Build a deterministic feature scope id for the active symbol universe."""
+        if symbols is None:
+            if self.data is not None and not self.data.empty and "symbol" in self.data.columns:
+                symbols = sorted(
+                    {
+                        str(symbol).strip().upper()
+                        for symbol in self.data["symbol"].dropna().tolist()
+                        if str(symbol).strip()
+                    }
+                )
+            else:
+                symbols = sorted({str(symbol).strip().upper() for symbol in self.config.symbols if str(symbol).strip()})
+
+        namespace = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.config.feature_set_id).strip("_") or "default"
+        scope_payload = json.dumps(
+            {
+                "namespace": namespace,
+                "symbols": sorted(symbols),
+                "timeframe": self.config.timeframe,
+                "groups": sorted(self.config.feature_groups),
+                "cross_sectional": bool(self.config.enable_cross_sectional),
+                "pipeline_fingerprint": self.feature_pipeline_fingerprint,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha1(scope_payload.encode("utf-8")).hexdigest()[:12]
+        return f"{namespace[:32]}_{digest}"
 
     def _compute_features_full_pipeline(self) -> None:
         """Compute institutional features with adaptive memory-safe fallback behavior."""
@@ -1788,12 +1812,15 @@ class ModelTrainer:
 
         db_manager = get_db_manager()
         redis_mgr = get_redis_manager()
+        timeframe = normalize_timeframe(self.config.timeframe)
+        feature_set_id = self._resolve_feature_set_id(symbols)
 
         start_date = pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
         end_date = pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
 
         cache_key = (
             f"train:features:coverage:v3:{','.join(symbols)}:"
+            f"{timeframe}:{feature_set_id}:"
             f"{start_date.isoformat() if start_date is not None else 'none'}:"
             f"{end_date.isoformat() if end_date is not None else 'none'}"
         )
@@ -1830,6 +1857,12 @@ class ModelTrainer:
                 "Feature pipeline fingerprint changed since cache write; recomputing features."
             )
             return None
+        if schema_payload.get("timeframe") != timeframe:
+            self.logger.info("Feature cache timeframe changed; recomputing features.")
+            return None
+        if schema_payload.get("feature_set_id") != feature_set_id:
+            self.logger.info("Feature cache scope changed; recomputing features.")
+            return None
 
         query = text(
             """
@@ -1840,6 +1873,8 @@ class ModelTrainer:
                 value
             FROM features
             WHERE symbol = :symbol
+              AND timeframe = :timeframe
+              AND feature_set_id = :feature_set_id
               AND (:start_date IS NULL OR timestamp >= :start_date)
               AND (:end_date IS NULL OR timestamp <= :end_date)
             ORDER BY timestamp, feature_name
@@ -1853,7 +1888,13 @@ class ModelTrainer:
             for symbol in symbols:
                 result = session.execute(
                     query,
-                    {"symbol": symbol, "start_date": start_date, "end_date": end_date},
+                    {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "feature_set_id": feature_set_id,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    },
                 )
                 rows = result.fetchall()
                 if not rows:
@@ -1937,12 +1978,16 @@ class ModelTrainer:
         export_df = export_df.dropna(subset=["timestamp"])
         if export_df.empty:
             return
+        timeframe = normalize_timeframe(self.config.timeframe)
+        feature_set_id = self._resolve_feature_set_id(
+            sorted(export_df["symbol"].dropna().unique().tolist())
+        )
 
         upsert = text(
             """
-            INSERT INTO features (symbol, timestamp, feature_name, value)
-            VALUES (:symbol, :timestamp, :feature_name, :value)
-            ON CONFLICT (symbol, timestamp, feature_name)
+            INSERT INTO features (symbol, timestamp, timeframe, feature_name, feature_set_id, value)
+            VALUES (:symbol, :timestamp, :timeframe, :feature_name, :feature_set_id, :value)
+            ON CONFLICT (symbol, timestamp, timeframe, feature_name, feature_set_id)
             DO UPDATE SET value = EXCLUDED.value
             """
         )
@@ -1990,7 +2035,9 @@ class ModelTrainer:
                                     if hasattr(row.timestamp, "to_pydatetime")
                                     else row.timestamp
                                 ),
+                                "timeframe": timeframe,
                                 "feature_name": row.feature_name,
+                                "feature_set_id": feature_set_id,
                                 "value": float(row.value),
                             }
                             for row in chunk_df.itertuples(index=False)
@@ -2011,7 +2058,7 @@ class ModelTrainer:
             checkpoint_file.unlink()
 
         redis_mgr = get_redis_manager()
-        redis_mgr.delete("train:ohlcv_symbols")
+        redis_mgr.delete(f"train:ohlcv_symbols:{timeframe}")
         symbols = sorted(export_df["symbol"].dropna().unique().tolist())
         start_date = pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
         end_date = pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
@@ -2020,7 +2067,7 @@ class ModelTrainer:
             start_date=start_date,
             end_date=end_date,
         )
-        schema_metadata = self._build_feature_schema_metadata(feature_cols)
+        schema_metadata = self._build_feature_schema_metadata(feature_cols, feature_set_id)
         redis_mgr.set(schema_key, json.dumps(schema_metadata, ensure_ascii=True), expire_seconds=604800)
         self.logger.info(f"Persisted {total_upserted_rows} feature rows to PostgreSQL")
 
@@ -2191,8 +2238,14 @@ class ModelTrainer:
         holdout_count = max(1, int(round(len(unique_ts) * self.config.holdout_pct))) if len(unique_ts) else 0
         holdout_ts = set(unique_ts[-holdout_count:]) if holdout_count > 0 else set()
         holdout_mask = ts_series.isin(holdout_ts).to_numpy() if holdout_ts else np.zeros(len(labeled_frame), dtype=bool)
-        if int(np.sum(~holdout_mask)) < 1000 or int(np.sum(holdout_mask)) < 200:
-            holdout_mask = np.zeros(len(labeled_frame), dtype=bool)
+        dev_rows = int(np.sum(~holdout_mask))
+        holdout_rows = int(np.sum(holdout_mask))
+        if dev_rows < 1000 or holdout_rows < 200:
+            raise ValueError(
+                "Institutional training requires a non-trivial untouched holdout block. "
+                f"Computed dev_rows={dev_rows}, holdout_rows={holdout_rows}, "
+                f"unique_timestamps={len(unique_ts)}, holdout_pct={self.config.holdout_pct:.2f}."
+            )
         dev_mask = ~holdout_mask
 
         dev_frame = labeled_frame.loc[dev_mask].reset_index(drop=True)
@@ -2566,6 +2619,21 @@ class ModelTrainer:
         )
         return candidate_splits
 
+    def _leakage_validation_order_vector(self) -> np.ndarray:
+        """Build a strictly increasing order vector for panel-aware leak validation."""
+        if self.timestamps is None:
+            raise ValueError("Timestamp array missing for leakage validation")
+
+        ts_series = pd.Series(pd.to_datetime(self.timestamps, utc=True, errors="coerce"))
+        if ts_series.isna().any():
+            raise ValueError("Timestamp array contains invalid entries after conversion")
+
+        if self.row_symbols is None or len(self.row_symbols) != len(ts_series):
+            return ts_series.astype("int64", copy=False).to_numpy()
+        # Panel datasets legitimately contain duplicate timestamps across symbols.
+        # Strict temporal integrity is enforced separately by _validate_symbol_timestamp_ordering().
+        return np.arange(len(ts_series), dtype=np.int64)
+
     def _validate_no_future_leakage(self) -> None:
         """Run strict future-leak checks on dataset and planned CV splits."""
         from quant_trading_system.models.model_manager import FutureLeakValidator
@@ -2578,7 +2646,7 @@ class ModelTrainer:
             self.features.values,
             self.labels.values,
             feature_names=self.feature_names,
-            timestamps=None,
+            timestamps=self._leakage_validation_order_vector(),
         )
         if not is_valid:
             raise ValueError(f"Future-leak validation failed: {issues}")
@@ -6707,7 +6775,8 @@ class ModelTrainer:
         )
         if not holdout_available:
             self.logger.warning(
-                "Holdout block unavailable for this run; holdout-specific gates treated as non-blocking."
+                "Holdout block unavailable for this validation pass; "
+                "full training pipeline now fails earlier during holdout construction."
             )
 
         gates = {
@@ -8328,7 +8397,7 @@ def run_training(args: argparse.Namespace) -> int:
 
     try:
         if getattr(args, "gpu", False) or getattr(args, "use_gpu", False):
-            logger.warning("`--gpu/--use-gpu` is deprecated and ignored. Institutional mode always uses GPU.")
+            logger.warning("`--gpu/--use-gpu` is deprecated; GPU acceleration is auto-detected.")
         if getattr(args, "no_database", False) or getattr(args, "no_redis_cache", False):
             raise ValueError(
                 "Institutional mode does not allow disabling PostgreSQL or Redis."
@@ -8367,7 +8436,7 @@ def run_training(args: argparse.Namespace) -> int:
         set_global_seed(global_seed)
 
         _verify_institutional_infra()
-        _verify_gpu_stack(model_list)
+        resolved_use_gpu = _verify_gpu_stack(model_list)
 
         audit_logger = None
         try:
@@ -8437,7 +8506,7 @@ def run_training(args: argparse.Namespace) -> int:
             primary_horizon = int(run_spec["primary_horizon"])
             model_params = _load_model_defaults(
                 model_type=model_type,
-                use_gpu=True,
+                use_gpu=resolved_use_gpu,
             )
             replay_model_params = replay_config.get("model_params")
             if isinstance(replay_model_params, dict):
@@ -8491,6 +8560,10 @@ def run_training(args: argparse.Namespace) -> int:
                 end_date=_cfg_value(
                     "end_date",
                     getattr(args, "end_date", "") or getattr(args, "end", ""),
+                ),
+                timeframe=_cfg_value(
+                    "timeframe",
+                    getattr(args, "timeframe", DEFAULT_TIMEFRAME),
                 ),
                 cv_method=_cfg_value("cv_method", getattr(args, "cv_method", "purged_kfold")),
                 n_splits=int(_cfg_value("n_splits", getattr(args, "n_splits", 5))),
@@ -8613,7 +8686,7 @@ def run_training(args: argparse.Namespace) -> int:
                 ),
                 apply_multiple_testing=True,
                 correction_method="deflated_sharpe",
-                use_gpu=True,
+                use_gpu=resolved_use_gpu,
                 use_database=True,
                 use_redis_cache=True,
                 compute_shap=True,
@@ -8811,6 +8884,10 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_cross_sectional", False)),
                     )
                 ),
+                cross_sectional_user_locked=bool(
+                    ("enable_cross_sectional" in replay_config)
+                    or bool(getattr(args, "disable_cross_sectional", False))
+                ),
                 max_cross_sectional_symbols=int(
                     _cfg_value(
                         "max_cross_sectional_symbols",
@@ -8846,6 +8923,12 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "persist_features_to_postgres",
                         not bool(getattr(args, "skip_feature_persist", False)),
+                    )
+                ),
+                feature_set_id=str(
+                    _cfg_value(
+                        "feature_set_id",
+                        getattr(args, "feature_set_id", "default"),
                     )
                 ),
                 windows_force_fallback_features=bool(
@@ -8933,7 +9016,7 @@ def run_training(args: argparse.Namespace) -> int:
             logger.info("Redis cache: enabled (mandatory)")
             logger.info(f"CV method: {config.cv_method} ({config.n_splits} splits)")
             logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
-            logger.info(f"GPU: {config.use_gpu} (mandatory)")
+            logger.info(f"GPU acceleration enabled: {config.use_gpu}")
             logger.info(
                 "Institutional stack: Nested Walk-Forward + Optuna + Meta-Labeling + "
                 "Multiple-Testing + SHAP + Leak-Validation"
@@ -9226,6 +9309,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbols", nargs="+", default=[])
     parser.add_argument("--start", "--start-date", dest="start_date", type=str, default="")
     parser.add_argument("--end", "--end-date", dest="end_date", type=str, default="")
+    parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)
     parser.add_argument("--cv-method", choices=["purged_kfold", "combinatorial", "walk_forward"], default="purged_kfold")
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--embargo-pct", type=float, default=0.01)
@@ -9285,12 +9369,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--use-gpu",
         action="store_true",
-        help="Deprecated: institutional mode enforces GPU automatically.",
+        help="Deprecated: training auto-detects GPU acceleration.",
     )
     parser.add_argument(
         "--gpu",
         action="store_true",
-        help="Deprecated: institutional mode enforces GPU automatically.",
+        help="Deprecated: training auto-detects GPU acceleration.",
     )
     parser.add_argument(
         "--no-database",
@@ -9404,6 +9488,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-feature-persist",
         action="store_true",
         help="Skip persisting computed features to PostgreSQL.",
+    )
+    parser.add_argument(
+        "--feature-set-id",
+        type=str,
+        default="default",
+        help="Optional namespace seed for feature cache scoping.",
     )
     parser.add_argument(
         "--windows-fallback-features",

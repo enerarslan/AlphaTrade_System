@@ -108,6 +108,58 @@ def test_backtest_engine_allows_short_signal_when_shorting_enabled():
     assert engine._state.pending_orders[0].side == OrderSide.SELL
 
 
+def test_pandas_data_handler_uses_union_timestamp_stream_for_multi_symbol_panels():
+    t0 = pd.Timestamp("2024-01-02 14:30:00+00:00")
+    t1 = pd.Timestamp("2024-01-02 14:45:00+00:00")
+    handler = PandasDataHandler(
+        {
+            "AAPL": pd.DataFrame(
+                {
+                    "open": [100.0, 101.0],
+                    "high": [101.0, 102.0],
+                    "low": [99.0, 100.0],
+                    "close": [100.5, 101.5],
+                    "volume": [1_000_000, 1_000_000],
+                },
+                index=pd.DatetimeIndex([t0, t1]),
+            ),
+            "MSFT": pd.DataFrame(
+                {
+                    "open": [200.0],
+                    "high": [201.0],
+                    "low": [199.0],
+                    "close": [200.5],
+                    "volume": [1_000_000],
+                },
+                index=pd.DatetimeIndex([t1]),
+            ),
+        }
+    )
+
+    assert handler.update_bars() is True
+    assert handler.get_current_timestamp() == t0.to_pydatetime()
+    assert handler.get_updated_symbols() == ["AAPL"]
+
+    assert handler.update_bars() is True
+    assert set(handler.get_updated_symbols()) == {"AAPL", "MSFT"}
+
+
+def test_backtest_engine_risk_limit_uses_configured_max_position_pct():
+    engine = BacktestEngine(
+        data_handler=_sample_handler(),
+        strategy=NoSignalStrategy(),
+        config=BacktestConfig(
+            initial_capital=Decimal("100000"),
+            max_position_pct=0.10,
+            use_market_simulator=False,
+        ),
+    )
+
+    risk_config = engine._build_risk_limits_config()
+
+    assert risk_config.max_position_value == Decimal("10000")
+
+
 def test_backtest_engine_blocks_new_orders_when_kill_switch_active():
     handler = _sample_handler()
     engine = BacktestEngine(
@@ -141,6 +193,7 @@ def test_backtest_engine_halts_on_drawdown_via_risk_manager():
         max_position_pct=0.9,
         max_drawdown_halt=0.10,
         use_market_simulator=False,
+        enforce_market_calendar=False,
         allow_fractional=False,
     )
     engine = BacktestEngine(data_handler=handler, strategy=strategy, config=config)

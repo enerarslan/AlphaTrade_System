@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import polars as pl
 
 from quant_trading_system.core.exceptions import DataError, DataNotFoundError
+from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
 from quant_trading_system.database.connection import DatabaseManager, get_db_manager
 from quant_trading_system.database.models import Feature
 from quant_trading_system.database.repository import (
@@ -85,6 +86,8 @@ class DatabaseFeatureStore:
         symbol: str,
         timestamp: datetime,
         features: dict[str, float],
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
         batch_mode: bool = False,
     ) -> int:
         """
@@ -100,6 +103,8 @@ class DatabaseFeatureStore:
             Number of features saved.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
 
         # Ensure timezone-aware timestamp
         if timestamp.tzinfo is None:
@@ -112,7 +117,9 @@ class DatabaseFeatureStore:
                 feature_records.append({
                     "symbol": symbol,
                     "timestamp": timestamp,
+                    "timeframe": timeframe,
                     "feature_name": name,
+                    "feature_set_id": feature_set_id,
                     "value": float(value),
                 })
 
@@ -124,7 +131,7 @@ class DatabaseFeatureStore:
             count = self._feature_repo.bulk_insert(session, feature_records)
 
         # Update caches
-        cache_key = self._make_cache_key(symbol, timestamp)
+        cache_key = self._make_cache_key(symbol, timestamp, timeframe, feature_set_id)
 
         # Update memory cache
         self._memory_cache[cache_key] = features
@@ -148,6 +155,8 @@ class DatabaseFeatureStore:
         self,
         symbol: str,
         features_df: pl.DataFrame,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
     ) -> int:
         """
         Batch save features from a DataFrame.
@@ -160,6 +169,8 @@ class DatabaseFeatureStore:
             Total number of features saved.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
 
         if "timestamp" not in features_df.columns:
             raise DataError("features_df must have 'timestamp' column")
@@ -181,7 +192,9 @@ class DatabaseFeatureStore:
                     feature_records.append({
                         "symbol": symbol,
                         "timestamp": timestamp,
+                        "timeframe": timeframe,
                         "feature_name": col,
+                        "feature_set_id": feature_set_id,
                         "value": float(value),
                     })
 
@@ -205,6 +218,8 @@ class DatabaseFeatureStore:
         self,
         symbol: str,
         timestamp: datetime,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
         feature_names: list[str] | None = None,
     ) -> dict[str, float] | None:
         """
@@ -221,7 +236,9 @@ class DatabaseFeatureStore:
             Dictionary of feature name to value, or None if not found.
         """
         symbol = symbol.upper()
-        cache_key = self._make_cache_key(symbol, timestamp)
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
+        cache_key = self._make_cache_key(symbol, timestamp, timeframe, feature_set_id)
 
         # L1: Check memory cache
         if cache_key in self._memory_cache:
@@ -251,6 +268,8 @@ class DatabaseFeatureStore:
             db_features = self._feature_repo.get_features(
                 session,
                 symbol,
+                timeframe=timeframe,
+                feature_set_id=feature_set_id,
                 feature_names=feature_names,
                 start_time=timestamp,
                 end_time=timestamp,
@@ -276,6 +295,8 @@ class DatabaseFeatureStore:
     def get_latest_features(
         self,
         symbol: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
         feature_names: list[str] | None = None,
     ) -> dict[str, float]:
         """
@@ -289,10 +310,16 @@ class DatabaseFeatureStore:
             Dictionary of feature name to value.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
 
         with self._db.session() as session:
             return self._feature_repo.get_latest_features(
-                session, symbol, feature_names
+                session,
+                symbol,
+                timeframe=timeframe,
+                feature_set_id=feature_set_id,
+                feature_names=feature_names,
             )
 
     def get_features_range(
@@ -300,6 +327,8 @@ class DatabaseFeatureStore:
         symbol: str,
         start_date: datetime,
         end_date: datetime,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
         feature_names: list[str] | None = None,
     ) -> pl.DataFrame:
         """
@@ -315,11 +344,15 @@ class DatabaseFeatureStore:
             Polars DataFrame with features.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
 
         with self._db.session() as session:
             db_features = self._feature_repo.get_features(
                 session,
                 symbol,
+                timeframe=timeframe,
+                feature_set_id=feature_set_id,
                 feature_names=feature_names,
                 start_time=start_date,
                 end_time=end_date,
@@ -348,6 +381,8 @@ class DatabaseFeatureStore:
         output_path: Path,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
         feature_names: list[str] | None = None,
         compression: str = "zstd",
     ) -> Path:
@@ -366,6 +401,8 @@ class DatabaseFeatureStore:
             Path to exported file.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -375,14 +412,23 @@ class DatabaseFeatureStore:
         if end_date is None:
             end_date = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
-        df = self.get_features_range(symbol, start_date, end_date, feature_names)
+        df = self.get_features_range(
+            symbol,
+            start_date,
+            end_date,
+            timeframe=timeframe,
+            feature_set_id=feature_set_id,
+            feature_names=feature_names,
+        )
 
         if len(df) == 0:
             raise DataNotFoundError(f"No features found for {symbol}")
 
         df.write_parquet(output_path, compression=compression, statistics=True)
 
-        logger.info(f"Exported {len(df)} feature rows for {symbol} to {output_path}")
+        logger.info(
+            f"Exported {len(df)} feature rows for {symbol} ({timeframe}, {feature_set_id}) to {output_path}"
+        )
         return output_path
 
     def export_all_to_parquet(
@@ -391,6 +437,8 @@ class DatabaseFeatureStore:
         symbols: list[str] | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
         compression: str = "zstd",
     ) -> dict[str, Path]:
         """
@@ -408,17 +456,24 @@ class DatabaseFeatureStore:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
 
         if symbols is None:
-            symbols = self.get_available_symbols()
+            symbols = self.get_available_symbols(timeframe=timeframe, feature_set_id=feature_set_id)
 
         results = {}
         for symbol in symbols:
             try:
                 output_path = output_dir / f"{symbol}_features.parquet"
                 self.export_to_parquet(
-                    symbol, output_path, start_date, end_date,
-                    compression=compression
+                    symbol,
+                    output_path,
+                    start_date,
+                    end_date,
+                    timeframe=timeframe,
+                    feature_set_id=feature_set_id,
+                    compression=compression,
                 )
                 results[symbol] = output_path
             except DataNotFoundError:
@@ -428,23 +483,51 @@ class DatabaseFeatureStore:
 
         return results
 
-    def get_available_symbols(self) -> list[str]:
+    def get_available_symbols(
+        self,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
+    ) -> list[str]:
         """Get list of symbols with features in database."""
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
         with self._db.session() as session:
-            from sqlalchemy import select
-            stmt = select(Feature.symbol).distinct()
+            from sqlalchemy import and_, select
+            stmt = (
+                select(Feature.symbol)
+                .where(
+                    and_(
+                        Feature.timeframe == timeframe,
+                        Feature.feature_set_id == feature_set_id,
+                    )
+                )
+                .distinct()
+            )
             result = session.execute(stmt)
             return sorted([row[0] for row in result])
 
-    def get_feature_names(self, symbol: str) -> list[str]:
+    def get_feature_names(
+        self,
+        symbol: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        feature_set_id: str = "default",
+    ) -> list[str]:
         """Get list of feature names for a symbol."""
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
+        feature_set_id = str(feature_set_id or "default").strip() or "default"
 
         with self._db.session() as session:
-            from sqlalchemy import select
+            from sqlalchemy import and_, select
             stmt = (
                 select(Feature.feature_name)
-                .where(Feature.symbol == symbol)
+                .where(
+                    and_(
+                        Feature.symbol == symbol,
+                        Feature.timeframe == timeframe,
+                        Feature.feature_set_id == feature_set_id,
+                    )
+                )
                 .distinct()
             )
             result = session.execute(stmt)
@@ -464,10 +547,16 @@ class DatabaseFeatureStore:
             except Exception as e:
                 logger.warning(f"Failed to clear Redis cache: {e}")
 
-    def _make_cache_key(self, symbol: str, timestamp: datetime) -> str:
+    def _make_cache_key(
+        self,
+        symbol: str,
+        timestamp: datetime,
+        timeframe: str,
+        feature_set_id: str,
+    ) -> str:
         """Generate cache key for symbol and timestamp."""
         ts_str = timestamp.isoformat()
-        return f"feature:{symbol}:{ts_str}"
+        return f"feature:{symbol}:{timeframe}:{feature_set_id}:{ts_str}"
 
     def _update_cache_lru(self, key: str) -> None:
         """Update LRU tracking for memory cache."""

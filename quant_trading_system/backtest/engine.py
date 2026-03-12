@@ -229,6 +229,16 @@ class DataHandler(ABC):
         """Get the current bar for a symbol."""
         pass
 
+    @abstractmethod
+    def get_updated_symbols(self) -> list[str]:
+        """Get symbols that received a bar on the current event timestamp."""
+        pass
+
+    @abstractmethod
+    def get_current_timestamp(self) -> datetime | None:
+        """Get the current event timestamp."""
+        pass
+
 
 class PandasDataHandler(DataHandler):
     """Data handler using pandas DataFrames."""
@@ -250,6 +260,8 @@ class PandasDataHandler(DataHandler):
         self._symbols = list(data.keys())
         self._current_index = 0
         self._latest_bars: dict[str, deque] = {s: deque(maxlen=1000) for s in self._symbols}
+        self._current_timestamp: datetime | None = None
+        self._updated_symbols: list[str] = []
 
         # Filter and align data
         self._prepare_data(start_date, end_date)
@@ -259,20 +271,18 @@ class PandasDataHandler(DataHandler):
         start_date: datetime | None,
         end_date: datetime | None,
     ) -> None:
-        """Prepare and align data across symbols."""
-        # Get common date range
-        all_indices = [df.index for df in self._data.values()]
-        common_index = all_indices[0]
-        for idx in all_indices[1:]:
-            common_index = common_index.intersection(idx)
+        """Prepare per-symbol data and build a union timestamp stream."""
+        all_dates: set[pd.Timestamp] = set()
+        for symbol, df in self._data.items():
+            working = df.sort_index()
+            if start_date:
+                working = working.loc[working.index >= pd.Timestamp(start_date)]
+            if end_date:
+                working = working.loc[working.index <= pd.Timestamp(end_date)]
+            self._data[symbol] = working
+            all_dates.update(pd.Index(working.index).tolist())
 
-        # Apply date filters
-        if start_date:
-            common_index = common_index[common_index >= pd.Timestamp(start_date)]
-        if end_date:
-            common_index = common_index[common_index <= pd.Timestamp(end_date)]
-
-        self._dates = list(common_index)
+        self._dates = sorted(all_dates)
         self._max_index = len(self._dates)
 
     def get_symbols(self) -> list[str]:
@@ -287,24 +297,31 @@ class PandasDataHandler(DataHandler):
         return bars[-n:]
 
     def update_bars(self) -> bool:
-        """Update bars for all symbols."""
+        """Advance the event stream and publish bars for symbols updated at this timestamp."""
         if self._current_index >= self._max_index:
             return False
 
         current_date = self._dates[self._current_index]
+        current_timestamp = (
+            current_date.to_pydatetime()
+            if hasattr(current_date, "to_pydatetime")
+            else current_date
+        )
+        if current_timestamp.tzinfo is None:
+            current_timestamp = current_timestamp.replace(tzinfo=timezone.utc)
+        self._current_timestamp = current_timestamp
+        self._updated_symbols = []
 
         for symbol in self._symbols:
             df = self._data[symbol]
             if current_date in df.index:
                 row = df.loc[current_date]
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[-1]
                 # Round to 8 decimal places to satisfy OHLCVBar validation
                 bar = OHLCVBar(
                     symbol=symbol,
-                    timestamp=(
-                        current_date.to_pydatetime()
-                        if hasattr(current_date, "to_pydatetime")
-                        else current_date
-                    ),
+                    timestamp=current_timestamp,
                     open=Decimal(str(round(row.get("open", row.get("Open", 0)), 8))),
                     high=Decimal(str(round(row.get("high", row.get("High", 0)), 8))),
                     low=Decimal(str(round(row.get("low", row.get("Low", 0)), 8))),
@@ -312,6 +329,7 @@ class PandasDataHandler(DataHandler):
                     volume=int(row.get("volume", row.get("Volume", 0))),
                 )
                 self._latest_bars[symbol].append(bar)
+                self._updated_symbols.append(symbol)
 
         self._current_index += 1
         return True
@@ -321,9 +339,19 @@ class PandasDataHandler(DataHandler):
         bars = self.get_latest_bars(symbol, 1)
         return bars[0] if bars else None
 
+    def get_updated_symbols(self) -> list[str]:
+        """Get symbols updated on the current event timestamp."""
+        return self._updated_symbols.copy()
+
+    def get_current_timestamp(self) -> datetime | None:
+        """Get current event timestamp."""
+        return self._current_timestamp
+
     def reset(self) -> None:
         """Reset to beginning of data."""
         self._current_index = 0
+        self._current_timestamp = None
+        self._updated_symbols = []
         self._latest_bars = {s: deque(maxlen=1000) for s in self._symbols}
 
 
@@ -354,6 +382,8 @@ class PolarsDataHandler(DataHandler):
         self._symbols = list(data.keys())
         self._current_index = 0
         self._latest_bars: dict[str, deque] = {s: deque(maxlen=1000) for s in self._symbols}
+        self._current_timestamp: datetime | None = None
+        self._updated_symbols: list[str] = []
 
         # Filter and align data
         self._prepare_data(start_date, end_date)
@@ -363,59 +393,44 @@ class PolarsDataHandler(DataHandler):
         start_date: datetime | None,
         end_date: datetime | None,
     ) -> None:
-        """Prepare and align data across symbols."""
+        """Prepare per-symbol data and build a union timestamp stream."""
         pl = self._pl
 
-        # Get all timestamps from each symbol
-        all_timestamps = []
+        start_normalized = (
+            start_date.replace(tzinfo=None)
+            if start_date is not None and start_date.tzinfo is not None
+            else start_date
+        )
+        end_normalized = (
+            end_date.replace(tzinfo=None)
+            if end_date is not None and end_date.tzinfo is not None
+            else end_date
+        )
+
+        all_timestamps: set[Any] = set()
+        self._data_indexed: dict[str, dict[Any, dict[str, Any]]] = {}
         for symbol, df in self._data.items():
-            if "timestamp" in df.columns:
-                ts = df["timestamp"].to_list()
-                all_timestamps.append(set(ts))
+            if "timestamp" not in df.columns:
+                continue
+            working = df
+            if start_normalized is not None:
+                working = working.filter(pl.col("timestamp") >= start_normalized)
+            if end_normalized is not None:
+                working = working.filter(pl.col("timestamp") <= end_normalized)
+            self._data[symbol] = working
+            self._data_indexed[symbol] = {}
+            for row in working.iter_rows(named=True):
+                ts = row.get("timestamp")
+                all_timestamps.add(ts)
+                self._data_indexed[symbol][ts] = row
 
         if not all_timestamps:
             self._dates = []
             self._max_index = 0
             return
 
-        # Find common timestamps across all symbols
-        common_timestamps = all_timestamps[0]
-        for ts_set in all_timestamps[1:]:
-            common_timestamps = common_timestamps.intersection(ts_set)
-
-        # Convert to sorted list
-        dates = sorted(list(common_timestamps))
-
-        # Apply date filters
-        if start_date:
-            start_naive = (
-                start_date.replace(tzinfo=None)
-                if hasattr(start_date, "tzinfo") and start_date.tzinfo
-                else start_date
-            )
-            dates = [d for d in dates if d >= start_naive]
-        if end_date:
-            end_naive = (
-                end_date.replace(tzinfo=None)
-                if hasattr(end_date, "tzinfo") and end_date.tzinfo
-                else end_date
-            )
-            dates = [d for d in dates if d <= end_naive]
-
-        self._dates = dates
+        self._dates = sorted(all_timestamps)
         self._max_index = len(self._dates)
-
-        # Pre-index data for fast lookup
-        self._data_indexed: dict[str, dict] = {}
-        for symbol, df in self._data.items():
-            if "timestamp" in df.columns:
-                # Create a lookup dict for O(1) access
-                self._data_indexed[symbol] = {}
-                for i in range(len(df)):
-                    row = df.row(i, named=True)
-                    ts = row.get("timestamp")
-                    if ts in common_timestamps:
-                        self._data_indexed[symbol][ts] = row
 
     def get_symbols(self) -> list[str]:
         """Get list of symbols."""
@@ -429,11 +444,19 @@ class PolarsDataHandler(DataHandler):
         return bars[-n:]
 
     def update_bars(self) -> bool:
-        """Update bars for all symbols."""
+        """Advance the event stream and publish bars for symbols updated at this timestamp."""
         if self._current_index >= self._max_index:
             return False
 
         current_date = self._dates[self._current_index]
+        if isinstance(current_date, datetime):
+            current_timestamp = current_date
+        else:
+            current_timestamp = pd.Timestamp(current_date).to_pydatetime()
+            if current_timestamp.tzinfo is None:
+                current_timestamp = current_timestamp.replace(tzinfo=timezone.utc)
+        self._current_timestamp = current_timestamp
+        self._updated_symbols = []
 
         for symbol in self._symbols:
             if symbol not in self._data_indexed:
@@ -441,17 +464,10 @@ class PolarsDataHandler(DataHandler):
 
             row = self._data_indexed[symbol].get(current_date)
             if row is not None:
-                if isinstance(current_date, datetime):
-                    timestamp = current_date
-                else:
-                    timestamp = pd.Timestamp(current_date).to_pydatetime()
-                    if timestamp.tzinfo is None:
-                        timestamp = timestamp.replace(tzinfo=timezone.utc)
-
                 # Create OHLCVBar from Polars row
                 bar = OHLCVBar(
                     symbol=symbol,
-                    timestamp=timestamp,
+                    timestamp=current_timestamp,
                     open=Decimal(str(round(row.get("open", row.get("Open", 0)), 8))),
                     high=Decimal(str(round(row.get("high", row.get("High", 0)), 8))),
                     low=Decimal(str(round(row.get("low", row.get("Low", 0)), 8))),
@@ -459,6 +475,7 @@ class PolarsDataHandler(DataHandler):
                     volume=int(row.get("volume", row.get("Volume", 0))),
                 )
                 self._latest_bars[symbol].append(bar)
+                self._updated_symbols.append(symbol)
 
         self._current_index += 1
         return True
@@ -468,9 +485,19 @@ class PolarsDataHandler(DataHandler):
         bars = self.get_latest_bars(symbol, 1)
         return bars[0] if bars else None
 
+    def get_updated_symbols(self) -> list[str]:
+        """Get symbols updated on the current event timestamp."""
+        return self._updated_symbols.copy()
+
+    def get_current_timestamp(self) -> datetime | None:
+        """Get current event timestamp."""
+        return self._current_timestamp
+
     def reset(self) -> None:
         """Reset to beginning of data."""
         self._current_index = 0
+        self._current_timestamp = None
+        self._updated_symbols = []
         self._latest_bars = {s: deque(maxlen=1000) for s in self._symbols}
 
 
@@ -590,9 +617,7 @@ class BacktestEngine:
         max_order_value = self.config.initial_capital * Decimal(
             str(max(self.config.max_leverage, 1.0))
         )
-        max_position_value = self.config.initial_capital * Decimal(
-            str(max(self.config.max_position_pct, 1.0))
-        )
+        max_position_value = self.config.initial_capital * Decimal(str(position_pct))
 
         return RiskLimitsConfig(
             max_position_pct=position_pct,
@@ -723,7 +748,9 @@ class BacktestEngine:
     def _process_bar(self) -> None:
         """Process current bar for all symbols."""
         processed_any_bar = False
-        for symbol in self.data_handler.get_symbols():
+        updated_symbols = self.data_handler.get_updated_symbols()
+        current_timestamp = self.data_handler.get_current_timestamp()
+        for symbol in updated_symbols:
             bar = self.data_handler.get_current_bar(symbol)
             if bar is None:
                 continue
@@ -731,7 +758,7 @@ class BacktestEngine:
                 continue
 
             processed_any_bar = True
-            self._state.timestamp = bar.timestamp
+            self._state.timestamp = current_timestamp or bar.timestamp
             self._state.bars_processed += 1
 
             # Update positions with new prices
@@ -1263,6 +1290,9 @@ class BacktestEngine:
         """Process a trading signal and create order."""
         bar = self.data_handler.get_current_bar(signal.symbol)
         if bar is None:
+            return
+        current_timestamp = self.data_handler.get_current_timestamp()
+        if current_timestamp is not None and bar.timestamp != current_timestamp:
             return
         if not self._execution_quality_gate_open():
             return

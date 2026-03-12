@@ -134,6 +134,7 @@ class OHLCVRepository(BaseRepository[OHLCVBar]):
         self,
         session: Session,
         symbol: str,
+        timeframe: str = "15Min",
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         limit: int = 1000,
@@ -150,7 +151,12 @@ class OHLCVRepository(BaseRepository[OHLCVBar]):
         Returns:
             List of OHLCV bars ordered by timestamp.
         """
-        stmt = select(OHLCVBar).where(OHLCVBar.symbol == symbol.upper())
+        stmt = select(OHLCVBar).where(
+            and_(
+                OHLCVBar.symbol == symbol.upper(),
+                OHLCVBar.timeframe == timeframe,
+            )
+        )
 
         if start_time:
             stmt = stmt.where(OHLCVBar.timestamp >= start_time)
@@ -160,7 +166,12 @@ class OHLCVRepository(BaseRepository[OHLCVBar]):
         stmt = stmt.order_by(OHLCVBar.timestamp).limit(limit)
         return list(session.scalars(stmt).all())
 
-    def get_latest_bar(self, session: Session, symbol: str) -> OHLCVBar | None:
+    def get_latest_bar(
+        self,
+        session: Session,
+        symbol: str,
+        timeframe: str = "15Min",
+    ) -> OHLCVBar | None:
         """Get the most recent bar for a symbol.
 
         Args:
@@ -172,7 +183,12 @@ class OHLCVRepository(BaseRepository[OHLCVBar]):
         """
         stmt = (
             select(OHLCVBar)
-            .where(OHLCVBar.symbol == symbol.upper())
+            .where(
+                and_(
+                    OHLCVBar.symbol == symbol.upper(),
+                    OHLCVBar.timeframe == timeframe,
+                )
+            )
             .order_by(desc(OHLCVBar.timestamp))
             .limit(1)
         )
@@ -193,7 +209,7 @@ class OHLCVRepository(BaseRepository[OHLCVBar]):
         session.flush()
         return len(instances)
 
-    def get_symbols(self, session: Session) -> list[str]:
+    def get_symbols(self, session: Session, timeframe: str | None = None) -> list[str]:
         """Get list of all symbols with data.
 
         Args:
@@ -203,6 +219,8 @@ class OHLCVRepository(BaseRepository[OHLCVBar]):
             List of unique symbols.
         """
         stmt = select(OHLCVBar.symbol).distinct()
+        if timeframe:
+            stmt = stmt.where(OHLCVBar.timeframe == timeframe)
         return list(session.scalars(stmt).all())
 
 
@@ -215,6 +233,8 @@ class FeatureRepository(BaseRepository[Feature]):
         self,
         session: Session,
         symbol: str,
+        timeframe: str = "15Min",
+        feature_set_id: str = "default",
         feature_names: list[str] | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
@@ -231,7 +251,13 @@ class FeatureRepository(BaseRepository[Feature]):
         Returns:
             List of feature records.
         """
-        stmt = select(Feature).where(Feature.symbol == symbol.upper())
+        stmt = select(Feature).where(
+            and_(
+                Feature.symbol == symbol.upper(),
+                Feature.timeframe == timeframe,
+                Feature.feature_set_id == feature_set_id,
+            )
+        )
 
         if feature_names:
             stmt = stmt.where(Feature.feature_name.in_(feature_names))
@@ -247,6 +273,8 @@ class FeatureRepository(BaseRepository[Feature]):
         self,
         session: Session,
         symbol: str,
+        timeframe: str = "15Min",
+        feature_set_id: str = "default",
         feature_names: list[str] | None = None,
     ) -> dict[str, float]:
         """Get latest feature values for a symbol.
@@ -262,7 +290,13 @@ class FeatureRepository(BaseRepository[Feature]):
         # Get the latest timestamp for this symbol
         subq = (
             select(Feature.timestamp)
-            .where(Feature.symbol == symbol.upper())
+            .where(
+                and_(
+                    Feature.symbol == symbol.upper(),
+                    Feature.timeframe == timeframe,
+                    Feature.feature_set_id == feature_set_id,
+                )
+            )
             .order_by(desc(Feature.timestamp))
             .limit(1)
             .scalar_subquery()
@@ -271,6 +305,8 @@ class FeatureRepository(BaseRepository[Feature]):
         stmt = select(Feature).where(
             and_(
                 Feature.symbol == symbol.upper(),
+                Feature.timeframe == timeframe,
+                Feature.feature_set_id == feature_set_id,
                 Feature.timestamp == subq,
             )
         )

@@ -97,6 +97,7 @@ class DataLoader:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         columns: list[str] | None = None,
+        timeframe: str | None = None,
     ) -> pl.DataFrame:
         """
         Load OHLCV data for a single symbol.
@@ -118,16 +119,17 @@ class DataLoader:
 
         # Use database loader if configured
         if self.use_database and self._db_loader is not None:
-            try:
-                df = self._db_loader.load_symbol(symbol, start_date, end_date, columns)
-                if self.validate:
-                    df = self._validate_data(df, symbol)
-                logger.debug(f"Loaded {len(df)} bars for {symbol} from database")
-                return df
-            except DataNotFoundError:
-                # Fallback to file-based loading if database has no data
-                logger.warning(f"No database data for {symbol}, falling back to files")
-                # Continue with file-based loading below
+            df = self._db_loader.load_symbol(
+                symbol,
+                start_date,
+                end_date,
+                columns,
+                timeframe=timeframe or "15Min",
+            )
+            if self.validate:
+                df = self._validate_data(df, symbol)
+            logger.debug(f"Loaded {len(df)} bars for {symbol} from database")
+            return df
 
         # File-based loading
         file_path = self._find_data_file(
@@ -355,14 +357,12 @@ class DataLoader:
         # Round to 8 decimal places to match OHLCVBar field constraints
         return Decimal(str(round(value, 8)))
 
-    def get_available_symbols(self) -> list[str]:
+    def get_available_symbols(self, timeframe: str | None = None) -> list[str]:
         """Get list of available symbols based on data source."""
         # Use database if configured
         if self.use_database and self._db_loader is not None:
-            db_symbols = self._db_loader.get_available_symbols()
-            if db_symbols:
-                return sorted(db_symbols)
-            # Fallback to files if database empty
+            db_symbols = self._db_loader.get_available_symbols(timeframe=timeframe or "15Min")
+            return sorted(db_symbols)
 
         # File-based symbol discovery
         symbols = []
@@ -378,7 +378,11 @@ class DataLoader:
                     symbols.append(symbol)
         return sorted(symbols)
 
-    def get_date_range(self, symbol: str) -> tuple[datetime, datetime]:
+    def get_date_range(
+        self,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> tuple[datetime, datetime]:
         """
         Get the date range available for a symbol.
 
@@ -388,7 +392,7 @@ class DataLoader:
         Returns:
             Tuple of (start_date, end_date)
         """
-        df = self.load_symbol(symbol, columns=["timestamp"])
+        df = self.load_symbol(symbol, columns=["timestamp"], timeframe=timeframe)
         min_date = df["timestamp"].min()
         max_date = df["timestamp"].max()
         return (min_date, max_date)

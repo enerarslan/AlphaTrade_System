@@ -45,11 +45,13 @@ class TestParseArgs:
             'main.py', 'backtest',
             '--start-date', '2024-01-01',
             '--end-date', '2024-12-31',
+            '--timeframe', '1D',
         ]):
             args = parse_args()
             assert args.command == "backtest"
             assert args.start_date == "2024-01-01"
             assert args.end_date == "2024-12-31"
+            assert args.timeframe == "1D"
 
     def test_parse_backtest_with_capital(self):
         """Test parsing backtest command with initial capital."""
@@ -77,6 +79,8 @@ class TestParseArgs:
                 "--symbols",
                 "AAPL",
                 "MSFT",
+                "--timeframe",
+                "1D",
                 "--max-drawdown",
                 "0.15",
                 "--no-allow-short",
@@ -87,6 +91,7 @@ class TestParseArgs:
             assert args.start_date == "2024-01-01"
             assert args.end_date == "2024-01-31"
             assert args.symbols == ["AAPL", "MSFT"]
+            assert args.timeframe == "1D"
             assert args.max_drawdown == pytest.approx(0.15)
             assert args.allow_short is False
 
@@ -117,19 +122,31 @@ class TestParseArgs:
             "main.py",
             "train",
             "--model",
-            "elastic_net",
+            "lightgbm_ranker",
             "--name",
             "elastic_v1",
+            "--timeframe",
+            "1D",
+            "--feature-set-id",
+            "universe_a",
             "--no-redis-cache",
             "--min-accuracy",
             "0.55",
+            "--min-white-reality-stat",
+            "0.02",
+            "--max-white-reality-pvalue",
+            "0.05",
         ]):
             args = parse_args()
             assert args.command == "train"
-            assert args.model == "elastic_net"
+            assert args.model == "lightgbm_ranker"
             assert args.name == "elastic_v1"
+            assert args.timeframe == "1D"
+            assert args.feature_set_id == "universe_a"
             assert args.no_redis_cache is True
             assert args.min_accuracy == pytest.approx(0.55)
+            assert args.min_white_reality_stat == pytest.approx(0.02)
+            assert args.max_white_reality_pvalue == pytest.approx(0.05)
 
     def test_parse_train_replay_and_nested_flags(self):
         with patch.object(

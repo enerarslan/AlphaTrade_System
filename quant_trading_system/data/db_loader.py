@@ -28,6 +28,12 @@ from quant_trading_system.data.ingestion_contracts import (
     apply_ohlcv_ingestion_contract,
     quality_summary,
 )
+from quant_trading_system.data.timeframe import (
+    DEFAULT_TIMEFRAME,
+    infer_symbol_and_timeframe,
+    normalize_timeframe,
+    timeframe_slug,
+)
 from quant_trading_system.database.connection import DatabaseManager, get_db_manager
 from quant_trading_system.database.models import OHLCVBar as OHLCVBarModel
 from quant_trading_system.database.repository import (
@@ -74,6 +80,7 @@ class DatabaseDataLoader:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         columns: list[str] | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
     ) -> pl.DataFrame:
         """
         Load OHLCV data for a single symbol from database.
@@ -91,6 +98,7 @@ class DatabaseDataLoader:
             DataNotFoundError: If no data found for symbol.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
 
         with self._db.session() as session:
             # Use a high limit for full data retrieval
@@ -98,6 +106,7 @@ class DatabaseDataLoader:
             bars = self._ohlcv_repo.get_bars(
                 session,
                 symbol,
+                timeframe=timeframe,
                 start_time=start_date,
                 end_time=end_date,
                 limit=10_000_000,  # Effectively unlimited
@@ -115,7 +124,7 @@ class DatabaseDataLoader:
                 if available_cols:
                     df = df.select(available_cols)
 
-            logger.debug(f"Loaded {len(df)} bars for {symbol} from database")
+            logger.debug(f"Loaded {len(df)} bars for {symbol} ({timeframe}) from database")
             return df
 
     def load_symbols(
@@ -124,6 +133,7 @@ class DatabaseDataLoader:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         columns: list[str] | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
     ) -> dict[str, pl.DataFrame]:
         """
         Load OHLCV data for multiple symbols from database.
@@ -142,7 +152,13 @@ class DatabaseDataLoader:
 
         for symbol in symbols:
             try:
-                df = self.load_symbol(symbol, start_date, end_date, columns)
+                df = self.load_symbol(
+                    symbol,
+                    start_date,
+                    end_date,
+                    columns,
+                    timeframe=timeframe,
+                )
                 results[symbol.upper()] = df
             except DataError as e:
                 errors.append(f"{symbol}: {str(e)}")
@@ -153,12 +169,17 @@ class DatabaseDataLoader:
 
         return results
 
-    def get_available_symbols(self) -> list[str]:
+    def get_available_symbols(self, timeframe: str = DEFAULT_TIMEFRAME) -> list[str]:
         """Get list of available symbols in database."""
+        timeframe = normalize_timeframe(timeframe)
         with self._db.session() as session:
-            return self._ohlcv_repo.get_symbols(session)
+            return self._ohlcv_repo.get_symbols(session, timeframe=timeframe)
 
-    def get_date_range(self, symbol: str) -> tuple[datetime, datetime] | None:
+    def get_date_range(
+        self,
+        symbol: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> tuple[datetime, datetime] | None:
         """
         Get the date range available for a symbol.
 
@@ -169,16 +190,17 @@ class DatabaseDataLoader:
             Tuple of (start_date, end_date) or None if no data.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
 
         with self._db.session() as session:
             # Get first bar
-            bars = self._ohlcv_repo.get_bars(session, symbol, limit=1)
+            bars = self._ohlcv_repo.get_bars(session, symbol, timeframe=timeframe, limit=1)
             if not bars:
                 return None
             min_date = bars[0].timestamp
 
             # Get last bar
-            latest_bar = self._ohlcv_repo.get_latest_bar(session, symbol)
+            latest_bar = self._ohlcv_repo.get_latest_bar(session, symbol, timeframe=timeframe)
             if not latest_bar:
                 return None
             max_date = latest_bar.timestamp
@@ -189,6 +211,7 @@ class DatabaseDataLoader:
         self,
         csv_path: Path,
         symbol: str | None = None,
+        timeframe: str | None = None,
         batch_size: int | None = None,
         validate: bool = True,
         source_timezone: str = "America/New_York",
@@ -218,14 +241,10 @@ class DatabaseDataLoader:
         if not csv_path.exists():
             raise DataNotFoundError(f"CSV file not found: {csv_path}")
 
-        # Infer symbol from filename if not provided
-        if symbol is None:
-            # Common patterns: AAPL.csv, AAPL_15min.csv
-            stem = csv_path.stem.upper()
-            symbol = stem.replace("_15MIN", "").replace("_15Min", "").replace("_1D", "").replace("_DAILY", "")
-
-        symbol = symbol.upper()
-        logger.info(f"Loading {csv_path} for symbol {symbol}")
+        inferred_symbol, inferred_timeframe = infer_symbol_and_timeframe(csv_path)
+        symbol = (symbol or inferred_symbol).upper()
+        timeframe = normalize_timeframe(timeframe or inferred_timeframe)
+        logger.info(f"Loading {csv_path} for symbol {symbol} ({timeframe})")
 
         try:
             # Read CSV with Polars for speed
@@ -237,6 +256,9 @@ class DatabaseDataLoader:
             # Add symbol column if not present
             if "symbol" not in df.columns:
                 df = df.with_columns(pl.lit(symbol).alias("symbol"))
+            else:
+                df = df.with_columns(pl.col("symbol").cast(pl.Utf8).str.to_uppercase().alias("symbol"))
+            df = df.with_columns(pl.lit(timeframe).alias("timeframe"))
 
             # Validate if requested
             if validate:
@@ -362,11 +384,11 @@ class DatabaseDataLoader:
             if checkpoint_file is not None and checkpoint_file.exists():
                 checkpoint_file.unlink()
 
-            logger.info(f"Loaded {total_inserted} bars for {symbol} into database")
+            logger.info(f"Loaded {total_inserted} bars for {symbol} ({timeframe}) into database")
             return total_inserted
 
         except Exception as e:
-            raise DataError(f"Failed to load Parquet {parquet_path}: {e}")
+            raise DataError(f"Failed to load CSV {csv_path}: {e}")
 
     def export_to_parquet(
         self,
@@ -374,6 +396,7 @@ class DatabaseDataLoader:
         output_path: Path,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
         compression: str = "zstd",
     ) -> Path:
         """
@@ -393,11 +416,12 @@ class DatabaseDataLoader:
             Path to exported file.
         """
         symbol = symbol.upper()
+        timeframe = normalize_timeframe(timeframe)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Load from database
-        df = self.load_symbol(symbol, start_date, end_date)
+        df = self.load_symbol(symbol, start_date, end_date, timeframe=timeframe)
 
         # Write to Parquet with compression
         df.write_parquet(
@@ -406,7 +430,7 @@ class DatabaseDataLoader:
             statistics=True,
         )
 
-        logger.info(f"Exported {len(df)} bars for {symbol} to {output_path}")
+        logger.info(f"Exported {len(df)} bars for {symbol} ({timeframe}) to {output_path}")
         return output_path
 
     def export_all_to_parquet(
@@ -415,6 +439,7 @@ class DatabaseDataLoader:
         symbols: list[str] | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
         compression: str = "zstd",
     ) -> dict[str, Path]:
         """
@@ -432,16 +457,22 @@ class DatabaseDataLoader:
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        timeframe = normalize_timeframe(timeframe)
 
         if symbols is None:
-            symbols = self.get_available_symbols()
+            symbols = self.get_available_symbols(timeframe=timeframe)
 
         results = {}
         for symbol in symbols:
             try:
-                output_path = output_dir / f"{symbol}.parquet"
+                output_path = output_dir / f"{symbol}_{timeframe_slug(timeframe)}.parquet"
                 self.export_to_parquet(
-                    symbol, output_path, start_date, end_date, compression
+                    symbol,
+                    output_path,
+                    start_date,
+                    end_date,
+                    timeframe,
+                    compression,
                 )
                 results[symbol] = output_path
             except DataError as e:
@@ -449,7 +480,11 @@ class DatabaseDataLoader:
 
         return results
 
-    def insert_bars(self, bars: list[OHLCVBar]) -> int:
+    def insert_bars(
+        self,
+        bars: list[OHLCVBar],
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> int:
         """
         Insert OHLCV bars into database.
 
@@ -461,12 +496,14 @@ class DatabaseDataLoader:
         """
         if not bars:
             return 0
+        timeframe = normalize_timeframe(timeframe)
 
         bar_dicts = []
         for bar in bars:
             bar_dicts.append({
                 "symbol": bar.symbol.upper(),
                 "timestamp": bar.timestamp,
+                "timeframe": timeframe,
                 "open": bar.open,
                 "high": bar.high,
                 "low": bar.low,
@@ -479,7 +516,11 @@ class DatabaseDataLoader:
         with self._db.session() as session:
             return self._ohlcv_repo.bulk_insert(session, bar_dicts)
 
-    def upsert_bar(self, bar: OHLCVBar) -> None:
+    def upsert_bar(
+        self,
+        bar: OHLCVBar,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> None:
         """
         Upsert a single OHLCV bar (insert or update on conflict).
 
@@ -489,11 +530,13 @@ class DatabaseDataLoader:
             bar: OHLCVBar to upsert.
         """
         from sqlalchemy.dialects.postgresql import insert
+        timeframe = normalize_timeframe(timeframe)
 
         with self._db.session() as session:
             stmt = insert(OHLCVBarModel).values(
                 symbol=bar.symbol.upper(),
                 timestamp=bar.timestamp,
+                timeframe=timeframe,
                 open=bar.open,
                 high=bar.high,
                 low=bar.low,
@@ -503,9 +546,9 @@ class DatabaseDataLoader:
                 trade_count=bar.trade_count,
             )
 
-            # On conflict (symbol, timestamp), update the values
+            # On conflict (symbol, timestamp, timeframe), update the values
             stmt = stmt.on_conflict_do_update(
-                index_elements=["symbol", "timestamp"],
+                index_elements=["symbol", "timestamp", "timeframe"],
                 set_={
                     "open": stmt.excluded.open,
                     "high": stmt.excluded.high,
@@ -524,6 +567,7 @@ class DatabaseDataLoader:
         self,
         df: pl.DataFrame | pd.DataFrame,
         symbol: str | None = None,
+        timeframe: str | None = None,
         batch_size: int | None = None,
         source_timezone: str = "UTC",
     ) -> int:
@@ -549,6 +593,7 @@ class DatabaseDataLoader:
 
         batch_size = batch_size or self._batch_size
         frame = self._standardize_columns(frame)
+        default_timeframe = normalize_timeframe(timeframe or DEFAULT_TIMEFRAME)
 
         symbol_override = symbol.upper() if symbol else None
         if "symbol" not in frame.columns:
@@ -564,6 +609,19 @@ class DatabaseDataLoader:
                     .otherwise(pl.col("symbol"))
                     .alias("symbol")
                 )
+
+        if "timeframe" not in frame.columns:
+            frame = frame.with_columns(pl.lit(default_timeframe).alias("timeframe"))
+        else:
+            frame = frame.with_columns(
+                pl.col("timeframe")
+                .cast(pl.Utf8)
+                .map_elements(
+                    lambda value: normalize_timeframe(value, default=default_timeframe),
+                    return_dtype=pl.Utf8,
+                )
+                .alias("timeframe")
+            )
 
         contract = OHLCVIngestionContract(source_timezone=source_timezone)
         unique_symbols = [s for s in frame["symbol"].unique().to_list() if isinstance(s, str) and s]
@@ -596,6 +654,7 @@ class DatabaseDataLoader:
         data = {
             "timestamp": [],
             "symbol": [],
+            "timeframe": [],
             "open": [],
             "high": [],
             "low": [],
@@ -608,6 +667,7 @@ class DatabaseDataLoader:
         for bar in bars:
             data["timestamp"].append(bar.timestamp)
             data["symbol"].append(bar.symbol)
+            data["timeframe"].append(bar.timeframe)
             data["open"].append(float(bar.open))
             data["high"].append(float(bar.high))
             data["low"].append(float(bar.low))
@@ -626,6 +686,7 @@ class DatabaseDataLoader:
             record = {
                 "symbol": row["symbol"].upper() if "symbol" in row else "UNKNOWN",
                 "timestamp": row["timestamp"],
+                "timeframe": normalize_timeframe(row.get("timeframe"), default=DEFAULT_TIMEFRAME),
                 "open": self._to_decimal(row["open"]),
                 "high": self._to_decimal(row["high"]),
                 "low": self._to_decimal(row["low"]),
@@ -729,7 +790,7 @@ class DatabaseDataLoader:
 
             stmt = pg_insert(OHLCVBarModel).values(bars)
             stmt = stmt.on_conflict_do_update(
-                index_elements=["symbol", "timestamp"],
+                index_elements=["symbol", "timestamp", "timeframe"],
                 set_={
                     "open": stmt.excluded.open,
                     "high": stmt.excluded.high,
@@ -748,7 +809,7 @@ class DatabaseDataLoader:
 
             stmt = sqlite_insert(OHLCVBarModel).values(bars)
             stmt = stmt.on_conflict_do_update(
-                index_elements=["symbol", "timestamp"],
+                index_elements=["symbol", "timestamp", "timeframe"],
                 set_={
                     "open": stmt.excluded.open,
                     "high": stmt.excluded.high,

@@ -599,6 +599,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Use GPU acceleration for feature computation",
     )
     backtest_parser.add_argument(
+        "--timeframe",
+        type=str,
+        default="15Min",
+        help="Bar timeframe stored in PostgreSQL (default: 15Min)",
+    )
+    backtest_parser.add_argument(
         "--use-database",
         action="store_true",
         default=True,
@@ -607,7 +613,7 @@ For more information, visit: https://github.com/alphatrade/docs
     backtest_parser.add_argument(
         "--no-database",
         action="store_true",
-        help="Load data from CSV files instead of database",
+        help="Forbidden in institutional mode; retained for explicit fail-fast validation",
     )
     backtest_parser.set_defaults(func=cmd_backtest)
 
@@ -743,6 +749,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Do not fail replay when kill switch remains active at run end",
     )
     replay_parser.add_argument(
+        "--timeframe",
+        type=str,
+        default="15Min",
+        help="Bar timeframe stored in PostgreSQL (default: 15Min)",
+    )
+    replay_parser.add_argument(
         "--use-database",
         action="store_true",
         default=True,
@@ -751,13 +763,7 @@ For more information, visit: https://github.com/alphatrade/docs
     replay_parser.add_argument(
         "--no-database",
         action="store_true",
-        help="Load data from CSV files instead of database",
-    )
-    replay_parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=Path("data/raw"),
-        help="Data directory for file-based replay mode (default: data/raw)",
+        help="Forbidden in institutional mode; retained for explicit fail-fast validation",
     )
     replay_parser.add_argument(
         "--output",
@@ -797,6 +803,9 @@ For more information, visit: https://github.com/alphatrade/docs
         choices=[
             "xgboost",
             "lightgbm",
+            "lightgbm_ranker",
+            "xgboost_regressor",
+            "lightgbm_regressor",
             "random_forest",
             "elastic_net",
             "lstm",
@@ -829,6 +838,12 @@ For more information, visit: https://github.com/alphatrade/docs
         "--end",
         type=str,
         help="Training end date (YYYY-MM-DD)",
+    )
+    train_parser.add_argument(
+        "--timeframe",
+        type=str,
+        default="15Min",
+        help="Bar timeframe stored in PostgreSQL (default: 15Min)",
     )
     train_parser.add_argument(
         "--cv-method",
@@ -958,12 +973,12 @@ For more information, visit: https://github.com/alphatrade/docs
     train_parser.add_argument(
         "--gpu",
         action="store_true",
-        help="Deprecated: institutional mode enforces GPU automatically",
+        help="Deprecated: training auto-detects GPU acceleration",
     )
     train_parser.add_argument(
         "--use-gpu",
         action="store_true",
-        help="Deprecated: institutional mode enforces GPU automatically",
+        help="Deprecated: training auto-detects GPU acceleration",
     )
     train_parser.add_argument(
         "--no-database",
@@ -1294,6 +1309,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Skip writing computed features back to PostgreSQL for this training run",
     )
     train_parser.add_argument(
+        "--feature-set-id",
+        type=str,
+        default="default",
+        help="Optional namespace seed for feature cache scoping",
+    )
+    train_parser.add_argument(
         "--windows-fallback-features",
         action="store_true",
         help="Force deterministic fallback feature computation on Windows",
@@ -1351,6 +1372,18 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Hard promotion gate for probability of backtest overfitting (default: 0.45)",
     )
     train_parser.add_argument(
+        "--min-white-reality-stat",
+        type=float,
+        default=0.0,
+        help="Hard promotion gate for White's Reality Check statistic (default: 0.0)",
+    )
+    train_parser.add_argument(
+        "--max-white-reality-pvalue",
+        type=float,
+        default=0.10,
+        help="Hard promotion gate for White's Reality Check p-value (default: 0.10)",
+    )
+    train_parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("models"),
@@ -1376,7 +1409,7 @@ For more information, visit: https://github.com/alphatrade/docs
     data_load = data_subparsers.add_parser("load", help="Load historical data")
     data_load.add_argument(
         "--source",
-        choices=["alpaca", "csv", "database"],
+        choices=["alpaca"],
         default="alpaca",
         help="Data source (default: alpaca)",
     )
@@ -1431,7 +1464,7 @@ For more information, visit: https://github.com/alphatrade/docs
     )
     data_download.add_argument(
         "--source",
-        choices=["alpaca", "csv", "database"],
+        choices=["alpaca"],
         default="alpaca",
         help="Data source (default: alpaca)",
     )

@@ -23,6 +23,7 @@ def _base_args(**overrides):
         "end": "",
         "start_date": "",
         "end_date": "",
+        "timeframe": "15Min",
         "cv_method": "purged_kfold",
         "n_splits": 2,
         "embargo_pct": 0.01,
@@ -86,6 +87,7 @@ def _base_args(**overrides):
         "feature_materialization_batch_rows": 5000,
         "feature_reuse_min_coverage": 0.20,
         "skip_feature_persist": False,
+        "feature_set_id": "default",
         "windows_fallback_features": False,
         "disable_dynamic_no_trade_band": False,
         "execution_vol_target_daily": 0.012,
@@ -123,7 +125,7 @@ def test_run_training_uses_start_end_alias(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(start="2024-01-01", end="2024-12-31")
     exit_code = train_script.run_training(args)
@@ -146,7 +148,7 @@ def test_run_training_maps_feature_pipeline_flags(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
         feature_groups=["technical", "statistical"],
@@ -183,13 +185,48 @@ def test_run_training_maps_allow_partial_feature_fallback(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(allow_partial_feature_fallback=True, strict_feature_groups=False)
     exit_code = train_script.run_training(args)
 
     assert exit_code == 0
     assert captured["config"].allow_feature_group_fallback is True
+
+
+def test_auto_live_profile_does_not_override_explicit_cross_sectional_disable():
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        enable_cross_sectional=False,
+        cross_sectional_user_locked=True,
+        auto_live_profile_symbol_threshold=2,
+        auto_live_profile_min_years=1.0,
+    )
+    trainer = train_script.ModelTrainer(config)
+    trainer.data = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "MSFT", "AAPL", "MSFT"],
+            "timestamp": pd.to_datetime(
+                [
+                    "2021-01-01T00:00:00Z",
+                    "2021-01-01T00:00:00Z",
+                    "2023-01-01T00:00:00Z",
+                    "2023-01-01T00:00:00Z",
+                ],
+                utc=True,
+            ),
+            "open": [1.0, 1.0, 1.0, 1.0],
+            "high": [1.0, 1.0, 1.0, 1.0],
+            "low": [1.0, 1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0, 1.0],
+            "volume": [1_000.0, 1_000.0, 1_000.0, 1_000.0],
+        }
+    )
+
+    trainer._apply_live_multi_symbol_profile()
+
+    assert trainer.training_metrics["auto_live_profile_applied"] is True
+    assert trainer.config.enable_cross_sectional is False
 
 
 def test_run_training_maps_tail_risk_and_monotonic_flags(monkeypatch):
@@ -204,7 +241,7 @@ def test_run_training_maps_tail_risk_and_monotonic_flags(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
         model="lightgbm",
@@ -238,7 +275,7 @@ def test_run_training_maps_symbol_concentration_and_quality_filters(monkeypatch)
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
         objective_weight_symbol_concentration=0.33,
@@ -279,7 +316,7 @@ def test_run_training_maps_horizon_and_meta_threshold_flags(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
         primary_horizon=3,
@@ -309,7 +346,7 @@ def test_run_training_horizon_sweep_dispatch(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(model="xgboost", name="sweep", primary_horizon_sweep=[1, 5, 10])
     exit_code = train_script.run_training(args)
@@ -342,7 +379,7 @@ def test_run_training_all_dispatch(monkeypatch):
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "EnsembleTrainer", DummyEnsembleTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(model="all")
     exit_code = train_script.run_training(args)
@@ -387,7 +424,7 @@ def test_run_training_all_continues_when_one_model_fails(monkeypatch):
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "EnsembleTrainer", DummyEnsembleTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(model="all")
     exit_code = train_script.run_training(args)
@@ -2372,7 +2409,7 @@ def test_run_training_replay_manifest_overrides_cli(monkeypatch, tmp_path):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
-    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     replay_path = tmp_path / "replay_manifest.json"
     replay_path.write_text(

@@ -23,6 +23,7 @@ from quant_trading_system.backtest.replay import (
     ReplaySignalConfig,
     run_replay_scenario,
 )
+from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
 from quant_trading_system.data.loader import DataLoader
 
 
@@ -61,9 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-orders-for-slo", type=int, default=1)
     parser.add_argument("--no-fail-on-kill-switch", action="store_true")
 
+    parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)
     parser.add_argument("--use-database", action="store_true", default=True)
     parser.add_argument("--no-database", action="store_true")
-    parser.add_argument("--data-dir", type=Path, default=Path("data/raw"))
 
     parser.add_argument("--output", type=Path, help="Optional output path for replay JSON result")
     parser.add_argument("--format", choices=["text", "json"], default="text")
@@ -100,11 +101,10 @@ def _load_replay_data(
     symbols: list[str],
     start_date: datetime,
     end_date: datetime,
-    use_database: bool,
-    data_dir: Path,
+    timeframe: str,
 ) -> dict[str, pd.DataFrame]:
     """Load replay data for all symbols and normalize to pandas."""
-    loader = DataLoader(data_dir=data_dir, use_database=use_database)
+    loader = DataLoader(data_dir=Path("data/raw"), use_database=True)
     loaded: dict[str, pd.DataFrame] = {}
 
     for symbol in symbols:
@@ -113,12 +113,23 @@ def _load_replay_data(
             symbol=normalized_symbol,
             start_date=start_date,
             end_date=end_date,
+            timeframe=timeframe,
         )
         loaded[normalized_symbol] = _to_pandas_frame(frame)
 
     if not loaded:
         raise ValueError("Replay data could not be loaded for any symbol")
     return loaded
+
+
+def _verify_replay_infra() -> None:
+    """Fail-fast institutional infrastructure check for replay runs."""
+    from quant_trading_system.database.connection import get_db_manager, get_redis_manager
+
+    if not get_db_manager().health_check():
+        raise RuntimeError("PostgreSQL health check failed. Replay requires PostgreSQL.")
+    if not get_redis_manager().health_check():
+        raise RuntimeError("Redis health check failed. Replay requires Redis.")
 
 
 def run_replay(args: argparse.Namespace) -> int:
@@ -134,9 +145,17 @@ def run_replay(args: argparse.Namespace) -> int:
         print(f"End date ({args.end}) must be after start date ({args.start})", file=sys.stderr)
         return 1
 
-    use_database = bool(getattr(args, "use_database", True)) and not bool(
-        getattr(args, "no_database", False)
-    )
+    if not bool(getattr(args, "use_database", True)) or bool(getattr(args, "no_database", False)):
+        print("Institutional replay requires PostgreSQL + Redis. CSV mode is disabled.", file=sys.stderr)
+        return 1
+
+    try:
+        _verify_replay_infra()
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    timeframe = normalize_timeframe(getattr(args, "timeframe", DEFAULT_TIMEFRAME))
 
     try:
         symbols = [symbol.upper() for symbol in args.symbols]
@@ -144,8 +163,7 @@ def run_replay(args: argparse.Namespace) -> int:
             symbols=symbols,
             start_date=start_date,
             end_date=end_date,
-            use_database=use_database,
-            data_dir=Path(getattr(args, "data_dir", Path("data/raw"))),
+            timeframe=timeframe,
         )
         scenario = ReplayScenario(
             scenario_id=str(getattr(args, "scenario_id", "trading_day_replay")),

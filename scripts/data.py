@@ -721,7 +721,10 @@ class DataManager:
             from quant_trading_system.data.db_loader import get_db_loader
 
             db_loader = get_db_loader()
-            date_range = db_loader.get_date_range(symbol.upper())
+            date_range = db_loader.get_date_range(
+                symbol.upper(),
+                timeframe=getattr(self.config, "timeframe", "15Min"),
+            )
             if not date_range:
                 return None
 
@@ -1746,9 +1749,26 @@ if __name__ == "__main__":
 
     # Download command
     download_parser = subparsers.add_parser("download", help="Download market data")
+    download_parser.add_argument("--source", choices=["alpaca"], default="alpaca")
     download_parser.add_argument("--symbols", nargs="+", required=True)
+    download_parser.add_argument("--timeframe", type=str, default="15Min")
+    download_parser.add_argument("--output-dir", type=Path, default=Path("data/raw"))
+    download_parser.add_argument("--sync-db", action="store_true")
+    download_parser.add_argument("--incremental", action="store_true")
+    download_parser.add_argument("--batch-size", type=int, default=5000)
     download_parser.add_argument("--start-date", type=str)
     download_parser.add_argument("--end-date", type=str)
+
+    load_parser = subparsers.add_parser("load", help="Load market data")
+    load_parser.add_argument("--source", choices=["alpaca"], default="alpaca")
+    load_parser.add_argument("--symbols", nargs="+", required=True)
+    load_parser.add_argument("--timeframe", type=str, default="15Min")
+    load_parser.add_argument("--output-dir", type=Path, default=Path("data/raw"))
+    load_parser.add_argument("--sync-db", action="store_true")
+    load_parser.add_argument("--incremental", action="store_true")
+    load_parser.add_argument("--batch-size", type=int, default=5000)
+    load_parser.add_argument("--start-date", type=str)
+    load_parser.add_argument("--end-date", type=str)
 
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate data")
@@ -1757,6 +1777,27 @@ if __name__ == "__main__":
     # List command
     list_parser = subparsers.add_parser("list", help="List available symbols")
     list_parser.add_argument("--path", type=str, default="data/raw")
+
+    migrate_parser = subparsers.add_parser("migrate", help="Migrate CSV data into PostgreSQL")
+    migrate_parser.add_argument("--source", type=Path, default=Path("data/raw"))
+    migrate_parser.add_argument("--symbols", nargs="+")
+    migrate_parser.add_argument("--batch-size", type=int, default=50000)
+    migrate_parser.add_argument("--verify", action="store_true")
+    migrate_parser.add_argument("--source-timezone", type=str, default="America/New_York")
+    migrate_parser.add_argument("--no-resume", action="store_true")
+
+    export_training_parser = subparsers.add_parser(
+        "export-training",
+        help="Export PostgreSQL training data to parquet",
+    )
+    export_training_parser.add_argument("--output", type=Path, default=Path("data/training"))
+    export_training_parser.add_argument("--symbols", nargs="+")
+    export_training_parser.add_argument("--start-date", type=str)
+    export_training_parser.add_argument("--end-date", type=str)
+    export_training_parser.add_argument("--ohlcv-only", action="store_true")
+    export_training_parser.add_argument("--features-only", action="store_true")
+
+    subparsers.add_parser("db-status", help="Check PostgreSQL/TimescaleDB status")
 
     args = parser.parse_args()
     sys.exit(run_data_command(args))

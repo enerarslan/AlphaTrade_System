@@ -36,6 +36,8 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.declarative import declared_attr
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME
+
 
 class Base(DeclarativeBase):
     """Base class for all ORM models."""
@@ -88,6 +90,11 @@ class OHLCVBar(Base):
         DateTime(timezone=True),
         primary_key=True,
     )
+    timeframe: Mapped[str] = mapped_column(
+        String(16),
+        primary_key=True,
+        default=DEFAULT_TIMEFRAME,
+    )
     open: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
     high: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
     low: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
@@ -99,6 +106,7 @@ class OHLCVBar(Base):
     __table_args__ = (
         Index("ix_ohlcv_bars_timestamp", "timestamp", postgresql_using="btree"),
         Index("ix_ohlcv_bars_symbol", "symbol", postgresql_using="btree"),
+        Index("ix_ohlcv_bars_symbol_timeframe", "symbol", "timeframe", postgresql_using="btree"),
     )
 
     def __repr__(self) -> str:
@@ -119,6 +127,7 @@ class OHLCVBar(Base):
             return {
                 "symbol": self.symbol,
                 "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+                "timeframe": self.timeframe,
                 "open": str(self.open) if self.open else None,
                 "high": str(self.high) if self.high else None,
                 "low": str(self.low) if self.low else None,
@@ -131,6 +140,7 @@ class OHLCVBar(Base):
             return {
                 "symbol": self.symbol,
                 "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+                "timeframe": self.timeframe,
                 "open": float(self.open) if self.open else None,
                 "high": float(self.high) if self.high else None,
                 "low": float(self.low) if self.low else None,
@@ -155,11 +165,22 @@ class Feature(Base):
         DateTime(timezone=True),
         primary_key=True,
     )
+    timeframe: Mapped[str] = mapped_column(
+        String(16),
+        primary_key=True,
+        default=DEFAULT_TIMEFRAME,
+    )
     feature_name: Mapped[str] = mapped_column(String(100), primary_key=True)
+    feature_set_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        default="default",
+    )
     value: Mapped[float] = mapped_column(Float, nullable=False)
 
     __table_args__ = (
-        Index("ix_features_symbol_timestamp", "symbol", "timestamp"),
+        Index("ix_features_symbol_timestamp", "symbol", "timeframe", "timestamp"),
+        Index("ix_features_symbol_feature_set", "symbol", "timeframe", "feature_set_id"),
         Index("ix_features_feature_name", "feature_name"),
     )
 

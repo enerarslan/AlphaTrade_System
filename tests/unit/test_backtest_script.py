@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from quant_trading_system.backtest.engine import BacktestState, Trade
+from quant_trading_system.backtest.engine import BacktestState, PandasDataHandler, Trade
 from quant_trading_system.backtest.performance_attribution import PerformanceAttributionService
-from quant_trading_system.core.data_types import OrderSide
-from scripts.backtest import BacktestRunner, BacktestSession
+from quant_trading_system.core.data_types import Direction, OrderSide, Portfolio
+from scripts.backtest import BacktestRunner, BacktestSession, SignalBasedStrategy, run_backtest
 
 
 def test_performance_attribution_compute_attribution_accepts_backtest_state():
@@ -129,3 +129,70 @@ def test_backtest_runner_passes_benchmark_returns_to_analyzer(monkeypatch):
     benchmark_returns = captured.get("benchmark_returns")
     assert benchmark_returns is not None
     assert len(benchmark_returns) == 2
+
+
+def test_signal_based_strategy_uses_bar_timestamp_lookup():
+    t0 = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(minutes=15)
+    handler = PandasDataHandler(
+        {
+            "AAPL": pd.DataFrame(
+                {
+                    "open": [100.0, 100.0],
+                    "high": [101.0, 101.0],
+                    "low": [99.0, 99.0],
+                    "close": [100.0, 100.0],
+                    "volume": [1_000_000, 1_000_000],
+                },
+                index=pd.DatetimeIndex([t0, t1]),
+            )
+        }
+    )
+    strategy = SignalBasedStrategy(
+        {
+            "AAPL": pd.DataFrame(
+                {"signal": [0.0, -0.8]},
+                index=pd.DatetimeIndex([t0, t1]),
+            )
+        },
+        signal_threshold=0.1,
+    )
+    portfolio = Portfolio(
+        equity=Decimal("100000"),
+        cash=Decimal("100000"),
+        buying_power=Decimal("100000"),
+        positions={},
+    )
+
+    assert handler.update_bars() is True
+    assert strategy.generate_signals(handler, portfolio) == []
+
+    assert handler.update_bars() is True
+    signals = strategy.generate_signals(handler, portfolio)
+
+    assert len(signals) == 1
+    assert signals[0].direction == Direction.SHORT
+    assert signals[0].timestamp == t1
+
+
+def test_run_backtest_rejects_csv_mode():
+    args = SimpleNamespace(
+        start="2025-01-01",
+        end="2025-01-02",
+        symbols=["AAPL"],
+        capital=100000.0,
+        strategy="momentum",
+        execution_mode="realistic",
+        gpu=False,
+        timeframe="15Min",
+        use_database=True,
+        no_database=True,
+        benchmark=None,
+        slippage_bps=5.0,
+        commission_bps=1.0,
+        monte_carlo=0,
+        output=None,
+        log_level="INFO",
+    )
+
+    assert run_backtest(args) == 1
