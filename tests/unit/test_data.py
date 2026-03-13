@@ -205,6 +205,19 @@ class TestDataLoader:
                 loader.load_symbol("AAPL")
 
 
+class TestDataAccessLayer:
+    """Tests for the unified runtime data access layer."""
+
+    def test_data_access_defaults_disable_file_fallback(self):
+        """Institutional runtime should not silently fall back to files."""
+        from quant_trading_system.data.data_access import DataAccessConfig
+
+        config = DataAccessConfig()
+
+        assert config.use_database is True
+        assert config.fallback_to_files is False
+
+
 class TestParquetDataStore:
     """Tests for ParquetDataStore class."""
 

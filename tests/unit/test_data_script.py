@@ -197,3 +197,47 @@ def test_download_data_uses_alpaca_next_page_token(monkeypatch):
     assert len(result["AAPL"]) == 2
     assert fake_client.calls[0].get("page_token") is None
     assert fake_client.calls[1].get("page_token") == "tok_1"
+
+
+def test_data_manager_load_symbol_requires_database(monkeypatch):
+    class _FakePolarsFrame:
+        def to_pandas(self):
+            return pd.DataFrame(
+                {
+                    "timestamp": [datetime(2026, 1, 2, 14, 0, tzinfo=timezone.utc)],
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1000],
+                }
+            )
+
+    class _FakeDbLoader:
+        def __init__(self):
+            self.calls: list[tuple[str, datetime | None, datetime | None, str]] = []
+
+        def load_symbol(self, symbol, start_date=None, end_date=None, timeframe="15Min"):
+            self.calls.append((symbol, start_date, end_date, timeframe))
+            return _FakePolarsFrame()
+
+        def get_available_symbols(self, timeframe="15Min"):
+            return ["AAPL", "MSFT"]
+
+    fake_loader = _FakeDbLoader()
+    manager = data_script.DataManager(
+        data_script.DataConfig(
+            symbols=["AAPL"],
+            timeframe="15Min",
+            use_database=True,
+        )
+    )
+    monkeypatch.setattr(manager, "_get_db_loader", lambda: fake_loader)
+
+    frame = manager.load_symbol("AAPL", "2026-01-02", "2026-01-03")
+    symbols = manager.get_available_symbols()
+
+    assert len(frame) == 1
+    assert symbols == ["AAPL", "MSFT"]
+    assert fake_loader.calls[0][0] == "AAPL"
+    assert fake_loader.calls[0][3] == "15Min"

@@ -87,7 +87,7 @@ class DataConfig:
     outlier_std: float = 5.0
 
     # Database settings
-    use_database: bool = False
+    use_database: bool = True
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "alphatrade"
@@ -123,6 +123,7 @@ class DataManager:
         self.config = config
         self.logger = logging.getLogger("DataManager")
         self.data_cache: dict[str, pd.DataFrame] = {}
+        self._db_loader = None
 
     # ========================================================================
     # DATA LOADING
@@ -152,41 +153,33 @@ class DataManager:
         if cache_key in self.data_cache:
             return self.data_cache[cache_key]
 
-        # Try different data sources
-        df = None
+        if not self.config.use_database:
+            raise RuntimeError(
+                "Institutional data workflows require PostgreSQL. "
+                "File-based reads are disabled."
+            )
 
-        # Try internal loader first
-        try:
-            from quant_trading_system.data.loader import DataLoader
-
-            data_dir = PROJECT_ROOT / "data" / "raw"
-            loader = DataLoader(data_dir=data_dir)
-            df = loader.load_symbol(symbol, start_date, end_date)
-        except ImportError:
-            pass
-
-        # Fallback to CSV
-        if df is None:
-            df = self._load_from_csv(symbol)
-
-        # Fallback to Parquet
-        if df is None:
-            df = self._load_from_parquet(symbol)
-
-        if df is None:
-            raise FileNotFoundError(f"No data found for symbol: {symbol}")
-
-        # Filter by date range
-        if start_date:
-            start_dt = pd.to_datetime(start_date)
-            df = df[df["timestamp"] >= start_dt]
-        if end_date:
-            end_dt = pd.to_datetime(end_date)
-            df = df[df["timestamp"] <= end_dt]
+        start_dt = self._parse_datetime_utc(start_date)
+        end_dt = self._parse_datetime_utc(end_date, end_of_day=True)
+        db_loader = self._get_db_loader()
+        df = db_loader.load_symbol(
+            symbol.upper(),
+            start_date=start_dt,
+            end_date=end_dt,
+            timeframe=self.config.timeframe,
+        ).to_pandas()
 
         # Cache and return
         self.data_cache[cache_key] = df
         return df
+
+    def _get_db_loader(self):
+        """Get the PostgreSQL-backed loader for institutional workflows."""
+        if self._db_loader is None:
+            from quant_trading_system.data.db_loader import get_db_loader
+
+            self._db_loader = get_db_loader()
+        return self._db_loader
 
     def _load_from_csv(self, symbol: str) -> pd.DataFrame | None:
         """Load data from CSV file."""
@@ -245,21 +238,15 @@ class DataManager:
 
     def get_available_symbols(self) -> list[str]:
         """Get list of available symbols."""
-        symbols = set()
+        if not self.config.use_database:
+            raise RuntimeError(
+                "Institutional data workflows require PostgreSQL. "
+                "File-based symbol discovery is disabled."
+            )
 
-        # Check CSV files
-        raw_dir = Path(self.config.raw_data_dir)
-        if raw_dir.exists():
-            for csv_file in raw_dir.glob("*.csv"):
-                symbols.add(csv_file.stem.upper())
-
-        # Check Parquet files
-        processed_dir = Path(self.config.processed_data_dir)
-        if processed_dir.exists():
-            for pq_file in processed_dir.glob("*.parquet"):
-                symbols.add(pq_file.stem.upper())
-
-        return sorted(list(symbols))
+        return sorted(
+            self._get_db_loader().get_available_symbols(timeframe=self.config.timeframe)
+        )
 
     # ========================================================================
     # DATA VALIDATION

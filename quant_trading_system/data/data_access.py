@@ -1,9 +1,8 @@
 """
 Unified data access layer for AlphaTrade System.
 
-Provides a single interface for accessing data from multiple sources:
-- PostgreSQL + TimescaleDB (primary source of truth)
-- File-based storage (CSV, Parquet - fallback)
+Provides a single interface for accessing institutional trading data:
+- PostgreSQL + TimescaleDB (source of truth)
 - Redis cache (hot data for live trading)
 
 This layer abstracts the underlying data sources and provides:
@@ -42,7 +41,7 @@ class DataAccessConfig:
     def __init__(
         self,
         use_database: bool = True,
-        fallback_to_files: bool = True,
+        fallback_to_files: bool = False,
         data_dir: Path | None = None,
         training_data_dir: Path | None = None,
     ):
@@ -52,6 +51,7 @@ class DataAccessConfig:
         Args:
             use_database: Whether to use PostgreSQL as primary source.
             fallback_to_files: Whether to fall back to files if DB fails.
+                Institutional runtime should keep this disabled.
             data_dir: Directory for raw data files.
             training_data_dir: Directory for training Parquet files.
         """
@@ -63,7 +63,7 @@ class DataAccessConfig:
 
 class DataAccessLayer:
     """
-    Unified data access layer with database + file fallback.
+    Unified data access layer with PostgreSQL as the primary runtime source.
 
     Provides consistent interface for accessing OHLCV data, features,
     orders, and positions from the appropriate source.
@@ -164,7 +164,7 @@ class DataAccessLayer:
                     symbol, start_date, end_date
                 )
             except DataNotFoundError:
-                logger.info(f"No database data for {symbol}, trying files")
+                logger.info(f"No database data for {symbol}")
             except Exception as e:
                 logger.warning(f"Database error for {symbol}: {e}")
 
@@ -192,6 +192,11 @@ class DataAccessLayer:
                     return df
                 except Exception as e:
                     logger.warning(f"Parquet read error for {symbol}: {e}")
+
+        if self.config.use_database and not self.config.fallback_to_files:
+            raise DataNotFoundError(
+                f"No PostgreSQL data found for {symbol}. File fallback is disabled."
+            )
 
         raise DataNotFoundError(f"No data found for {symbol} from any source")
 
@@ -346,7 +351,7 @@ def get_data_access(config: DataAccessConfig | None = None) -> DataAccessLayer:
 
 def configure_data_access(
     use_database: bool = True,
-    fallback_to_files: bool = True,
+    fallback_to_files: bool = False,
     data_dir: Path | str | None = None,
 ) -> DataAccessLayer:
     """
