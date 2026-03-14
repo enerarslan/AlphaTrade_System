@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import pandas as pd
 
 from quant_trading_system.core.reproducibility import child_seed, set_global_seed
 from quant_trading_system.models.base import ModelType, TradingModel
@@ -639,6 +640,7 @@ class FutureLeakValidator:
         train_timestamps: np.ndarray,
         test_timestamps: np.ndarray,
         gap_bars: int = 0,
+        reference_timestamps: np.ndarray | None = None,
     ) -> tuple[bool, list[str]]:
         """
         Validate that train/test split respects time ordering.
@@ -647,6 +649,8 @@ class FutureLeakValidator:
             train_timestamps: Timestamps of training data
             test_timestamps: Timestamps of test data
             gap_bars: Expected gap between train and test
+            reference_timestamps: Optional full ordered timeline used to verify
+                embargo/purge gap in bar space instead of wall-clock time.
 
         Returns:
             Tuple of (is_valid, list of messages)
@@ -658,13 +662,25 @@ class FutureLeakValidator:
             issues.append("Empty train or test timestamps")
             return False, issues
 
-        # Get max train timestamp and min test timestamp
-        if hasattr(train_timestamps[0], 'timestamp'):
-            train_max = max(t.timestamp() for t in train_timestamps)
-            test_min = min(t.timestamp() for t in test_timestamps)
-        else:
-            train_max = np.max(train_timestamps)
-            test_min = np.min(test_timestamps)
+        def _coerce(values: np.ndarray, label: str) -> tuple[np.ndarray, bool]:
+            series = pd.Series(np.asarray(values).reshape(-1))
+            timestamps = pd.to_datetime(series, utc=True, errors="coerce")
+            if not timestamps.isna().any():
+                return pd.DatetimeIndex(timestamps).asi8, True
+
+            numeric = pd.to_numeric(series, errors="coerce")
+            if numeric.isna().any():
+                raise ValueError(f"{label} contains values that are neither temporal nor numeric")
+            return numeric.to_numpy(dtype=float), False
+
+        try:
+            train_numeric, is_temporal = _coerce(train_timestamps, "train_timestamps")
+            test_numeric, _ = _coerce(test_timestamps, "test_timestamps")
+        except ValueError as exc:
+            return False, [str(exc)]
+
+        train_max = np.max(train_numeric)
+        test_min = np.min(test_numeric)
 
         if train_max >= test_min:
             issues.append(
@@ -672,6 +688,41 @@ class FutureLeakValidator:
                 f"but test data starts at {test_min}. Train must precede test!"
             )
             is_valid = False
+
+        if is_valid and gap_bars > 0:
+            realized_gap: int | None = None
+
+            if reference_timestamps is not None and len(reference_timestamps) > 0:
+                try:
+                    reference_numeric, _ = _coerce(reference_timestamps, "reference_timestamps")
+                except ValueError as exc:
+                    issues.append(str(exc))
+                    return False, issues
+
+                ordered_reference = np.sort(np.unique(reference_numeric))
+                train_pos = np.searchsorted(ordered_reference, train_max, side="right") - 1
+                test_pos = np.searchsorted(ordered_reference, test_min, side="left")
+                if 0 <= train_pos < len(ordered_reference) and 0 <= test_pos < len(ordered_reference):
+                    realized_gap = max(0, int(test_pos - train_pos - 1))
+            else:
+                combined = np.sort(np.unique(np.concatenate([train_numeric, test_numeric])))
+                positive_diffs = np.diff(combined)
+                positive_diffs = positive_diffs[positive_diffs > 0]
+                if positive_diffs.size > 0:
+                    cadence = float(np.median(positive_diffs))
+                    if cadence > 0:
+                        realized_gap = max(
+                            0,
+                            int(np.floor((float(test_min) - float(train_max)) / cadence) - 1),
+                        )
+
+            if realized_gap is not None and realized_gap < int(gap_bars):
+                unit_label = "bars" if is_temporal else "steps"
+                issues.append(
+                    f"GAP VIOLATION: Expected at least {int(gap_bars)} empty {unit_label} "
+                    f"between train and test, found {realized_gap}."
+                )
+                is_valid = False
 
         return is_valid, issues
 

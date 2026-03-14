@@ -589,18 +589,14 @@ class DatabaseManager:
         self.logger.info("Running database migrations...")
 
         try:
-            from quant_trading_system.database.connection import get_connection
+            from quant_trading_system.database.connection import DatabaseManager as AppDatabaseManager
             from quant_trading_system.database.models import Base
 
-            import asyncio
-
-            async def run_migrations():
-                engine = await get_connection()
-                async with engine.begin() as conn:
-                    await conn.run_sync(Base.metadata.create_all)
-                return True
-
-            return asyncio.run(run_migrations())
+            db = AppDatabaseManager()
+            with db.engine.begin() as conn:
+                Base.metadata.create_all(bind=conn)
+            db.close()
+            return True
 
         except ImportError:
             self.logger.warning("Database module not available, skipping migrations")
@@ -1117,8 +1113,15 @@ def run_deploy_command(args: argparse.Namespace) -> int:
 def run_deployment(args: argparse.Namespace) -> int:
     """Compatibility wrapper for `main.py` deploy command argument schema."""
     # main.py uses `operation` and `action`; standalone script uses deploy_command/docker_action.
-    if getattr(args, "deploy_command", None) is None and getattr(args, "operation", None):
-        setattr(args, "deploy_command", getattr(args, "operation"))
+    operation = getattr(args, "operation", None)
+    if getattr(args, "deploy_command", None) is None and operation:
+        # `main.py deploy migrate` is modeled as a top-level operation, but the
+        # deployment script expects the database subcommand shape (`db migrate`).
+        if operation == "migrate":
+            setattr(args, "deploy_command", "db")
+            setattr(args, "db_action", "migrate")
+        else:
+            setattr(args, "deploy_command", operation)
     if getattr(args, "docker_action", None) is None and getattr(args, "action", None):
         setattr(args, "docker_action", getattr(args, "action"))
     if getattr(args, "k8s_action", None) is None and getattr(args, "action", None) and getattr(args, "deploy_command", "") == "k8s":

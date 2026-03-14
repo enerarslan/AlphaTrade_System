@@ -45,7 +45,7 @@ import sys
 import time
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +61,7 @@ from quant_trading_system.models.training_lineage import (
     build_data_quality_report,
     build_snapshot_manifest,
     compute_data_quality_hash,
+    estimate_missing_bars_count,
     load_registry_entries,
     persist_active_model_pointer,
     persist_snapshot_bundle,
@@ -151,6 +152,7 @@ def _compute_feature_pipeline_fingerprint() -> str:
         PROJECT_ROOT / "quant_trading_system" / "features" / "feature_pipeline.py",
         PROJECT_ROOT / "quant_trading_system" / "features" / "optimized_pipeline.py",
         PROJECT_ROOT / "quant_trading_system" / "features" / "cross_sectional.py",
+        PROJECT_ROOT / "quant_trading_system" / "features" / "reference.py",
     ]
     for file_path in candidate_files:
         if not file_path.exists():
@@ -203,6 +205,37 @@ def _load_replay_manifest(replay_manifest_path: Path) -> dict[str, Any]:
         "manifest": manifest,
         "training_config": training_config,
     }
+
+
+def _load_symbols_file(symbols_file: Path) -> list[str]:
+    """Load symbols from newline/comma separated text or JSON payloads."""
+    path = Path(symbols_file)
+    raw_text = path.read_text(encoding="utf-8")
+    stripped = raw_text.strip()
+    if not stripped:
+        return []
+
+    payload: Any | None = None
+    if stripped[0] in "[{":
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+
+    candidates: list[Any]
+    if isinstance(payload, dict):
+        candidates = payload.get("symbols", [])
+    elif isinstance(payload, list):
+        candidates = payload
+    else:
+        candidates = re.split(r"[\s,;]+", raw_text)
+
+    symbols: list[str] = []
+    for raw_symbol in candidates:
+        normalized = str(raw_symbol).strip().upper()
+        if normalized and normalized not in symbols:
+            symbols.append(normalized)
+    return symbols
 
 
 def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, Any]:
@@ -496,6 +529,8 @@ class TrainingConfig:
     feature_groups: list[str] = field(
         default_factory=lambda: ["technical", "statistical", "microstructure", "cross_sectional"]
     )
+    enable_reference_features: bool = True
+    adjust_prices_for_corporate_actions: bool = True
     enable_cross_sectional: bool = True
     cross_sectional_user_locked: bool = False
     max_cross_sectional_symbols: int = 20
@@ -605,6 +640,8 @@ class TrainingConfig:
         self.feature_groups = [str(g).strip().lower() for g in self.feature_groups if str(g).strip()]
         if not self.feature_groups:
             self.feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
+        self.enable_reference_features = bool(self.enable_reference_features)
+        self.adjust_prices_for_corporate_actions = bool(self.adjust_prices_for_corporate_actions)
 
     def to_trading_cost_model(self) -> TradingCostModel:
         """Build canonical execution cost model from training configuration."""
@@ -803,6 +840,7 @@ class ModelTrainer:
                 "Disable is not allowed."
             )
         self._load_data_from_postgres()
+        self._apply_corporate_action_adjustments()
         self._sanitize_loaded_data()
         self._apply_symbol_universe_filters()
         self._capture_data_quality_report()
@@ -983,6 +1021,158 @@ class ModelTrainer:
             f"extreme_return_removed={extreme_return_count}"
         )
 
+    def _load_corporate_actions_for_adjustment(
+        self,
+        *,
+        symbols: list[str],
+        min_trade_date: date,
+        max_trade_date: date,
+    ) -> pd.DataFrame:
+        """Load dividend and split actions needed for OHLCV back-adjustment."""
+        from sqlalchemy import select
+        from quant_trading_system.database.connection import get_db_manager
+        from quant_trading_system.database.models import CorporateAction
+
+        if not symbols:
+            return pd.DataFrame(columns=["symbol", "action_type", "ex_date", "amount", "split_ratio"])
+
+        db_manager = get_db_manager()
+        with db_manager.session() as session:
+            rows = list(
+                session.execute(
+                    select(
+                        CorporateAction.symbol,
+                        CorporateAction.action_type,
+                        CorporateAction.ex_date,
+                        CorporateAction.amount,
+                        CorporateAction.split_from,
+                        CorporateAction.split_to,
+                    ).where(
+                        CorporateAction.symbol.in_(symbols),
+                        CorporateAction.ex_date >= min_trade_date,
+                        CorporateAction.ex_date <= max_trade_date,
+                    )
+                ).all()
+            )
+
+        if not rows:
+            return pd.DataFrame(columns=["symbol", "action_type", "ex_date", "amount", "split_ratio"])
+
+        actions = pd.DataFrame(
+            rows,
+            columns=["symbol", "action_type", "ex_date", "amount", "split_from", "split_to"],
+        )
+        actions["symbol"] = actions["symbol"].astype(str).str.upper().str.strip()
+        actions["action_type"] = actions["action_type"].astype(str).str.upper().str.strip()
+        actions["amount"] = pd.to_numeric(actions["amount"], errors="coerce").fillna(0.0)
+        split_from = pd.to_numeric(actions["split_from"], errors="coerce")
+        split_to = pd.to_numeric(actions["split_to"], errors="coerce")
+        denominator = split_from.replace(0.0, np.nan)
+        split_ratio = (split_to / denominator).replace([np.inf, -np.inf], np.nan)
+        missing_ratio = split_ratio.isna()
+        split_ratio.loc[missing_ratio] = split_to.loc[missing_ratio]
+        actions["split_ratio"] = split_ratio.fillna(0.0)
+        return actions[["symbol", "action_type", "ex_date", "amount", "split_ratio"]].copy()
+
+    def _apply_corporate_action_adjustments(self) -> None:
+        """Back-adjust OHLCV history for splits and dividends before training."""
+        if (
+            not bool(self.config.adjust_prices_for_corporate_actions)
+            or self.data is None
+            or self.data.empty
+        ):
+            return
+
+        df = self.data.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["symbol", "timestamp"]).copy()
+        if df.empty:
+            return
+
+        symbols = sorted(df["symbol"].astype(str).str.upper().str.strip().unique().tolist())
+        min_trade_date = pd.Timestamp(df["timestamp"].min()).date()
+        max_trade_date = pd.Timestamp(df["timestamp"].max()).date()
+        actions = self._load_corporate_actions_for_adjustment(
+            symbols=symbols,
+            min_trade_date=min_trade_date,
+            max_trade_date=max_trade_date,
+        )
+        if actions.empty:
+            self.training_metrics["corporate_action_adjustment_split_events"] = 0.0
+            self.training_metrics["corporate_action_adjustment_dividend_events"] = 0.0
+            self.training_metrics["corporate_action_adjustment_row_operations"] = 0.0
+            return
+
+        price_cols = ["open", "high", "low", "close"]
+        for column in [*price_cols, "volume"]:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+        split_events = 0
+        dividend_events = 0
+        adjusted_row_operations = 0
+
+        for symbol, row_index in df.groupby("symbol", sort=False).groups.items():
+            symbol_actions = actions[actions["symbol"] == symbol].sort_values("ex_date", ascending=False)
+            if symbol_actions.empty:
+                continue
+
+            symbol_frame = df.loc[row_index].sort_values("timestamp").copy()
+            symbol_timestamps = pd.to_datetime(symbol_frame["timestamp"], utc=True, errors="coerce")
+
+            for action in symbol_actions.itertuples(index=False):
+                cutoff = pd.Timestamp(action.ex_date, tz="UTC")
+                prior_mask = symbol_timestamps < cutoff
+                affected_rows = int(prior_mask.sum())
+                if affected_rows <= 0:
+                    continue
+
+                if action.action_type == "SPLIT":
+                    ratio = float(action.split_ratio)
+                    if ratio <= 0.0 or np.isclose(ratio, 1.0):
+                        continue
+                    symbol_frame.loc[prior_mask, price_cols] = (
+                        symbol_frame.loc[prior_mask, price_cols].astype(float) / ratio
+                    )
+                    symbol_frame.loc[prior_mask, "volume"] = np.round(
+                        symbol_frame.loc[prior_mask, "volume"].astype(float) * ratio
+                    )
+                    split_events += 1
+                    adjusted_row_operations += affected_rows
+                    continue
+
+                if action.action_type != "DIVIDEND":
+                    continue
+                amount = float(action.amount)
+                if amount <= 0.0:
+                    continue
+                previous_rows = symbol_frame.loc[prior_mask]
+                if previous_rows.empty:
+                    continue
+                previous_close = float(previous_rows["close"].iloc[-1])
+                if previous_close <= amount or previous_close <= 0.0:
+                    continue
+                factor = (previous_close - amount) / previous_close
+                if factor <= 0.0 or np.isclose(factor, 1.0):
+                    continue
+                symbol_frame.loc[prior_mask, price_cols] = (
+                    symbol_frame.loc[prior_mask, price_cols].astype(float) * factor
+                )
+                dividend_events += 1
+                adjusted_row_operations += affected_rows
+
+            df.loc[symbol_frame.index, [*price_cols, "volume"]] = symbol_frame[[*price_cols, "volume"]]
+
+        self.data = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+        self.training_metrics["corporate_action_adjustment_split_events"] = float(split_events)
+        self.training_metrics["corporate_action_adjustment_dividend_events"] = float(dividend_events)
+        self.training_metrics["corporate_action_adjustment_row_operations"] = float(adjusted_row_operations)
+        self.logger.info(
+            "Applied corporate action back-adjustments: splits=%d dividends=%d row_ops=%d",
+            split_events,
+            dividend_events,
+            adjusted_row_operations,
+        )
+
     @staticmethod
     def _symbol_missing_ratio(group: pd.DataFrame) -> float:
         """Estimate missing-bar ratio for one symbol stream."""
@@ -991,21 +1181,9 @@ class ModelTrainer:
         ts = pd.to_datetime(group["timestamp"], utc=True, errors="coerce").dropna().sort_values()
         if len(ts) < 2:
             return 0.0
-        diffs = ts.diff().dropna().dt.total_seconds()
-        positive_diffs = diffs[diffs > 0]
-        if positive_diffs.empty:
+        missing_count, inferred_bar_seconds = estimate_missing_bars_count(ts)
+        if inferred_bar_seconds is None or inferred_bar_seconds <= 0.0:
             return 0.0
-        inferred_bar_seconds = float(np.median(positive_diffs.to_numpy()))
-        if inferred_bar_seconds <= 0:
-            return 0.0
-        regular_gap_limit = inferred_bar_seconds * 1.5
-        session_break_limit = max(inferred_bar_seconds * 24.0, 6.0 * 3600.0)
-        missing_from_gaps = np.where(
-            (positive_diffs > regular_gap_limit) & (positive_diffs <= session_break_limit),
-            np.floor(positive_diffs / inferred_bar_seconds) - 1.0,
-            0.0,
-        )
-        missing_count = float(np.maximum(missing_from_gaps, 0.0).sum())
         expected_rows = float(len(ts) + missing_count)
         if expected_rows <= 0.0:
             return 0.0
@@ -1610,13 +1788,14 @@ class ModelTrainer:
         symbol_part = ",".join(sorted(symbols))
         groups_part = ",".join(sorted(self.config.feature_groups))
         cross_sectional_part = "1" if self.config.enable_cross_sectional else "0"
+        reference_part = "1" if self.config.enable_reference_features else "0"
         start_part = start_date.isoformat() if start_date is not None else "none"
         end_part = end_date.isoformat() if end_date is not None else "none"
         return (
             "train:features:schema:v2:"
             f"{symbol_part}:{start_part}:{end_part}:"
             f"{self.config.timeframe}:{feature_set_id}:{groups_part}:"
-            f"{cross_sectional_part}:{self.feature_pipeline_fingerprint}"
+            f"{cross_sectional_part}:{reference_part}:{self.feature_pipeline_fingerprint}"
         )
 
     def _build_feature_schema_metadata(
@@ -1630,6 +1809,7 @@ class ModelTrainer:
             "feature_names": sorted(str(name) for name in feature_names),
             "feature_groups": sorted(str(name) for name in self.config.feature_groups),
             "enable_cross_sectional": bool(self.config.enable_cross_sectional),
+            "enable_reference_features": bool(self.config.enable_reference_features),
             "timeframe": self.config.timeframe,
             "feature_set_id": feature_set_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1657,6 +1837,7 @@ class ModelTrainer:
                 "timeframe": self.config.timeframe,
                 "groups": sorted(self.config.feature_groups),
                 "cross_sectional": bool(self.config.enable_cross_sectional),
+                "reference_features": bool(self.config.enable_reference_features),
                 "pipeline_fingerprint": self.feature_pipeline_fingerprint,
             },
             sort_keys=True,
@@ -1664,6 +1845,34 @@ class ModelTrainer:
         )
         digest = hashlib.sha1(scope_payload.encode("utf-8")).hexdigest()[:12]
         return f"{namespace[:32]}_{digest}"
+
+    def _augment_reference_features(self, matrix: pd.DataFrame) -> pd.DataFrame:
+        """Augment computed market features with point-in-time reference/event layers."""
+        from quant_trading_system.features.reference import ReferenceFeatureBuilder
+
+        if matrix is None or matrix.empty:
+            return matrix
+
+        try:
+            builder = ReferenceFeatureBuilder(logger_=self.logger)
+            enriched = builder.augment(matrix)
+            added_cols = [column for column in enriched.columns if column not in matrix.columns]
+            self.logger.info(
+                "Reference feature augmentation added %d columns",
+                len(added_cols),
+            )
+            return enriched
+        except Exception as exc:
+            if self.config.allow_feature_group_fallback:
+                self.logger.warning(
+                    "Reference feature augmentation skipped due to runtime error: %s",
+                    exc,
+                )
+                return matrix
+            raise RuntimeError(
+                "Reference feature augmentation failed; institutional training requires a "
+                "deterministic point-in-time reference layer."
+            ) from exc
 
     def _compute_features_full_pipeline(self) -> None:
         """Compute institutional features with adaptive memory-safe fallback behavior."""
@@ -1793,6 +2002,8 @@ class ModelTrainer:
 
         if features_list:
             raw_features = pd.concat(features_list, ignore_index=True)
+            if self.config.enable_reference_features:
+                raw_features = self._augment_reference_features(raw_features)
             self.features = self._finalize_feature_matrix(raw_features)
             self.logger.info(
                 f"Total: {len(self.features.columns)} columns for {len(features_list)} symbols"
@@ -2432,14 +2643,14 @@ class ModelTrainer:
             raise ValueError("Timestamp array contains invalid entries after conversion")
 
         if self.row_symbols is None or len(self.row_symbols) != len(ts_series):
-            diffs = np.diff(ts_series.astype("int64", copy=False).to_numpy())
+            diffs = np.diff(pd.DatetimeIndex(ts_series).asi8)
             if np.any(diffs <= 0):
                 raise ValueError("Timestamp ordering violation detected in training data.")
             return
 
         symbol_series = pd.Series(self.row_symbols.astype(str))
         for symbol, idx in symbol_series.groupby(symbol_series).groups.items():
-            symbol_ts = ts_series.iloc[idx].astype("int64", copy=False).to_numpy()
+            symbol_ts = pd.DatetimeIndex(ts_series.iloc[idx]).asi8
             if np.any(np.diff(symbol_ts) <= 0):
                 raise ValueError(
                     f"Timestamp ordering violation for symbol {symbol}. "
@@ -2456,14 +2667,20 @@ class ModelTrainer:
         if ts_series.isna().any():
             raise ValueError("Invalid timestamps detected during panel split mapping.")
 
-        ts_ns = ts_series.astype("int64", copy=False).to_numpy()
+        ts_ns = pd.DatetimeIndex(ts_series).asi8
         unique_ts_ns = np.sort(np.unique(ts_ns))
         if len(unique_ts_ns) < 3:
             raise ValueError("Insufficient unique timestamps for panel-aware cross-validation.")
 
         unique_dummy = np.zeros((len(unique_ts_ns), 1), dtype=float)
         splits: list[tuple[np.ndarray, np.ndarray]] = []
-        for train_ts_idx, test_ts_idx in splitter.split(unique_dummy, unique_dummy[:, 0]):
+        unique_times = pd.to_datetime(unique_ts_ns, utc=True)
+        try:
+            raw_splits = splitter.split(unique_dummy, unique_dummy[:, 0], times=unique_times)
+        except TypeError:
+            raw_splits = splitter.split(unique_dummy, unique_dummy[:, 0])
+
+        for train_ts_idx, test_ts_idx in raw_splits:
             train_ts_ns = unique_ts_ns[np.asarray(train_ts_idx, dtype=int)]
             test_ts_ns = unique_ts_ns[np.asarray(test_ts_idx, dtype=int)]
 
@@ -2478,6 +2695,30 @@ class ModelTrainer:
         if not splits:
             raise ValueError("Panel-aware cross-validation produced no valid splits.")
         return splits
+
+    @staticmethod
+    def _split_with_optional_times(
+        splitter: Any,
+        X: np.ndarray,
+        y: np.ndarray,
+        times: np.ndarray | None = None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Call CV splitters with timestamps when supported."""
+        if times is None:
+            iterator = splitter.split(X, y)
+        else:
+            time_values = pd.to_datetime(times, utc=True, errors="coerce")
+            if pd.isna(time_values).any():
+                raise ValueError("Invalid timestamps detected during CV split generation.")
+            try:
+                iterator = splitter.split(X, y, times=time_values)
+            except TypeError:
+                iterator = splitter.split(X, y)
+
+        return [
+            (np.asarray(train_idx, dtype=int), np.asarray(test_idx, dtype=int))
+            for train_idx, test_idx in iterator
+        ]
 
     @staticmethod
     def _regime_distribution(regimes: np.ndarray | list[str] | None) -> dict[str, float]:
@@ -2567,10 +2808,7 @@ class ModelTrainer:
         """
         if self.timestamps is None or len(self.timestamps) != len(X):
             cv = self._get_cv_splitter(n_samples=len(X))
-            candidate_splits = [
-                (np.asarray(tr, dtype=int), np.asarray(te, dtype=int))
-                for tr, te in cv.split(X, y)
-            ]
+            candidate_splits = self._split_with_optional_times(cv, X, y, times=None)
             return candidate_splits
 
         ts_series = pd.Series(pd.to_datetime(self.timestamps, utc=True, errors="coerce"))
@@ -2585,10 +2823,7 @@ class ModelTrainer:
         )
         if not has_duplicate_ts and not has_panel_symbols:
             cv = self._get_cv_splitter(n_samples=len(X))
-            candidate_splits = [
-                (np.asarray(tr, dtype=int), np.asarray(te, dtype=int))
-                for tr, te in cv.split(X, y)
-            ]
+            candidate_splits = self._split_with_optional_times(cv, X, y, times=ts_series.to_numpy())
         else:
             cv = self._get_cv_splitter(n_samples=int(ts_series.nunique()))
             candidate_splits = self._panelize_timestamp_splits(cv, ts_series.to_numpy())
@@ -2653,12 +2888,22 @@ class ModelTrainer:
         self._validate_symbol_timestamp_ordering()
 
         splits = self._generate_cv_splits(self.features.values, self.labels.values)
+        reference_sample_count = len(self.features)
+        if self.timestamps is not None and len(self.timestamps) == len(self.features):
+            ts_reference = pd.to_datetime(self.timestamps, utc=True, errors="coerce")
+            if pd.notna(ts_reference).all():
+                reference_sample_count = int(pd.Series(ts_reference).nunique())
+        expected_gap_bars = max(
+            self._effective_cv_prediction_horizon(reference_sample_count),
+            int(self.config.purge_pct * 100),
+        )
         for fold_idx, (train_idx, test_idx) in enumerate(splits):
             if self.config.cv_method == "walk_forward":
                 valid_split, split_issues = validator.validate_time_series_split(
                     self.timestamps[train_idx],
                     self.timestamps[test_idx],
-                    gap_bars=max(self._prediction_horizon(), int(self.config.purge_pct * 100)),
+                    gap_bars=expected_gap_bars,
+                    reference_timestamps=self.timestamps,
                 )
                 if not valid_split:
                     raise ValueError(
@@ -2999,9 +3244,9 @@ class ModelTrainer:
                     "falling back to row-wise walk-forward outer splits.",
                     exc,
                 )
-                outer_splits = list(outer_cv.split(X, y))
+                outer_splits = self._split_with_optional_times(outer_cv, X, y, times=timestamps)
         else:
-            outer_splits = list(outer_cv.split(X, y))
+            outer_splits = self._split_with_optional_times(outer_cv, X, y, times=timestamps)
         if not outer_splits:
             raise ValueError("Nested walk-forward requires at least one outer split.")
 
@@ -3086,9 +3331,19 @@ class ModelTrainer:
                         outer_fold,
                         exc,
                     )
-                    inner_splits = list(inner_cv.split(X_outer_train, y_outer_train))
+                    inner_splits = self._split_with_optional_times(
+                        inner_cv,
+                        X_outer_train,
+                        y_outer_train,
+                        times=ts_outer_train,
+                    )
             else:
-                inner_splits = list(inner_cv.split(X_outer_train, y_outer_train))
+                inner_splits = self._split_with_optional_times(
+                    inner_cv,
+                    X_outer_train,
+                    y_outer_train,
+                    times=ts_outer_train,
+                )
             if not inner_splits:
                 self.logger.warning(f"Outer fold {outer_fold}: no valid inner splits, skipping fold.")
                 continue
@@ -4846,6 +5101,15 @@ class ModelTrainer:
         self._fit_final_model_full_data()
         self._evaluate_holdout_performance()
 
+    def _effective_cv_prediction_horizon(self, n_samples: int | None = None) -> int:
+        """Return the capped prediction horizon actually used by CV splitters."""
+        prediction_horizon = self._prediction_horizon()
+        requested_splits = max(1, int(self.config.n_splits))
+        if n_samples is not None:
+            horizon_cap = max(1, n_samples // max(4, requested_splits + 1))
+            prediction_horizon = min(prediction_horizon, horizon_cap)
+        return prediction_horizon
+
     def _get_cv_splitter(self, n_samples: int | None = None):
         """
         Get cross-validation splitter based on configuration.
@@ -4867,11 +5131,8 @@ class ModelTrainer:
             # Typical 15-min data has ~26 bars/day, so 2% = ~5 bars
             purge_gap = max(1, int(self.config.purge_pct * 100))  # purge_gap as integer bars
 
-            prediction_horizon = self._prediction_horizon()
+            prediction_horizon = self._effective_cv_prediction_horizon(n_samples)
             requested_splits = max(1, int(self.config.n_splits))
-            if n_samples is not None:
-                horizon_cap = max(1, n_samples // max(4, requested_splits + 1))
-                prediction_horizon = min(prediction_horizon, horizon_cap)
             if n_samples is None:
                 effective_splits = requested_splits
             elif self.config.cv_method == "walk_forward":
@@ -8459,6 +8720,11 @@ def run_training(args: argparse.Namespace) -> int:
             value = replay_config.get(key, fallback)
             return fallback if value is None else value
 
+        cli_symbols = list(getattr(args, "symbols", []) or [])
+        symbols_file_arg = getattr(args, "symbols_file", None)
+        if symbols_file_arg:
+            cli_symbols.extend(_load_symbols_file(Path(symbols_file_arg)))
+
         raw_primary_horizon_sweep = _cfg_value(
             "primary_horizon_sweep",
             getattr(args, "primary_horizon_sweep", []),
@@ -8530,7 +8796,7 @@ def run_training(args: argparse.Namespace) -> int:
             else:
                 label_horizons = [1, 5, 20]
 
-            raw_symbols = _cfg_value("symbols", getattr(args, "symbols", []))
+            raw_symbols = _cfg_value("symbols", cli_symbols)
             if isinstance(raw_symbols, (list, tuple, set)):
                 symbols = [str(s).strip().upper() for s in raw_symbols if str(s).strip()]
             elif raw_symbols:
@@ -9307,6 +9573,12 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=SUPPORTED_MODELS + ["all"])
     parser.add_argument("--name", type=str, default="")
     parser.add_argument("--symbols", nargs="+", default=[])
+    parser.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
     parser.add_argument("--start", "--start-date", dest="start_date", type=str, default="")
     parser.add_argument("--end", "--end-date", dest="end_date", type=str, default="")
     parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)

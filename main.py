@@ -830,6 +830,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Symbols to train on (default: all available symbols)",
     )
     train_parser.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
+    train_parser.add_argument(
         "--start",
         type=str,
         help="Training start date (YYYY-MM-DD)",
@@ -1416,8 +1422,14 @@ For more information, visit: https://github.com/alphatrade/docs
     data_load.add_argument(
         "--symbols",
         nargs="+",
-        required=True,
+        default=[],
         help="Symbols to load",
+    )
+    data_load.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
     )
     data_load.add_argument(
         "--start",
@@ -1471,8 +1483,14 @@ For more information, visit: https://github.com/alphatrade/docs
     data_download.add_argument(
         "--symbols",
         nargs="+",
-        required=True,
+        default=[],
         help="Symbols to load",
+    )
+    data_download.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
     )
     data_download.add_argument(
         "--start",
@@ -1511,6 +1529,109 @@ For more information, visit: https://github.com/alphatrade/docs
         default=5000,
         help="Batch size for database upserts (default: 5000)",
     )
+
+    data_bootstrap = data_subparsers.add_parser(
+        "bootstrap-free",
+        help="Bootstrap a multi-source institutional-style dataset from free providers",
+    )
+    data_bootstrap.add_argument(
+        "--broad-universe-size",
+        type=int,
+        default=250,
+        help="Target size for the broad daily universe (default: 250)",
+    )
+    data_bootstrap.add_argument(
+        "--daily-years",
+        type=int,
+        default=15,
+        help="Years of daily bars to fetch for the broad universe (default: 15)",
+    )
+    data_bootstrap.add_argument(
+        "--intraday-15m-years",
+        type=int,
+        default=5,
+        help="Years of 15-minute bars to fetch for the core universe (default: 5)",
+    )
+    data_bootstrap.add_argument(
+        "--intraday-1m-years",
+        type=int,
+        default=2,
+        help="Years of 1-minute bars to fetch for the core universe (default: 2)",
+    )
+    data_bootstrap.add_argument(
+        "--news-days",
+        type=int,
+        default=365,
+        help="Days of Alpaca news history to fetch (default: 365)",
+    )
+    data_bootstrap.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("data"),
+        help="Root directory for downloaded datasets (default: data)",
+    )
+    data_bootstrap.add_argument(
+        "--no-sync-db",
+        action="store_true",
+        help="Skip writing normalized outputs to PostgreSQL",
+    )
+    data_bootstrap.add_argument("--no-news", action="store_true", help="Skip news ingestion")
+    data_bootstrap.add_argument("--no-sec", action="store_true", help="Skip SEC filings ingestion")
+    data_bootstrap.add_argument("--no-macro", action="store_true", help="Skip macro/VIX ingestion")
+    data_bootstrap.add_argument("--no-actions", action="store_true", help="Skip corporate actions ingestion")
+    data_bootstrap.add_argument("--no-fundamentals", action="store_true", help="Skip Finnhub fundamentals/earnings")
+    data_bootstrap.add_argument("--no-daily", action="store_true", help="Skip broad-universe daily bars")
+    data_bootstrap.add_argument("--no-intraday", action="store_true", help="Skip core-universe intraday bars")
+
+    data_gap_bootstrap = data_subparsers.add_parser(
+        "bootstrap-gap-free",
+        help="Bootstrap missing institutional-style free data layers",
+    )
+    data_gap_bootstrap.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("data"),
+        help="Root directory for downloaded datasets (default: data)",
+    )
+    data_gap_bootstrap.add_argument(
+        "--quote-trade-days",
+        type=int,
+        default=1,
+        help="Recent trading days of SIP quotes/trades to capture (default: 1)",
+    )
+    data_gap_bootstrap.add_argument(
+        "--quote-trade-symbol-limit",
+        type=int,
+        default=12,
+        help="Maximum number of core symbols for SIP quote/trade capture (default: 12)",
+    )
+    data_gap_bootstrap.add_argument(
+        "--short-sale-days",
+        type=int,
+        default=30,
+        help="Recent trading days of FINRA short-sale files to capture (default: 30)",
+    )
+    data_gap_bootstrap.add_argument(
+        "--ftd-periods",
+        type=int,
+        default=4,
+        help="Recent SEC FTD half-month periods to capture (default: 4)",
+    )
+    data_gap_bootstrap.add_argument(
+        "--alfred-years",
+        type=int,
+        default=15,
+        help="Historical years of ALFRED vintages to capture (default: 15)",
+    )
+    data_gap_bootstrap.add_argument(
+        "--no-sync-db",
+        action="store_true",
+        help="Skip writing normalized outputs to PostgreSQL",
+    )
+    data_gap_bootstrap.add_argument("--no-quotes-trades", action="store_true", help="Skip SIP quote/trade capture")
+    data_gap_bootstrap.add_argument("--no-short-sale", action="store_true", help="Skip FINRA short-sale capture")
+    data_gap_bootstrap.add_argument("--no-ftd", action="store_true", help="Skip SEC fails-to-deliver capture")
+    data_gap_bootstrap.add_argument("--no-alfred", action="store_true", help="Skip ALFRED vintage capture")
 
     # data validate
     data_validate = data_subparsers.add_parser("validate", help="Validate data quality")
@@ -1607,6 +1728,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Symbols to export (default: all)",
     )
     data_export_training.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
+    data_export_training.add_argument(
         "--start",
         type=str,
         help="Start date (YYYY-MM-DD)",
@@ -1625,6 +1752,38 @@ For more information, visit: https://github.com/alphatrade/docs
         "--features-only",
         action="store_true",
         help="Export only feature data (no OHLCV)",
+    )
+    data_export_training.add_argument(
+        "--timeframe",
+        type=str,
+        default="15Min",
+        help="Bar timeframe namespace (default: 15Min)",
+    )
+    data_export_training.add_argument(
+        "--feature-set-id",
+        type=str,
+        default="default",
+        help="Feature namespace to export (default: default)",
+    )
+    data_export_training.add_argument(
+        "--materialize-missing-features",
+        action="store_true",
+        help="Compute and persist missing feature rows before export.",
+    )
+    data_export_training.add_argument(
+        "--disable-reference-features",
+        action="store_true",
+        help="Disable point-in-time reference features during on-demand materialization.",
+    )
+    data_export_training.add_argument(
+        "--allow-partial-feature-fallback",
+        action="store_true",
+        help="Allow deterministic fallback if a requested feature group cannot be materialized.",
+    )
+    data_export_training.add_argument(
+        "--windows-fallback-features",
+        action="store_true",
+        help="Force the basic Windows-safe fallback feature pipeline during materialization.",
     )
 
     # data db-status - Database status check

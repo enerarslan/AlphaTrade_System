@@ -92,6 +92,42 @@ class CVSummary:
         }
 
 
+def _coerce_array(values: Any, expected_length: int, field_name: str) -> np.ndarray:
+    """Return a flat array and validate its length."""
+    if values is None:
+        raise ValueError(f"{field_name} cannot be None")
+
+    if isinstance(values, (pd.Series, pd.Index, pd.DatetimeIndex)):
+        array = values.to_numpy()
+    else:
+        array = np.asarray(values)
+
+    array = np.asarray(array).reshape(-1)
+    if len(array) != expected_length:
+        raise ValueError(
+            f"{field_name} length ({len(array)}) must match sample count ({expected_length})"
+        )
+    return array
+
+
+def _coerce_temporal_or_numeric(values: Any, expected_length: int, field_name: str) -> np.ndarray | None:
+    """Coerce temporal or numeric arrays for ordered/event-aware splitting."""
+    if values is None:
+        return None
+
+    array = _coerce_array(values, expected_length, field_name)
+
+    timestamps = pd.to_datetime(array, utc=True, errors="coerce")
+    if not pd.isna(timestamps).any():
+        return np.asarray(timestamps.astype("int64"), dtype=np.int64)
+
+    numeric = pd.to_numeric(pd.Series(array), errors="coerce")
+    if not numeric.isna().any():
+        return numeric.to_numpy(dtype=float)
+
+    return None
+
+
 # =============================================================================
 # Purged K-Fold Cross-Validation
 # =============================================================================
@@ -189,7 +225,25 @@ class PurgedKFold(BaseCrossValidator):
             Tuple of (train_indices, test_indices) for each fold.
         """
         n_samples = len(X)
-        indices = np.arange(n_samples)
+        base_indices = np.arange(n_samples, dtype=int)
+
+        ordered_values = _coerce_temporal_or_numeric(times, n_samples, "times")
+        if ordered_values is None:
+            ordered_values = np.arange(n_samples, dtype=np.int64)
+        sort_order = np.argsort(ordered_values, kind="mergesort")
+        sorted_indices = base_indices[sort_order]
+        sorted_ordered_values = ordered_values[sort_order]
+
+        event_end_values: np.ndarray | None = None
+        if groups is not None:
+            event_end_values = _coerce_temporal_or_numeric(groups, n_samples, "groups")
+            if event_end_values is None:
+                logger.warning(
+                    "PurgedKFold received non-temporal/non-numeric groups; "
+                    "falling back to positional purging for this split."
+                )
+            else:
+                event_end_values = event_end_values[sort_order]
 
         # Calculate embargo size
         test_size = n_samples // self.n_splits
@@ -201,25 +255,37 @@ class PurgedKFold(BaseCrossValidator):
             test_end = (fold + 1) * test_size if fold < self.n_splits - 1 else n_samples
 
             # Create test indices
-            test_indices = indices[test_start:test_end]
+            test_indices = sorted_indices[test_start:test_end]
 
-            # Create train indices with purging
+            # Create train indices with purging on time-ordered positions.
             train_mask = np.ones(n_samples, dtype=bool)
-
             # Remove test indices from training
             train_mask[test_start:test_end] = False
 
-            # Apply purging: remove samples before test that might overlap
-            purge_start = max(0, test_start - self.purge_gap - self.prediction_horizon)
-            purge_end = test_start
-            train_mask[purge_start:purge_end] = False
+            if event_end_values is not None and test_end > test_start:
+                test_min_time = sorted_ordered_values[test_start]
+                test_max_time = sorted_ordered_values[test_end - 1]
+                overlap_mask = (
+                    (sorted_ordered_values <= test_max_time)
+                    & (event_end_values >= test_min_time)
+                )
+                train_mask[overlap_mask] = False
+
+                if self.purge_gap > 0:
+                    purge_start = max(0, test_start - self.purge_gap)
+                    train_mask[purge_start:test_start] = False
+            else:
+                # Apply positional purging when no event window metadata is available.
+                purge_start = max(0, test_start - self.purge_gap - self.prediction_horizon)
+                purge_end = test_start
+                train_mask[purge_start:purge_end] = False
 
             # Apply embargo: remove samples after test
             embargo_start = test_end
             embargo_end = min(n_samples, test_end + embargo_size)
             train_mask[embargo_start:embargo_end] = False
 
-            train_indices = indices[train_mask]
+            train_indices = sorted_indices[train_mask]
 
             yield train_indices, test_indices
 
@@ -247,12 +313,13 @@ class PurgedKFold(BaseCrossValidator):
         train_sizes = []
         test_sizes = []
 
-        for fold_idx, (train_idx, test_idx) in enumerate(self.split(X)):
+        for fold_idx, (train_idx, test_idx) in enumerate(self.split(X, times=times)):
             test_start = fold_idx * test_size
             test_end = (fold_idx + 1) * test_size if fold_idx < self.n_splits - 1 else n_samples
 
-            purge_count = self.purge_gap + self.prediction_horizon
-            embargo_count = embargo_size
+            embargo_count = min(embargo_size, max(0, n_samples - test_end))
+            removable_without_test = n_samples - len(test_idx)
+            purge_count = max(0, removable_without_test - len(train_idx) - embargo_count)
 
             fold_result = CVFoldResult(
                 fold_index=fold_idx,
@@ -269,11 +336,13 @@ class PurgedKFold(BaseCrossValidator):
                     time_values = times.values
 
                 if len(train_idx) > 0:
-                    fold_result.train_start = pd.Timestamp(time_values[train_idx[0]])
-                    fold_result.train_end = pd.Timestamp(time_values[train_idx[-1]])
+                    train_times = pd.DatetimeIndex(time_values[train_idx])
+                    fold_result.train_start = pd.Timestamp(train_times.min())
+                    fold_result.train_end = pd.Timestamp(train_times.max())
                 if len(test_idx) > 0:
-                    fold_result.test_start = pd.Timestamp(time_values[test_idx[0]])
-                    fold_result.test_end = pd.Timestamp(time_values[test_idx[-1]])
+                    test_times = pd.DatetimeIndex(time_values[test_idx])
+                    fold_result.test_start = pd.Timestamp(test_times.min())
+                    fold_result.test_end = pd.Timestamp(test_times.max())
 
             folds.append(fold_result)
             total_purged += purge_count
@@ -394,7 +463,22 @@ class CombinatorialPurgedKFold(BaseCrossValidator):
             Tuple of (train_indices, test_indices) for each path.
         """
         n_samples = len(X)
-        indices = np.arange(n_samples)
+        ordered_values = _coerce_temporal_or_numeric(times, n_samples, "times")
+        if ordered_values is None:
+            ordered_values = np.arange(n_samples, dtype=np.int64)
+        sort_order = np.argsort(ordered_values, kind="mergesort")
+        sorted_indices = np.arange(n_samples, dtype=int)[sort_order]
+        sorted_ordered_values = ordered_values[sort_order]
+        event_end_values: np.ndarray | None = None
+        if groups is not None:
+            event_end_values = _coerce_temporal_or_numeric(groups, n_samples, "groups")
+            if event_end_values is None:
+                logger.warning(
+                    "CombinatorialPurgedKFold received non-temporal/non-numeric groups; "
+                    "falling back to positional purging for this split."
+                )
+            else:
+                event_end_values = event_end_values[sort_order]
         group_size = n_samples // self.n_splits
 
         # Get all test combinations
@@ -408,7 +492,7 @@ class CombinatorialPurgedKFold(BaseCrossValidator):
                 end = (group_idx + 1) * group_size if group_idx < self.n_splits - 1 else n_samples
                 test_mask[start:end] = True
 
-            test_indices = indices[test_mask]
+            test_indices = sorted_indices[test_mask]
 
             # Create train mask
             train_mask = ~test_mask.copy()
@@ -420,15 +504,27 @@ class CombinatorialPurgedKFold(BaseCrossValidator):
                 group_start = group_idx * group_size
                 group_end = (group_idx + 1) * group_size if group_idx < self.n_splits - 1 else n_samples
 
-                # Purge before test group
-                purge_start = max(0, group_start - self.purge_gap - self.prediction_horizon)
-                train_mask[purge_start:group_start] = False
+                if event_end_values is not None and group_end > group_start:
+                    test_min_time = sorted_ordered_values[group_start]
+                    test_max_time = sorted_ordered_values[group_end - 1]
+                    overlap_mask = (
+                        (sorted_ordered_values <= test_max_time)
+                        & (event_end_values >= test_min_time)
+                    )
+                    train_mask[overlap_mask] = False
+                    if self.purge_gap > 0:
+                        purge_start = max(0, group_start - self.purge_gap)
+                        train_mask[purge_start:group_start] = False
+                else:
+                    # Purge before test group
+                    purge_start = max(0, group_start - self.purge_gap - self.prediction_horizon)
+                    train_mask[purge_start:group_start] = False
 
                 # Embargo after test group
                 embargo_end = min(n_samples, group_end + embargo_size)
                 train_mask[group_end:embargo_end] = False
 
-            train_indices = indices[train_mask]
+            train_indices = sorted_indices[train_mask]
 
             yield train_indices, test_indices
 
@@ -538,7 +634,11 @@ class WalkForwardCV(BaseCrossValidator):
             Tuple of (train_indices, test_indices).
         """
         n_samples = len(X)
-        indices = np.arange(n_samples)
+        ordered_values = _coerce_temporal_or_numeric(times, n_samples, "times")
+        if ordered_values is None:
+            ordered_values = np.arange(n_samples, dtype=np.int64)
+        sort_order = np.argsort(ordered_values, kind="mergesort")
+        sorted_indices = np.arange(n_samples, dtype=int)[sort_order]
 
         # Calculate sizes
         initial_train_size = int(n_samples * self.train_pct)
@@ -557,7 +657,7 @@ class WalkForwardCV(BaseCrossValidator):
             if fold == self.n_splits - 1:
                 test_end = n_samples
 
-            test_indices = indices[test_start:test_end]
+            test_indices = sorted_indices[test_start:test_end]
 
             # Train indices based on window type
             if self.window_type == "expanding":
@@ -569,7 +669,7 @@ class WalkForwardCV(BaseCrossValidator):
                 train_end = max(0, test_start - self.purge_gap - self.prediction_horizon)
                 train_start = max(0, test_start - initial_train_size)
 
-            train_indices = indices[train_start:train_end]
+            train_indices = sorted_indices[train_start:train_end]
 
             # Skip if not enough training data
             if len(train_indices) < (self.min_train_size or 10):

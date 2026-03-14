@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import CustomBusinessDay
 
 SNAPSHOT_MANIFEST_SCHEMA_VERSION = "1.0.0"
 MODEL_REGISTRY_SCHEMA_VERSION = "1.0.0"
@@ -22,6 +24,8 @@ DEFAULT_DATA_QUALITY_THRESHOLDS: dict[str, float] = {
     "extreme_move_ratio_max": 0.01,
     "corporate_action_jump_ratio_max": 0.001,
 }
+_US_TRADING_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
+_DAILY_BAR_SECONDS_FLOOR = 20.0 * 3600.0
 
 
 def _canonical_hash(payload: Any) -> str:
@@ -53,6 +57,53 @@ def _safe_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return float(np.nan_to_num(casted, nan=0.0, posinf=0.0, neginf=0.0))
+
+
+def _count_missing_daily_bars(timestamps: pd.Series) -> int:
+    """Estimate missing bars for daily data without penalizing weekends/holidays."""
+    if timestamps.empty:
+        return 0
+
+    normalized = pd.to_datetime(timestamps, utc=True, errors="coerce").dropna().dt.normalize()
+    if len(normalized) < 2:
+        return 0
+
+    missing = 0
+    for prev, curr in zip(normalized.iloc[:-1], normalized.iloc[1:], strict=False):
+        if curr <= prev:
+            continue
+        expected = len(pd.date_range(prev, curr, freq=_US_TRADING_DAY))
+        if expected > 1:
+            missing += max(0, expected - 2)
+    return int(missing)
+
+
+def estimate_missing_bars_count(timestamps: pd.Series) -> tuple[int, float | None]:
+    """Estimate missing bars count and inferred bar spacing from timestamps."""
+    ts = pd.to_datetime(timestamps, utc=True, errors="coerce").dropna().sort_values()
+    if len(ts) < 2:
+        return 0, None
+
+    diffs = ts.diff().dropna().dt.total_seconds()
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.empty:
+        return 0, None
+
+    inferred_bar_seconds = float(np.median(positive_diffs.to_numpy()))
+    if inferred_bar_seconds <= 0.0:
+        return 0, None
+
+    if inferred_bar_seconds >= _DAILY_BAR_SECONDS_FLOOR:
+        return _count_missing_daily_bars(ts), inferred_bar_seconds
+
+    regular_gap_limit = inferred_bar_seconds * 1.5
+    session_break_limit = max(inferred_bar_seconds * 24.0, 6.0 * 3600.0)
+    missing_from_gaps = np.where(
+        (positive_diffs > regular_gap_limit) & (positive_diffs <= session_break_limit),
+        np.floor(positive_diffs / inferred_bar_seconds) - 1.0,
+        0.0,
+    )
+    return int(np.maximum(missing_from_gaps, 0.0).sum()), inferred_bar_seconds
 
 
 def build_data_quality_report(
@@ -97,21 +148,7 @@ def build_data_quality_report(
         inferred_bar_seconds = None
 
         if len(timestamps) >= 2:
-            diffs = timestamps.diff().dropna().dt.total_seconds()
-            positive_diffs = diffs[diffs > 0]
-            if not positive_diffs.empty:
-                inferred_bar_seconds = float(np.median(positive_diffs.to_numpy()))
-                if inferred_bar_seconds > 0:
-                    regular_gap_limit = inferred_bar_seconds * 1.5
-                    # Treat long gaps (overnight/weekend/session breaks) as non-missing.
-                    # Missing bars are counted only inside regular trading segments.
-                    session_break_limit = max(inferred_bar_seconds * 24.0, 6.0 * 3600.0)
-                    missing_from_gaps = np.where(
-                        (positive_diffs > regular_gap_limit) & (positive_diffs <= session_break_limit),
-                        np.floor(positive_diffs / inferred_bar_seconds) - 1.0,
-                        0.0,
-                    )
-                    symbol_missing = int(np.maximum(missing_from_gaps, 0.0).sum())
+            symbol_missing, inferred_bar_seconds = estimate_missing_bars_count(timestamps)
 
         returns = group["close"].pct_change()
         returns = returns.replace([np.inf, -np.inf], np.nan).dropna()

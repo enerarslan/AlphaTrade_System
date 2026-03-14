@@ -35,7 +35,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -54,6 +54,44 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("data")
+
+
+def _load_symbols_file(symbols_file: Path) -> list[str]:
+    """Load symbols from newline/comma separated text or JSON payloads."""
+    raw_text = Path(symbols_file).read_text(encoding="utf-8")
+    stripped = raw_text.strip()
+    if not stripped:
+        return []
+
+    payload = None
+    if stripped[0] in "[{":
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+
+    if isinstance(payload, dict):
+        candidates = payload.get("symbols", [])
+    elif isinstance(payload, list):
+        candidates = payload
+    else:
+        candidates = re.split(r"[\s,;]+", raw_text)
+
+    symbols: list[str] = []
+    for raw_symbol in candidates:
+        normalized = str(raw_symbol).strip().upper()
+        if normalized and normalized not in symbols:
+            symbols.append(normalized)
+    return symbols
+
+
+def _resolve_cli_symbols(args: argparse.Namespace) -> list[str]:
+    """Resolve CLI symbols from direct args plus optional file payload."""
+    symbols = list(getattr(args, "symbols", []) or [])
+    symbols_file = getattr(args, "symbols_file", None)
+    if symbols_file:
+        symbols.extend(_load_symbols_file(Path(symbols_file)))
+    return symbols
 
 # ============================================================================
 # DATA CONFIGURATION
@@ -1226,7 +1264,7 @@ def cmd_download(args: argparse.Namespace) -> int:
     end_arg = getattr(args, "end", None) or getattr(args, "end_date", None) or ""
 
     config = DataConfig(
-        symbols=getattr(args, "symbols", []),
+        symbols=_resolve_cli_symbols(args),
         start_date=start_arg,
         end_date=end_arg,
         timeframe=getattr(args, "timeframe", "15Min"),
@@ -1291,6 +1329,78 @@ def cmd_download(args: argparse.Namespace) -> int:
             return 1
 
     return asyncio.run(_download())
+
+
+def cmd_bootstrap_free(args: argparse.Namespace) -> int:
+    """Bootstrap a multi-source institutional-style research dataset."""
+    logger.info("=" * 80)
+    logger.info("INSTITUTIONAL FREE-DATA BOOTSTRAP")
+    logger.info("=" * 80)
+
+    from quant_trading_system.data.institutional_bootstrap import (
+        InstitutionalBootstrapConfig,
+        InstitutionalDataBootstrapper,
+    )
+
+    today = date.today()
+    config = InstitutionalBootstrapConfig(
+        broad_universe_size=int(getattr(args, "broad_universe_size", 250)),
+        output_root=Path(getattr(args, "output_root", "data")),
+        sync_db=not bool(getattr(args, "no_sync_db", False)),
+        daily_start=today - timedelta(days=365 * int(getattr(args, "daily_years", 15))),
+        intraday_15m_start=today - timedelta(days=365 * int(getattr(args, "intraday_15m_years", 5))),
+        intraday_1m_start=today - timedelta(days=365 * int(getattr(args, "intraday_1m_years", 2))),
+        news_start=today - timedelta(days=int(getattr(args, "news_days", 365))),
+        include_news=not bool(getattr(args, "no_news", False)),
+        include_sec=not bool(getattr(args, "no_sec", False)),
+        include_macro=not bool(getattr(args, "no_macro", False)),
+        include_corporate_actions=not bool(getattr(args, "no_actions", False)),
+        include_fundamentals=not bool(getattr(args, "no_fundamentals", False)),
+        include_daily_bars=not bool(getattr(args, "no_daily", False)),
+        include_intraday_bars=not bool(getattr(args, "no_intraday", False)),
+    )
+    bootstrapper = InstitutionalDataBootstrapper(config)
+    manifest = bootstrapper.run()
+    logger.info(
+        "Bootstrap complete: %s datasets captured, manifest written to %s",
+        len(manifest.get("datasets", {})),
+        Path(config.output_root) / "export" / "institutional_bootstrap_manifest.json",
+    )
+    return 0
+
+
+def cmd_bootstrap_gap_free(args: argparse.Namespace) -> int:
+    """Bootstrap the highest-value missing free data layers."""
+    logger.info("=" * 80)
+    logger.info("FREE GAP-DATA BOOTSTRAP")
+    logger.info("=" * 80)
+
+    from quant_trading_system.data.free_gap_loader import (
+        FreeGapBootstrapConfig,
+        FreeGapDataBootstrapper,
+    )
+
+    config = FreeGapBootstrapConfig(
+        output_root=Path(getattr(args, "output_root", "data")),
+        sync_db=not bool(getattr(args, "no_sync_db", False)),
+        quote_trade_days=int(getattr(args, "quote_trade_days", 1)),
+        quote_trade_symbol_limit=getattr(args, "quote_trade_symbol_limit", 12),
+        short_sale_days=int(getattr(args, "short_sale_days", 30)),
+        ftd_periods=int(getattr(args, "ftd_periods", 4)),
+        alfred_years=int(getattr(args, "alfred_years", 15)),
+        include_quotes_trades=not bool(getattr(args, "no_quotes_trades", False)),
+        include_short_sale=not bool(getattr(args, "no_short_sale", False)),
+        include_ftd=not bool(getattr(args, "no_ftd", False)),
+        include_alfred=not bool(getattr(args, "no_alfred", False)),
+    )
+    bootstrapper = FreeGapDataBootstrapper(config)
+    manifest = bootstrapper.run()
+    logger.info(
+        "Gap bootstrap complete: %s datasets captured, manifest written to %s",
+        len(manifest.get("datasets", {})),
+        Path(config.output_root) / "export" / "free_gap_manifest.json",
+    )
+    return 0
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -1571,9 +1681,9 @@ def cmd_export_training(args: argparse.Namespace) -> int:
         from scripts.export_training_data import export_ohlcv_data, export_features_data
 
         output_dir = Path(getattr(args, "output", "data/training"))
-        symbols = getattr(args, "symbols", None)
-        start_date = getattr(args, "start_date", None)
-        end_date = getattr(args, "end_date", None)
+        symbols = _resolve_cli_symbols(args) or None
+        start_date = getattr(args, "start_date", None) or getattr(args, "start", None)
+        end_date = getattr(args, "end_date", None) or getattr(args, "end", None)
 
         # Parse dates if provided
         if start_date and isinstance(start_date, str):
@@ -1587,12 +1697,35 @@ def cmd_export_training(args: argparse.Namespace) -> int:
         total_exported = 0
 
         if not features_only:
-            ohlcv_results = export_ohlcv_data(output_dir, symbols, start_date, end_date)
+            ohlcv_results = export_ohlcv_data(
+                output_dir,
+                symbols,
+                start_date,
+                end_date,
+                timeframe=getattr(args, "timeframe", "15Min"),
+            )
             total_exported += len(ohlcv_results)
             logger.info(f"Exported OHLCV for {len(ohlcv_results)} symbols")
 
         if not ohlcv_only:
-            features_results = export_features_data(output_dir, symbols, start_date, end_date)
+            features_results = export_features_data(
+                output_dir,
+                symbols,
+                start_date,
+                end_date,
+                timeframe=getattr(args, "timeframe", "15Min"),
+                feature_set_id=getattr(args, "feature_set_id", "default"),
+                materialize_missing=bool(getattr(args, "materialize_missing_features", False)),
+                enable_reference_features=not bool(
+                    getattr(args, "disable_reference_features", False)
+                ),
+                allow_feature_group_fallback=bool(
+                    getattr(args, "allow_partial_feature_fallback", False)
+                ),
+                windows_force_fallback_features=bool(
+                    getattr(args, "windows_fallback_features", False)
+                ),
+            )
             total_exported += len(features_results)
             logger.info(f"Exported features for {len(features_results)} symbols")
 
@@ -1708,6 +1841,8 @@ def run_data_command(args: argparse.Namespace) -> int:
     commands = {
         "load": cmd_download,
         "download": cmd_download,
+        "bootstrap-free": cmd_bootstrap_free,
+        "bootstrap-gap-free": cmd_bootstrap_gap_free,
         "validate": cmd_validate,
         "preprocess": cmd_preprocess,
         "export": cmd_export,
@@ -1737,7 +1872,13 @@ if __name__ == "__main__":
     # Download command
     download_parser = subparsers.add_parser("download", help="Download market data")
     download_parser.add_argument("--source", choices=["alpaca"], default="alpaca")
-    download_parser.add_argument("--symbols", nargs="+", required=True)
+    download_parser.add_argument("--symbols", nargs="+", default=[])
+    download_parser.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
     download_parser.add_argument("--timeframe", type=str, default="15Min")
     download_parser.add_argument("--output-dir", type=Path, default=Path("data/raw"))
     download_parser.add_argument("--sync-db", action="store_true")
@@ -1748,7 +1889,13 @@ if __name__ == "__main__":
 
     load_parser = subparsers.add_parser("load", help="Load market data")
     load_parser.add_argument("--source", choices=["alpaca"], default="alpaca")
-    load_parser.add_argument("--symbols", nargs="+", required=True)
+    load_parser.add_argument("--symbols", nargs="+", default=[])
+    load_parser.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
     load_parser.add_argument("--timeframe", type=str, default="15Min")
     load_parser.add_argument("--output-dir", type=Path, default=Path("data/raw"))
     load_parser.add_argument("--sync-db", action="store_true")
@@ -1756,6 +1903,41 @@ if __name__ == "__main__":
     load_parser.add_argument("--batch-size", type=int, default=5000)
     load_parser.add_argument("--start-date", type=str)
     load_parser.add_argument("--end-date", type=str)
+
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap-free",
+        help="Bootstrap a multi-source institutional-style dataset from free providers",
+    )
+    bootstrap_parser.add_argument("--broad-universe-size", type=int, default=250)
+    bootstrap_parser.add_argument("--daily-years", type=int, default=15)
+    bootstrap_parser.add_argument("--intraday-15m-years", type=int, default=5)
+    bootstrap_parser.add_argument("--intraday-1m-years", type=int, default=2)
+    bootstrap_parser.add_argument("--news-days", type=int, default=365)
+    bootstrap_parser.add_argument("--output-root", type=Path, default=Path("data"))
+    bootstrap_parser.add_argument("--no-sync-db", action="store_true")
+    bootstrap_parser.add_argument("--no-news", action="store_true")
+    bootstrap_parser.add_argument("--no-sec", action="store_true")
+    bootstrap_parser.add_argument("--no-macro", action="store_true")
+    bootstrap_parser.add_argument("--no-actions", action="store_true")
+    bootstrap_parser.add_argument("--no-fundamentals", action="store_true")
+    bootstrap_parser.add_argument("--no-daily", action="store_true")
+    bootstrap_parser.add_argument("--no-intraday", action="store_true")
+
+    gap_bootstrap_parser = subparsers.add_parser(
+        "bootstrap-gap-free",
+        help="Bootstrap missing institutional-style free data layers",
+    )
+    gap_bootstrap_parser.add_argument("--output-root", type=Path, default=Path("data"))
+    gap_bootstrap_parser.add_argument("--quote-trade-days", type=int, default=1)
+    gap_bootstrap_parser.add_argument("--quote-trade-symbol-limit", type=int, default=12)
+    gap_bootstrap_parser.add_argument("--short-sale-days", type=int, default=30)
+    gap_bootstrap_parser.add_argument("--ftd-periods", type=int, default=4)
+    gap_bootstrap_parser.add_argument("--alfred-years", type=int, default=15)
+    gap_bootstrap_parser.add_argument("--no-sync-db", action="store_true")
+    gap_bootstrap_parser.add_argument("--no-quotes-trades", action="store_true")
+    gap_bootstrap_parser.add_argument("--no-short-sale", action="store_true")
+    gap_bootstrap_parser.add_argument("--no-ftd", action="store_true")
+    gap_bootstrap_parser.add_argument("--no-alfred", action="store_true")
 
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate data")
@@ -1779,10 +1961,22 @@ if __name__ == "__main__":
     )
     export_training_parser.add_argument("--output", type=Path, default=Path("data/training"))
     export_training_parser.add_argument("--symbols", nargs="+")
+    export_training_parser.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
     export_training_parser.add_argument("--start-date", type=str)
     export_training_parser.add_argument("--end-date", type=str)
+    export_training_parser.add_argument("--timeframe", type=str, default="15Min")
+    export_training_parser.add_argument("--feature-set-id", type=str, default="default")
     export_training_parser.add_argument("--ohlcv-only", action="store_true")
     export_training_parser.add_argument("--features-only", action="store_true")
+    export_training_parser.add_argument("--materialize-missing-features", action="store_true")
+    export_training_parser.add_argument("--disable-reference-features", action="store_true")
+    export_training_parser.add_argument("--allow-partial-feature-fallback", action="store_true")
+    export_training_parser.add_argument("--windows-fallback-features", action="store_true")
 
     subparsers.add_parser("db-status", help="Check PostgreSQL/TimescaleDB status")
 

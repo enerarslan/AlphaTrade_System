@@ -24,10 +24,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+# Ensure direct os.environ readers see values from the project .env file,
+# even when modules are imported outside main.py.
+load_dotenv(override=True)
 
 
 # Base paths

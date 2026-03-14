@@ -105,10 +105,9 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Local assistant/tooling folders
-.claude/
+# Local assistant/tooling folders (keep .claude/ and CLAUDE.md tracked)
+.claude/settings.local.json
 /AGENTS.md
-/CLAUDE.md
 
 # Local OpenClaw workspace guidance files
 /.openclaw/

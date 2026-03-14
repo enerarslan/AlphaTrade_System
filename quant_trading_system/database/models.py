@@ -11,7 +11,7 @@ Defines all database tables including:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -186,6 +186,349 @@ class Feature(Base):
 
     def __repr__(self) -> str:
         return f"<Feature({self.symbol}, {self.feature_name}={self.value})>"
+
+
+# =============================================================================
+# Market Intelligence / Reference Data Models
+# =============================================================================
+
+
+class SecurityMaster(Base, TimestampMixin):
+    """Reference master for tradable instruments."""
+
+    __tablename__ = "security_master"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    exchange: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    asset_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    ipo_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    delisting_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sector: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    industry: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    market_cap: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+    shares_outstanding: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+    cik: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="mixed", index=True)
+    security_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_security_master_exchange_status", "exchange", "status"),
+    )
+
+
+class CorporateAction(Base, TimestampMixin):
+    """Dividend and split events for point-in-time adjustment workflows."""
+
+    __tablename__ = "corporate_actions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    ex_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    record_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    payment_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    declaration_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    split_from: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    split_to: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="mixed", index=True)
+    action_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "action_type",
+            "ex_date",
+            "source",
+            name="uq_corporate_actions_symbol_type_date_source",
+        ),
+        Index("ix_corporate_actions_symbol_type_date", "symbol", "action_type", "ex_date"),
+    )
+
+
+class FundamentalSnapshot(Base, TimestampMixin):
+    """Daily snapshots of slowly changing fundamental state."""
+
+    __tablename__ = "fundamental_snapshots"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    as_of_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32), primary_key=True, default="mixed")
+    market_cap: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+    shares_outstanding: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+    pe_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    peg_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_to_book: Mapped[float | None] = mapped_column(Float, nullable=True)
+    eps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    book_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dividend_per_share: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dividend_yield: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revenue_ttm: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+    gross_profit_ttm: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+    operating_margin_ttm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    beta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    week_52_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    week_52_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    analyst_target_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fundamentals_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_fundamental_snapshots_symbol_source", "symbol", "source"),
+    )
+
+
+class EarningsEvent(Base, TimestampMixin):
+    """Earnings history and event metadata."""
+
+    __tablename__ = "earnings_events"
+
+    symbol: Mapped[str] = mapped_column(String(16), primary_key=True)
+    fiscal_date_ending: Mapped[date] = mapped_column(Date, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32), primary_key=True, default="mixed")
+    reported_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    announcement_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    availability_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    first_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    reported_eps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimated_eps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    surprise: Mapped[float | None] = mapped_column(Float, nullable=True)
+    surprise_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    earnings_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_earnings_events_symbol_reported", "symbol", "reported_date"),
+    )
+
+
+class SECFiling(Base, TimestampMixin):
+    """Recent SEC filing metadata for event-driven research."""
+
+    __tablename__ = "sec_filings"
+
+    accession_number: Mapped[str] = mapped_column(String(32), primary_key=True)
+    symbol: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    cik: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    form: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    filed_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    report_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    filing_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filing_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_sec_filings_symbol_form_date", "symbol", "form", "filed_date"),
+    )
+
+
+class MacroObservation(Base, TimestampMixin):
+    """Macro and volatility series used for regime detection."""
+
+    __tablename__ = "macro_observations"
+
+    series_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    observation_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    interval: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    value: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    macro_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_macro_observations_source_date", "source", "observation_date"),
+    )
+
+
+class NewsArticle(Base, TimestampMixin):
+    """News metadata stored for NLP and event studies."""
+
+    __tablename__ = "news_articles"
+
+    article_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    headline: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    author: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_source: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    updated_at_source: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    symbols: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    sentiment: Mapped[float | None] = mapped_column(Float, nullable=True)
+    news_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_news_articles_source_created", "source", "created_at_source"),
+    )
+
+
+# =============================================================================
+# Market Microstructure / Short Pressure Models
+# =============================================================================
+
+
+class StockQuote(Base, TimestampMixin):
+    """Historical top-of-book quote updates for market microstructure research."""
+
+    __tablename__ = "stock_quotes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="alpaca_sip", index=True)
+    bid_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 6), nullable=True)
+    bid_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bid_exchange: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    ask_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 6), nullable=True)
+    ask_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ask_exchange: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    tape: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    condition_codes: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    quote_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "timestamp",
+            "bid_price",
+            "bid_size",
+            "bid_exchange",
+            "ask_price",
+            "ask_size",
+            "ask_exchange",
+            "source",
+            name="uq_stock_quotes_event",
+        ),
+        Index("ix_stock_quotes_symbol_timestamp", "symbol", "timestamp"),
+    )
+
+
+class StockTrade(Base, TimestampMixin):
+    """Historical trade prints for market microstructure research."""
+
+    __tablename__ = "stock_trades"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="alpaca_sip", index=True)
+    trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(16, 6), nullable=True)
+    size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    exchange: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    tape: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    condition_codes: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    trade_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "timestamp",
+            "trade_id",
+            "exchange",
+            "source",
+            name="uq_stock_trades_event",
+        ),
+        Index("ix_stock_trades_symbol_timestamp", "symbol", "timestamp"),
+    )
+
+
+class ShortSaleVolume(Base, TimestampMixin):
+    """FINRA Reg SHO short sale volume aggregates."""
+
+    __tablename__ = "short_sale_volumes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    market: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="finra_regsho", index=True)
+    short_volume: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    short_exempt_volume: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    total_volume: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    volume_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "trade_date",
+            "market",
+            "source",
+            name="uq_short_sale_volumes_symbol_date_market_source",
+        ),
+        Index("ix_short_sale_volumes_symbol_date", "symbol", "trade_date"),
+    )
+
+
+class FailsToDeliver(Base, TimestampMixin):
+    """SEC fails-to-deliver dataset for settlement stress analysis."""
+
+    __tablename__ = "fails_to_deliver"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    settlement_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    cusip: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    symbol: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="sec_ftd", index=True)
+    quantity: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(16, 6), nullable=True)
+    ftd_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "settlement_date",
+            "cusip",
+            "symbol",
+            "source",
+            name="uq_fails_to_deliver_settlement_cusip_symbol_source",
+        ),
+        Index("ix_fails_to_deliver_symbol_settlement", "symbol", "settlement_date"),
+    )
+
+
+class MacroVintageObservation(Base, TimestampMixin):
+    """Point-in-time macro vintages from ALFRED for revision-aware training."""
+
+    __tablename__ = "macro_vintage_observations"
+
+    series_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    observation_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    realtime_start: Mapped[date] = mapped_column(Date, primary_key=True)
+    realtime_end: Mapped[date] = mapped_column(Date, primary_key=True)
+    source: Mapped[str] = mapped_column(String(32), primary_key=True, default="alfred")
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    interval: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    value: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    vintage_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        Index("ix_macro_vintage_observations_series_date", "series_id", "observation_date"),
+        Index("ix_macro_vintage_observations_realtime", "source", "realtime_start"),
+    )
 
 
 # =============================================================================

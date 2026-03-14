@@ -19,6 +19,7 @@ def _base_args(**overrides):
         "model": "xgboost",
         "name": "",
         "symbols": [],
+        "symbols_file": None,
         "start": "",
         "end": "",
         "start_date": "",
@@ -113,6 +114,95 @@ def test_extract_base_symbol():
     assert train_script.ModelTrainer._extract_base_symbol("MSFT") == "MSFT"
 
 
+def test_symbol_missing_ratio_ignores_daily_weekends():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-03T21:00:00Z",
+                    "2025-01-06T21:00:00Z",
+                    "2025-01-07T21:00:00Z",
+                ],
+                utc=True,
+            )
+        }
+    )
+
+    ratio = train_script.ModelTrainer._symbol_missing_ratio(frame)
+
+    assert ratio == pytest.approx(0.0)
+
+
+def test_apply_corporate_action_adjustments_back_adjusts_splits(monkeypatch):
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    trainer.data = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(["2025-01-09T21:00:00Z", "2025-01-10T21:00:00Z"], utc=True),
+            "open": [396.0, 99.0],
+            "high": [404.0, 101.0],
+            "low": [392.0, 98.0],
+            "close": [400.0, 100.0],
+            "volume": [100.0, 400.0],
+        }
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_load_corporate_actions_for_adjustment",
+        lambda **kwargs: pd.DataFrame(
+            {
+                "symbol": ["AAPL"],
+                "action_type": ["SPLIT"],
+                "ex_date": [pd.Timestamp("2025-01-10").date()],
+                "amount": [0.0],
+                "split_ratio": [4.0],
+            }
+        ),
+    )
+
+    trainer._apply_corporate_action_adjustments()
+
+    assert trainer.data.loc[0, "close"] == pytest.approx(100.0)
+    assert trainer.data.loc[0, "open"] == pytest.approx(99.0)
+    assert trainer.data.loc[0, "volume"] == pytest.approx(400.0)
+    assert trainer.training_metrics["corporate_action_adjustment_split_events"] == pytest.approx(1.0)
+
+
+def test_apply_corporate_action_adjustments_back_adjusts_dividends(monkeypatch):
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    trainer.data = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(["2025-01-09T21:00:00Z", "2025-01-10T21:00:00Z"], utc=True),
+            "open": [100.0, 100.0],
+            "high": [101.0, 101.0],
+            "low": [99.0, 99.0],
+            "close": [100.0, 99.0],
+            "volume": [1000.0, 1100.0],
+        }
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_load_corporate_actions_for_adjustment",
+        lambda **kwargs: pd.DataFrame(
+            {
+                "symbol": ["AAPL"],
+                "action_type": ["DIVIDEND"],
+                "ex_date": [pd.Timestamp("2025-01-10").date()],
+                "amount": [1.0],
+                "split_ratio": [0.0],
+            }
+        ),
+    )
+
+    trainer._apply_corporate_action_adjustments()
+
+    assert trainer.data.loc[0, "close"] == pytest.approx(99.0)
+    assert trainer.data.loc[0, "open"] == pytest.approx(99.0)
+    assert trainer.data.loc[0, "volume"] == pytest.approx(1000.0)
+    assert trainer.training_metrics["corporate_action_adjustment_dividend_events"] == pytest.approx(1.0)
+
+
 def test_run_training_uses_start_end_alias(monkeypatch):
     captured = {}
 
@@ -171,6 +261,56 @@ def test_run_training_maps_feature_pipeline_flags(monkeypatch):
     assert captured["config"].feature_materialization_batch_rows == 3000
     assert captured["config"].feature_reuse_min_coverage == 0.35
     assert captured["config"].windows_force_fallback_features is True
+
+
+def test_run_training_loads_symbols_from_file(monkeypatch, tmp_path):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    symbols_path = tmp_path / "symbols.txt"
+    symbols_path.write_text("aapl\nmsft, nvda\n", encoding="utf-8")
+
+    args = _base_args(symbols_file=symbols_path)
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].symbols == ["AAPL", "MSFT", "NVDA"]
+
+
+def test_generate_cv_splits_passes_times_to_splitter(monkeypatch):
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    trainer.timestamps = pd.to_datetime(
+        [
+            "2025-01-02T00:00:00Z",
+            "2025-01-03T00:00:00Z",
+            "2025-01-06T00:00:00Z",
+            "2025-01-07T00:00:00Z",
+        ],
+        utc=True,
+    ).to_numpy()
+    captured = {}
+
+    class _DummySplitter:
+        def split(self, X, y, times=None):
+            captured["times"] = times
+            yield np.array([0, 1]), np.array([2, 3])
+
+    monkeypatch.setattr(trainer, "_get_cv_splitter", lambda n_samples=None: _DummySplitter())
+
+    splits = trainer._generate_cv_splits(np.zeros((4, 2)), np.zeros(4))
+
+    assert len(splits) == 1
+    assert captured["times"] is not None
 
 
 def test_run_training_maps_allow_partial_feature_fallback(monkeypatch):
@@ -1487,6 +1627,12 @@ def test_build_parser_supports_feature_pipeline_flags():
     assert args.feature_materialization_batch_rows == 4000
     assert args.feature_reuse_min_coverage == 0.3
     assert args.windows_fallback_features is True
+
+
+def test_build_parser_supports_symbols_file():
+    parser = train_script.build_parser()
+    args = parser.parse_args(["--symbols-file", "config/symbols.txt"])
+    assert str(args.symbols_file).endswith("config\\symbols.txt") or str(args.symbols_file).endswith("config/symbols.txt")
 
 
 def test_build_parser_supports_allow_partial_feature_fallback_flag():

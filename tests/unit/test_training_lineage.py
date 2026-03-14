@@ -10,6 +10,7 @@ from quant_trading_system.models.training_lineage import (
     build_data_quality_report,
     build_snapshot_manifest,
     compute_data_quality_hash,
+    estimate_missing_bars_count,
     load_registry_entries,
     persist_active_model_pointer,
     persist_snapshot_bundle,
@@ -40,6 +41,43 @@ def test_build_data_quality_report_detects_missing_duplicate_and_outlier() -> No
     assert summary["duplicate_bars_count"] >= 1
     assert summary["extreme_move_count"] >= 1
     assert "missing_bars" in report["threshold_breaches"]
+
+
+def test_estimate_missing_bars_count_ignores_daily_weekends() -> None:
+    timestamps = pd.Series(
+        pd.to_datetime(
+            [
+                "2025-01-03T21:00:00Z",  # Friday
+                "2025-01-06T21:00:00Z",  # Monday
+                "2025-01-07T21:00:00Z",  # Tuesday
+            ],
+            utc=True,
+        )
+    )
+
+    missing_count, inferred_bar_seconds = estimate_missing_bars_count(timestamps)
+
+    assert missing_count == 0
+    assert inferred_bar_seconds is not None
+    assert inferred_bar_seconds >= 24 * 3600
+
+
+def test_estimate_missing_bars_count_detects_daily_business_day_gaps() -> None:
+    timestamps = pd.Series(
+        pd.to_datetime(
+            [
+                "2025-01-06T21:00:00Z",  # Monday
+                "2025-01-07T21:00:00Z",  # Tuesday
+                "2025-01-10T21:00:00Z",  # Friday, missing Wed/Thu
+            ],
+            utc=True,
+        )
+    )
+
+    missing_count, inferred_bar_seconds = estimate_missing_bars_count(timestamps)
+
+    assert missing_count == 2
+    assert inferred_bar_seconds is not None
 
 
 def test_build_snapshot_manifest_is_deterministic_for_same_inputs() -> None:
