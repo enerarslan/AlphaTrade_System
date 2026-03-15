@@ -16,6 +16,7 @@ const LoginPage = lazy(() => import("@/pages/login"));
 const AnalyticsPage = lazy(() => import("@/pages/analytics"));
 const BacktestPage = lazy(() => import("@/pages/backtest"));
 const DatabasePage = lazy(() => import("@/pages/database"));
+const AlternativeDataPage = lazy(() => import("@/pages/alternative-data"));
 
 function GuardedRoute({ permission, children }: { permission: string; children: import("react").ReactElement }) {
   const role = useStore((state) => state.role);
@@ -104,6 +105,14 @@ function ProtectedApp() {
             element={
               <GuardedRoute permission="read.basic">
                 <AnalyticsPage />
+              </GuardedRoute>
+            }
+          />
+          <Route
+            path="/alt-data"
+            element={
+              <GuardedRoute permission="read.basic">
+                <AlternativeDataPage />
               </GuardedRoute>
             }
           />

@@ -6177,6 +6177,80 @@ async def get_db_features_list(current_user: AuthenticatedUser) -> dict[str, Any
         return {"features": [], "count": 0, "error": str(e)}
 
 
+@app.get("/db/news", tags=["Database"])
+async def get_db_news(
+    current_user: AuthenticatedUser,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """Query news articles from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    SELECT article_id, source, headline, summary, url,
+                           symbols, sentiment, created_at_source
+                    FROM news_articles
+                    ORDER BY created_at_source DESC NULLS LAST
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": min(limit, 100)},
+            )
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                if row.get("created_at_source"):
+                    row["created_at_source"] = str(row["created_at_source"])
+                if row.get("symbols") is None:
+                    row["symbols"] = []
+                rows.append(row)
+            return {"data": rows, "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/macro", tags=["Database"])
+async def get_db_macro(
+    current_user: AuthenticatedUser,
+    series_id: str | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """Query macro economic observations from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = (
+                "SELECT series_id, observation_date, source, name, interval,"
+                " unit, value FROM macro_observations WHERE 1=1"
+            )
+            params: dict[str, Any] = {}
+            if series_id:
+                query += " AND series_id = :series_id"
+                params["series_id"] = series_id
+            query += " ORDER BY observation_date DESC LIMIT :limit"
+            params["limit"] = min(limit, 200)
+            result = conn.execute(text(query), params)
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                if row.get("observation_date"):
+                    row["observation_date"] = str(row["observation_date"])
+                if row.get("value") is not None:
+                    row["value"] = float(row["value"])
+                rows.append(row)
+            return {"data": rows, "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
 # =============================================================================
 # WebSocket Endpoints
 # =============================================================================

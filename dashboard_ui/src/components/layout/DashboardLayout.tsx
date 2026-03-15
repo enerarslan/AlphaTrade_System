@@ -33,6 +33,7 @@ import ParticleBackground from "@/components/ui/ParticleBackground";
 import LiveClock from "@/components/ui/LiveClock";
 import FearGreedGauge from "@/components/ui/FearGreedGauge";
 import NotificationPanel from "@/components/ui/NotificationPanel";
+import AICopilotWidget from "@/components/ui/AICopilotWidget";
 
 type NavItem = {
   icon: ElementType;
@@ -46,6 +47,7 @@ const navItems: NavItem[] = [
   { icon: BriefcaseBusiness, label: "Execution", href: "/trading", permission: "control.trading.status" },
   { icon: Boxes, label: "Platform", href: "/platform", permission: "read.basic" },
   { icon: BarChart2, label: "Analytics", href: "/analytics", permission: "read.basic" },
+  { icon: Database, label: "Alt Data & News", href: "/alt-data", permission: "read.basic" },
   { icon: ShieldAlert, label: "Risk", href: "/risk", permission: "risk.advanced.read" },
   { icon: Bot, label: "Models", href: "/models", permission: "models.governance.read" },
   { icon: FlaskConical, label: "Backtest Lab", href: "/backtest", permission: "control.jobs.create" },
@@ -66,6 +68,8 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
   const location = useLocation();
   const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
+  // AI Copilot State
+  const [isCopilotOpen, setIsCopilotOpen] = useState(false);
   const [visualEffectsEnabled, setVisualEffectsEnabled] = useState(shouldEnableVisualEffects);
 
   const { user, role, mfaStatus, tradingStatus, logout, activeAlerts, lastRefreshAt } = useStore(
@@ -239,7 +243,16 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
                 {visibleNavItems.find((item) => item.href === location.pathname)?.label ?? "Dashboard"}
               </h2>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1">
+            <Button
+              variant="outline"
+              size="sm"
+              className={`gap-2 h-9 border-white/[0.08] ${isCopilotOpen ? "bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30" : "bg-white/[0.02] text-slate-300 hover:text-white"}`}
+              onClick={() => setIsCopilotOpen(!isCopilotOpen)}
+            >
+              <Bot size={16} className={isCopilotOpen ? "text-fuchsia-400" : ""} />
+              Copilot
+            </Button>
               <ConnectionStatus />
               <NotificationPanel />
               <Badge variant={tradingStatus?.running ? "success" : "outline"}>
@@ -263,6 +276,9 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
             </motion.div>
           </main>
         </div>
+        
+        {/* Persistent AI Copilot Sidebar / Drawer */}
+        <AICopilotWidget isOpen={isCopilotOpen} onClose={() => setIsCopilotOpen(false)} />
       </div>
     </div>
   );

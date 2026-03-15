@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { SignalTape } from "@/components/live/SignalTape";
 import { useStore } from "@/lib/store";
-import EquityCurveChart from "@/components/charts/EquityCurveChart";
+import AdvancedChartWidget from "@/components/charts/AdvancedChartWidget";
 import PnLBarChart from "@/components/charts/PnLBarChart";
 import MiniGauge from "@/components/ui/mini-gauge";
 import Sparkline from "@/components/ui/sparkline";
@@ -16,6 +16,8 @@ import WatchlistWidget from "@/components/live/WatchlistWidget";
 import MarketNewsFeed from "@/components/live/MarketNewsFeed";
 import PanelLayout from "@/components/layout/PanelLayout";
 import PortfolioTreemap from "@/components/charts/PortfolioTreemap";
+import DarkPoolWidget from "@/components/live/DarkPoolWidget";
+import MacroCalendarWidget from "@/components/live/MacroCalendarWidget";
 
 const stagger = {
   hidden: { opacity: 0 },
@@ -358,12 +360,12 @@ export default function OverviewPage() {
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2 text-xl">
                       <TrendingUp size={18} className="text-cyan-400" />
-                      Equity Curve
+                      Advanced Technical Chart
                     </CardTitle>
-                    <CardDescription>Portfolio equity over time (estimated from snapshot).</CardDescription>
+                    <CardDescription>Multi-pane charting: Price, Volume, RSI(14), and Algo Markers.</CardDescription>
                   </CardHeader>
-                  <CardContent>
-                    <EquityCurveChart data={equityData} height={300} />
+                  <CardContent className="h-[300px] p-0 rounded-b-xl overflow-hidden">
+                    <AdvancedChartWidget height={300} symbol="AAPL" />
                   </CardContent>
                 </Card>
               ),
@@ -632,6 +634,47 @@ export default function OverviewPage() {
           </Card>
         </motion.section>
       )}
+
+      {/* Dark Pool & Macro Calendar */}
+      <motion.section variants={fadeUp} className="h-[420px]">
+        <PanelLayout
+          orientation="horizontal"
+          storageKey="overview-intel-panes"
+          panels={[
+            {
+              id: "dark-pool",
+              defaultSize: 55,
+              minSize: 35,
+              children: (
+                <Card className="h-full border-purple-500/20 bg-slate-950/50">
+                  <CardHeader className="p-3 border-b border-white/[0.06]">
+                    <CardTitle className="text-sm flex items-center gap-2">
+                      <ShieldAlert size={14} className="text-purple-400" />
+                      Dark Pool & Institutional Flow
+                      <Badge variant="outline" className="text-[9px] border-purple-500/30 text-purple-300">LIVE</Badge>
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0 h-[calc(100%-48px)]">
+                    <DarkPoolWidget />
+                  </CardContent>
+                </Card>
+              ),
+            },
+            {
+              id: "macro-calendar",
+              defaultSize: 45,
+              minSize: 30,
+              children: (
+                <Card className="h-full border-cyan-500/10 bg-slate-950/50">
+                  <CardContent className="p-0 h-full">
+                    <MacroCalendarWidget />
+                  </CardContent>
+                </Card>
+              ),
+            },
+          ]}
+        />
+      </motion.section>
 
       {/* Bottom two-column */}
       <motion.section variants={fadeUp} className="grid gap-4 lg:grid-cols-2">

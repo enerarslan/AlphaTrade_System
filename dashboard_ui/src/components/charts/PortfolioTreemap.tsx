@@ -12,6 +12,27 @@ type Position = {
   cost_basis: number;
 };
 
+// Mock mapping
+const SECTOR_MAP: Record<string, string> = {
+  AAPL: "Technology",
+  MSFT: "Technology",
+  GOOGL: "Technology",
+  NVDA: "Technology",
+  META: "Technology",
+  AMZN: "Consumer",
+  TSLA: "Consumer",
+  NFLX: "Consumer",
+  JPM: "Finance",
+  BAC: "Finance",
+  GS: "Finance",
+  JNJ: "Healthcare",
+  UNH: "Healthcare"
+};
+
+function getSector(symbol: string) {
+  return SECTOR_MAP[symbol] || "Other";
+}
+
 interface PortfolioTreemapProps {
   positions: Position[];
   height?: number;
@@ -27,6 +48,8 @@ function getColor(pct: number): string {
 }
 
 function TreemapCell(props: {
+  root?: unknown;
+  depth?: number;
   x?: number;
   y?: number;
   width?: number;
@@ -35,57 +58,100 @@ function TreemapCell(props: {
   pnlPct?: number;
   pnl?: number;
   marketValue?: number;
+  children?: unknown[];
   [key: string]: unknown;
 }) {
-  const { x = 0, y = 0, width = 0, height = 0, name, pnlPct = 0, marketValue } = props;
+  const { depth, x = 0, y = 0, width = 0, height = 0, name, pnlPct = 0, marketValue } = props;
 
-  if (width < 30 || height < 25) return null;
+  if (width < 20 || height < 20) return null;
 
+  // Root Element (Depth 0) -> Just a container, don't draw
+  if (depth === 0) return null;
+
+  // Sector Level (Depth 1) -> Draw transparent border/label
+  if (depth === 1) {
+     return (
+       <g>
+         <rect
+           x={x} y={y} width={width} height={height}
+           fill="rgba(15, 23, 42, 0.4)"
+           stroke="rgba(255,255,255,0.15)"
+           strokeWidth={2}
+           rx={6}
+         />
+         {width > 60 && height > 30 && (
+           <text
+             x={x + 8} y={y + 16}
+             fill="#94a3b8"
+             fontSize={11}
+             fontWeight="bold"
+             className="uppercase tracking-widest opacity-60"
+           >
+             {name}
+           </text>
+         )}
+       </g>
+     );
+  }
+
+  // Symbol Level (Depth 2)
   const fill = getColor(pnlPct);
   const symbolFontSize = width > 80 ? 14 : 11;
+
+  // Reduce size slightly to fit inside sector
+  const boxX = x + 2;
+  const boxY = y + 2;
+  const boxW = Math.max(0, width - 4);
+  const boxH = Math.max(0, height - 4);
+
+  if (boxW < 20 || boxH < 20) return null;
 
   return (
     <g>
       <rect
-        x={x}
-        y={y}
-        width={width}
-        height={height}
+        x={boxX}
+        y={boxY}
+        width={boxW}
+        height={boxH}
         rx={4}
         fill={fill}
         stroke="rgba(255,255,255,0.08)"
         strokeWidth={1}
+        className="transition-all hover:opacity-80 cursor-pointer"
       />
-      {width > 50 && height > 40 && (
+      {boxW > 50 && boxH > 40 && (
         <>
           <text
-            x={x + width / 2}
-            y={y + height / 2 - 8}
+            x={boxX + boxW / 2}
+            y={boxY + boxH / 2 - 8}
             textAnchor="middle"
             fill="#e2e8f0"
             fontSize={symbolFontSize}
             fontWeight="bold"
+            className="pointer-events-none"
           >
             {name}
           </text>
           <text
-            x={x + width / 2}
-            y={y + height / 2 + 10}
+            x={boxX + boxW / 2}
+            y={boxY + boxH / 2 + 10}
             textAnchor="middle"
             fill={pnlPct >= 0 ? "#6ee7b7" : "#fda4af"}
             fontSize={11}
             fontFamily="monospace"
+            className="pointer-events-none"
           >
             {pnlPct >= 0 ? "+" : ""}
             {pnlPct?.toFixed(1)}%
           </text>
-          {width > 90 && height > 60 && (
+          {boxW > 90 && boxH > 60 && (
             <text
-              x={x + width / 2}
-              y={y + height / 2 + 26}
+              x={boxX + boxW / 2}
+              y={boxY + boxH / 2 + 26}
               textAnchor="middle"
               fill="#94a3b8"
               fontSize={9}
+              className="pointer-events-none"
             >
               ${Math.abs(marketValue ?? 0).toLocaleString()}
             </text>
@@ -148,19 +214,31 @@ function TreemapTooltip({ active, payload }: { active?: boolean; payload?: Array
 export default function PortfolioTreemap({ positions, height = 350 }: PortfolioTreemapProps) {
   const treemapData = useMemo(() => {
     if (positions.length === 0) return [];
+
+    // Group by sector
+    const sectors: Record<string, any[]> = {};
+    positions.forEach(p => {
+      const sec = getSector(p.symbol);
+      if (!sectors[sec]) sectors[sec] = [];
+      sectors[sec].push({
+        name: p.symbol,
+        size: Math.abs(p.market_value) || 1, // ensure size>0
+        pnl: p.unrealized_pnl,
+        pnlPct: p.unrealized_pnl_pct,
+        quantity: p.quantity,
+        entryPrice: p.avg_entry_price,
+        currentPrice: p.current_price,
+        marketValue: p.market_value,
+      });
+    });
+
     return [
       {
         name: "Portfolio",
-        children: positions.map((p) => ({
-          name: p.symbol,
-          size: Math.abs(p.market_value),
-          pnl: p.unrealized_pnl,
-          pnlPct: p.unrealized_pnl_pct,
-          quantity: p.quantity,
-          entryPrice: p.avg_entry_price,
-          currentPrice: p.current_price,
-          marketValue: p.market_value,
-        })),
+        children: Object.entries(sectors).map(([sectorName, children]) => ({
+          name: sectorName,
+          children
+        }))
       },
     ];
   }, [positions]);
