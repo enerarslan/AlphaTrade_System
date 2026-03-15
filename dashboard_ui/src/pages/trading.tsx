@@ -282,6 +282,96 @@ export default function TradingPage() {
         </Card>
       </motion.div>
 
+      {/* Execution Detail */}
+      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-3">
+        {/* Venue Breakdown */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Venue Breakdown</CardTitle>
+            <CardDescription>Order distribution across venues.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {Object.keys(tca?.venue_breakdown ?? {}).length === 0 ? (
+              <p className="text-sm text-slate-500">No venue data.</p>
+            ) : (
+              Object.entries(tca?.venue_breakdown ?? {}).sort((a, b) => b[1] - a[1]).map(([venue, pct]) => (
+                <div key={venue} className="space-y-1">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-300">{venue}</span>
+                    <span className="font-mono text-cyan-300">{(pct * 100).toFixed(1)}%</span>
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+                    <div className="h-full rounded-full bg-cyan-500/60" style={{ width: `${Math.min(100, pct * 100)}%` }} />
+                  </div>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Fill Rates */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Fill Rates</CardTitle>
+            <CardDescription>Buy vs Sell fill performance.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-emerald-400">Buy Fill Rate</span>
+                <span className="font-mono text-emerald-300">{((executionQuality?.fill_rate_buy ?? 0) * 100).toFixed(1)}%</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-white/[0.06]">
+                <div className="h-full rounded-full bg-emerald-500/60" style={{ width: `${Math.min(100, (executionQuality?.fill_rate_buy ?? 0) * 100)}%` }} />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-rose-400">Sell Fill Rate</span>
+                <span className="font-mono text-rose-300">{((executionQuality?.fill_rate_sell ?? 0) * 100).toFixed(1)}%</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-white/[0.06]">
+                <div className="h-full rounded-full bg-rose-500/60" style={{ width: `${Math.min(100, (executionQuality?.fill_rate_sell ?? 0) * 100)}%` }} />
+              </div>
+            </div>
+            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center mt-3">
+              <p className="text-[10px] uppercase text-slate-500">VWAP Savings</p>
+              <p className={`font-mono text-lg font-semibold ${(tca?.cost_savings_vs_vwap ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                {(tca?.cost_savings_vs_vwap ?? 0) >= 0 ? "+" : ""}{(tca?.cost_savings_vs_vwap ?? 0).toFixed(2)} bps
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Latency Distribution */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Latency Distribution</CardTitle>
+            <CardDescription>Order execution latency buckets.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {Object.keys(executionQuality?.latency_distribution_ms ?? {}).length === 0 ? (
+              <p className="text-sm text-slate-500">No latency data.</p>
+            ) : (
+              Object.entries(executionQuality?.latency_distribution_ms ?? {}).map(([bucket, value]) => {
+                const maxVal = Math.max(...Object.values(executionQuality?.latency_distribution_ms ?? {}));
+                return (
+                  <div key={bucket} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-300">{bucket}</span>
+                      <span className="font-mono text-amber-300">{typeof value === 'number' ? value.toFixed(1) : value}ms</span>
+                    </div>
+                    <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+                      <div className="h-full rounded-full bg-amber-500/60" style={{ width: `${Math.min(100, (Number(value) / (maxVal || 1)) * 100)}%` }} />
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </CardContent>
+        </Card>
+      </motion.div>
+
       {/* Order Blotter + Command Jobs — Resizable Panels */}
       <motion.div variants={fadeUp}>
         <PanelLayout

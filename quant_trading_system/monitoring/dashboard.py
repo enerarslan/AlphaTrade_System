@@ -5774,6 +5774,410 @@ async def flush_audit_siem(
 
 
 # =============================================================================
+# Database Exploration Endpoints
+# =============================================================================
+
+
+@app.get("/db/tables", tags=["Database"])
+async def get_db_tables(current_user: AuthenticatedUser) -> dict[str, Any]:
+    """List all public tables with approximate row counts and sizes."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    SELECT
+                        schemaname,
+                        tablename as table_name,
+                        pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as total_size,
+                        pg_total_relation_size(schemaname||'.'||tablename) as size_bytes
+                    FROM pg_tables
+                    WHERE schemaname = 'public'
+                    ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+                    """
+                )
+            )
+            tables = []
+            for row in result.mappings():
+                count_result = conn.execute(
+                    text(
+                        "SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = :tbl"
+                    ),
+                    {"tbl": row["table_name"]},
+                )
+                count_row = count_result.mappings().first()
+                row_count = int(count_row["estimate"]) if count_row else 0
+                tables.append(
+                    {
+                        "table_name": row["table_name"],
+                        "total_size": row["total_size"],
+                        "size_bytes": row["size_bytes"],
+                        "row_count": max(0, row_count),
+                    }
+                )
+            return {"tables": tables, "total_tables": len(tables)}
+    except Exception as e:
+        return {"tables": [], "total_tables": 0, "error": str(e)}
+
+
+@app.get("/db/ohlcv", tags=["Database"])
+async def get_db_ohlcv(
+    current_user: AuthenticatedUser,
+    symbol: str = "AAPL",
+    timeframe: str = "15Min",
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Query OHLCV bar data from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = (
+                "SELECT symbol, timestamp, timeframe, open, high, low, close, volume, vwap, trade_count"
+                " FROM ohlcv_bars"
+                " WHERE symbol = :symbol AND timeframe = :timeframe"
+            )
+            params: dict[str, Any] = {"symbol": symbol, "timeframe": timeframe}
+            if start:
+                query += " AND timestamp >= :start"
+                params["start"] = start
+            if end:
+                query += " AND timestamp <= :end"
+                params["end"] = end
+            query += " ORDER BY timestamp DESC LIMIT :limit"
+            params["limit"] = min(limit, 5000)
+            result = conn.execute(text(query), params)
+            rows = [dict(r) for r in result.mappings()]
+            for row in rows:
+                if row.get("timestamp"):
+                    row["timestamp"] = str(row["timestamp"])
+                for k in ("open", "high", "low", "close", "vwap"):
+                    if row.get(k) is not None:
+                        row[k] = float(row[k])
+                if row.get("volume") is not None:
+                    row["volume"] = int(row["volume"])
+            return {
+                "data": list(reversed(rows)),
+                "count": len(rows),
+                "symbol": symbol,
+                "timeframe": timeframe,
+            }
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/daily-performance", tags=["Database"])
+async def get_db_daily_performance(
+    current_user: AuthenticatedUser,
+    limit: int = 365,
+) -> dict[str, Any]:
+    """Query daily performance records from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    SELECT date, starting_equity, ending_equity, pnl, pnl_percent,
+                           trades_count, win_count, loss_count, max_drawdown, sharpe_estimate
+                    FROM daily_performance
+                    ORDER BY date DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": min(limit, 1000)},
+            )
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                row["date"] = str(row["date"])
+                for k in ("starting_equity", "ending_equity", "pnl"):
+                    if row.get(k) is not None:
+                        row[k] = float(row[k])
+                rows.append(row)
+            return {"data": list(reversed(rows)), "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/trade-log", tags=["Database"])
+async def get_db_trade_log(
+    current_user: AuthenticatedUser,
+    symbol: str | None = None,
+    strategy: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Query complete round-trip trade records from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = "SELECT * FROM trade_log WHERE 1=1"
+            params: dict[str, Any] = {}
+            if symbol:
+                query += " AND symbol = :symbol"
+                params["symbol"] = symbol
+            if strategy:
+                query += " AND strategy = :strategy"
+                params["strategy"] = strategy
+            query += " ORDER BY entry_time DESC LIMIT :limit"
+            params["limit"] = min(limit, 1000)
+            result = conn.execute(text(query), params)
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                for k in ("trade_id",):
+                    if row.get(k) is not None:
+                        row[k] = str(row[k])
+                for k in ("entry_time", "exit_time"):
+                    if row.get(k) is not None:
+                        row[k] = str(row[k])
+                for k in (
+                    "entry_price",
+                    "exit_price",
+                    "pnl",
+                    "entry_quantity",
+                    "exit_quantity",
+                    "commission_total",
+                ):
+                    if row.get(k) is not None:
+                        row[k] = float(row[k])
+                rows.append(row)
+            return {"data": rows, "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/signals-history", tags=["Database"])
+async def get_db_signals_history(
+    current_user: AuthenticatedUser,
+    symbol: str | None = None,
+    model_source: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Query historical signal records from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = (
+                "SELECT signal_id, timestamp, symbol, direction, strength, confidence,"
+                " horizon, model_source FROM signals WHERE 1=1"
+            )
+            params: dict[str, Any] = {}
+            if symbol:
+                query += " AND symbol = :symbol"
+                params["symbol"] = symbol
+            if model_source:
+                query += " AND model_source = :model_source"
+                params["model_source"] = model_source
+            query += " ORDER BY timestamp DESC LIMIT :limit"
+            params["limit"] = min(limit, 1000)
+            result = conn.execute(text(query), params)
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                row["signal_id"] = str(row["signal_id"])
+                row["timestamp"] = str(row["timestamp"])
+                rows.append(row)
+            return {"data": rows, "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/risk-events", tags=["Database"])
+async def get_db_risk_events(
+    current_user: AuthenticatedUser,
+    event_type: str | None = None,
+    severity: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Query risk event records from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = "SELECT * FROM risk_events WHERE 1=1"
+            params: dict[str, Any] = {}
+            if event_type:
+                query += " AND event_type = :event_type"
+                params["event_type"] = event_type
+            if severity:
+                query += " AND severity = :severity"
+                params["severity"] = severity
+            query += " ORDER BY timestamp DESC LIMIT :limit"
+            params["limit"] = min(limit, 500)
+            result = conn.execute(text(query), params)
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                row["timestamp"] = str(row["timestamp"])
+                if row.get("order_id"):
+                    row["order_id"] = str(row["order_id"])
+                if row.get("resolved_at"):
+                    row["resolved_at"] = str(row["resolved_at"])
+                rows.append(row)
+            return {"data": rows, "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/security-master", tags=["Database"])
+async def get_db_security_master(
+    current_user: AuthenticatedUser,
+    status: str | None = None,
+    sector: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Query security master reference data from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = (
+                "SELECT symbol, name, exchange, asset_type, status, sector, industry,"
+                " market_cap, currency, country, ipo_date FROM security_master WHERE 1=1"
+            )
+            params: dict[str, Any] = {}
+            if status:
+                query += " AND status = :status"
+                params["status"] = status
+            if sector:
+                query += " AND sector = :sector"
+                params["sector"] = sector
+            query += " ORDER BY market_cap DESC NULLS LAST LIMIT :limit"
+            params["limit"] = min(limit, 500)
+            result = conn.execute(text(query), params)
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                if row.get("market_cap") is not None:
+                    row["market_cap"] = float(row["market_cap"])
+                if row.get("ipo_date"):
+                    row["ipo_date"] = str(row["ipo_date"])
+                rows.append(row)
+            return {"data": rows, "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/fundamentals", tags=["Database"])
+async def get_db_fundamentals(
+    current_user: AuthenticatedUser,
+    symbol: str = "AAPL",
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Query fundamental data snapshots from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    SELECT symbol, as_of_date, pe_ratio, peg_ratio, price_to_book, eps,
+                           book_value, dividend_yield, revenue_ttm, profit_margin, beta,
+                           week_52_high, week_52_low, market_cap, analyst_target_price
+                    FROM fundamental_snapshots
+                    WHERE symbol = :symbol
+                    ORDER BY as_of_date DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"symbol": symbol, "limit": min(limit, 200)},
+            )
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                row["as_of_date"] = str(row["as_of_date"])
+                for k in ("market_cap", "revenue_ttm"):
+                    if row.get(k) is not None:
+                        row[k] = float(row[k])
+                rows.append(row)
+            return {"data": rows, "count": len(rows), "symbol": symbol}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/earnings", tags=["Database"])
+async def get_db_earnings(
+    current_user: AuthenticatedUser,
+    symbol: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Query earnings events from the database."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = (
+                "SELECT symbol, fiscal_date_ending, reported_date, reported_eps,"
+                " estimated_eps, surprise, surprise_pct"
+                " FROM earnings_events WHERE 1=1"
+            )
+            params: dict[str, Any] = {}
+            if symbol:
+                query += " AND symbol = :symbol"
+                params["symbol"] = symbol
+            query += " ORDER BY fiscal_date_ending DESC LIMIT :limit"
+            params["limit"] = min(limit, 500)
+            result = conn.execute(text(query), params)
+            rows = []
+            for r in result.mappings():
+                row = dict(r)
+                for k in ("fiscal_date_ending", "reported_date"):
+                    if row.get(k) is not None:
+                        row[k] = str(row[k])
+                rows.append(row)
+            return {"data": rows, "count": len(rows)}
+    except Exception as e:
+        return {"data": [], "count": 0, "error": str(e)}
+
+
+@app.get("/db/features-list", tags=["Database"])
+async def get_db_features_list(current_user: AuthenticatedUser) -> dict[str, Any]:
+    """List distinct feature names available in the feature store."""
+    try:
+        from quant_trading_system.database.connection import get_engine
+        from sqlalchemy import text
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    "SELECT DISTINCT feature_name FROM features ORDER BY feature_name LIMIT 500"
+                )
+            )
+            names = [row["feature_name"] for row in result.mappings()]
+            return {"features": names, "count": len(names)}
+    except Exception as e:
+        return {"features": [], "count": 0, "error": str(e)}
+
+
+# =============================================================================
 # WebSocket Endpoints
 # =============================================================================
 

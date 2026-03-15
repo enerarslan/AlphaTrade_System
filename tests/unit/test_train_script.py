@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sys
 from argparse import Namespace
+from contextlib import nullcontext
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
@@ -165,7 +167,9 @@ def test_apply_corporate_action_adjustments_back_adjusts_splits(monkeypatch):
     assert trainer.data.loc[0, "close"] == pytest.approx(100.0)
     assert trainer.data.loc[0, "open"] == pytest.approx(99.0)
     assert trainer.data.loc[0, "volume"] == pytest.approx(400.0)
-    assert trainer.training_metrics["corporate_action_adjustment_split_events"] == pytest.approx(1.0)
+    assert trainer.training_metrics["corporate_action_adjustment_split_events"] == pytest.approx(
+        1.0
+    )
 
 
 def test_apply_corporate_action_adjustments_back_adjusts_dividends(monkeypatch):
@@ -200,7 +204,58 @@ def test_apply_corporate_action_adjustments_back_adjusts_dividends(monkeypatch):
     assert trainer.data.loc[0, "close"] == pytest.approx(99.0)
     assert trainer.data.loc[0, "open"] == pytest.approx(99.0)
     assert trainer.data.loc[0, "volume"] == pytest.approx(1000.0)
-    assert trainer.training_metrics["corporate_action_adjustment_dividend_events"] == pytest.approx(1.0)
+    assert trainer.training_metrics["corporate_action_adjustment_dividend_events"] == pytest.approx(
+        1.0
+    )
+
+
+def test_verify_institutional_infra_rejects_missing_ohlcv_table(monkeypatch):
+    import quant_trading_system.database.connection as conn_module
+
+    fake_db = MagicMock()
+    fake_db.health_check.return_value = True
+    fake_db.engine = object()
+
+    fake_redis = MagicMock()
+    fake_redis.health_check.return_value = True
+
+    monkeypatch.setattr(conn_module, "get_db_manager", lambda: fake_db)
+    monkeypatch.setattr(conn_module, "get_redis_manager", lambda: fake_redis)
+
+    class FakeInspector:
+        def get_table_names(self):
+            return ["features"]
+
+    monkeypatch.setattr(train_script, "sa_inspect", lambda engine: FakeInspector())
+
+    with pytest.raises(RuntimeError, match="Missing required tables: ohlcv_bars"):
+        train_script._verify_institutional_infra()
+
+
+def test_verify_institutional_infra_rejects_empty_ohlcv_table(monkeypatch):
+    import quant_trading_system.database.connection as conn_module
+
+    fake_db = MagicMock()
+    fake_db.health_check.return_value = True
+    fake_db.engine = object()
+    fake_session = MagicMock()
+    fake_session.execute.return_value.scalar.return_value = None
+    fake_db.session.return_value = nullcontext(fake_session)
+
+    fake_redis = MagicMock()
+    fake_redis.health_check.return_value = True
+
+    monkeypatch.setattr(conn_module, "get_db_manager", lambda: fake_db)
+    monkeypatch.setattr(conn_module, "get_redis_manager", lambda: fake_redis)
+
+    class FakeInspector:
+        def get_table_names(self):
+            return ["ohlcv_bars"]
+
+    monkeypatch.setattr(train_script, "sa_inspect", lambda engine: FakeInspector())
+
+    with pytest.raises(RuntimeError, match="ohlcv_bars table is empty"):
+        train_script._verify_institutional_infra()
 
 
 def test_run_training_uses_start_end_alias(monkeypatch):
@@ -745,7 +800,9 @@ def test_optuna_search_space_regularizes_xgboost_for_small_folds():
 
 
 def test_fold_reliability_weight_penalizes_low_support():
-    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost", min_trades=40))
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="xgboost", min_trades=40)
+    )
     strong_metrics = {
         "test_size": 220,
         "trade_count": 18.0,
@@ -772,9 +829,18 @@ def test_fold_reliability_weight_penalizes_low_support():
 
 
 def test_has_binary_class_support_detects_single_class_folds():
-    assert train_script.ModelTrainer._has_binary_class_support(np.array([0, 1, 0, 1], dtype=float)) is True
-    assert train_script.ModelTrainer._has_binary_class_support(np.array([1, 1, 1], dtype=float)) is False
-    assert train_script.ModelTrainer._has_binary_class_support(np.array([0, 0, 0], dtype=float)) is False
+    assert (
+        train_script.ModelTrainer._has_binary_class_support(np.array([0, 1, 0, 1], dtype=float))
+        is True
+    )
+    assert (
+        train_script.ModelTrainer._has_binary_class_support(np.array([1, 1, 1], dtype=float))
+        is False
+    )
+    assert (
+        train_script.ModelTrainer._has_binary_class_support(np.array([0, 0, 0], dtype=float))
+        is False
+    )
 
 
 def test_infer_regime_side_bias_shifts_long_short_by_regime_and_drift():
@@ -1080,8 +1146,12 @@ def test_calculate_fold_metrics_sorts_execution_inputs_by_timestamp(monkeypatch)
         return_details=False,
     ):
         captured["y_proba"] = np.asarray(y_proba, dtype=float).copy()
-        captured["timestamps"] = np.asarray(timestamps).copy() if timestamps is not None else np.array([])
-        captured["symbols"] = np.asarray(symbols, dtype=object).copy() if symbols is not None else np.array([])
+        captured["timestamps"] = (
+            np.asarray(timestamps).copy() if timestamps is not None else np.array([])
+        )
+        captured["symbols"] = (
+            np.asarray(symbols, dtype=object).copy() if symbols is not None else np.array([])
+        )
         n = len(y_proba)
         empty = np.zeros(n, dtype=float)
         details = {
@@ -1357,7 +1427,9 @@ def test_validate_model_normalizes_gate_bool_types():
 
 
 def test_select_final_model_prefers_reliability_adjusted_score():
-    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost", min_trades=40))
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="xgboost", min_trades=40)
+    )
     models = [object(), object()]
     fold_results = [
         {
@@ -1454,8 +1526,12 @@ def test_build_execution_profile_is_realized_return_leakage_safe():
         realized_returns=realized_neg,
     )
 
-    np.testing.assert_allclose(profile_pos["long_threshold_series"], profile_neg["long_threshold_series"])
-    np.testing.assert_allclose(profile_pos["short_threshold_series"], profile_neg["short_threshold_series"])
+    np.testing.assert_allclose(
+        profile_pos["long_threshold_series"], profile_neg["long_threshold_series"]
+    )
+    np.testing.assert_allclose(
+        profile_pos["short_threshold_series"], profile_neg["short_threshold_series"]
+    )
     np.testing.assert_allclose(profile_pos["raw_signals"], profile_neg["raw_signals"])
     np.testing.assert_allclose(profile_pos["positions"], profile_neg["positions"])
 
@@ -1482,9 +1558,15 @@ def test_compute_features_windows_full_pipeline_fails_fast_without_partial_fallb
 
     monkeypatch.setattr(train_script.os, "name", "nt", raising=False)
     monkeypatch.setattr(trainer, "_load_features_from_postgres", lambda: None)
-    monkeypatch.setattr(trainer, "_compute_features_full_pipeline", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(
+        trainer,
+        "_compute_features_full_pipeline",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
     fallback_called = {"value": False}
-    monkeypatch.setattr(trainer, "_compute_features_fallback", lambda: fallback_called.__setitem__("value", True))
+    monkeypatch.setattr(
+        trainer, "_compute_features_fallback", lambda: fallback_called.__setitem__("value", True)
+    )
 
     with pytest.raises(RuntimeError, match="Full feature pipeline failed on Windows"):
         trainer._compute_features()
@@ -1513,9 +1595,15 @@ def test_compute_features_windows_allows_partial_fallback_when_enabled(monkeypat
 
     monkeypatch.setattr(train_script.os, "name", "nt", raising=False)
     monkeypatch.setattr(trainer, "_load_features_from_postgres", lambda: None)
-    monkeypatch.setattr(trainer, "_compute_features_full_pipeline", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(
+        trainer,
+        "_compute_features_full_pipeline",
+        lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
     fallback_called = {"value": False}
-    monkeypatch.setattr(trainer, "_compute_features_fallback", lambda: fallback_called.__setitem__("value", True))
+    monkeypatch.setattr(
+        trainer, "_compute_features_fallback", lambda: fallback_called.__setitem__("value", True)
+    )
 
     trainer._compute_features()
     assert fallback_called["value"] is True
@@ -1632,7 +1720,9 @@ def test_build_parser_supports_feature_pipeline_flags():
 def test_build_parser_supports_symbols_file():
     parser = train_script.build_parser()
     args = parser.parse_args(["--symbols-file", "config/symbols.txt"])
-    assert str(args.symbols_file).endswith("config\\symbols.txt") or str(args.symbols_file).endswith("config/symbols.txt")
+    assert str(args.symbols_file).endswith("config\\symbols.txt") or str(
+        args.symbols_file
+    ).endswith("config/symbols.txt")
 
 
 def test_build_parser_supports_allow_partial_feature_fallback_flag():
@@ -1764,7 +1854,9 @@ def test_build_parser_supports_horizon_sweep_and_meta_threshold_flags():
 
 def test_build_parser_supports_white_reality_gate_flags():
     parser = train_script.build_parser()
-    args = parser.parse_args(["--min-white-reality-stat", "0.05", "--max-white-reality-pvalue", "0.08"])
+    args = parser.parse_args(
+        ["--min-white-reality-stat", "0.05", "--max-white-reality-pvalue", "0.08"]
+    )
     assert args.min_white_reality_stat == pytest.approx(0.05)
     assert args.max_white_reality_pvalue == pytest.approx(0.08)
 
@@ -2077,7 +2169,9 @@ def test_multiple_testing_correction_records_pbo_diagnostics_and_gate_metric():
 
 
 def test_effective_pbo_threshold_tightens_with_holdout_gap():
-    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost", max_pbo=0.45))
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="xgboost", max_pbo=0.45)
+    )
 
     relaxed = trainer._effective_pbo_threshold(
         sample_size=300,
@@ -2385,11 +2479,7 @@ def test_auto_live_profile_applies_for_5y_46_symbol_dataset():
     )
     symbols = [f"S{i:02d}" for i in range(46)]
     dates = pd.date_range("2019-01-01", "2024-12-31", freq="10D", tz="UTC")
-    rows = [
-        {"symbol": symbol, "timestamp": ts}
-        for symbol in symbols
-        for ts in dates
-    ]
+    rows = [{"symbol": symbol, "timestamp": ts} for symbol in symbols for ts in dates]
     trainer.data = pd.DataFrame(rows)
 
     trainer._apply_live_multi_symbol_profile()
@@ -2415,11 +2505,7 @@ def test_auto_live_profile_skips_small_or_short_dataset():
     )
     symbols = [f"S{i:02d}" for i in range(12)]
     dates = pd.date_range("2023-01-01", "2024-01-01", freq="14D", tz="UTC")
-    rows = [
-        {"symbol": symbol, "timestamp": ts}
-        for symbol in symbols
-        for ts in dates
-    ]
+    rows = [{"symbol": symbol, "timestamp": ts} for symbol in symbols for ts in dates]
     trainer.data = pd.DataFrame(rows)
 
     trainer._apply_live_multi_symbol_profile()
@@ -2502,9 +2588,7 @@ def test_fit_model_falls_back_to_sample_weight_keyword():
         def fit(self, X, y, sample_weight=None):
             captured["sample_weight"] = sample_weight
 
-    trainer = train_script.ModelTrainer(
-        train_script.TrainingConfig(model_type="xgboost")
-    )
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
     X = np.random.rand(10, 3)
     y = np.random.randint(0, 2, size=10)
     w = np.linspace(0.5, 1.5, 10)

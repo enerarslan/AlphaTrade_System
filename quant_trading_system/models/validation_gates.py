@@ -94,10 +94,7 @@ class ValidationReport:
     @property
     def all_critical_passed(self) -> bool:
         """Check if all critical gates passed."""
-        return all(
-            r.passed for r in self.gate_results
-            if r.severity == GateSeverity.CRITICAL
-        )
+        return all(r.passed for r in self.gate_results if r.severity == GateSeverity.CRITICAL)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -229,16 +226,16 @@ class ModelValidationGates:
 
     def __init__(
         self,
-        min_sharpe_ratio: float = 0.5,
-        max_drawdown: float = 0.25,
-        min_win_rate: float = 0.45,
-        min_profit_factor: float = 1.1,
-        max_is_oos_ratio: float = 2.0,
+        min_sharpe_ratio: float = 1.0,
+        max_drawdown: float = 0.15,
+        min_win_rate: float = 0.52,
+        min_profit_factor: float = 1.3,
+        max_is_oos_ratio: float = 1.3,
         min_samples: int = 500,
         min_r2: float = 0.0,
-        max_volatility: float = 0.30,
-        min_stability_score: float = 0.3,
-        min_information_ratio: float = 0.3,
+        max_volatility: float = 0.25,
+        min_stability_score: float = 0.5,
+        min_information_ratio: float = 0.5,
     ):
         """
         Initialize validation gates with thresholds.
@@ -258,81 +255,99 @@ class ModelValidationGates:
         self.gates: list[ValidationGate] = []
 
         # Performance Gates
-        self.gates.append(ValidationGate(
-            name="Minimum Sharpe Ratio",
-            category=GateCategory.PERFORMANCE,
-            severity=GateSeverity.CRITICAL,
-            threshold=min_sharpe_ratio,
-            comparison=">=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Minimum Sharpe Ratio",
+                category=GateCategory.PERFORMANCE,
+                severity=GateSeverity.CRITICAL,
+                threshold=min_sharpe_ratio,
+                comparison=">=",
+            )
+        )
 
-        self.gates.append(ValidationGate(
-            name="Minimum Win Rate",
-            category=GateCategory.PERFORMANCE,
-            severity=GateSeverity.CRITICAL,
-            threshold=min_win_rate,
-            comparison=">=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Minimum Win Rate",
+                category=GateCategory.PERFORMANCE,
+                severity=GateSeverity.CRITICAL,
+                threshold=min_win_rate,
+                comparison=">=",
+            )
+        )
 
-        self.gates.append(ValidationGate(
-            name="Minimum Profit Factor",
-            category=GateCategory.PERFORMANCE,
-            severity=GateSeverity.WARNING,
-            threshold=min_profit_factor,
-            comparison=">=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Minimum Profit Factor",
+                category=GateCategory.PERFORMANCE,
+                severity=GateSeverity.CRITICAL,
+                threshold=min_profit_factor,
+                comparison=">=",
+            )
+        )
 
-        self.gates.append(ValidationGate(
-            name="Minimum Information Ratio",
-            category=GateCategory.PERFORMANCE,
-            severity=GateSeverity.WARNING,
-            threshold=min_information_ratio,
-            comparison=">=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Minimum Information Ratio",
+                category=GateCategory.PERFORMANCE,
+                severity=GateSeverity.WARNING,
+                threshold=min_information_ratio,
+                comparison=">=",
+            )
+        )
 
         # Risk Gates
-        self.gates.append(ValidationGate(
-            name="Maximum Drawdown",
-            category=GateCategory.RISK,
-            severity=GateSeverity.CRITICAL,
-            threshold=max_drawdown,
-            comparison="<=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Maximum Drawdown",
+                category=GateCategory.RISK,
+                severity=GateSeverity.CRITICAL,
+                threshold=max_drawdown,
+                comparison="<=",
+            )
+        )
 
-        self.gates.append(ValidationGate(
-            name="Maximum Volatility",
-            category=GateCategory.RISK,
-            severity=GateSeverity.WARNING,
-            threshold=max_volatility,
-            comparison="<=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Maximum Volatility",
+                category=GateCategory.RISK,
+                severity=GateSeverity.WARNING,
+                threshold=max_volatility,
+                comparison="<=",
+            )
+        )
 
         # Overfitting Gates
-        self.gates.append(ValidationGate(
-            name="Maximum IS/OOS Ratio",
-            category=GateCategory.OVERFITTING,
-            severity=GateSeverity.CRITICAL,
-            threshold=max_is_oos_ratio,
-            comparison="<=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Maximum IS/OOS Ratio",
+                category=GateCategory.OVERFITTING,
+                severity=GateSeverity.CRITICAL,
+                threshold=max_is_oos_ratio,
+                comparison="<=",
+            )
+        )
 
         # Data Quality Gates
-        self.gates.append(ValidationGate(
-            name="Minimum Sample Size",
-            category=GateCategory.DATA_QUALITY,
-            severity=GateSeverity.CRITICAL,
-            threshold=float(min_samples),
-            comparison=">=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Minimum Sample Size",
+                category=GateCategory.DATA_QUALITY,
+                severity=GateSeverity.CRITICAL,
+                threshold=float(min_samples),
+                comparison=">=",
+            )
+        )
 
         # Stability Gates
-        self.gates.append(ValidationGate(
-            name="Minimum Stability Score",
-            category=GateCategory.STABILITY,
-            severity=GateSeverity.WARNING,
-            threshold=min_stability_score,
-            comparison=">=",
-        ))
+        self.gates.append(
+            ValidationGate(
+                name="Minimum Stability Score",
+                category=GateCategory.STABILITY,
+                severity=GateSeverity.CRITICAL,
+                threshold=min_stability_score,
+                comparison=">=",
+            )
+        )
 
         # Store thresholds for custom checks
         self.min_r2 = min_r2
@@ -409,15 +424,17 @@ class ModelValidationGates:
         # Custom validation: R-squared for regression
         if predictions is not None and actuals is not None:
             r2 = self._compute_r2(predictions, actuals)
-            gate_results.append(GateResult(
-                gate_name="Minimum R-squared",
-                category=GateCategory.PERFORMANCE,
-                severity=GateSeverity.WARNING,
-                passed=r2 >= self.min_r2,
-                actual_value=r2,
-                threshold_value=self.min_r2,
-                message=f"R² = {r2:.4f} vs min {self.min_r2:.4f}",
-            ))
+            gate_results.append(
+                GateResult(
+                    gate_name="Minimum R-squared",
+                    category=GateCategory.PERFORMANCE,
+                    severity=GateSeverity.WARNING,
+                    passed=r2 >= self.min_r2,
+                    actual_value=r2,
+                    threshold_value=self.min_r2,
+                    message=f"R² = {r2:.4f} vs min {self.min_r2:.4f}",
+                )
+            )
 
         # Economic sensibility check
         economic_check = self._check_economic_sensibility(holdout_metrics)
@@ -426,12 +443,10 @@ class ModelValidationGates:
 
         # Count failures
         critical_failures = sum(
-            1 for r in gate_results
-            if not r.passed and r.severity == GateSeverity.CRITICAL
+            1 for r in gate_results if not r.passed and r.severity == GateSeverity.CRITICAL
         )
         warning_failures = sum(
-            1 for r in gate_results
-            if not r.passed and r.severity == GateSeverity.WARNING
+            1 for r in gate_results if not r.passed and r.severity == GateSeverity.WARNING
         )
 
         # Overall pass/fail
@@ -568,11 +583,13 @@ def validate_model_for_deployment(
     """
     if strict:
         gates = ModelValidationGates(
-            min_sharpe_ratio=0.7,
-            max_drawdown=0.20,
-            min_win_rate=0.48,
-            min_profit_factor=1.2,
-            max_is_oos_ratio=1.5,
+            min_sharpe_ratio=1.1,
+            max_drawdown=0.12,
+            min_win_rate=0.54,
+            min_profit_factor=1.4,
+            max_is_oos_ratio=1.2,
+            min_stability_score=0.55,
+            min_information_ratio=0.6,
         )
     else:
         gates = ModelValidationGates()

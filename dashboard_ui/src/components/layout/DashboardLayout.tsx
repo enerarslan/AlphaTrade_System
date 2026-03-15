@@ -4,10 +4,13 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useShallow } from "zustand/react/shallow";
 import {
   AlertTriangle,
+  BarChart2,
   BarChart3,
   Bot,
   Boxes,
   BriefcaseBusiness,
+  Database,
+  FlaskConical,
   Gauge,
   LogOut,
   Menu,
@@ -42,9 +45,12 @@ const navItems: NavItem[] = [
   { icon: Gauge, label: "Command Center", href: "/" },
   { icon: BriefcaseBusiness, label: "Execution", href: "/trading", permission: "control.trading.status" },
   { icon: Boxes, label: "Platform", href: "/platform", permission: "read.basic" },
+  { icon: BarChart2, label: "Analytics", href: "/analytics", permission: "read.basic" },
   { icon: ShieldAlert, label: "Risk", href: "/risk", permission: "risk.advanced.read" },
   { icon: Bot, label: "Models", href: "/models", permission: "models.governance.read" },
+  { icon: FlaskConical, label: "Backtest Lab", href: "/backtest", permission: "control.jobs.create" },
   { icon: Workflow, label: "Operations", href: "/operations", permission: "operations.sre.read" },
+  { icon: Database, label: "Database", href: "/database", permission: "read.basic" },
   { icon: AlertTriangle, label: "Alerts", href: "/alerts" },
   { icon: Settings, label: "Settings", href: "/settings", permission: "control.risk.kill_switch.reset" },
 ];

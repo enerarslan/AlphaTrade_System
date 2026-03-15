@@ -213,12 +213,14 @@ class TripleBarrierLabeler:
             signal = signals.iloc[i]
 
             if signal == 0 or pd.isna(signal):
-                results.append({
-                    "label": np.nan,
-                    "barrier_touched": None,
-                    "holding_period": 0,
-                    "return": 0.0,
-                })
+                results.append(
+                    {
+                        "label": np.nan,
+                        "barrier_touched": None,
+                        "holding_period": 0,
+                        "return": 0.0,
+                    }
+                )
                 continue
 
             entry_price = prices.iloc[i]
@@ -281,12 +283,14 @@ class TripleBarrierLabeler:
             else:
                 ret = (entry_price - exit_price) / entry_price
 
-            results.append({
-                "label": label,
-                "barrier_touched": barrier,
-                "holding_period": holding_period,
-                "return": ret,
-            })
+            results.append(
+                {
+                    "label": label,
+                    "barrier_touched": barrier,
+                    "holding_period": holding_period,
+                    "return": ret,
+                }
+            )
 
         return pd.DataFrame(results, index=prices.index)
 
@@ -377,9 +381,7 @@ class MetaLabeler:
                     device="cuda" if use_cuda else "cpu",
                 )
             except Exception as exc:
-                logger.warning(
-                    f"XGBoost meta-labeler unavailable ({exc}), using random_forest"
-                )
+                logger.warning(f"XGBoost meta-labeler unavailable ({exc}), using random_forest")
                 return RandomForestClassifier(
                     n_estimators=self.config.n_estimators,
                     max_depth=self.config.max_depth,
@@ -452,7 +454,7 @@ class MetaLabeler:
 
         if self.config.include_timing_features:
             # Time of day/week if datetime index
-            if hasattr(X.index, 'hour'):
+            if hasattr(X.index, "hour"):
                 meta_features["hour"] = X.index.hour
                 meta_features["day_of_week"] = X.index.dayofweek
 
@@ -480,7 +482,7 @@ class MetaLabeler:
 
         # Generate labels using triple barrier
         if isinstance(signals, np.ndarray):
-            signals = pd.Series(signals, index=prices.index[:len(signals)])
+            signals = pd.Series(signals, index=prices.index[: len(signals)])
 
         labels_df = self._labeler.generate_labels(prices, signals)
 
@@ -502,26 +504,36 @@ class MetaLabeler:
         gap = min(self.config.max_holding_period, max(0, len(X_train) // 10))
         split_idx = len(X_train) - val_size - gap
 
+        if split_idx < 20:
+            raise ValueError(
+                "Not enough labeled samples for unbiased temporal validation. "
+                f"Need at least 20 fit samples before the holdout window, got {split_idx}."
+            )
+
+        if np.unique(y_train).size < 2:
+            raise ValueError("Meta-labeler requires both positive and negative labels.")
+
+        X_fit = X_train[:split_idx]
+        y_fit = y_train[:split_idx]
+        X_val = X_train[split_idx + gap :]
+        y_val = y_train[split_idx + gap :]
+
+        if len(X_val) == 0:
+            raise ValueError("Meta-labeler temporal validation window is empty.")
+        if np.unique(y_fit).size < 2:
+            raise ValueError("Meta-labeler fit window requires both positive and negative labels.")
+        if np.unique(y_val).size < 2:
+            raise ValueError(
+                "Meta-labeler validation window requires both positive and negative labels."
+            )
+
         self._model = self._create_model()
+        self._model.fit(X_fit, y_fit)
+        y_pred = self._model.predict(X_val)
+        y_proba = self._model.predict_proba(X_val)[:, 1]
 
-        if split_idx >= 20:
-            X_fit = X_train[:split_idx]
-            y_fit = y_train[:split_idx]
-            X_val = X_train[split_idx + gap :]
-            y_val = y_train[split_idx + gap :]
-
-            self._model.fit(X_fit, y_fit)
-            y_pred = self._model.predict(X_val)
-            y_proba = self._model.predict_proba(X_val)[:, 1]
-
-            # Refit on all data after unbiased metric estimation.
-            self._model.fit(X_train, y_train)
-        else:
-            # Fallback for very small samples.
-            self._model.fit(X_train, y_train)
-            y_pred = self._model.predict(X_train)
-            y_proba = self._model.predict_proba(X_train)[:, 1]
-            y_val = y_train
+        # Refit on all data after unbiased metric estimation.
+        self._model.fit(X_train, y_train)
 
         self._is_fitted = True
 
@@ -606,12 +618,14 @@ class MetaLabeler:
         filtered[has_signal & below_threshold] = 0
 
         # Build result DataFrame
-        result = pd.DataFrame({
-            "original_signal": signals.values,
-            "confidence": confidences,
-            "filtered_signal": filtered.values,
-            "passed_filter": ~(has_signal & below_threshold),
-        })
+        result = pd.DataFrame(
+            {
+                "original_signal": signals.values,
+                "confidence": confidences,
+                "filtered_signal": filtered.values,
+                "passed_filter": ~(has_signal & below_threshold),
+            }
+        )
 
         n_filtered = (has_signal & below_threshold).sum()
         n_total = has_signal.sum()
@@ -647,7 +661,7 @@ class MetaLabeler:
         threshold = threshold or self._threshold
 
         if isinstance(signals, np.ndarray):
-            signals = pd.Series(signals, index=prices.index[:len(signals)])
+            signals = pd.Series(signals, index=prices.index[: len(signals)])
 
         # Generate ground truth labels
         labels_df = self._labeler.generate_labels(prices, signals)
@@ -682,7 +696,11 @@ class MetaLabeler:
         trades_avoided = (would_trade & was_filtered & would_have_lost).sum()
 
         return MetaLabelMetrics(
-            precision=precision_score(y_true[passed_filter], y_pred[passed_filter]) if passed_filter.sum() > 0 else 0.0,
+            precision=(
+                precision_score(y_true[passed_filter], y_pred[passed_filter])
+                if passed_filter.sum() > 0
+                else 0.0
+            ),
             recall=passed_filter.sum() / len(y_true),
             f1=f1_score(y_true, y_pred),
             auc_roc=roc_auc_score(y_true, y_proba),
@@ -707,10 +725,12 @@ class MetaLabeler:
         else:
             raise ValueError("Model does not have feature_importances_")
 
-        return pd.DataFrame({
-            "feature": self._feature_names,
-            "importance": importance,
-        }).sort_values("importance", ascending=False)
+        return pd.DataFrame(
+            {
+                "feature": self._feature_names,
+                "importance": importance,
+            }
+        ).sort_values("importance", ascending=False)
 
     @property
     def is_fitted(self) -> bool:

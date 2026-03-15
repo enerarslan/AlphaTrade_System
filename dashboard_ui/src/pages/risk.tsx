@@ -108,44 +108,28 @@ export default function RiskPage() {
     return Math.min(100, Math.round(drawdown * 2.2 + concentration * 0.7 + correlation * 0.35));
   }, [riskMetrics, riskConcentration, riskCorrelation]);
 
-  // Generate synthetic drawdown data from risk metrics
+  // Build drawdown line from known anchor points only — no synthetic sine waves
   const drawdownData = useMemo(() => {
-    const maxDD = riskMetrics?.max_drawdown_30d ?? -0.05;
-    const curDD = riskMetrics?.current_drawdown ?? -0.02;
-    const points: Array<{ time: string; value: number }> = [];
+    const maxDD = riskMetrics?.max_drawdown_30d;
+    const curDD = riskMetrics?.current_drawdown;
+    if (maxDD == null || curDD == null) return [];
     const now = new Date();
-    for (let i = 89; i >= 0; i--) {
-      const date = new Date(now.getTime() - i * 86400_000);
-      const t = (90 - i) / 90;
-      // simulate drawdown that deepens then recovers
-      const cycle = Math.sin(t * Math.PI * 2.5) * 0.5 - 0.5;
-      const val = Math.max(maxDD * 1.2, Math.min(0, cycle * Math.abs(maxDD)));
-      points.push({
-        time: date.toISOString().slice(0, 10),
-        value: i === 0 ? curDD : val,
-      });
-    }
-    return points;
+    // Three-point estimate: start at 0, trough at max_drawdown_30d (mid-period), recover toward current_drawdown
+    const midDate = new Date(now.getTime() - 15 * 86400_000);
+    const startDate = new Date(now.getTime() - 30 * 86400_000);
+    return [
+      { time: startDate.toISOString().slice(0, 10), value: 0 },
+      { time: midDate.toISOString().slice(0, 10), value: maxDD },
+      { time: now.toISOString().slice(0, 10), value: curDD },
+    ];
   }, [riskMetrics]);
 
-  // Build correlation matrix from store data
+  // Build correlation matrix from store data — no placeholder fabrication
   const correlationMatrix = useMemo(() => {
     const rawPairs = riskCorrelation?.matrix;
     if (!rawPairs || rawPairs.length === 0) {
-      // Generate a sample matrix for visual placeholder
-      const syms = ["AAPL", "MSFT", "GOOG", "AMZN", "TSLA"];
-      const m: Record<string, Record<string, number>> = {};
-      syms.forEach((a) => {
-        m[a] = {};
-        syms.forEach((b) => {
-          m[a][b] = a === b ? 1 : +(Math.random() * 1.6 - 0.3).toFixed(3);
-        });
-      });
-      // Make symmetric
-      syms.forEach((a) => syms.forEach((b) => { m[b][a] = m[a][b]; }));
-      return m;
+      return null;
     }
-    // Build from pairs
     const symbols = new Set<string>();
     rawPairs.forEach((p) => {
       symbols.add(p.symbol_a);
@@ -226,10 +210,19 @@ export default function RiskPage() {
                       <TrendingDown size={18} className="text-rose-400" />
                       Drawdown Analysis
                     </CardTitle>
-                    <CardDescription>Portfolio drawdown depth over time (TradingView).</CardDescription>
+                    <CardDescription>
+                    Portfolio drawdown anchored to max_drawdown_30d and current_drawdown.{" "}
+                    {drawdownData.length > 0 && <span className="text-amber-400/70 text-[10px] uppercase tracking-wider">Estimated</span>}
+                  </CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <DrawdownChart data={drawdownData} height={260} />
+                    {drawdownData.length > 0 ? (
+                      <DrawdownChart data={drawdownData} height={260} />
+                    ) : (
+                      <div className="flex items-center justify-center h-[260px] text-sm text-slate-500">
+                        No historical drawdown data available.
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               ),
@@ -248,7 +241,13 @@ export default function RiskPage() {
                     <CardDescription>Position correlation heatmap (-1 red to +1 cyan).</CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <CorrelationHeatmap matrix={correlationMatrix} cellSize={40} />
+                    {correlationMatrix ? (
+                      <CorrelationHeatmap matrix={correlationMatrix} cellSize={40} />
+                    ) : (
+                      <div className="flex items-center justify-center h-[200px] text-sm text-slate-500">
+                        No correlation data available. Positions needed for correlation analysis.
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               ),
@@ -357,18 +356,22 @@ export default function RiskPage() {
                 />
               </div>
             </div>
-            <div className="grid grid-cols-3 gap-2 text-sm">
+            <div className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
               <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
                 <p className="text-[10px] uppercase text-slate-500">VaR (95%)</p>
                 <p className="font-mono font-semibold text-rose-300">${(riskMetrics?.portfolio_var_95 ?? 0).toLocaleString()}</p>
               </div>
               <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
-                <p className="text-[10px] uppercase text-slate-500">Max DD 30D</p>
-                <p className="font-mono font-semibold text-amber-300">{((riskMetrics?.max_drawdown_30d ?? 0) * 100).toFixed(2)}%</p>
+                <p className="text-[10px] uppercase text-slate-500">VaR (99%)</p>
+                <p className="font-mono font-semibold text-rose-400">{varData?.var_99 != null ? `$${varData.var_99.toLocaleString()}` : "—"}</p>
               </div>
               <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
-                <p className="text-[10px] uppercase text-slate-500">Beta</p>
-                <p className="font-mono font-semibold text-cyan-300">{(riskMetrics?.beta_exposure ?? 0).toFixed(3)}</p>
+                <p className="text-[10px] uppercase text-slate-500">CVaR (95%) ES</p>
+                <p className="font-mono font-semibold text-rose-500">{varData?.cvar_95 != null ? `$${varData.cvar_95.toLocaleString()}` : "—"}</p>
+              </div>
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
+                <p className="text-[10px] uppercase text-slate-500">Max DD 30D</p>
+                <p className="font-mono font-semibold text-amber-300">{((riskMetrics?.max_drawdown_30d ?? 0) * 100).toFixed(2)}%</p>
               </div>
             </div>
           </CardContent>
@@ -436,6 +439,65 @@ export default function RiskPage() {
                   );
                 })}
               </div>
+            )}
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* Risk Attribution Detail */}
+      <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Pre-Trade Checks</CardTitle>
+            <CardDescription>Risk checks performed before order execution.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {(riskAttribution?.pre_trade_checks ?? []).length === 0 ? (
+              <p className="text-sm text-slate-500">No pre-trade check data.</p>
+            ) : (
+              (riskAttribution?.pre_trade_checks ?? []).map((check, i) => (
+                <div key={i} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-slate-300">
+                      {String(check.check ?? check.name ?? `Check ${i + 1}`)}
+                    </span>
+                    <Badge variant={check.passed ? "success" : "error"}>
+                      {check.passed ? "PASS" : "FAIL"}
+                    </Badge>
+                  </div>
+                  {Boolean(check.reason) && (
+                    <p className="mt-1 text-xs text-slate-500">{String(check.reason)}</p>
+                  )}
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Post-Trade Findings</CardTitle>
+            <CardDescription>Risk observations after trade execution.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {(riskAttribution?.post_trade_findings ?? []).length === 0 ? (
+              <p className="text-sm text-slate-500">No post-trade findings.</p>
+            ) : (
+              (riskAttribution?.post_trade_findings ?? []).map((finding, i) => (
+                <div key={i} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-slate-300">
+                      {String(finding.finding ?? finding.name ?? `Finding ${i + 1}`)}
+                    </span>
+                    <Badge variant={finding.severity === "HIGH" || finding.severity === "CRITICAL" ? "error" : "warning"}>
+                      {String(finding.severity ?? "INFO")}
+                    </Badge>
+                  </div>
+                  {Boolean(finding.detail) && (
+                    <p className="mt-1 text-xs text-slate-500">{String(finding.detail)}</p>
+                  )}
+                </div>
+              ))
             )}
           </CardContent>
         </Card>

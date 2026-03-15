@@ -13,6 +13,9 @@ const ModelsPage = lazy(() => import("@/pages/models"));
 const AlertsPage = lazy(() => import("@/pages/alerts"));
 const SettingsPage = lazy(() => import("@/pages/settings"));
 const LoginPage = lazy(() => import("@/pages/login"));
+const AnalyticsPage = lazy(() => import("@/pages/analytics"));
+const BacktestPage = lazy(() => import("@/pages/backtest"));
+const DatabasePage = lazy(() => import("@/pages/database"));
 
 function GuardedRoute({ permission, children }: { permission: string; children: import("react").ReactElement }) {
   const role = useStore((state) => state.role);
@@ -87,7 +90,31 @@ function ProtectedApp() {
               </GuardedRoute>
             }
           />
+          <Route
+            path="/database"
+            element={
+              <GuardedRoute permission="read.basic">
+                <DatabasePage />
+              </GuardedRoute>
+            }
+          />
           <Route path="/alerts" element={<AlertsPage />} />
+          <Route
+            path="/analytics"
+            element={
+              <GuardedRoute permission="read.basic">
+                <AnalyticsPage />
+              </GuardedRoute>
+            }
+          />
+          <Route
+            path="/backtest"
+            element={
+              <GuardedRoute permission="control.jobs.create">
+                <BacktestPage />
+              </GuardedRoute>
+            }
+          />
           <Route
             path="/settings"
             element={

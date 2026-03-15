@@ -11,10 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import sessionmaker
 
 # Check if redis is available
 try:
     import redis
+
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
@@ -361,6 +364,47 @@ class TestBaseRepository:
         repo = OHLCVRepository(mock_db_manager)
 
         assert repo._db is mock_db_manager
+
+
+class TestFeatureRepository:
+    """Tests for feature repository persistence semantics."""
+
+    def test_bulk_insert_upserts_duplicate_feature_rows(self):
+        """Saving the same feature twice should update in place, not violate PK constraints."""
+        from quant_trading_system.database.models import Feature
+        from quant_trading_system.database.repository import FeatureRepository
+
+        engine = create_engine("sqlite:///:memory:")
+        Feature.__table__.create(bind=engine)
+        session_factory = sessionmaker(bind=engine)
+        repo = FeatureRepository(MagicMock())
+        timestamp = datetime(2025, 1, 1, 14, 30, tzinfo=timezone.utc)
+
+        first = {
+            "symbol": "AAPL",
+            "timestamp": timestamp,
+            "timeframe": "15Min",
+            "feature_name": "alpha_score",
+            "feature_set_id": "default",
+            "value": 1.0,
+        }
+        second = {**first, "value": 2.5}
+
+        with session_factory() as session:
+            assert repo.bulk_insert(session, [first]) == 1
+            session.commit()
+
+        with session_factory() as session:
+            assert repo.bulk_insert(session, [second]) == 1
+            session.commit()
+
+        with session_factory() as session:
+            stored = session.scalar(select(Feature))
+            count = session.scalar(select(func.count()).select_from(Feature))
+
+        assert count == 1
+        assert stored is not None
+        assert stored.value == 2.5
 
 
 class TestOHLCVRepository:

@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import quant_trading_system.models.classical_ml as classical_ml_models
@@ -440,6 +441,23 @@ class TestElasticNetModel:
         importance = model.get_feature_importance()
         assert len(importance) == X.shape[1]
 
+    def test_predict_proba_platt_alias_warns_and_matches_sigmoid(
+        self, sample_regression_data, caplog
+    ):
+        """Deprecated platt alias should warn and behave like heuristic sigmoid."""
+        X, y = sample_regression_data
+
+        model = ElasticNetModel(alpha=0.1)
+        model.fit(X, y)
+
+        with caplog.at_level("WARNING"):
+            proba_platt = model.predict_proba(X[:20], calibration_method="platt")
+
+        proba_sigmoid = model.predict_proba(X[:20], calibration_method="sigmoid")
+
+        assert "deprecated" in caplog.text.lower()
+        np.testing.assert_allclose(proba_platt, proba_sigmoid)
+
 
 class TestSampleWeights:
     """Tests for sample weight generation."""
@@ -502,7 +520,10 @@ class TestTimeSeriesSplitter:
         for train_idx, test_idx in splits:
             # No overlap (with gap)
             for test_i in test_idx:
-                assert all(abs(train_i - test_i) > 5 or train_i < test_idx.min() - 5 for train_i in train_idx)
+                assert all(
+                    abs(train_i - test_i) > 5 or train_i < test_idx.min() - 5
+                    for train_i in train_idx
+                )
 
     def test_expanding_window_split(self, sample_regression_data):
         """Test expanding window validation split."""
@@ -768,7 +789,9 @@ class TestModelManagerInstitutionalValidation:
 
         def fake_optimize(self, X, y, cv_splitter, scoring_func=None, sample_weights=None):
             self.best_score = 0.0
-            captured["optimizer_weight_len"] = len(sample_weights) if sample_weights is not None else -1
+            captured["optimizer_weight_len"] = (
+                len(sample_weights) if sample_weights is not None else -1
+            )
             return {"bias": 0.0}
 
         monkeypatch.setattr(
@@ -1031,9 +1054,7 @@ class TestDeepLearningModelSerialization:
         loaded_predictions = loaded_model.predict(X)
 
         # Predictions should match
-        np.testing.assert_array_almost_equal(
-            original_predictions, loaded_predictions, decimal=5
-        )
+        np.testing.assert_array_almost_equal(original_predictions, loaded_predictions, decimal=5)
 
     def test_lstm_load_preserves_architecture_params(self, sample_time_series_data, temp_model_dir):
         """Test that load() restores network architecture parameters."""
@@ -1044,7 +1065,7 @@ class TestDeepLearningModelSerialization:
         model = LSTMModel(
             lookback_window=10,
             hidden_size=32,  # Non-default
-            num_layers=3,    # Non-default
+            num_layers=3,  # Non-default
             epochs=2,
             device="cpu",
         )
@@ -1091,9 +1112,7 @@ class TestDeepLearningModelSerialization:
         # CRITICAL: This would crash before the fix
         loaded_predictions = loaded_model.predict(X)
 
-        np.testing.assert_array_almost_equal(
-            original_predictions, loaded_predictions, decimal=5
-        )
+        np.testing.assert_array_almost_equal(original_predictions, loaded_predictions, decimal=5)
 
     def test_tcn_save_load_roundtrip(self, sample_time_series_data, temp_model_dir):
         """Test TCN model can be saved and loaded correctly.
@@ -1122,9 +1141,7 @@ class TestDeepLearningModelSerialization:
         # CRITICAL: This would crash before the fix
         loaded_predictions = loaded_model.predict(X)
 
-        np.testing.assert_array_almost_equal(
-            original_predictions, loaded_predictions, decimal=5
-        )
+        np.testing.assert_array_almost_equal(original_predictions, loaded_predictions, decimal=5)
 
     def test_load_without_architecture_params_fails(self, temp_model_dir):
         """Test that loading a model without architecture params fails gracefully.
@@ -1220,6 +1237,53 @@ class TestEnsembles:
         ensemble.fit(X, y)
 
         assert ensemble.is_fitted
+
+
+class TestMetaLabeler:
+    """Tests for meta-labeling validation behavior."""
+
+    def test_meta_labeler_rejects_small_sample_without_unbiased_holdout(self, monkeypatch):
+        """Small datasets must fail instead of scoring on training data."""
+        from quant_trading_system.models.meta_labeling import MetaLabelConfig, MetaLabeler
+
+        X = pd.DataFrame(np.random.randn(24, 3), columns=["f0", "f1", "f2"])
+        signals = pd.Series(np.where(np.arange(24) % 2 == 0, 1, -1), index=X.index)
+        prices = pd.Series(np.linspace(100.0, 102.3, 24), index=X.index)
+        labels_df = pd.DataFrame({"label": np.tile([0, 1], 12)}, index=X.index)
+
+        meta_labeler = MetaLabeler(MetaLabelConfig())
+        monkeypatch.setattr(
+            meta_labeler._labeler,
+            "generate_labels",
+            lambda prices, signals: labels_df,
+        )
+
+        with pytest.raises(ValueError, match="unbiased temporal validation"):
+            meta_labeler.fit(X, signals, prices)
+
+
+class TestValidationGatesDefaults:
+    """Tests for institutional validation gate defaults."""
+
+    def test_default_thresholds_are_institutional(self):
+        """Default validation gates should enforce institutional-safe thresholds."""
+        from quant_trading_system.models.validation_gates import (
+            GateSeverity,
+            ModelValidationGates,
+        )
+
+        gates = ModelValidationGates()
+        thresholds = {gate.name: gate.threshold for gate in gates.gates}
+        severities = {gate.name: gate.severity for gate in gates.gates}
+
+        assert thresholds["Minimum Sharpe Ratio"] == pytest.approx(1.0)
+        assert thresholds["Maximum Drawdown"] == pytest.approx(0.15)
+        assert thresholds["Minimum Win Rate"] == pytest.approx(0.52)
+        assert thresholds["Minimum Profit Factor"] == pytest.approx(1.3)
+        assert thresholds["Maximum IS/OOS Ratio"] == pytest.approx(1.3)
+        assert thresholds["Minimum Stability Score"] == pytest.approx(0.5)
+        assert severities["Minimum Profit Factor"] == GateSeverity.CRITICAL
+        assert severities["Minimum Stability Score"] == GateSeverity.CRITICAL
 
 
 # ==================== Reinforcement Learning Tests ====================

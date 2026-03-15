@@ -44,6 +44,7 @@ class DataAccessConfig:
         fallback_to_files: bool = False,
         data_dir: Path | None = None,
         training_data_dir: Path | None = None,
+        max_missing_symbols: int = 0,
     ):
         """
         Initialize data access configuration.
@@ -54,11 +55,14 @@ class DataAccessConfig:
                 Institutional runtime should keep this disabled.
             data_dir: Directory for raw data files.
             training_data_dir: Directory for training Parquet files.
+            max_missing_symbols: Maximum number of missing/error symbols tolerated
+                by get_ohlcv_bars_multi() before failing fast.
         """
         self.use_database = use_database
         self.fallback_to_files = fallback_to_files
         self.data_dir = data_dir or Path("data/raw")
         self.training_data_dir = training_data_dir or Path("data/training")
+        self.max_missing_symbols = max(0, int(max_missing_symbols))
 
 
 class DataAccessLayer:
@@ -102,6 +106,7 @@ class DataAccessLayer:
         """Get database data loader, initializing if needed."""
         if self._db_loader is None:
             from quant_trading_system.data.db_loader import DatabaseDataLoader
+
             self._db_loader = DatabaseDataLoader(self._get_db_manager())
         return self._db_loader
 
@@ -109,6 +114,7 @@ class DataAccessLayer:
         """Get database feature store, initializing if needed."""
         if self._feature_store is None:
             from quant_trading_system.data.db_feature_store import DatabaseFeatureStore
+
             self._feature_store = DatabaseFeatureStore(self._get_db_manager())
         return self._feature_store
 
@@ -116,6 +122,7 @@ class DataAccessLayer:
         """Get file-based data loader, initializing if needed."""
         if self._file_loader is None:
             from quant_trading_system.data.loader import DataLoader
+
             self._file_loader = DataLoader(self.config.data_dir)
         return self._file_loader
 
@@ -160,9 +167,7 @@ class DataAccessLayer:
         # Try database first if configured
         if self.config.use_database and self._is_db_available():
             try:
-                return self._get_db_loader().load_symbol(
-                    symbol, start_date, end_date
-                )
+                return self._get_db_loader().load_symbol(symbol, start_date, end_date)
             except DataNotFoundError:
                 logger.info(f"No database data for {symbol}")
             except Exception as e:
@@ -171,9 +176,7 @@ class DataAccessLayer:
         # Try file-based fallback
         if self.config.fallback_to_files:
             try:
-                return self._get_file_loader().load_symbol(
-                    symbol, start_date, end_date
-                )
+                return self._get_file_loader().load_symbol(symbol, start_date, end_date)
             except DataNotFoundError:
                 pass
             except Exception as e:
@@ -217,15 +220,46 @@ class DataAccessLayer:
         Returns:
             Dictionary mapping symbol to DataFrame.
         """
-        results = {}
-        for symbol in symbols:
+        normalized_symbols = [str(symbol).upper() for symbol in symbols]
+        results: dict[str, pl.DataFrame] = {}
+        failed_symbols: list[str] = []
+        failure_details: dict[str, str] = {}
+
+        for symbol in normalized_symbols:
             try:
                 df = self.get_ohlcv_bars(symbol, start_date, end_date)
-                results[symbol.upper()] = df
-            except DataNotFoundError:
+                results[symbol] = df
+            except DataNotFoundError as exc:
+                failed_symbols.append(symbol)
+                failure_details[symbol] = str(exc)
                 logger.warning(f"No data found for {symbol}")
             except Exception as e:
+                failed_symbols.append(symbol)
+                failure_details[symbol] = str(e)
                 logger.error(f"Error loading {symbol}: {e}")
+
+        if failed_symbols:
+            failed_count = len(failed_symbols)
+            if failed_count > self.config.max_missing_symbols:
+                failures = ", ".join(
+                    f"{symbol}={failure_details.get(symbol, 'unknown')}"
+                    for symbol in failed_symbols
+                )
+                raise DataError(
+                    "Failed to load complete symbol universe. "
+                    f"requested={len(normalized_symbols)}, loaded={len(results)}, "
+                    f"failed={failed_count}, max_missing_symbols={self.config.max_missing_symbols}, "
+                    f"failures=[{failures}]"
+                )
+
+            logger.warning(
+                "Partial symbol universe returned: requested=%d loaded=%d failed=%d "
+                "max_missing_symbols=%d",
+                len(normalized_symbols),
+                len(results),
+                failed_count,
+                self.config.max_missing_symbols,
+            )
 
         return results
 
@@ -248,9 +282,7 @@ class DataAccessLayer:
         """
         if self.config.use_database and self._is_db_available():
             try:
-                return self._get_feature_store().get_features(
-                    symbol, timestamp, feature_names
-                )
+                return self._get_feature_store().get_features(symbol, timestamp, feature_names)
             except Exception as e:
                 logger.warning(f"Feature store error: {e}")
 
@@ -273,9 +305,7 @@ class DataAccessLayer:
         """
         if self.config.use_database and self._is_db_available():
             try:
-                return self._get_feature_store().get_latest_features(
-                    symbol, feature_names
-                )
+                return self._get_feature_store().get_latest_features(symbol, feature_names)
             except Exception as e:
                 logger.warning(f"Feature store error: {e}")
 
@@ -300,9 +330,7 @@ class DataAccessLayer:
         """
         if self.config.use_database and self._is_db_available():
             try:
-                return self._get_feature_store().save_features(
-                    symbol, timestamp, features
-                )
+                return self._get_feature_store().save_features(symbol, timestamp, features)
             except Exception as e:
                 logger.error(f"Failed to save features: {e}")
                 return 0
@@ -353,6 +381,7 @@ def configure_data_access(
     use_database: bool = True,
     fallback_to_files: bool = False,
     data_dir: Path | str | None = None,
+    max_missing_symbols: int = 0,
 ) -> DataAccessLayer:
     """
     Configure and return the data access layer.
@@ -361,6 +390,8 @@ def configure_data_access(
         use_database: Whether to use PostgreSQL as primary source.
         fallback_to_files: Whether to fall back to files if DB fails.
         data_dir: Directory for raw data files.
+        max_missing_symbols: Maximum number of missing/error symbols tolerated
+            by get_ohlcv_bars_multi() before failing fast.
 
     Returns:
         Configured DataAccessLayer instance.
@@ -371,6 +402,7 @@ def configure_data_access(
         use_database=use_database,
         fallback_to_files=fallback_to_files,
         data_dir=Path(data_dir) if data_dir else None,
+        max_missing_symbols=max_missing_symbols,
     )
 
     _data_access = DataAccessLayer(config)

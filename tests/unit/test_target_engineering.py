@@ -66,6 +66,8 @@ def test_generate_targets_emits_diagnostics_with_regime_distribution() -> None:
     assert diagnostics["label_count"] >= 0
     assert 0.0 <= diagnostics["positive_rate"] <= 1.0
     assert 0.0 <= diagnostics["label_drift_abs"] <= 1.0
+    assert 0.0 <= diagnostics["neutral_filtered_rate"] <= 1.0
+    assert 0.0 <= diagnostics["forward_outlier_filtered_rate"] <= 1.0
     assert isinstance(diagnostics["regime_distribution"], dict)
 
 
@@ -96,3 +98,17 @@ def test_generate_targets_filters_forward_return_outliers() -> None:
     result = generate_targets(frame, config)
 
     assert result.diagnostics["forward_outlier_filtered_count"] >= 1
+
+
+def test_generate_targets_logs_filter_diagnostics(caplog) -> None:
+    frame = _sample_frame(n=80)
+    config = TargetEngineeringConfig(
+        min_signal_abs_return_bps=0.0,
+        max_abs_forward_return=0.001,
+    )
+
+    with caplog.at_level("INFO"):
+        generate_targets(frame, config)
+
+    assert "TARGET_ENGINEERING_DIAGNOSTICS" in caplog.text
+    assert "TARGET_ENGINEERING_OUTLIER_RATE_HIGH" in caplog.text

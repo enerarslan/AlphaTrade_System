@@ -113,6 +113,7 @@ export default function SystemStatusPage() {
     auditTrail,
     siemStatus,
     incidents,
+    incidentTimeline,
     runbooks,
     hasPermission,
     fetchHealth,
@@ -135,6 +136,7 @@ export default function SystemStatusPage() {
       auditTrail: state.auditTrail,
       siemStatus: state.siemStatus,
       incidents: state.incidents,
+      incidentTimeline: state.incidentTimeline,
       runbooks: state.runbooks,
       hasPermission: state.hasPermission,
       fetchHealth: state.fetchHealth,
@@ -253,16 +255,66 @@ export default function SystemStatusPage() {
                     </CardTitle>
                     <CardDescription>Service-level objectives.</CardDescription>
                   </CardHeader>
-                  <CardContent className="space-y-2 text-sm">
+                  <CardContent className="space-y-4">
                     {!sloStatus ? (
                       <p className="text-slate-500">No SLO data.</p>
                     ) : (
-                      Object.entries(sloStatus).map(([key, val]) => (
-                        <div key={key} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                          <span className="text-slate-400">{key.replaceAll("_", " ")}</span>
-                          <span className="font-mono text-slate-200">{typeof val === "number" ? val.toFixed(3) : String(val)}</span>
+                      <>
+                        {/* Availability */}
+                        <div className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-4">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-sm text-slate-400">Availability</span>
+                            <span className={`text-2xl font-bold font-mono ${(sloStatus.availability ?? 0) >= 0.999 ? "text-emerald-400" : (sloStatus.availability ?? 0) >= 0.99 ? "text-amber-400" : "text-rose-400"}`}>
+                              {((sloStatus.availability ?? 0) * 100).toFixed(3)}%
+                            </span>
+                          </div>
+                          <div className="h-2 overflow-hidden rounded-full bg-white/[0.06]">
+                            <div
+                              className={`h-full rounded-full transition-all ${(sloStatus.availability ?? 0) >= 0.999 ? "bg-emerald-500" : (sloStatus.availability ?? 0) >= 0.99 ? "bg-amber-500" : "bg-rose-500"}`}
+                              style={{ width: `${Math.min(100, (sloStatus.availability ?? 0) * 100)}%` }}
+                            />
+                          </div>
                         </div>
-                      ))
+                        {/* Error Budget */}
+                        <div className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-4">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-sm text-slate-400">Error Budget Remaining</span>
+                            <span className={`text-lg font-bold font-mono ${(sloStatus.error_budget_remaining_pct ?? 0) > 50 ? "text-emerald-400" : (sloStatus.error_budget_remaining_pct ?? 0) > 20 ? "text-amber-400" : "text-rose-400"}`}>
+                              {(sloStatus.error_budget_remaining_pct ?? 0).toFixed(1)}%
+                            </span>
+                          </div>
+                          <div className="h-2 overflow-hidden rounded-full bg-white/[0.06]">
+                            <div
+                              className={`h-full rounded-full transition-all ${(sloStatus.error_budget_remaining_pct ?? 0) > 50 ? "bg-emerald-500" : (sloStatus.error_budget_remaining_pct ?? 0) > 20 ? "bg-amber-500" : "bg-rose-500"}`}
+                              style={{ width: `${Math.min(100, sloStatus.error_budget_remaining_pct ?? 0)}%` }}
+                            />
+                          </div>
+                        </div>
+                        {/* Metrics Grid */}
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
+                            <p className="text-[10px] uppercase text-slate-500">P95 Latency</p>
+                            <p className="font-mono font-semibold text-cyan-300">{(sloStatus.p95_action_latency_ms ?? 0).toFixed(0)}ms</p>
+                          </div>
+                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
+                            <p className="text-[10px] uppercase text-slate-500">P99 Latency</p>
+                            <p className="font-mono font-semibold text-amber-300">{(sloStatus.p99_action_latency_ms ?? 0).toFixed(0)}ms</p>
+                          </div>
+                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
+                            <p className="text-[10px] uppercase text-slate-500">Burn Rate 1h</p>
+                            <p className={`font-mono font-semibold ${(sloStatus.burn_rate_1h ?? 0) > 1 ? "text-rose-400" : "text-emerald-400"}`}>{(sloStatus.burn_rate_1h ?? 0).toFixed(2)}x</p>
+                          </div>
+                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-2 text-center">
+                            <p className="text-[10px] uppercase text-slate-500">Burn Rate 6h</p>
+                            <p className={`font-mono font-semibold ${(sloStatus.burn_rate_6h ?? 0) > 1 ? "text-rose-400" : "text-emerald-400"}`}>{(sloStatus.burn_rate_6h ?? 0).toFixed(2)}x</p>
+                          </div>
+                        </div>
+                        <div className="flex justify-center">
+                          <Badge variant={sloStatus.status === "HEALTHY" ? "success" : sloStatus.status === "AT_RISK" ? "warning" : "error"}>
+                            SLO: {sloStatus.status ?? "UNKNOWN"}
+                          </Badge>
+                        </div>
+                      </>
                     )}
                   </CardContent>
                 </Card>
@@ -452,6 +504,49 @@ export default function SystemStatusPage() {
           </CardContent>
         </Card>
       </motion.div>
+
+      {/* Incident Timeline */}
+      {incidentTimeline.length > 0 && (
+        <motion.div variants={fadeUp}>
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ScrollText size={18} className="text-indigo-400" />
+                Incident Timeline
+              </CardTitle>
+              <CardDescription>Chronological event flow across incidents.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="relative border-l-2 border-white/[0.08] ml-3 space-y-4">
+                {incidentTimeline.slice(0, 20).map((event, i) => {
+                  const sevColor = event.severity === "CRITICAL" ? "bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.5)]"
+                    : event.severity === "HIGH" ? "bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.4)]"
+                    : event.severity === "MEDIUM" ? "bg-yellow-400"
+                    : "bg-slate-400";
+                  return (
+                    <div key={i} className="relative pl-6">
+                      <div className={`absolute -left-[9px] top-1.5 h-4 w-4 rounded-full ${sevColor}`} />
+                      <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Badge variant={event.severity === "CRITICAL" ? "error" : event.severity === "HIGH" ? "warning" : "outline"}>
+                              {event.severity}
+                            </Badge>
+                            <span className="text-xs font-medium text-slate-300">{event.event_type}</span>
+                            <span className="text-xs text-slate-500">from {event.source}</span>
+                          </div>
+                          <span className="text-xs text-slate-500">{new Date(event.timestamp).toLocaleString()}</span>
+                        </div>
+                        <p className="mt-1 text-sm text-slate-400">{event.message}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+      )}
     </motion.div>
   );
 }

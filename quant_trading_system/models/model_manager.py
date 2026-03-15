@@ -72,7 +72,7 @@ class TimeSeriesSplitter:
         n_splits: int = 5,
         train_size: int | float | None = None,
         test_size: int | float | None = None,
-        gap: int = 0,
+        gap: int = 5,
     ):
         """
         Initialize splitter.
@@ -82,7 +82,8 @@ class TimeSeriesSplitter:
             n_splits: Number of splits
             train_size: Training window size (samples or fraction)
             test_size: Test window size (samples or fraction)
-            gap: Gap between train and test (to prevent leakage)
+            gap: Gap between train and test (to prevent leakage).
+                 Default 5 bars to prevent autocorrelation leakage.
         """
         self.method = method
         self.n_splits = n_splits
@@ -639,7 +640,7 @@ class FutureLeakValidator:
         self,
         train_timestamps: np.ndarray,
         test_timestamps: np.ndarray,
-        gap_bars: int = 0,
+        gap_bars: int = 5,
         reference_timestamps: np.ndarray | None = None,
     ) -> tuple[bool, list[str]]:
         """
@@ -648,7 +649,7 @@ class FutureLeakValidator:
         Args:
             train_timestamps: Timestamps of training data
             test_timestamps: Timestamps of test data
-            gap_bars: Expected gap between train and test
+            gap_bars: Expected gap between train and test (default 5)
             reference_timestamps: Optional full ordered timeline used to verify
                 embargo/purge gap in bar space instead of wall-clock time.
 

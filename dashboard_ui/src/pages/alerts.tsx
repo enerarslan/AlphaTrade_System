@@ -1,7 +1,7 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useShallow } from "zustand/react/shallow";
-import { Bell, CheckCircle, ShieldAlert, X } from "lucide-react";
+import { Bell, CheckCircle, Search, ShieldAlert, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -61,6 +61,9 @@ export default function AlertsPage() {
 
   const canManageAlerts = hasPermission("control.alerts.manage");
 
+  const [severityFilter, setSeverityFilter] = useState<string>("ALL");
+  const [searchQuery, setSearchQuery] = useState("");
+
   useEffect(() => {
     void fetchAlerts();
     const timer = setInterval(() => {
@@ -78,6 +81,30 @@ export default function AlertsPage() {
     () => alerts.filter((a) => a.status === "RESOLVED").slice(0, 20),
     [alerts],
   );
+
+  const filteredActive = useMemo(() => {
+    let filtered = activeAlerts;
+    if (severityFilter !== "ALL") {
+      filtered = filtered.filter((a) => a.severity === severityFilter);
+    }
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      filtered = filtered.filter((a) => a.title.toLowerCase().includes(q) || a.message.toLowerCase().includes(q));
+    }
+    return filtered;
+  }, [activeAlerts, severityFilter, searchQuery]);
+
+  const filteredResolved = useMemo(() => {
+    let filtered = alerts.filter((a) => a.status === "RESOLVED");
+    if (severityFilter !== "ALL") {
+      filtered = filtered.filter((a) => a.severity === severityFilter);
+    }
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      filtered = filtered.filter((a) => a.title.toLowerCase().includes(q) || a.message.toLowerCase().includes(q));
+    }
+    return filtered.slice(0, 20);
+  }, [alerts, severityFilter, searchQuery]);
 
   const criticalCount = useMemo(() => activeAlerts.filter((a) => a.severity === "CRITICAL").length, [activeAlerts]);
 
@@ -98,6 +125,38 @@ export default function AlertsPage() {
         </div>
       </motion.section>
 
+      {/* Filters */}
+      <motion.div variants={fadeUp} className="flex flex-wrap items-center gap-3">
+        <div className="flex gap-1.5">
+          {["ALL", "CRITICAL", "HIGH", "MEDIUM", "LOW"].map((sev) => (
+            <button
+              key={sev}
+              onClick={() => setSeverityFilter(sev)}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-all ${
+                severityFilter === sev
+                  ? sev === "CRITICAL" ? "bg-rose-500/20 text-rose-300 border border-rose-500/30"
+                  : sev === "HIGH" ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                  : sev === "MEDIUM" ? "bg-yellow-500/20 text-yellow-300 border border-yellow-500/30"
+                  : sev === "LOW" ? "bg-slate-500/20 text-slate-300 border border-slate-500/30"
+                  : "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
+                  : "text-slate-500 border border-white/[0.06] hover:bg-white/[0.04]"
+              }`}
+            >
+              {sev}
+            </button>
+          ))}
+        </div>
+        <div className="relative flex-1 min-w-[200px]">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+          <input
+            className="glass-input h-9 w-full pl-9 text-sm"
+            placeholder="Search alerts..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
+      </motion.div>
+
       {/* Active Alerts */}
       <motion.div variants={fadeUp}>
         <Card>
@@ -106,16 +165,16 @@ export default function AlertsPage() {
               <Bell size={18} className="text-amber-400" />
               Active Alerts
             </CardTitle>
-            <CardDescription>{activeAlerts.length} unresolved alerts.</CardDescription>
+            <CardDescription>{filteredActive.length} unresolved alerts{severityFilter !== "ALL" || searchQuery ? " (filtered)" : ""}.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
             <AnimatePresence mode="popLayout">
-              {activeAlerts.length === 0 ? (
+              {filteredActive.length === 0 ? (
                 <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex items-center gap-2 text-sm text-emerald-400">
                   <CheckCircle size={16} /> All clear — no active alerts.
                 </motion.p>
               ) : (
-                activeAlerts.map((alert) => (
+                filteredActive.map((alert) => (
                   <motion.div
                     key={alert.alert_id}
                     layout
@@ -176,10 +235,10 @@ export default function AlertsPage() {
             <CardDescription>Recently resolved alert history.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
-            {resolvedAlerts.length === 0 ? (
+            {filteredResolved.length === 0 ? (
               <p className="text-sm text-slate-500">No resolved alerts.</p>
             ) : (
-              resolvedAlerts.map((alert) => (
+              filteredResolved.map((alert) => (
                 <div key={alert.alert_id} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">

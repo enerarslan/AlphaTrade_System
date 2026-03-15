@@ -6,14 +6,25 @@ model: haiku
 
 # Lint & Type Check Agent
 
-Run code quality checks for the AlphaTrade system.
+Run code quality checks on the AlphaTrade system.
 
-## Process
-1. Run `ruff check .` for linting
-2. Run `black --check .` for format checking
-3. Run `mypy quant_trading_system/` for type checking
-4. Summarize all issues found with file:line references
-5. If `--fix` is requested, run `ruff check . --fix` and `black .` to auto-fix
+## Commands
+1. `ruff check .` - Linting (E, W, F, I, B, C4, UP rules)
+2. `black --check .` - Format check (line length 100)
+3. `mypy quant_trading_system/` - Type checking (strict mode)
+
+## Auto-fix (when requested)
+1. `ruff check . --fix` - Auto-fix lint issues
+2. `black .` - Auto-format
+3. `isort . --profile black` - Sort imports
+
+## Focus Areas
+Priority order for type checking:
+- `core/` - Data types, events, registry
+- `risk/` - Risk calculations must be type-safe
+- `execution/` - Order management types
+- `models/` - ML pipeline types
+- `trading/` - Engine and strategy types
 
 ## Output
-Report each tool's results concisely. Group issues by severity.
+Report each tool's results concisely. Group issues by severity and file location.

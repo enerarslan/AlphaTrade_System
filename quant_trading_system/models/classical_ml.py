@@ -68,19 +68,21 @@ class XGBoostModel(TradingModel):
         """
         super().__init__(name, version, model_type, **kwargs)
 
-        self._params.update({
-            "n_estimators": n_estimators,
-            "max_depth": max_depth,
-            "learning_rate": learning_rate,
-            "subsample": subsample,
-            "colsample_bytree": colsample_bytree,
-            "reg_alpha": reg_alpha,
-            "reg_lambda": reg_lambda,
-            "min_child_weight": min_child_weight,
-            "early_stopping_rounds": early_stopping_rounds,
-            "use_gpu": use_gpu,
-            "random_state": random_state,
-        })
+        self._params.update(
+            {
+                "n_estimators": n_estimators,
+                "max_depth": max_depth,
+                "learning_rate": learning_rate,
+                "subsample": subsample,
+                "colsample_bytree": colsample_bytree,
+                "reg_alpha": reg_alpha,
+                "reg_lambda": reg_lambda,
+                "min_child_weight": min_child_weight,
+                "early_stopping_rounds": early_stopping_rounds,
+                "use_gpu": use_gpu,
+                "random_state": random_state,
+            }
+        )
 
     def fit(
         self,
@@ -261,21 +263,23 @@ class LightGBMModel(TradingModel):
         """
         super().__init__(name, version, model_type, **kwargs)
 
-        self._params.update({
-            "num_leaves": num_leaves,
-            "max_depth": max_depth,
-            "learning_rate": learning_rate,
-            "n_estimators": n_estimators,
-            "feature_fraction": feature_fraction,
-            "bagging_fraction": bagging_fraction,
-            "bagging_freq": bagging_freq,
-            "lambda_l1": lambda_l1,
-            "lambda_l2": lambda_l2,
-            "min_data_in_leaf": min_data_in_leaf,
-            "early_stopping_rounds": early_stopping_rounds,
-            "use_gpu": use_gpu,
-            "random_state": random_state,
-        })
+        self._params.update(
+            {
+                "num_leaves": num_leaves,
+                "max_depth": max_depth,
+                "learning_rate": learning_rate,
+                "n_estimators": n_estimators,
+                "feature_fraction": feature_fraction,
+                "bagging_fraction": bagging_fraction,
+                "bagging_freq": bagging_freq,
+                "lambda_l1": lambda_l1,
+                "lambda_l2": lambda_l2,
+                "min_data_in_leaf": min_data_in_leaf,
+                "early_stopping_rounds": early_stopping_rounds,
+                "use_gpu": use_gpu,
+                "random_state": random_state,
+            }
+        )
 
     def fit(
         self,
@@ -448,17 +452,19 @@ class CatBoostModel(TradingModel):
         """
         super().__init__(name, version, model_type, **kwargs)
 
-        self._params.update({
-            "iterations": iterations,
-            "depth": depth,
-            "learning_rate": learning_rate,
-            "l2_leaf_reg": l2_leaf_reg,
-            "random_strength": random_strength,
-            "bagging_temperature": bagging_temperature,
-            "early_stopping_rounds": early_stopping_rounds,
-            "use_gpu": use_gpu,
-            "random_state": random_state,
-        })
+        self._params.update(
+            {
+                "iterations": iterations,
+                "depth": depth,
+                "learning_rate": learning_rate,
+                "l2_leaf_reg": l2_leaf_reg,
+                "random_strength": random_strength,
+                "bagging_temperature": bagging_temperature,
+                "early_stopping_rounds": early_stopping_rounds,
+                "use_gpu": use_gpu,
+                "random_state": random_state,
+            }
+        )
 
     def fit(
         self,
@@ -601,17 +607,19 @@ class RandomForestModel(TradingModel):
         if os.name == "nt" and n_jobs != 1:
             n_jobs = 1
 
-        self._params.update({
-            "n_estimators": n_estimators,
-            "max_depth": max_depth,
-            "min_samples_split": min_samples_split,
-            "min_samples_leaf": min_samples_leaf,
-            "max_features": max_features,
-            "bootstrap": bootstrap,
-            "oob_score": oob_score,
-            "random_state": random_state,
-            "n_jobs": n_jobs,
-        })
+        self._params.update(
+            {
+                "n_estimators": n_estimators,
+                "max_depth": max_depth,
+                "min_samples_split": min_samples_split,
+                "min_samples_leaf": min_samples_leaf,
+                "max_features": max_features,
+                "bootstrap": bootstrap,
+                "oob_score": oob_score,
+                "random_state": random_state,
+                "n_jobs": n_jobs,
+            }
+        )
 
     def fit(
         self,
@@ -745,13 +753,15 @@ class ElasticNetModel(TradingModel):
         """
         super().__init__(name, version, model_type, **kwargs)
 
-        self._params.update({
-            "alpha": alpha,
-            "l1_ratio": l1_ratio,
-            "max_iter": max_iter,
-            "tol": tol,
-            "random_state": random_state,
-        })
+        self._params.update(
+            {
+                "alpha": alpha,
+                "l1_ratio": l1_ratio,
+                "max_iter": max_iter,
+                "tol": tol,
+                "random_state": random_state,
+            }
+        )
 
     def fit(
         self,
@@ -816,7 +826,7 @@ class ElasticNetModel(TradingModel):
     def predict_proba(
         self,
         X: np.ndarray,
-        calibration_method: str = "platt",
+        calibration_method: str = "sigmoid",
     ) -> np.ndarray:
         """Generate pseudo-probability estimates for regression outputs.
 
@@ -831,7 +841,9 @@ class ElasticNetModel(TradingModel):
         Args:
             X: Feature matrix (n_samples, n_features)
             calibration_method: Method for converting regression to probabilities.
-                - "platt": Platt scaling using sigmoid (default)
+                - "sigmoid": Heuristic sigmoid scaling (default)
+                - "sigmoid_heuristic": Explicit alias for heuristic sigmoid scaling
+                - "platt": Deprecated alias for heuristic sigmoid scaling
                 - "minmax": Min-max scaling to [0, 1]
                 - "quantile": Quantile-based normalization
 
@@ -850,41 +862,47 @@ class ElasticNetModel(TradingModel):
 
         X = self._validate_input(X)
         predictions = self.predict(X)
+        resolved_method = str(calibration_method or "sigmoid").strip().lower()
 
-        if calibration_method == "platt":
-            # Platt scaling: apply sigmoid to convert regression output to probability
-            # P1 FIX: Check if model was properly calibrated with held-out data
+        if resolved_method == "platt":
+            logger.warning(
+                "calibration_method='platt' is deprecated in ElasticNetModel.predict_proba(). "
+                "Using heuristic sigmoid scaling for backward compatibility. "
+                "For fitted Platt scaling, call calibrate(..., method='sigmoid') and "
+                "use predict_proba_calibrated()."
+            )
+            resolved_method = "sigmoid_heuristic"
+
+        if resolved_method in {"sigmoid", "sigmoid_heuristic"}:
+            # Heuristic sigmoid transform for uncalibrated regression outputs.
             if not hasattr(self, "_calibration_scale") or self._calibration_scale is None:
-                # P1 FIX: Use a conservative default rather than training data statistics
-                # This avoids look-ahead bias but may be less accurate.
-                # For best results, call calibrate() with held-out data first.
                 logger.warning(
                     "Model not calibrated with held-out data. Using default scale=1.0. "
-                    "For accurate probabilities, call calibrate(X_cal, y_cal) with "
-                    "a held-out calibration set."
+                    "For fitted probabilities, call calibrate(X_cal, y_cal) with "
+                    "a held-out calibration set and use predict_proba_calibrated()."
                 )
                 self._calibration_scale = 1.0
 
-            # Sigmoid transformation: P(positive) = 1 / (1 + exp(-prediction/scale))
             scaled_preds = predictions / self._calibration_scale
             prob_positive = 1.0 / (1.0 + np.exp(-scaled_preds))
 
-        elif calibration_method == "minmax":
+        elif resolved_method == "minmax":
             # Min-max scaling to [0, 1]
             pred_min = np.min(predictions)
             pred_max = np.max(predictions)
             pred_range = max(pred_max - pred_min, 1e-6)
             prob_positive = (predictions - pred_min) / pred_range
 
-        elif calibration_method == "quantile":
+        elif resolved_method == "quantile":
             # Quantile-based: rank / n gives uniform distribution
             from scipy import stats
+
             prob_positive = stats.rankdata(predictions) / len(predictions)
 
         else:
             raise ValueError(
                 f"Unknown calibration method: {calibration_method}. "
-                "Choose from: 'platt', 'minmax', 'quantile'"
+                "Choose from: 'sigmoid', 'sigmoid_heuristic', 'platt', 'minmax', 'quantile'"
             )
 
         # Ensure probabilities are in [0, 1]
@@ -982,9 +1000,7 @@ class ElasticNetModel(TradingModel):
         if self._calibration_method == "isotonic":
             prob_positive = self._calibrator.predict(predictions)
         else:  # sigmoid
-            prob_positive = self._calibrator.predict_proba(
-                predictions.reshape(-1, 1)
-            )[:, 1]
+            prob_positive = self._calibrator.predict_proba(predictions.reshape(-1, 1))[:, 1]
 
         prob_positive = np.clip(prob_positive, 0.0, 1.0)
         prob_negative = 1.0 - prob_positive

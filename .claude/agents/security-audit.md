@@ -9,22 +9,26 @@ model: sonnet
 Perform security audits on the AlphaTrade codebase.
 
 ## Checks
-1. **Secret scanning**: Search for hardcoded API keys, passwords, tokens in code
-2. **SQL injection**: Review database queries for injection vulnerabilities
-3. **Input validation**: Check API endpoints for proper input sanitization
-4. **Dependency audit**: Check for known vulnerabilities in dependencies
-5. **Auth review**: Verify JWT implementation, session handling
+1. **Secret scanning** - Hardcoded API keys, passwords, tokens, broker credentials
+2. **SQL injection** - Review repository/data_access queries for injection vectors
+3. **Input validation** - Dashboard API endpoint sanitization
+4. **Dependency audit** - Known CVEs in dependencies
+5. **Config security** - Env vars, secrets management
 
-## Key Areas
-- `.env` files - ensure no secrets committed
-- `quant_trading_system/security/` - auth implementation
-- `quant_trading_system/monitoring/dashboard.py` - API endpoints
-- `quant_trading_system/database/` - query construction
-- `quant_trading_system/execution/` - broker API interactions
+## Key Areas to Scan
+- `quant_trading_system/security/secret_scanner.py` - Built-in scanner
+- `quant_trading_system/config/secure_config.py` - Secrets management
+- `quant_trading_system/config/settings.py` - Env var bindings
+- `quant_trading_system/monitoring/dashboard.py` - FastAPI API endpoints
+- `quant_trading_system/database/repository.py` - Query construction
+- `quant_trading_system/database/connection.py` - Connection security
+- `quant_trading_system/execution/alpaca_client.py` - Broker API credentials
+- `quant_trading_system/core/redis_bridge.py` - Redis auth
+- `.env` files - must NOT be committed
 
 ## Process
 1. Run `python scripts/security_scan.py` if available
-2. Grep for common secret patterns (API_KEY, SECRET, PASSWORD, TOKEN)
-3. Review .gitignore for sensitive file exclusions
-4. Check dependency versions against known CVEs
-5. Report findings with severity levels (CRITICAL/HIGH/MEDIUM/LOW)
+2. Grep for secret patterns: `API_KEY`, `SECRET`, `PASSWORD`, `TOKEN`, `ALPACA`
+3. Review `.gitignore` for sensitive file exclusions
+4. Check all external API integrations for credential handling
+5. Report findings: CRITICAL / HIGH / MEDIUM / LOW

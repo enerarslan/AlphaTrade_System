@@ -161,7 +161,7 @@ class PurgedKFold(BaseCrossValidator):
     def __init__(
         self,
         n_splits: int = 5,
-        purge_gap: int = 0,
+        purge_gap: int = 5,
         embargo_pct: float = 0.01,
         prediction_horizon: int = 1,
     ):
@@ -390,7 +390,7 @@ class CombinatorialPurgedKFold(BaseCrossValidator):
         self,
         n_splits: int = 6,
         n_test_splits: int = 2,
-        purge_gap: int = 0,
+        purge_gap: int = 5,
         embargo_pct: float = 0.01,
         prediction_horizon: int = 1,
     ):
@@ -400,6 +400,7 @@ class CombinatorialPurgedKFold(BaseCrossValidator):
             n_splits: Total number of time groups/splits.
             n_test_splits: Number of splits to use for testing in each iteration.
             purge_gap: Number of periods to purge around boundaries.
+                      Default 5 bars to prevent autocorrelation leakage.
             embargo_pct: Percentage of test size for embargo.
                         MUST be >= 0.01 (1%) to prevent look-ahead bias.
             prediction_horizon: Forward-looking window of labels.
@@ -565,7 +566,7 @@ class WalkForwardCV(BaseCrossValidator):
         train_pct: float = 0.6,
         window_type: str = "expanding",  # "expanding" or "sliding"
         min_train_size: int | None = None,
-        purge_gap: int = 0,
+        purge_gap: int = 5,
         embargo_pct: float = 0.01,
         prediction_horizon: int = 1,
     ):
@@ -577,6 +578,7 @@ class WalkForwardCV(BaseCrossValidator):
             window_type: "expanding" or "sliding".
             min_train_size: Minimum training samples required.
             purge_gap: Number of periods to purge.
+                      Default 5 bars to prevent autocorrelation leakage.
             embargo_pct: Embargo percentage. MUST be >= 0.01 (1%).
             prediction_horizon: Label lookahead.
 

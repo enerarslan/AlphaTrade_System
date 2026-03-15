@@ -327,10 +327,40 @@ class FeatureRepository(BaseRepository[Feature]):
         Returns:
             Number of features inserted.
         """
-        instances = [Feature(**f) for f in features]
-        session.add_all(instances)
+        if not features:
+            return 0
+
+        dialect_name = session.bind.dialect.name if session.bind is not None else ""
+        conflict_keys = ["symbol", "timestamp", "timeframe", "feature_name", "feature_set_id"]
+
+        if dialect_name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            stmt = pg_insert(Feature).values(features)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=conflict_keys,
+                set_={"value": stmt.excluded.value},
+            )
+            session.execute(stmt)
+            session.flush()
+            return len(features)
+
+        if dialect_name == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(Feature).values(features)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=conflict_keys,
+                set_={"value": stmt.excluded.value},
+            )
+            session.execute(stmt)
+            session.flush()
+            return len(features)
+
+        for row in features:
+            session.merge(Feature(**row))
         session.flush()
-        return len(instances)
+        return len(features)
 
 
 class OrderRepository(BaseRepository[Order]):
@@ -440,11 +470,7 @@ class TradeRepository(BaseRepository[Trade]):
         Returns:
             List of trades.
         """
-        stmt = (
-            select(Trade)
-            .where(Trade.order_id == order_id)
-            .order_by(Trade.executed_at)
-        )
+        stmt = select(Trade).where(Trade.order_id == order_id).order_by(Trade.executed_at)
         return list(session.scalars(stmt).all())
 
     def get_trades_by_symbol(

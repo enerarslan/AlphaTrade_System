@@ -22,6 +22,8 @@ from quant_trading_system.data.live_feed import (
     AlpacaLiveFeed,
     AlpacaWebSocketFeed,
     BaseLiveFeed,
+    CircuitBreaker,
+    CircuitState,
     ConnectionState,
     MockLiveFeed,
     WebSocketConfig,
@@ -211,6 +213,27 @@ class TestHeartbeatMonitoring:
             pass
 
         # No errors should have occurred
+
+
+class TestCircuitBreakerTimestamps:
+    """Tests for timezone-safe circuit breaker timestamps."""
+
+    @pytest.mark.asyncio
+    async def test_record_failure_uses_utc_timestamp(self):
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=60.0)
+
+        await breaker.record_failure()
+
+        assert breaker._last_failure_time is not None
+        assert breaker._last_failure_time.tzinfo == timezone.utc
+        assert breaker.state == CircuitState.OPEN
+
+    def test_state_normalizes_legacy_naive_failure_timestamp(self):
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=1.0)
+        breaker._state = CircuitState.OPEN
+        breaker._last_failure_time = datetime.now() - timedelta(seconds=5)
+
+        assert breaker.state == CircuitState.HALF_OPEN
 
 
 class TestLiveFeedReconnection:

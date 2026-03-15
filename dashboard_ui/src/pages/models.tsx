@@ -31,6 +31,7 @@ export default function ModelsPage() {
     modelRegistry,
     modelDrift,
     modelValidation,
+    championChallenger,
     mfaStatus,
     fetchModelStatuses,
     fetchExplainability,
@@ -46,6 +47,7 @@ export default function ModelsPage() {
       modelRegistry: state.modelRegistry,
       modelDrift: state.modelDrift,
       modelValidation: state.modelValidation,
+      championChallenger: state.championChallenger,
       mfaStatus: state.mfaStatus,
       fetchModelStatuses: state.fetchModelStatuses,
       fetchExplainability: state.fetchExplainability,
@@ -161,14 +163,27 @@ export default function ModelsPage() {
               <p className="text-sm text-slate-500">No models registered.</p>
             ) : (
               modelStatuses.map((m) => (
-                <div key={m.model_name} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
-                  <div>
-                    <p className="font-medium text-slate-200">{m.model_name}</p>
-                    <p className="text-xs text-slate-500">Predictions: {m.prediction_count} | Errors: {m.error_count}</p>
+                <div key={m.model_name} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="font-medium text-slate-200">{m.model_name}</p>
+                      <p className="text-xs text-slate-500">Predictions: {m.prediction_count} | Errors: {m.error_count}</p>
+                    </div>
+                    <Badge variant={m.status.toLowerCase() === "healthy" ? "success" : "warning"}>
+                      {m.status}
+                    </Badge>
                   </div>
-                  <Badge variant={m.status.toLowerCase() === "healthy" ? "success" : "warning"}>
-                    {m.status}
-                  </Badge>
+                  <div className="mt-2 flex flex-wrap gap-3 text-xs">
+                    {m.accuracy != null && (
+                      <span className="font-mono text-slate-400">Acc: <span className="text-cyan-300">{(m.accuracy * 100).toFixed(1)}%</span></span>
+                    )}
+                    {m.auc != null && (
+                      <span className="font-mono text-slate-400">AUC: <span className="text-cyan-300">{m.auc.toFixed(3)}</span></span>
+                    )}
+                    {m.sharpe != null && (
+                      <span className="font-mono text-slate-400">Sharpe: <span className={m.sharpe >= 0 ? "text-emerald-300" : "text-rose-300"}>{m.sharpe.toFixed(2)}</span></span>
+                    )}
+                  </div>
                 </div>
               ))
             )}
@@ -225,7 +240,31 @@ export default function ModelsPage() {
             </CardTitle>
             <CardDescription>Model quality gates before production promotion.</CardDescription>
           </CardHeader>
-          <CardContent className="space-y-2">
+          <CardContent className="space-y-3">
+            {/* Decision Badge */}
+            {modelValidation && (
+              <div className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.02] p-3">
+                <span className="text-sm text-slate-400">Decision:</span>
+                <Badge variant={modelValidation.decision === "PROMOTE" ? "success" : modelValidation.decision === "REJECT" ? "error" : "warning"}>
+                  {modelValidation.decision || "PENDING"}
+                </Badge>
+                <Badge variant={modelValidation.passed ? "success" : "error"}>
+                  {modelValidation.passed ? "ALL PASSED" : "GATES FAILED"}
+                </Badge>
+              </div>
+            )}
+            {/* Failed Gates */}
+            {(modelValidation?.failed_gates ?? []).length > 0 && (
+              <div className="rounded-xl border border-rose-500/15 bg-rose-500/[0.03] p-3">
+                <p className="text-[10px] uppercase tracking-wider text-rose-400/70 mb-2">Failed Gates</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {modelValidation!.failed_gates.map((gate) => (
+                    <Badge key={gate} variant="error">{gate.replaceAll("_", " ")}</Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+            {/* Gate List */}
             {validationGates.length === 0 ? (
               <p className="text-sm text-slate-500">No validation gate data available.</p>
             ) : (
@@ -241,6 +280,50 @@ export default function ModelsPage() {
           </CardContent>
         </Card>
       </motion.div>
+
+      {/* Champion vs Challenger Comparison */}
+      {championChallenger && (championChallenger.champion || championChallenger.challenger) && (
+        <motion.div variants={fadeUp}>
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <GitCompare size={18} className="text-cyan-400" />
+                Champion vs Challenger
+              </CardTitle>
+              <CardDescription>Side-by-side model performance comparison.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="rounded-xl border border-emerald-500/15 bg-emerald-500/[0.03] p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-emerald-400/70">Champion</p>
+                  <p className="mt-1 text-lg font-bold text-slate-200">{championChallenger.champion ?? "None"}</p>
+                </div>
+                <div className="rounded-xl border border-amber-500/15 bg-amber-500/[0.03] p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-amber-400/70">Challenger</p>
+                  <p className="mt-1 text-lg font-bold text-slate-200">{championChallenger.challenger ?? "None"}</p>
+                </div>
+              </div>
+              {Object.keys(championChallenger.comparison).length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Metric Comparison (Challenger - Champion)</p>
+                  {Object.entries(championChallenger.comparison).map(([metric, diff]) => (
+                    <div key={metric} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+                      <span className="text-sm text-slate-300">{metric.replaceAll("_", " ")}</span>
+                      <span className={`font-mono text-sm font-semibold ${diff > 0 ? "text-emerald-400" : diff < 0 ? "text-rose-400" : "text-slate-400"}`}>
+                        {diff > 0 ? "+" : ""}{diff.toFixed(4)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="rounded-xl border border-indigo-500/15 bg-indigo-500/[0.03] p-3">
+                <p className="text-[10px] uppercase tracking-wider text-indigo-400/70">Recommendation</p>
+                <p className="mt-1 text-sm font-medium text-slate-200">{championChallenger.recommendation}</p>
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+      )}
 
       {/* Champion / Challenger Promotion + Training Jobs */}
       <motion.div variants={fadeUp} className="grid gap-4 lg:grid-cols-2">

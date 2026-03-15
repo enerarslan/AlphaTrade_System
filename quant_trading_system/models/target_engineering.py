@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,8 @@ import pandas as pd
 
 from quant_trading_system.models.meta_labeling import TripleBarrierLabeler
 from quant_trading_system.models.trading_costs import TradingCostModel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -166,12 +169,13 @@ def generate_targets(
             config.min_signal_abs_return_bps / 10000.0,
             total_cost * 1.25,
         )
-        vol_floor = (
-            np.nan_to_num(rolling_vol.to_numpy(dtype=float), nan=0.0)
-            * float(config.signal_volatility_floor_mult)
+        vol_floor = np.nan_to_num(rolling_vol.to_numpy(dtype=float), nan=0.0) * float(
+            config.signal_volatility_floor_mult
         )
         signal_floor = np.maximum(min_signal_abs_return, vol_floor)
-        primary_forward_values = pd.to_numeric(primary_forward, errors="coerce").to_numpy(dtype=float)
+        primary_forward_values = pd.to_numeric(primary_forward, errors="coerce").to_numpy(
+            dtype=float
+        )
         abs_primary_forward = np.abs(primary_forward_values)
         forward_outlier_mask = abs_primary_forward > float(config.max_abs_forward_return)
         active_signal_mask = (
@@ -203,7 +207,9 @@ def generate_targets(
         )
 
         sdf["primary_signal"] = primary_signals
-        sdf["trade_side_label"] = np.where(primary_signals > 0.0, 1, np.where(primary_signals < 0.0, -1, 0))
+        sdf["trade_side_label"] = np.where(
+            primary_signals > 0.0, 1, np.where(primary_signals < 0.0, -1, 0)
+        )
         sdf["binary_trade_label"] = (primary_signals != 0.0).astype(int)
         sdf["triple_barrier_label"] = pd.to_numeric(tb["label"], errors="coerce")
         sdf["triple_barrier_event_return"] = gross_ret
@@ -243,7 +249,9 @@ def generate_targets(
     class_weight_values = np.ones(len(labeled), dtype=float)
     if valid_mask.any():
         cw = _class_weights_binary(label_series[valid_mask].astype(int))
-        class_weight_values[valid_mask.to_numpy()] = label_series[valid_mask].astype(int).map(cw).to_numpy()
+        class_weight_values[valid_mask.to_numpy()] = (
+            label_series[valid_mask].astype(int).map(cw).to_numpy()
+        )
 
     regime_boost = {
         "high_vol": 1.10,
@@ -253,12 +261,16 @@ def generate_targets(
         "normal_range": 1.00,
     }
     regime_weight_values = labeled["regime"].map(regime_boost).fillna(1.0).to_numpy(dtype=float)
-    neutral_buffer = max(float(config.neutral_buffer_bps + config.edge_cost_buffer_bps) / 10000.0, 1e-6)
+    neutral_buffer = max(
+        float(config.neutral_buffer_bps + config.edge_cost_buffer_bps) / 10000.0, 1e-6
+    )
     net_return_abs = np.abs(
         pd.to_numeric(labeled["triple_barrier_net_return"], errors="coerce").to_numpy(dtype=float)
     )
     edge_weight_values = 1.0 + np.clip(net_return_abs / neutral_buffer, 0.0, 2.0)
-    sample_weights = temporal_weight * class_weight_values * regime_weight_values * edge_weight_values
+    sample_weights = (
+        temporal_weight * class_weight_values * regime_weight_values * edge_weight_values
+    )
     sample_weights = np.nan_to_num(sample_weights, nan=1.0, posinf=1.0, neginf=1.0)
     mean_w = float(np.mean(sample_weights)) if len(sample_weights) else 1.0
     if mean_w > 1e-12:
@@ -269,13 +281,18 @@ def generate_targets(
     pos_rate = float(valid_labels.mean()) if len(valid_labels) else 0.0
     half = max(1, len(valid_labels) // 2)
     first_half_rate = float(valid_labels.iloc[:half].mean()) if len(valid_labels) else 0.0
-    second_half_rate = float(valid_labels.iloc[half:].mean()) if len(valid_labels.iloc[half:]) else 0.0
+    second_half_rate = (
+        float(valid_labels.iloc[half:].mean()) if len(valid_labels.iloc[half:]) else 0.0
+    )
     drift_abs = abs(second_half_rate - first_half_rate)
 
     regime_distribution = labeled.loc[valid_mask, "regime"].value_counts(normalize=True).to_dict()
     label_counts = valid_labels.value_counts().to_dict()
     class_balance_ratio = (
-        float(min(label_counts.get(0, 0), label_counts.get(1, 0)) / max(label_counts.get(0, 1), label_counts.get(1, 1)))
+        float(
+            min(label_counts.get(0, 0), label_counts.get(1, 0))
+            / max(label_counts.get(0, 1), label_counts.get(1, 1))
+        )
         if label_counts
         else 0.0
     )
@@ -291,10 +308,22 @@ def generate_targets(
         "signal_candidate_count": int(total_signal_candidates),
         "signal_active_count": int(total_active_signals),
         "signal_active_rate": (
-            float(total_active_signals / total_signal_candidates) if total_signal_candidates > 0 else 0.0
+            float(total_active_signals / total_signal_candidates)
+            if total_signal_candidates > 0
+            else 0.0
         ),
         "neutral_filtered_count": int(total_neutral_filtered),
+        "neutral_filtered_rate": (
+            float(total_neutral_filtered / total_active_signals)
+            if total_active_signals > 0
+            else 0.0
+        ),
         "forward_outlier_filtered_count": int(total_forward_outlier_filtered),
+        "forward_outlier_filtered_rate": (
+            float(total_forward_outlier_filtered / total_signal_candidates)
+            if total_signal_candidates > 0
+            else 0.0
+        ),
         "cost_assumptions_bps": {
             "spread": float(cost_model.spread_bps),
             "slippage": float(cost_model.slippage_bps),
@@ -310,6 +339,40 @@ def generate_targets(
             "max_holding_period": int(config.max_holding_period),
         },
     }
+
+    logger.info(
+        "TARGET_ENGINEERING_DIAGNOSTICS label_count=%d signal_candidates=%d "
+        "signal_active=%d neutral_filtered=%d neutral_filtered_rate=%.4f "
+        "forward_outlier_filtered=%d forward_outlier_filtered_rate=%.4f "
+        "class_balance_ratio=%.4f label_drift_abs=%.4f",
+        diagnostics["label_count"],
+        diagnostics["signal_candidate_count"],
+        diagnostics["signal_active_count"],
+        diagnostics["neutral_filtered_count"],
+        diagnostics["neutral_filtered_rate"],
+        diagnostics["forward_outlier_filtered_count"],
+        diagnostics["forward_outlier_filtered_rate"],
+        diagnostics["class_balance_ratio"],
+        diagnostics["label_drift_abs"],
+    )
+
+    if diagnostics["forward_outlier_filtered_rate"] >= 0.01:
+        logger.warning(
+            "TARGET_ENGINEERING_OUTLIER_RATE_HIGH forward_outlier_filtered_count=%d "
+            "forward_outlier_filtered_rate=%.4f signal_candidates=%d",
+            diagnostics["forward_outlier_filtered_count"],
+            diagnostics["forward_outlier_filtered_rate"],
+            diagnostics["signal_candidate_count"],
+        )
+
+    if diagnostics["neutral_filtered_rate"] >= 0.50:
+        logger.warning(
+            "TARGET_ENGINEERING_NEUTRAL_FILTER_RATE_HIGH neutral_filtered_count=%d "
+            "neutral_filtered_rate=%.4f signal_active=%d",
+            diagnostics["neutral_filtered_count"],
+            diagnostics["neutral_filtered_rate"],
+            diagnostics["signal_active_count"],
+        )
 
     return TargetEngineeringResult(
         frame=labeled,

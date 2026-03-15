@@ -126,8 +126,13 @@ class CircuitBreaker:
         """Get current circuit state with automatic state transitions."""
         if self._state == CircuitState.OPEN:
             if self._last_failure_time:
-                # FIX: Use timezone-aware datetime to avoid comparison issues
-                elapsed = (datetime.now(timezone.utc) - self._last_failure_time).total_seconds()
+                failure_time = self._last_failure_time
+                if failure_time.tzinfo is None:
+                    elapsed = (datetime.now() - failure_time).total_seconds()
+                else:
+                    elapsed = (
+                        datetime.now(timezone.utc) - failure_time.astimezone(timezone.utc)
+                    ).total_seconds()
                 if elapsed >= self.recovery_timeout:
                     logger.info("Circuit breaker transitioning to HALF_OPEN")
                     self._state = CircuitState.HALF_OPEN
@@ -167,7 +172,7 @@ class CircuitBreaker:
         """Record a failed request."""
         async with self._lock:
             self._failure_count += 1
-            self._last_failure_time = datetime.now()
+            self._last_failure_time = datetime.now(timezone.utc)
 
             if self._state == CircuitState.HALF_OPEN:
                 logger.warning("Circuit breaker transitioning to OPEN (recovery failed)")
@@ -884,9 +889,7 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
             # Publish to event bus
             self._publish_quote_event(msg)
 
-            logger.debug(
-                f"Quote: {symbol} bid={msg.get('bp')} ask={msg.get('ap')}"
-            )
+            logger.debug(f"Quote: {symbol} bid={msg.get('bp')} ask={msg.get('ap')}")
 
         except Exception as e:
             logger.error(f"Error handling quote: {e}")
@@ -908,9 +911,7 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
             # Publish to event bus
             self._publish_trade_event(msg)
 
-            logger.debug(
-                f"Trade: {symbol} @ {msg.get('p')} x {msg.get('s')}"
-            )
+            logger.debug(f"Trade: {symbol} @ {msg.get('p')} x {msg.get('s')}")
 
         except Exception as e:
             logger.error(f"Error handling trade: {e}")
@@ -935,9 +936,7 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
                     if last_update is None:
                         # Never received data for this symbol
                         if symbol not in self._staleness_alerts_sent:
-                            logger.warning(
-                                f"DATA STALENESS: No data ever received for {symbol}"
-                            )
+                            logger.warning(f"DATA STALENESS: No data ever received for {symbol}")
                             self._staleness_alerts_sent[symbol] = "warning"
                             self._publish_staleness_alert(symbol, "warning", None)
                         continue
@@ -967,9 +966,7 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
                     else:
                         # Data is fresh - clear any previous alerts
                         if symbol in self._staleness_alerts_sent:
-                            logger.info(
-                                f"DATA STALENESS CLEARED: {symbol} is receiving data again"
-                            )
+                            logger.info(f"DATA STALENESS CLEARED: {symbol} is receiving data again")
                             self._staleness_alerts_sent.pop(symbol, None)
 
             except asyncio.CancelledError:
@@ -978,10 +975,7 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
                 logger.error(f"Staleness monitor error: {e}")
 
     def _publish_staleness_alert(
-        self,
-        symbol: str,
-        severity: str,
-        elapsed_seconds: float | None
+        self, symbol: str, severity: str, elapsed_seconds: float | None
     ) -> None:
         """Publish data staleness alert to event bus."""
         if self.event_bus:
@@ -1016,9 +1010,7 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
                         datetime.now(timezone.utc) - self._last_market_message
                     ).total_seconds()
                     if elapsed > self.config.heartbeat_timeout:
-                        logger.warning(
-                            f"No market data received for {elapsed:.0f}s - reconnecting"
-                        )
+                        logger.warning(f"No market data received for {elapsed:.0f}s - reconnecting")
                         await self._schedule_reconnect("market")
 
                 # Check trading stream health (more lenient - trading updates are sparse)
@@ -1028,9 +1020,7 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
                     ).total_seconds()
                     # Trading stream timeout is longer since updates are event-driven
                     if elapsed > self.config.heartbeat_timeout * 3:
-                        logger.warning(
-                            f"No trading updates for {elapsed:.0f}s - attempting ping"
-                        )
+                        logger.warning(f"No trading updates for {elapsed:.0f}s - attempting ping")
                         try:
                             pong = await asyncio.wait_for(
                                 self._trading_ws.ping(),
@@ -1067,10 +1057,13 @@ class AlpacaWebSocketFeed(BaseLiveFeed):
 
         # Calculate delay with exponential backoff and jitter
         jitter = random.uniform(0, self.config.reconnect_jitter)
-        delay = min(
-            self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)),
-            self.config.max_reconnect_delay,
-        ) + jitter
+        delay = (
+            min(
+                self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)),
+                self.config.max_reconnect_delay,
+            )
+            + jitter
+        )
 
         logger.info(
             f"Reconnection attempt {self._reconnect_attempts}/"
@@ -1418,10 +1411,7 @@ class BarAggregator:
                 completed_bar = self._complete_bar(symbol)
 
         # Initialize or update pending bar
-        if (
-            symbol not in self._pending_bars
-            or self._pending_bars[symbol]["bar_start"] != bar_start
-        ):
+        if symbol not in self._pending_bars or self._pending_bars[symbol]["bar_start"] != bar_start:
             self._pending_bars[symbol] = {
                 "bar_start": bar_start,
                 "open": price,
@@ -1454,9 +1444,7 @@ class BarAggregator:
 
         vwap = None
         if pending["volume"] > 0:
-            vwap = Decimal(
-                str(round(pending["vwap_volume_sum"] / pending["volume"], 4))
-            )
+            vwap = Decimal(str(round(pending["vwap_volume_sum"] / pending["volume"], 4)))
 
         bar = OHLCVBar(
             symbol=symbol,

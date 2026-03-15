@@ -257,7 +257,9 @@ class DatabaseDataLoader:
             if "symbol" not in df.columns:
                 df = df.with_columns(pl.lit(symbol).alias("symbol"))
             else:
-                df = df.with_columns(pl.col("symbol").cast(pl.Utf8).str.to_uppercase().alias("symbol"))
+                df = df.with_columns(
+                    pl.col("symbol").cast(pl.Utf8).str.to_uppercase().alias("symbol")
+                )
             df = df.with_columns(pl.lit(timeframe).alias("timeframe"))
 
             # Validate if requested
@@ -317,6 +319,7 @@ class DatabaseDataLoader:
         batch_size: int | None = None,
         source_timezone: str = "America/New_York",
         resume: bool = True,
+        timeframe: str | None = None,
     ) -> int:
         """
         Bulk load Parquet data into database.
@@ -335,11 +338,10 @@ class DatabaseDataLoader:
         if not parquet_path.exists():
             raise DataNotFoundError(f"Parquet file not found: {parquet_path}")
 
-        if symbol is None:
-            symbol = parquet_path.stem.upper()
-
-        symbol = symbol.upper()
-        logger.info(f"Loading {parquet_path} for symbol {symbol}")
+        inferred_symbol, inferred_timeframe = infer_symbol_and_timeframe(parquet_path)
+        symbol = (symbol or inferred_symbol).upper()
+        timeframe = normalize_timeframe(timeframe or inferred_timeframe)
+        logger.info(f"Loading {parquet_path} for symbol {symbol} ({timeframe})")
 
         try:
             df = pl.read_parquet(parquet_path)
@@ -347,6 +349,23 @@ class DatabaseDataLoader:
 
             if "symbol" not in df.columns:
                 df = df.with_columns(pl.lit(symbol).alias("symbol"))
+            else:
+                df = df.with_columns(
+                    pl.col("symbol").cast(pl.Utf8).str.to_uppercase().alias("symbol")
+                )
+
+            if "timeframe" not in df.columns:
+                df = df.with_columns(pl.lit(timeframe).alias("timeframe"))
+            else:
+                df = df.with_columns(
+                    pl.col("timeframe")
+                    .cast(pl.Utf8)
+                    .map_elements(
+                        lambda value: normalize_timeframe(value, default=timeframe),
+                        return_dtype=pl.Utf8,
+                    )
+                    .alias("timeframe")
+                )
 
             contract = OHLCVIngestionContract(source_timezone=source_timezone)
             df = apply_ohlcv_ingestion_contract(df, symbol, contract=contract)
@@ -388,7 +407,7 @@ class DatabaseDataLoader:
             return total_inserted
 
         except Exception as e:
-            raise DataError(f"Failed to load CSV {csv_path}: {e}")
+            raise DataError(f"Failed to load Parquet {parquet_path}: {e}")
 
     def export_to_parquet(
         self,
@@ -500,18 +519,20 @@ class DatabaseDataLoader:
 
         bar_dicts = []
         for bar in bars:
-            bar_dicts.append({
-                "symbol": bar.symbol.upper(),
-                "timestamp": bar.timestamp,
-                "timeframe": timeframe,
-                "open": bar.open,
-                "high": bar.high,
-                "low": bar.low,
-                "close": bar.close,
-                "volume": bar.volume,
-                "vwap": bar.vwap,
-                "trade_count": bar.trade_count,
-            })
+            bar_dicts.append(
+                {
+                    "symbol": bar.symbol.upper(),
+                    "timestamp": bar.timestamp,
+                    "timeframe": timeframe,
+                    "open": bar.open,
+                    "high": bar.high,
+                    "low": bar.low,
+                    "close": bar.close,
+                    "volume": bar.volume,
+                    "vwap": bar.vwap,
+                    "trade_count": bar.trade_count,
+                }
+            )
 
         with self._db.session() as session:
             return self._ohlcv_repo.bulk_insert(session, bar_dicts)
@@ -530,6 +551,7 @@ class DatabaseDataLoader:
             bar: OHLCVBar to upsert.
         """
         from sqlalchemy.dialects.postgresql import insert
+
         timeframe = normalize_timeframe(timeframe)
 
         with self._db.session() as session:
@@ -557,7 +579,7 @@ class DatabaseDataLoader:
                     "volume": stmt.excluded.volume,
                     "vwap": stmt.excluded.vwap,
                     "trade_count": stmt.excluded.trade_count,
-                }
+                },
             )
 
             session.execute(stmt)
@@ -598,10 +620,14 @@ class DatabaseDataLoader:
         symbol_override = symbol.upper() if symbol else None
         if "symbol" not in frame.columns:
             if symbol_override is None:
-                raise DataValidationError("Missing `symbol` column and no symbol override provided.")
+                raise DataValidationError(
+                    "Missing `symbol` column and no symbol override provided."
+                )
             frame = frame.with_columns(pl.lit(symbol_override).alias("symbol"))
         else:
-            frame = frame.with_columns(pl.col("symbol").cast(pl.Utf8).str.to_uppercase().alias("symbol"))
+            frame = frame.with_columns(
+                pl.col("symbol").cast(pl.Utf8).str.to_uppercase().alias("symbol")
+            )
             if symbol_override is not None:
                 frame = frame.with_columns(
                     pl.when((pl.col("symbol").is_null()) | (pl.col("symbol") == ""))

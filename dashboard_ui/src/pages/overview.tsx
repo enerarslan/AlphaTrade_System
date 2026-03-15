@@ -15,6 +15,7 @@ import SectorHeatmap from "@/components/live/SectorHeatmap";
 import WatchlistWidget from "@/components/live/WatchlistWidget";
 import MarketNewsFeed from "@/components/live/MarketNewsFeed";
 import PanelLayout from "@/components/layout/PanelLayout";
+import PortfolioTreemap from "@/components/charts/PortfolioTreemap";
 
 const stagger = {
   hidden: { opacity: 0 },
@@ -92,7 +93,6 @@ export default function OverviewPage() {
     modelDrift,
     sloStatus,
     systemCoverage,
-    lastRefreshAt,
     positions,
   } = useStore(useShallow((state) => ({
       hasPermission: state.hasPermission,
@@ -117,7 +117,6 @@ export default function OverviewPage() {
       modelDrift: state.modelDrift,
       sloStatus: state.sloStatus,
       systemCoverage: state.systemCoverage,
-      lastRefreshAt: state.lastRefreshAt,
       positions: state.positions,
     })));
 
@@ -289,10 +288,48 @@ export default function OverviewPage() {
               <AnimatedCounter value={riskMetrics?.portfolio_var_95 ?? 0} prefix="$" />
             </p>
           </div>
-          <div className="rounded-xl border border-cyan-500/20 bg-white/[0.03] px-4 py-3 backdrop-blur-sm shadow-[0_0_15px_rgba(6,182,212,0.08)]">
-            <p className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Refresh</p>
-            <p className="mt-1 text-lg font-bold font-mono text-cyan-300">{lastRefreshAt ? new Date(lastRefreshAt).toLocaleTimeString() : "--"}</p>
-          </div>
+          <GlowMetric label="Gross Exposure" value={`$${(portfolio?.gross_exposure ?? 0).toLocaleString()}`} accent="cyan" />
+        </div>
+      </motion.section>
+
+      {/* Performance Metrics Strip */}
+      <motion.section variants={fadeUp}>
+        <div className="mb-3 flex items-center gap-2">
+          <span className="inline-block h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(6,182,212,0.6)] pulse-dot" />
+          <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-400/80">Quant Performance</span>
+          <span className="text-[9px] text-slate-600">30-Day Rolling</span>
+        </div>
+        <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-6">
+          <GlowMetric
+            label="Sharpe Ratio (30d)"
+            value={(performance?.sharpe_ratio_30d ?? 0).toFixed(2)}
+            accent="cyan"
+          />
+          <GlowMetric
+            label="Sortino Ratio (30d)"
+            value={(performance?.sortino_ratio_30d ?? 0).toFixed(2)}
+            accent="cyan"
+          />
+          <GlowMetric
+            label="Win Rate"
+            value={`${((performance?.win_rate_30d ?? 0) * 100).toFixed(1)}%`}
+            accent={(performance?.win_rate_30d ?? 0) > 0.5 ? "emerald" : "rose"}
+          />
+          <GlowMetric
+            label="Profit Factor"
+            value={(performance?.profit_factor ?? 0).toFixed(2)}
+            accent={(performance?.profit_factor ?? 0) > 1 ? "emerald" : "rose"}
+          />
+          <GlowMetric
+            label="Total PnL"
+            value={`${(portfolio?.total_pnl ?? 0) >= 0 ? "+" : ""}$${(portfolio?.total_pnl ?? 0).toLocaleString()}`}
+            accent={(portfolio?.total_pnl ?? 0) >= 0 ? "emerald" : "rose"}
+          />
+          <GlowMetric
+            label="Avg Trade PnL"
+            value={`${(performance?.avg_trade_pnl ?? 0) >= 0 ? "+" : ""}$${(performance?.avg_trade_pnl ?? 0).toLocaleString()}`}
+            accent={(performance?.avg_trade_pnl ?? 0) >= 0 ? "emerald" : "rose"}
+          />
         </div>
       </motion.section>
 
@@ -323,7 +360,7 @@ export default function OverviewPage() {
                       <TrendingUp size={18} className="text-cyan-400" />
                       Equity Curve
                     </CardTitle>
-                    <CardDescription>Portfolio equity over time with TradingView professional charting.</CardDescription>
+                    <CardDescription>Portfolio equity over time (estimated from snapshot).</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <EquityCurveChart data={equityData} height={300} />
@@ -342,7 +379,7 @@ export default function OverviewPage() {
                       <Activity size={18} className="text-emerald-400" />
                       Daily P&L
                     </CardTitle>
-                    <CardDescription>Realized daily profit & loss histogram.</CardDescription>
+                    <CardDescription>Daily P&L distribution (estimated from snapshot).</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <PnLBarChart data={pnlData} height={300} />
@@ -577,6 +614,24 @@ export default function OverviewPage() {
           </CardContent>
         </Card>
       </motion.section>
+
+      {/* Portfolio Treemap */}
+      {positions.length > 0 && (
+        <motion.section variants={fadeUp}>
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-xl">
+                <TrendingUp size={18} className="text-emerald-400" />
+                Portfolio Treemap
+              </CardTitle>
+              <CardDescription>Position sizes by market value, colored by P&L performance.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <PortfolioTreemap positions={positions} height={350} />
+            </CardContent>
+          </Card>
+        </motion.section>
+      )}
 
       {/* Bottom two-column */}
       <motion.section variants={fadeUp} className="grid gap-4 lg:grid-cols-2">

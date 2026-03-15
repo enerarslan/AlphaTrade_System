@@ -10,38 +10,31 @@ Manage Docker infrastructure for the AlphaTrade system.
 
 ## Key Files
 - `docker/docker-compose.yml` - Development stack
-- `docker/docker-compose.production.yml` - Production
+- `docker/docker-compose.production.yml` - Production stack
 - `docker/Dockerfile` - Multi-stage build
 - `docker/kubernetes/multi-region-deployment.yaml` - K8s manifest
 
+## Services
+| Service | Port | Description |
+|---------|------|-------------|
+| `trading_app` | 8000 | FastAPI application (`main.py`) |
+| `postgres` | 5433 | TimescaleDB (PostgreSQL 15) |
+| `redis` | 6379 | Cache & pub/sub |
+| `prometheus` | 9090 | Metrics collection |
+| `grafana` | 3001 | Dashboards |
+| `alertmanager` | 9093 | Alert dispatch |
+
 ## Common Operations
 ```bash
-# Start dev stack
-docker-compose -f docker/docker-compose.yml up -d
-
-# View logs
-docker-compose -f docker/docker-compose.yml logs -f <service>
-
-# Rebuild
-docker-compose -f docker/docker-compose.yml up -d --build
-
-# Status
-docker-compose -f docker/docker-compose.yml ps
-
-# Stop
-docker-compose -f docker/docker-compose.yml down
+docker-compose -f docker/docker-compose.yml up -d           # Start dev
+docker-compose -f docker/docker-compose.yml logs -f <svc>   # View logs
+docker-compose -f docker/docker-compose.yml up -d --build   # Rebuild
+docker-compose -f docker/docker-compose.yml ps              # Status
+docker-compose -f docker/docker-compose.yml down             # Stop
 ```
 
-## Services
-- `trading_app` (port 8000) - FastAPI application
-- `postgres` (port 5433) - TimescaleDB
-- `redis` (port 6379) - Cache & pub/sub
-- `prometheus` (port 9090) - Metrics
-- `grafana` (port 3001) - Dashboards
-- `alertmanager` (port 9093) - Alerts
-
 ## Process
-1. Check current Docker state with `docker ps` and `docker-compose ps`
+1. Check current state: `docker ps` and `docker-compose ps`
 2. Execute requested operation
 3. Verify service health after changes
 4. Report status of all services

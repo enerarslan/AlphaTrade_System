@@ -6,6 +6,7 @@ Tests data loading, preprocessing, feature store, and live feed.
 
 import asyncio
 import tempfile
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -168,14 +169,16 @@ class TestDataLoader:
             loader = DataLoader(tmpdir)
 
             # Create a lazy frame with non-standard column names
-            df = pl.DataFrame({
-                "date": [datetime.now(timezone.utc)],
-                "Open": [100.0],
-                "High": [101.0],
-                "Low": [99.0],
-                "Close": [100.5],
-                "Volume": [1000],
-            })
+            df = pl.DataFrame(
+                {
+                    "date": [datetime.now(timezone.utc)],
+                    "Open": [100.0],
+                    "High": [101.0],
+                    "Low": [99.0],
+                    "Close": [100.5],
+                    "Volume": [1000],
+                }
+            )
 
             lf = loader._standardize_columns(df.lazy())
             result = lf.collect()
@@ -216,6 +219,168 @@ class TestDataAccessLayer:
 
         assert config.use_database is True
         assert config.fallback_to_files is False
+        assert config.max_missing_symbols == 0
+
+    def test_get_ohlcv_bars_multi_fails_fast_on_missing_symbols(self, monkeypatch):
+        """Multi-symbol access should fail by default when the requested universe is incomplete."""
+        from quant_trading_system.core.exceptions import DataError, DataNotFoundError
+        from quant_trading_system.data.data_access import DataAccessLayer
+
+        layer = DataAccessLayer()
+
+        def fake_get(symbol, start_date=None, end_date=None):
+            if symbol == "MISSING":
+                raise DataNotFoundError("missing")
+            return pl.DataFrame({"timestamp": [], "close": []})
+
+        monkeypatch.setattr(layer, "get_ohlcv_bars", fake_get)
+
+        with pytest.raises(DataError, match="complete symbol universe"):
+            layer.get_ohlcv_bars_multi(["AAPL", "MISSING"])
+
+    def test_get_ohlcv_bars_multi_allows_partial_results_with_tolerance(self, monkeypatch):
+        """Configured tolerance should allow partial symbol sets with explicit limits."""
+        from quant_trading_system.core.exceptions import DataNotFoundError
+        from quant_trading_system.data.data_access import DataAccessConfig, DataAccessLayer
+
+        layer = DataAccessLayer(config=DataAccessConfig(max_missing_symbols=1))
+
+        def fake_get(symbol, start_date=None, end_date=None):
+            if symbol == "MISSING":
+                raise DataNotFoundError("missing")
+            return pl.DataFrame({"timestamp": [], "close": []})
+
+        monkeypatch.setattr(layer, "get_ohlcv_bars", fake_get)
+
+        results = layer.get_ohlcv_bars_multi(["AAPL", "MISSING"])
+
+        assert list(results.keys()) == ["AAPL"]
+
+
+class TestDatabaseDataLoader:
+    """Tests for database-backed bulk loaders."""
+
+    def test_load_parquet_to_database_defaults_timeframe(self, tmp_path, monkeypatch):
+        """Parquet loads should default missing timeframe values safely."""
+        from quant_trading_system.data.db_loader import DatabaseDataLoader
+        from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME
+
+        parquet_path = tmp_path / "AAPL.parquet"
+        pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2025, 1, 1, 14, 30, tzinfo=timezone.utc),
+                    datetime(2025, 1, 1, 14, 45, tzinfo=timezone.utc),
+                ],
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [100.5, 101.5],
+                "volume": [1000, 1200],
+            }
+        ).write_parquet(parquet_path)
+
+        loader = DatabaseDataLoader(db_manager=MagicMock(), batch_size=10)
+        loader._db.session = lambda: nullcontext(MagicMock())
+        captured: dict[str, list[dict]] = {}
+
+        def fake_upsert(_session, rows):
+            captured["rows"] = rows
+            return len(rows)
+
+        monkeypatch.setattr(
+            "quant_trading_system.data.db_loader.apply_ohlcv_ingestion_contract",
+            lambda df, symbol, contract: df,
+        )
+        monkeypatch.setattr(loader, "_upsert_batch", fake_upsert)
+
+        inserted = loader.load_parquet_to_database(parquet_path, resume=False)
+
+        assert inserted == 2
+        assert all(row["timeframe"] == DEFAULT_TIMEFRAME for row in captured["rows"])
+
+    def test_load_parquet_to_database_uses_parquet_path_in_errors(self, tmp_path, monkeypatch):
+        """Parquet load failures should reference the parquet path, not csv variables."""
+        from quant_trading_system.core.exceptions import DataError
+        from quant_trading_system.data.db_loader import DatabaseDataLoader
+
+        parquet_path = tmp_path / "AAPL.parquet"
+        pl.DataFrame(
+            {
+                "timestamp": [datetime(2025, 1, 1, 14, 30, tzinfo=timezone.utc)],
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.5],
+                "volume": [1000],
+            }
+        ).write_parquet(parquet_path)
+
+        loader = DatabaseDataLoader(db_manager=MagicMock(), batch_size=10)
+        loader._db.session = lambda: nullcontext(MagicMock())
+
+        def raise_upsert(_session, _rows):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "quant_trading_system.data.db_loader.apply_ohlcv_ingestion_contract",
+            lambda df, symbol, contract: df,
+        )
+        monkeypatch.setattr(loader, "_upsert_batch", raise_upsert)
+
+        with pytest.raises(DataError, match="Failed to load Parquet") as exc_info:
+            loader.load_parquet_to_database(parquet_path, resume=False)
+
+        assert str(parquet_path) in str(exc_info.value)
+
+    def test_parquet_loader_infers_timeframe_from_filename(self, tmp_path, monkeypatch):
+        """Parquet ingestion should carry inferred timeframe into DB rows."""
+        from quant_trading_system.data.db_loader import DatabaseDataLoader
+
+        parquet_path = tmp_path / "AAPL_5MIN.parquet"
+        pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2025, 1, 1, 14, 30, tzinfo=timezone.utc),
+                    datetime(2025, 1, 1, 14, 35, tzinfo=timezone.utc),
+                ],
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.5, 100.5],
+                "close": [100.5, 101.5],
+                "volume": [1000, 1200],
+            }
+        ).write_parquet(parquet_path)
+
+        mock_session = MagicMock()
+        session_ctx = MagicMock()
+        session_ctx.__enter__.return_value = mock_session
+        session_ctx.__exit__.return_value = False
+        db_manager = MagicMock()
+        db_manager.session.return_value = session_ctx
+
+        loader = DatabaseDataLoader(db_manager=db_manager, batch_size=1)
+        captured_rows: list[dict[str, object]] = []
+
+        monkeypatch.setattr(
+            "quant_trading_system.data.db_loader.apply_ohlcv_ingestion_contract",
+            lambda df, symbol, contract: df,
+        )
+        monkeypatch.setattr(
+            "quant_trading_system.data.db_loader.quality_summary",
+            lambda df: "ok",
+        )
+
+        def fake_upsert(session, bars):
+            captured_rows.extend(bars)
+            return len(bars)
+
+        monkeypatch.setattr(loader, "_upsert_batch", fake_upsert)
+
+        inserted = loader.load_parquet_to_database(parquet_path, batch_size=1, resume=False)
+
+        assert inserted == 2
+        assert {row["timeframe"] for row in captured_rows} == {"5Min"}
 
 
 class TestParquetDataStore:
@@ -239,14 +404,18 @@ class TestParquetDataStore:
             store = ParquetDataStore(tmpdir)
 
             # Create test data
-            df = pl.DataFrame({
-                "timestamp": [datetime.now(timezone.utc) - timedelta(hours=i) for i in range(10)],
-                "open": [100.0 + i for i in range(10)],
-                "high": [101.0 + i for i in range(10)],
-                "low": [99.0 + i for i in range(10)],
-                "close": [100.5 + i for i in range(10)],
-                "volume": [1000 + i * 100 for i in range(10)],
-            })
+            df = pl.DataFrame(
+                {
+                    "timestamp": [
+                        datetime.now(timezone.utc) - timedelta(hours=i) for i in range(10)
+                    ],
+                    "open": [100.0 + i for i in range(10)],
+                    "high": [101.0 + i for i in range(10)],
+                    "low": [99.0 + i for i in range(10)],
+                    "close": [100.5 + i for i in range(10)],
+                    "volume": [1000 + i * 100 for i in range(10)],
+                }
+            )
 
             # Save
             path = store.save_symbol("AAPL", df)
@@ -264,14 +433,16 @@ class TestParquetDataStore:
             store = ParquetDataStore(tmpdir)
 
             # Create test data
-            df = pl.DataFrame({
-                "timestamp": [datetime.now(timezone.utc)],
-                "open": [100.0],
-                "high": [101.0],
-                "low": [99.0],
-                "close": [100.5],
-                "volume": [1000],
-            })
+            df = pl.DataFrame(
+                {
+                    "timestamp": [datetime.now(timezone.utc)],
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1000],
+                }
+            )
 
             store.save_symbol("AAPL", df)
             store.save_symbol("GOOGL", df)
@@ -304,14 +475,16 @@ class TestDataPreprocessor:
 
         preprocessor = DataPreprocessor()
 
-        df = pl.DataFrame({
-            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(5)],
-            "open": [100.0, 101.0, -50.0, 103.0, 104.0],
-            "high": [101.0, 102.0, 51.0, 104.0, 105.0],
-            "low": [99.0, 100.0, 49.0, 102.0, 103.0],
-            "close": [100.5, 101.5, 50.5, 103.5, 104.5],
-            "volume": [1000, 1100, 1200, 1300, 1400],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(5)],
+                "open": [100.0, 101.0, -50.0, 103.0, 104.0],
+                "high": [101.0, 102.0, 51.0, 104.0, 105.0],
+                "low": [99.0, 100.0, 49.0, 102.0, 103.0],
+                "close": [100.5, 101.5, 50.5, 103.5, 104.5],
+                "volume": [1000, 1100, 1200, 1300, 1400],
+            }
+        )
 
         cleaned = preprocessor.clean_data(df)
 
@@ -324,14 +497,16 @@ class TestDataPreprocessor:
 
         preprocessor = DataPreprocessor()
 
-        df = pl.DataFrame({
-            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(5)],
-            "open": [100.0, 101.0, 102.0, 103.0, 104.0],
-            "high": [101.0, 102.0, 100.0, 104.0, 105.0],  # 3rd row: high < open
-            "low": [99.0, 100.0, 99.0, 102.0, 103.0],
-            "close": [100.5, 101.5, 102.5, 103.5, 104.5],
-            "volume": [1000, 1100, 1200, 1300, 1400],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(5)],
+                "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+                "high": [101.0, 102.0, 100.0, 104.0, 105.0],  # 3rd row: high < open
+                "low": [99.0, 100.0, 99.0, 102.0, 103.0],
+                "close": [100.5, 101.5, 102.5, 103.5, 104.5],
+                "volume": [1000, 1100, 1200, 1300, 1400],
+            }
+        )
 
         cleaned = preprocessor.clean_data(df)
 
@@ -345,14 +520,16 @@ class TestDataPreprocessor:
         preprocessor = DataPreprocessor()
 
         ts = datetime.now(timezone.utc)
-        df = pl.DataFrame({
-            "timestamp": [ts, ts, ts + timedelta(hours=1)],
-            "open": [100.0, 101.0, 102.0],
-            "high": [101.0, 102.0, 103.0],
-            "low": [99.0, 100.0, 101.0],
-            "close": [100.5, 101.5, 102.5],
-            "volume": [1000, 1100, 1200],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [ts, ts, ts + timedelta(hours=1)],
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.5, 102.5],
+                "volume": [1000, 1100, 1200],
+            }
+        )
 
         cleaned = preprocessor.clean_data(df)
 
@@ -378,10 +555,12 @@ class TestNormalizationMethod:
 
         preprocessor = DataPreprocessor()
 
-        df = pl.DataFrame({
-            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(10)],
-            "close": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(10)],
+                "close": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
+            }
+        )
 
         result = preprocessor.normalize(df, ["close"], NormalizationMethod.LOG_RETURN)
 
@@ -393,10 +572,12 @@ class TestNormalizationMethod:
 
         preprocessor = DataPreprocessor()
 
-        df = pl.DataFrame({
-            "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(10)],
-            "close": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [datetime.now(timezone.utc) + timedelta(hours=i) for i in range(10)],
+                "close": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0],
+            }
+        )
 
         result = preprocessor.normalize(df, ["close"], NormalizationMethod.PERCENT_CHANGE)
 
@@ -486,14 +667,18 @@ class TestFeatureStore:
 
         store = FeatureStore()
 
-        df = pl.DataFrame({
-            "timestamp": [datetime.now(timezone.utc) + timedelta(minutes=15 * i) for i in range(100)],
-            "open": [100.0 + i * 0.1 for i in range(100)],
-            "high": [101.0 + i * 0.1 for i in range(100)],
-            "low": [99.0 + i * 0.1 for i in range(100)],
-            "close": [100.5 + i * 0.1 for i in range(100)],
-            "volume": [1000 + i * 10 for i in range(100)],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime.now(timezone.utc) + timedelta(minutes=15 * i) for i in range(100)
+                ],
+                "open": [100.0 + i * 0.1 for i in range(100)],
+                "high": [101.0 + i * 0.1 for i in range(100)],
+                "low": [99.0 + i * 0.1 for i in range(100)],
+                "close": [100.5 + i * 0.1 for i in range(100)],
+                "volume": [1000 + i * 10 for i in range(100)],
+            }
+        )
 
         result = store.compute_features(df, ["returns_1", "tech_sma_20_raw"])
 
@@ -551,11 +736,13 @@ class TestFeatureRegistry:
         registry = FeatureRegistry()
 
         for i in range(3):
-            registry.register(FeatureDefinition(
-                name=f"test_feature_{i}",
-                category="test",
-                compute_fn=lambda df: df["close"],
-            ))
+            registry.register(
+                FeatureDefinition(
+                    name=f"test_feature_{i}",
+                    category="test",
+                    compute_fn=lambda df: df["close"],
+                )
+            )
 
         features = registry.get_by_category("test")
 
@@ -638,6 +825,22 @@ class TestConnectionState:
         assert ConnectionState.CONNECTED == "connected"
         assert ConnectionState.RECONNECTING == "reconnecting"
         assert ConnectionState.ERROR == "error"
+
+
+class TestCircuitBreaker:
+    """Tests for live-feed circuit breaker timing semantics."""
+
+    @pytest.mark.asyncio
+    async def test_record_failure_uses_utc_timestamp(self):
+        """Failure timestamps must stay timezone-aware for recovery checks."""
+        from quant_trading_system.data.live_feed import CircuitBreaker, CircuitState
+
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0.0)
+        await breaker.record_failure()
+
+        assert breaker._last_failure_time is not None
+        assert breaker._last_failure_time.tzinfo == timezone.utc
+        assert breaker.state == CircuitState.HALF_OPEN
 
 
 class TestMockLiveFeed:
