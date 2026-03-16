@@ -18,6 +18,7 @@ const BacktestPage = lazy(() => import("@/pages/backtest"));
 const DatabasePage = lazy(() => import("@/pages/database"));
 const AlternativeDataPage = lazy(() => import("@/pages/alternative-data"));
 const StressMapPage = lazy(() => import("@/pages/stress-map"));
+const TradeForensicsPage = lazy(() => import("@/pages/trade-forensics"));
 
 function GuardedRoute({ permission, children }: { permission: string; children: import("react").ReactElement }) {
   const role = useStore((state) => state.role);
@@ -122,6 +123,14 @@ function ProtectedApp() {
             element={
               <GuardedRoute permission="risk.advanced.read">
                 <StressMapPage />
+              </GuardedRoute>
+            }
+          />
+          <Route
+            path="/forensics"
+            element={
+              <GuardedRoute permission="read.basic">
+                <TradeForensicsPage />
               </GuardedRoute>
             }
           />
