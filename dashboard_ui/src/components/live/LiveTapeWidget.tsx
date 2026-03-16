@@ -1,45 +1,95 @@
-import { useEffect, useState, useRef } from "react";
-import { ArrowUpRight, ArrowDownRight } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowDownRight, ArrowUpRight } from "lucide-react";
+import { api } from "@/lib/api";
 
-type TradeEvent = {
-  id: string;
-  time: Date;
+type TradeRow = {
+  trade_id: string | null;
+  symbol: string;
+  timestamp: string;
   price: number;
   size: number;
+  exchange: string | null;
+  tape: string | null;
+  notional: number | null;
+};
+
+type TradesResponse = {
+  symbol: string;
+  source: string;
+  count: number;
+  data: TradeRow[];
+};
+
+type TradeEvent = TradeRow & {
   side: "BUY" | "SELL";
 };
 
 export default function LiveTapeWidget({ symbol = "AAPL" }: { symbol?: string }) {
-  void symbol;
-  const [trades, setTrades] = useState<TradeEvent[]>([]);
-  const tapeRef = useRef<HTMLDivElement>(null);
+  const [trades, setTrades] = useState<TradeRow[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    let basePrice = 150.25;
+    let cancelled = false;
 
-    const interval = setInterval(() => {
-      // Simulate 1 to 3 trades hitting the tape every tick
-      const numTrades = Math.floor(Math.random() * 3) + 1;
-      const newTrades: TradeEvent[] = [];
-
-      for (let i = 0; i < numTrades; i++) {
-        const isBuy = Math.random() > 0.5;
-        basePrice += (isBuy ? 1 : -1) * (Math.random() * 0.05);
-        
-        newTrades.push({
-          id: Math.random().toString(36).substring(7),
-          time: new Date(),
-          price: basePrice,
-          size: Math.floor(Math.random() * 500) + 10,
-          side: isBuy ? "BUY" : "SELL"
+    async function load() {
+      try {
+        const response = await api.get<TradesResponse>("/market/trades", {
+          params: { symbol, limit: 60 },
         });
+        if (!cancelled) {
+          setTrades(response.data.data ?? []);
+        }
+      } catch {
+        if (!cancelled) {
+          setTrades([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
+    }
 
-      setTrades((prev) => [...newTrades, ...prev].slice(0, 50)); // Keep last 50
-    }, 250); // fast tape
+    setLoading(true);
+    void load();
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
+      void load();
+    }, 1500);
 
-    return () => clearInterval(interval);
-  }, []);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [symbol]);
+
+  const normalizedTrades = useMemo<TradeEvent[]>(() => {
+    let previousPrice: number | null = null;
+    return trades.map((trade) => {
+      const side: "BUY" | "SELL" =
+        previousPrice == null || trade.price >= previousPrice ? "BUY" : "SELL";
+      previousPrice = trade.price;
+      return { ...trade, side };
+    });
+  }, [trades]);
+
+  if (loading && normalizedTrades.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center text-xs text-slate-500">
+        Loading recent prints...
+      </div>
+    );
+  }
+
+  if (normalizedTrades.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center text-xs text-slate-500">
+        No recent trade prints available.
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden text-xs font-mono">
@@ -49,26 +99,31 @@ export default function LiveTapeWidget({ symbol = "AAPL" }: { symbol?: string })
         <span className="w-1/4 text-right">Size</span>
         <span className="w-1/4 text-right">Side</span>
       </div>
-      
-      <div 
-        ref={tapeRef}
-        className="flex-1 overflow-y-auto overflow-x-hidden pt-1 pr-1"
-      >
-        {trades.map((trade) => (
-          <div 
-            key={trade.id} 
-            className="group flex items-center justify-between py-1 hover:bg-white/[0.04] transition-colors border-b border-white/[0.02]"
+
+      <div className="flex-1 overflow-y-auto overflow-x-hidden pt-1 pr-1">
+        {normalizedTrades.map((trade, index) => (
+          <div
+            key={`${trade.trade_id ?? trade.timestamp}-${index}`}
+            className="group flex items-center justify-between border-b border-white/[0.02] py-1 transition-colors hover:bg-white/[0.04]"
           >
             <span className="w-1/4 text-left text-slate-500">
-              {trade.time.toLocaleTimeString(undefined, { hour12: false, fractionalSecondDigits: 1 })}
+              {new Date(trade.timestamp).toLocaleTimeString(undefined, {
+                hour12: false,
+                minute: "2-digit",
+                second: "2-digit",
+              })}
             </span>
-            <span className={`w-1/4 text-center font-bold ${trade.side === "BUY" ? "text-emerald-400" : "text-rose-400"}`}>
+            <span
+              className={`w-1/4 text-center font-bold ${
+                trade.side === "BUY" ? "text-emerald-400" : "text-rose-400"
+              }`}
+            >
               {trade.price.toFixed(2)}
             </span>
             <span className="w-1/4 text-right text-slate-300">
               {trade.size.toLocaleString()}
             </span>
-            <span className="w-1/4 flex justify-end items-center gap-1">
+            <span className="flex w-1/4 items-center justify-end gap-1">
               {trade.side === "BUY" ? (
                 <>
                   <span className="text-[10px] text-emerald-500">BUY</span>

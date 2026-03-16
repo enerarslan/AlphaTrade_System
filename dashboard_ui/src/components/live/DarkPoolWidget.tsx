@@ -1,74 +1,121 @@
-import { useEffect, useRef, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { useEffect, useMemo, useState } from "react";
+import { api } from "@/lib/api";
 
-type DarkPoolPrint = {
+type BlockTradeRow = {
   id: string;
-  time: string;
   symbol: string;
+  timestamp: string;
   price: number;
   size: number;
-  venue: "DARK" | "LIT" | "MIDPOINT";
+  notional: number | null;
+  venue: string | null;
+  source: string;
+  flags: string[];
+};
+
+type BlockTradesResponse = {
+  generated_at: string;
+  count: number;
+  data: BlockTradeRow[];
+};
+
+type EnrichedBlockTrade = BlockTradeRow & {
   side: "BUY" | "SELL" | "CROSS";
-  isBlock: boolean;
   icebergDetected: boolean;
 };
 
-const VENUES = ["DARK", "LIT", "MIDPOINT"] as const;
-const SIDES = ["BUY", "SELL", "CROSS"] as const;
-const SYMBOLS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "META", "JPM"];
-
-function randomPrint(): DarkPoolPrint {
-  const sym = SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
-  const size = Math.floor(Math.random() * 50000) + 500;
-  const isBlock = size > 25000;
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    time: new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-    symbol: sym,
-    price: +(150 + Math.random() * 100).toFixed(2),
-    size,
-    venue: VENUES[Math.floor(Math.random() * VENUES.length)],
-    side: SIDES[Math.floor(Math.random() * SIDES.length)],
-    isBlock,
-    icebergDetected: isBlock && Math.random() > 0.6,
-  };
-}
-
-function formatSize(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return n.toString();
+function formatSize(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return value.toString();
 }
 
 export default function DarkPoolWidget() {
-  const [prints, setPrints] = useState<DarkPoolPrint[]>([]);
-  const [stats, setStats] = useState({ totalVolume: 0, darkRatio: 0, blockCount: 0, icebergs: 0 });
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [prints, setPrints] = useState<BlockTradeRow[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    let totalVol = 0;
-    let darkVol = 0;
-    let blocks = 0;
-    let icebergs = 0;
+    let cancelled = false;
 
-    const interval = setInterval(() => {
-      const newPrint = randomPrint();
-      totalVol += newPrint.size;
-      if (newPrint.venue === "DARK") darkVol += newPrint.size;
-      if (newPrint.isBlock) blocks++;
-      if (newPrint.icebergDetected) icebergs++;
+    async function load() {
+      try {
+        const response = await api.get<BlockTradesResponse>("/market/block-trades", {
+          params: {
+            symbols: "AAPL,MSFT,NVDA,GOOGL,AMZN,TSLA,META,JPM",
+            limit: 50,
+            min_size: 1000,
+          },
+        });
+        if (!cancelled) {
+          setPrints(response.data.data ?? []);
+        }
+      } catch {
+        if (!cancelled) {
+          setPrints([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
 
-      setPrints(prev => [newPrint, ...prev].slice(0, 50));
-      setStats({
-        totalVolume: totalVol,
-        darkRatio: totalVol > 0 ? (darkVol / totalVol) * 100 : 0,
-        blockCount: blocks,
-        icebergs,
-      });
-    }, 800 + Math.random() * 1200);
+    setLoading(true);
+    void load();
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
+      void load();
+    }, 5000);
 
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, []);
+
+  const enrichedPrints = useMemo<EnrichedBlockTrade[]>(() => {
+    const frequency = new Map<string, number>();
+    prints.forEach((print) => {
+      const key = `${print.symbol}:${print.price.toFixed(2)}`;
+      frequency.set(key, (frequency.get(key) ?? 0) + 1);
+    });
+
+    let previousPrice: number | null = null;
+    return prints.map((print) => {
+      const key = `${print.symbol}:${print.price.toFixed(2)}`;
+      const side: "BUY" | "SELL" | "CROSS" =
+        previousPrice == null
+          ? "CROSS"
+          : print.price > previousPrice
+            ? "BUY"
+            : print.price < previousPrice
+              ? "SELL"
+              : "CROSS";
+      previousPrice = print.price;
+      return {
+        ...print,
+        side,
+        icebergDetected: (frequency.get(key) ?? 0) >= 3,
+      };
+    });
+  }, [prints]);
+
+  const stats = useMemo(() => {
+    const totalVolume = enrichedPrints.reduce((sum, print) => sum + print.size, 0);
+    const darkVolume = enrichedPrints
+      .filter((print) => (print.venue ?? "").toUpperCase().includes("DARK"))
+      .reduce((sum, print) => sum + print.size, 0);
+    const blockCount = enrichedPrints.length;
+    const icebergs = enrichedPrints.filter((print) => print.icebergDetected).length;
+    return {
+      totalVolume,
+      darkRatio: totalVolume > 0 ? (darkVolume / totalVolume) * 100 : 0,
+      blockCount,
+      icebergs,
+    };
+  }, [enrichedPrints]);
 
   const sideColor = (side: string) => {
     if (side === "BUY") return "text-emerald-400";
@@ -76,81 +123,126 @@ export default function DarkPoolWidget() {
     return "text-amber-400";
   };
 
-  const venueColor = (venue: string) => {
-    if (venue === "DARK") return "bg-purple-500/20 text-purple-300 border-purple-500/30";
-    if (venue === "MIDPOINT") return "bg-cyan-500/20 text-cyan-300 border-cyan-500/30";
+  const venueColor = (venue: string | null) => {
+    const normalized = (venue ?? "TAPE").toUpperCase();
+    if (normalized.includes("DARK")) {
+      return "bg-purple-500/20 text-purple-300 border-purple-500/30";
+    }
+    if (normalized.includes("MID")) {
+      return "bg-cyan-500/20 text-cyan-300 border-cyan-500/30";
+    }
     return "bg-slate-500/20 text-slate-300 border-slate-500/30";
   };
 
+  if (loading && enrichedPrints.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center text-xs text-slate-500">
+        Loading institutional flow...
+      </div>
+    );
+  }
+
+  if (enrichedPrints.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center text-xs text-slate-500">
+        No large prints available.
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col h-full">
-      {/* Stats Bar */}
-      <div className="grid grid-cols-4 gap-2 p-3 border-b border-white/[0.06]">
+    <div className="flex h-full flex-col">
+      <div className="grid grid-cols-4 gap-2 border-b border-white/[0.06] p-3">
         {[
-          { label: "Total Vol", value: formatSize(stats.totalVolume), color: "text-cyan-400" },
-          { label: "Dark %", value: `${stats.darkRatio.toFixed(1)}%`, color: "text-purple-400" },
-          { label: "Blocks", value: stats.blockCount.toString(), color: "text-amber-400" },
-          { label: "Icebergs", value: stats.icebergs.toString(), color: stats.icebergs > 0 ? "text-rose-400" : "text-slate-500" },
-        ].map(s => (
-          <div key={s.label} className="text-center">
-            <p className="text-[8px] uppercase tracking-widest text-slate-500 font-semibold">{s.label}</p>
-            <p className={`font-mono text-sm font-bold ${s.color}`}>{s.value}</p>
+          {
+            label: "Total Vol",
+            value: formatSize(stats.totalVolume),
+            color: "text-cyan-400",
+          },
+          {
+            label: "Dark %",
+            value: `${stats.darkRatio.toFixed(1)}%`,
+            color: "text-purple-400",
+          },
+          {
+            label: "Blocks",
+            value: stats.blockCount.toString(),
+            color: "text-amber-400",
+          },
+          {
+            label: "Icebergs",
+            value: stats.icebergs.toString(),
+            color: stats.icebergs > 0 ? "text-rose-400" : "text-slate-500",
+          },
+        ].map((metric) => (
+          <div key={metric.label} className="text-center">
+            <p className="text-[8px] font-semibold uppercase tracking-widest text-slate-500">
+              {metric.label}
+            </p>
+            <p className={`font-mono text-sm font-bold ${metric.color}`}>
+              {metric.value}
+            </p>
           </div>
         ))}
       </div>
 
-      {/* Feed */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-thin">
+      <div className="flex-1 overflow-y-auto scrollbar-thin">
         <table className="w-full text-[11px] font-mono">
           <thead className="sticky top-0 bg-slate-950/95 backdrop-blur-sm">
-            <tr className="text-[9px] uppercase tracking-wider text-slate-500 border-b border-white/[0.06]">
-              <th className="py-1.5 px-2 text-left font-semibold">Time</th>
-              <th className="py-1.5 px-2 text-left font-semibold">Sym</th>
-              <th className="py-1.5 px-2 text-right font-semibold">Price</th>
-              <th className="py-1.5 px-2 text-right font-semibold">Size</th>
-              <th className="py-1.5 px-2 text-center font-semibold">Side</th>
-              <th className="py-1.5 px-2 text-center font-semibold">Venue</th>
-              <th className="py-1.5 px-2 text-center font-semibold">Flags</th>
+            <tr className="border-b border-white/[0.06] text-[9px] uppercase tracking-wider text-slate-500">
+              <th className="px-2 py-1.5 text-left font-semibold">Time</th>
+              <th className="px-2 py-1.5 text-left font-semibold">Sym</th>
+              <th className="px-2 py-1.5 text-right font-semibold">Price</th>
+              <th className="px-2 py-1.5 text-right font-semibold">Size</th>
+              <th className="px-2 py-1.5 text-center font-semibold">Side</th>
+              <th className="px-2 py-1.5 text-center font-semibold">Venue</th>
+              <th className="px-2 py-1.5 text-center font-semibold">Flags</th>
             </tr>
           </thead>
           <tbody>
-            <AnimatePresence initial={false}>
-              {prints.map(p => (
-                <motion.tr
-                  key={p.id}
-                  initial={{ opacity: 0, backgroundColor: p.isBlock ? "rgba(217, 70, 239, 0.15)" : "rgba(6, 182, 212, 0.08)" }}
-                  animate={{ opacity: 1, backgroundColor: "transparent" }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 1.5 }}
-                  className={`border-b border-white/[0.03] hover:bg-white/[0.03] ${p.isBlock ? "font-semibold" : ""}`}
-                >
-                  <td className="py-1 px-2 text-slate-500">{p.time}</td>
-                  <td className="py-1 px-2 text-slate-200 font-bold">{p.symbol}</td>
-                  <td className="py-1 px-2 text-right text-slate-300">${p.price.toFixed(2)}</td>
-                  <td className={`py-1 px-2 text-right ${p.isBlock ? "text-amber-300" : "text-slate-400"}`}>
-                    {formatSize(p.size)}
-                  </td>
-                  <td className={`py-1 px-2 text-center ${sideColor(p.side)}`}>{p.side}</td>
-                  <td className="py-1 px-2 text-center">
-                    <span className={`inline-block rounded px-1.5 py-0.5 text-[9px] border ${venueColor(p.venue)}`}>
-                      {p.venue}
+            {enrichedPrints.map((print) => (
+              <tr
+                key={print.id}
+                className="border-b border-white/[0.03] hover:bg-white/[0.03]"
+              >
+                <td className="px-2 py-1 text-slate-500">
+                  {new Date(print.timestamp).toLocaleTimeString(undefined, {
+                    hour12: false,
+                    minute: "2-digit",
+                    second: "2-digit",
+                  })}
+                </td>
+                <td className="px-2 py-1 font-bold text-slate-200">{print.symbol}</td>
+                <td className="px-2 py-1 text-right text-slate-300">
+                  ${print.price.toFixed(2)}
+                </td>
+                <td className="px-2 py-1 text-right text-amber-300">
+                  {formatSize(print.size)}
+                </td>
+                <td className={`px-2 py-1 text-center ${sideColor(print.side)}`}>
+                  {print.side}
+                </td>
+                <td className="px-2 py-1 text-center">
+                  <span
+                    className={`inline-block rounded border px-1.5 py-0.5 text-[9px] ${venueColor(
+                      print.venue,
+                    )}`}
+                  >
+                    {(print.venue ?? print.source).toUpperCase()}
+                  </span>
+                </td>
+                <td className="space-x-1 px-2 py-1 text-center">
+                  <span className="inline-block rounded border border-amber-500/30 bg-amber-500/20 px-1 py-0.5 text-[8px] font-bold text-amber-300">
+                    BLOCK
+                  </span>
+                  {print.icebergDetected && (
+                    <span className="inline-block rounded border border-rose-500/30 bg-rose-500/20 px-1 py-0.5 text-[8px] font-bold text-rose-300">
+                      ICE
                     </span>
-                  </td>
-                  <td className="py-1 px-2 text-center space-x-1">
-                    {p.isBlock && (
-                      <span className="inline-block rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1 py-0.5 text-[8px] font-bold">
-                        BLOCK
-                      </span>
-                    )}
-                    {p.icebergDetected && (
-                      <span className="inline-block rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 px-1 py-0.5 text-[8px] font-bold animate-pulse">
-                        🧊 ICE
-                      </span>
-                    )}
-                  </td>
-                </motion.tr>
-              ))}
-            </AnimatePresence>
+                  )}
+                </td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>

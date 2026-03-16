@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
-import { Calendar, TrendingUp, TrendingDown, Minus, Clock } from "lucide-react";
+import { Calendar, TrendingUp, TrendingDown, Minus, Clock, Loader2 } from "lucide-react";
+import { api } from "@/lib/api";
 
 type MacroEvent = {
   id: string;
@@ -14,23 +15,109 @@ type MacroEvent = {
   surprise: "BEAT" | "MISS" | "INLINE" | null;
 };
 
-const MOCK_EVENTS: MacroEvent[] = [
-  { id: "1", time: "08:30", country: "🇺🇸", event: "Nonfarm Payrolls", impact: "HIGH", actual: "275K", forecast: "200K", previous: "229K", surprise: "BEAT" },
-  { id: "2", time: "08:30", country: "🇺🇸", event: "Unemployment Rate", impact: "HIGH", actual: "3.9%", forecast: "3.7%", previous: "3.7%", surprise: "MISS" },
-  { id: "3", time: "10:00", country: "🇺🇸", event: "ISM Manufacturing PMI", impact: "HIGH", actual: "47.8", forecast: "49.5", previous: "49.1", surprise: "MISS" },
-  { id: "4", time: "10:00", country: "🇺🇸", event: "Michigan Consumer Sentiment", impact: "MEDIUM", actual: null, forecast: "76.9", previous: "79.4", surprise: null },
-  { id: "5", time: "11:00", country: "🇪🇺", event: "ECB Deposit Rate Decision", impact: "HIGH", actual: "4.00%", forecast: "4.00%", previous: "4.00%", surprise: "INLINE" },
-  { id: "6", time: "13:00", country: "🇺🇸", event: "Fed Chair Speech", impact: "HIGH", actual: null, forecast: "—", previous: "—", surprise: null },
-  { id: "7", time: "08:00", country: "🇬🇧", event: "UK GDP (QoQ)", impact: "MEDIUM", actual: "-0.3%", forecast: "-0.1%", previous: "0.0%", surprise: "MISS" },
-  { id: "8", time: "14:00", country: "🇺🇸", event: "10-Year Note Auction", impact: "MEDIUM", actual: null, forecast: "4.28%", previous: "4.32%", surprise: null },
-  { id: "9", time: "07:00", country: "🇩🇪", event: "German CPI (YoY)", impact: "MEDIUM", actual: "2.5%", forecast: "2.6%", previous: "2.9%", surprise: "BEAT" },
-  { id: "10", time: "15:00", country: "🇺🇸", event: "Baker Hughes Rig Count", impact: "LOW", actual: null, forecast: "—", previous: "623", surprise: null },
-];
+type MacroObservation = {
+  key: string | null;
+  series_id: string;
+  label: string;
+  source: string;
+  unit: string;
+  observation_date: string;
+  value: number | null;
+  previous_value: number | null;
+  change_pct: number | null;
+};
+
+type MacroSummaryResponse = {
+  generated_at: string;
+  series: unknown[];
+  recent_observations: MacroObservation[];
+};
+
+const HIGH_IMPACT_SERIES = new Set(["FEDFUNDS", "DGS10", "VIX", "UNRATE", "PAYEMS", "CPIAUCSL", "GDPC1"]);
+const MEDIUM_IMPACT_SERIES = new Set(["DGS2", "RSAFS", "DGORDER"]);
+
+const ECB_SERIES = new Set<string>();
+
+function deriveImpact(seriesId: string): "HIGH" | "MEDIUM" | "LOW" {
+  if (HIGH_IMPACT_SERIES.has(seriesId)) return "HIGH";
+  if (MEDIUM_IMPACT_SERIES.has(seriesId)) return "MEDIUM";
+  return "LOW";
+}
+
+function deriveCountry(seriesId: string): string {
+  if (ECB_SERIES.has(seriesId)) return "🇪🇺";
+  return "🇺🇸";
+}
+
+function deriveTime(seriesId: string): string {
+  if (ECB_SERIES.has(seriesId)) return "07:00";
+  return "08:30";
+}
+
+function formatValue(value: number | null, unit: string): string | null {
+  if (value === null || value === undefined) return null;
+  return `${value}${unit}`;
+}
+
+function deriveSurprise(changePct: number | null, value: number | null): "BEAT" | "MISS" | "INLINE" | null {
+  if (value === null || value === undefined) return null;
+  if (changePct === null || changePct === undefined) return "INLINE";
+  if (changePct > 0.5) return "BEAT";
+  if (changePct < -0.5) return "MISS";
+  return "INLINE";
+}
+
+function transformObservations(observations: MacroObservation[]): MacroEvent[] {
+  return observations.map((obs, i) => ({
+    id: obs.series_id ? `${obs.series_id}-${obs.observation_date}` : String(i),
+    time: deriveTime(obs.series_id),
+    country: deriveCountry(obs.series_id),
+    event: obs.label,
+    impact: deriveImpact(obs.series_id),
+    actual: formatValue(obs.value, obs.unit),
+    forecast: "—",
+    previous: formatValue(obs.previous_value, obs.unit) ?? "—",
+    surprise: deriveSurprise(obs.change_pct, obs.value),
+  }));
+}
 
 export default function MacroCalendarWidget() {
   const [filter, setFilter] = useState<"ALL" | "HIGH" | "MEDIUM" | "LOW">("ALL");
+  const [events, setEvents] = useState<MacroEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const filtered = filter === "ALL" ? MOCK_EVENTS : MOCK_EVENTS.filter(e => e.impact === filter);
+  const fetchData = async () => {
+    try {
+      const response = await api.get<MacroSummaryResponse>("/market/macro/summary");
+      const transformed = transformObservations(response.data.recent_observations ?? []);
+      setEvents(transformed);
+      setError(null);
+    } catch (err) {
+      setError("Failed to load macro data");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+
+    intervalRef.current = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        fetchData();
+      }
+    }, 60_000);
+
+    return () => {
+      if (intervalRef.current !== null) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, []);
+
+  const filtered = filter === "ALL" ? events : events.filter(e => e.impact === filter);
 
   const impactStyle = (impact: string) => {
     if (impact === "HIGH") return "bg-rose-500/20 text-rose-300 border-rose-500/30";
@@ -72,64 +159,78 @@ export default function MacroCalendarWidget() {
 
       {/* Events List */}
       <div className="flex-1 overflow-y-auto scrollbar-thin">
-        {filtered.map((event, i) => (
-          <motion.div
-            key={event.id}
-            initial={{ opacity: 0, x: -10 }}
-            animate={{ opacity: 1, x: 0 }}
-            transition={{ delay: i * 0.03 }}
-            className={`flex items-center gap-3 px-3 py-2.5 border-b border-white/[0.04] hover:bg-white/[0.03] transition-colors ${
-              !event.actual ? "opacity-70" : ""
-            }`}
-          >
-            {/* Time + Country */}
-            <div className="w-16 shrink-0">
-              <p className="text-[10px] font-mono text-slate-500">{event.time}</p>
-              <p className="text-sm">{event.country}</p>
-            </div>
+        {loading ? (
+          <div className="flex items-center justify-center h-full">
+            <Loader2 size={20} className="text-cyan-400 animate-spin" />
+          </div>
+        ) : error ? (
+          <div className="flex items-center justify-center h-full">
+            <p className="text-xs text-slate-500">{error}</p>
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="flex items-center justify-center h-full">
+            <p className="text-xs text-slate-500">No events available</p>
+          </div>
+        ) : (
+          filtered.map((event, i) => (
+            <motion.div
+              key={event.id}
+              initial={{ opacity: 0, x: -10 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: i * 0.03 }}
+              className={`flex items-center gap-3 px-3 py-2.5 border-b border-white/[0.04] hover:bg-white/[0.03] transition-colors ${
+                !event.actual ? "opacity-70" : ""
+              }`}
+            >
+              {/* Time + Country */}
+              <div className="w-16 shrink-0">
+                <p className="text-[10px] font-mono text-slate-500">{event.time}</p>
+                <p className="text-sm">{event.country}</p>
+              </div>
 
-            {/* Impact Indicator */}
-            <div className="shrink-0">
-              <span className={`inline-block w-14 text-center rounded px-1.5 py-0.5 text-[8px] font-bold border uppercase ${impactStyle(event.impact)}`}>
-                {event.impact}
-              </span>
-            </div>
+              {/* Impact Indicator */}
+              <div className="shrink-0">
+                <span className={`inline-block w-14 text-center rounded px-1.5 py-0.5 text-[8px] font-bold border uppercase ${impactStyle(event.impact)}`}>
+                  {event.impact}
+                </span>
+              </div>
 
-            {/* Event Name */}
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-medium text-slate-200 truncate">{event.event}</p>
-            </div>
+              {/* Event Name */}
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium text-slate-200 truncate">{event.event}</p>
+              </div>
 
-            {/* Data Columns */}
-            <div className="flex items-center gap-3 shrink-0 font-mono text-[11px]">
-              <div className="text-center w-14">
-                <p className="text-[8px] text-slate-600 uppercase">Actual</p>
-                <p className={`font-bold ${
-                  event.actual 
-                    ? event.surprise === "BEAT" 
-                      ? "text-emerald-400" 
-                      : event.surprise === "MISS" 
-                        ? "text-rose-400" 
-                        : "text-slate-300"
-                    : "text-slate-600"
-                }`}>
-                  {event.actual ?? "—"}
-                </p>
+              {/* Data Columns */}
+              <div className="flex items-center gap-3 shrink-0 font-mono text-[11px]">
+                <div className="text-center w-14">
+                  <p className="text-[8px] text-slate-600 uppercase">Actual</p>
+                  <p className={`font-bold ${
+                    event.actual
+                      ? event.surprise === "BEAT"
+                        ? "text-emerald-400"
+                        : event.surprise === "MISS"
+                          ? "text-rose-400"
+                          : "text-slate-300"
+                      : "text-slate-600"
+                  }`}>
+                    {event.actual ?? "—"}
+                  </p>
+                </div>
+                <div className="text-center w-14">
+                  <p className="text-[8px] text-slate-600 uppercase">Forecast</p>
+                  <p className="text-slate-400">{event.forecast}</p>
+                </div>
+                <div className="text-center w-14">
+                  <p className="text-[8px] text-slate-600 uppercase">Previous</p>
+                  <p className="text-slate-500">{event.previous}</p>
+                </div>
+                <div className="w-5 flex items-center justify-center">
+                  {surpriseIcon(event.surprise)}
+                </div>
               </div>
-              <div className="text-center w-14">
-                <p className="text-[8px] text-slate-600 uppercase">Forecast</p>
-                <p className="text-slate-400">{event.forecast}</p>
-              </div>
-              <div className="text-center w-14">
-                <p className="text-[8px] text-slate-600 uppercase">Previous</p>
-                <p className="text-slate-500">{event.previous}</p>
-              </div>
-              <div className="w-5 flex items-center justify-center">
-                {surpriseIcon(event.surprise)}
-              </div>
-            </div>
-          </motion.div>
-        ))}
+            </motion.div>
+          ))
+        )}
       </div>
     </div>
   );

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { Bot, Send, User, Minimize2, Maximize2, X, BrainCircuit, Terminal } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useStore } from "@/lib/store";
+import { api } from "@/lib/api";
 
 type Message = {
   id: string;
@@ -34,47 +35,50 @@ export default function AICopilotWidget({ isOpen, onClose }: { isOpen: boolean; 
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isTyping, isOpen]);
 
-  const handleSend = () => {
-    if (!input.trim()) return;
-    
+  const handleSend = async () => {
+    if (!input.trim() || isTyping) return;
+
     const userMsg: Message = { id: Date.now().toString(), sender: "user", text: input, timestamp: new Date() };
     setMessages(prev => [...prev, userMsg]);
     setInput("");
     setIsTyping(true);
 
-    // Simulate AI Processing and Contextual Response
-    setTimeout(() => {
-      let responseText = "Processing request...";
-      const query = userMsg.text.toLowerCase();
-
-      if (query.includes("drawdown") || query.includes("risk")) {
-        responseText = `Current portfolio drawdown is ${((riskMetrics?.current_drawdown ?? 0)*100).toFixed(2)}%. Value at Risk (95%) is $${(riskMetrics?.portfolio_var_95 ?? 0).toLocaleString()}. Risk boundaries are currently holding steady.`;
-      } else if (query.includes("pnl") || query.includes("profit") || query.includes("loss")) {
-         const pnl = portfolio?.total_pnl ?? 0;
-         responseText = `Total PnL stands at ${pnl >= 0 ? "+" : ""}$${pnl.toLocaleString()}. The algorithmic execution seems stable across major pairs.`;
-      } else if (query.includes("alert") || query.includes("incident")) {
-         const activeCount = alerts.filter(a => a.status !== "RESOLVED").length;
-         responseText = `There are currently ${activeCount} active alerts in the command center. I recommend verifying the Operations terminal for infrastructure health.`;
-      } else if (query.includes("flatten") || query.includes("kill")) {
-         responseText = `WARNING: If you need to flatten the portfolio, use the 'F' hotkey on the Execution Terminal, or engage the Kill Switch if this is a systemic failure.`;
-      } else {
-         const responses = [
-           "I've cross-referenced that with the live tape. Algorithmic flow is normal.",
-           "Analyzing order book density... the resistance level above appears heavy.",
-           "Logging this query. SRE telemetry shows no immediate anomalies.",
-           "My NLP models suggest market sentiment is slightly leaning bullish right now based on alternative data streams."
-         ];
-         responseText = responses[Math.floor(Math.random() * responses.length)];
-      }
+    try {
+      const response = await api.post<{ response: string; sources: string[] }>("/copilot/chat", {
+        message: userMsg.text,
+        context: {
+          portfolio: {
+            equity: portfolio?.equity,
+            cash: portfolio?.cash,
+            daily_pnl: portfolio?.daily_pnl,
+            total_pnl: portfolio?.total_pnl,
+            positions_count: portfolio?.positions_count,
+          },
+          risk: {
+            current_drawdown: riskMetrics?.current_drawdown,
+            portfolio_var_95: riskMetrics?.portfolio_var_95,
+            portfolio_var_99: riskMetrics?.portfolio_var_99,
+          },
+          alerts_count: alerts.filter(a => a.status !== "RESOLVED").length,
+        },
+      });
 
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(),
         sender: "ai",
-        text: responseText,
+        text: response.data.response,
         timestamp: new Date()
       }]);
+    } catch {
+      setMessages(prev => [...prev, {
+        id: (Date.now() + 1).toString(),
+        sender: "ai",
+        text: "Connection to analysis engine failed. Please check system status.",
+        timestamp: new Date()
+      }]);
+    } finally {
       setIsTyping(false);
-    }, 1200 + Math.random() * 1000);
+    }
   };
 
   return (
@@ -154,7 +158,7 @@ export default function AICopilotWidget({ isOpen, onClose }: { isOpen: boolean; 
                   type="text" 
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleSend()}
+                  onKeyDown={(e) => e.key === "Enter" && void handleSend()}
                   placeholder="Ask the system..."
                   className="w-full bg-white/[0.03] border border-white/[0.1] rounded-lg py-2.5 pl-9 pr-12 text-sm text-slate-200 placeholder-slate-500 outline-none focus:border-fuchsia-500/50 focus:bg-white/[0.06] transition-all font-mono"
                 />
