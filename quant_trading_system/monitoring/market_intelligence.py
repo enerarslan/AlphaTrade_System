@@ -16,7 +16,7 @@ from typing import Any, Iterable
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from quant_trading_system.database.connection import get_engine
+from quant_trading_system.database.connection import get_db_manager
 
 logger = logging.getLogger(__name__)
 
@@ -597,7 +597,7 @@ def get_market_intelligence(symbols: list[str], news_limit: int = 20) -> dict[st
     }
 
     try:
-        engine = get_engine()
+        engine = get_db_manager().engine
         with engine.connect() as conn:
             payload["quotes"] = _load_quotes(conn, normalized_symbols)
             payload["news"] = _load_news(conn, news_limit)
@@ -624,7 +624,7 @@ def get_chart_snapshot(symbol: str, timeframe: str = "1Day", limit: int = 200) -
     }
 
     try:
-        engine = get_engine()
+        engine = get_db_manager().engine
         with engine.connect() as conn:
             candle_rows = list(
                 conn.execute(
@@ -726,7 +726,7 @@ def get_top_book(symbol: str, limit: int = 15) -> dict[str, Any]:
     }
 
     try:
-        engine = get_engine()
+        engine = get_db_manager().engine
         with engine.connect() as conn:
             rows = list(
                 conn.execute(
@@ -792,7 +792,7 @@ def get_trade_tape(symbol: str, limit: int = 50) -> dict[str, Any]:
     }
 
     try:
-        engine = get_engine()
+        engine = get_db_manager().engine
         with engine.connect() as conn:
             rows = list(
                 conn.execute(
@@ -866,7 +866,7 @@ def get_venue_flow(symbols: list[str] | None = None, limit: int = 60) -> dict[st
     }
 
     try:
-        engine = get_engine()
+        engine = get_db_manager().engine
         with engine.connect() as conn:
             params: dict[str, Any] = {"limit": min(max(limit, 10), 120)}
             where_sql = ""

@@ -521,6 +521,18 @@ def get_redis_manager(settings: Settings | None = None) -> RedisManager:
     return _redis_manager
 
 
+def get_engine() -> Engine:
+    """Get the global database engine.
+
+    Convenience function that returns the SQLAlchemy Engine
+    from the global DatabaseManager instance.
+
+    Returns:
+        SQLAlchemy Engine instance.
+    """
+    return get_db_manager().engine
+
+
 def reset_managers() -> None:
     """Reset global manager instances (for testing)."""
     global _db_manager, _redis_manager
