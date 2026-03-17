@@ -101,7 +101,7 @@ app = FastAPI(
 # CORS middleware for frontend access
 # SECURITY: Restrict CORS to specific origins instead of "*"
 # Get allowed origins from environment variable or use safe defaults
-_allowed_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+_allowed_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000").split(",")
 _allowed_origins = [origin.strip() for origin in _allowed_origins if origin.strip()]
 
 app.add_middleware(
@@ -7492,159 +7492,393 @@ class CopilotChatResponse(BaseModel):
 
     response: str
     sources: list[str] = Field(default_factory=list)
+    thinking: str | None = None
 
 
-def _build_copilot_response(message: str, context: dict[str, Any]) -> CopilotChatResponse:
-    """Generate a context-aware copilot response using real system data."""
-    query = message.lower()
-    sources: list[str] = []
-    portfolio_ctx = context.get("portfolio", {})
-    risk_ctx = context.get("risk", {})
-    alerts_count = context.get("alerts_count", 0)
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+_COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "qwen3:4b")
 
-    # --- Portfolio / PnL queries ---
-    if any(kw in query for kw in ("pnl", "profit", "loss", "p&l", "performance", "equity", "portfolio")):
-        sources = ["portfolio", "performance"]
-        equity = portfolio_ctx.get("equity")
-        cash = portfolio_ctx.get("cash")
-        daily_pnl = portfolio_ctx.get("daily_pnl")
-        total_pnl = portfolio_ctx.get("total_pnl")
-        positions_count = portfolio_ctx.get("positions_count", 0)
+_COPILOT_SYSTEM_PROMPT = """You are AlphaTrade Copilot — a JPMorgan-grade quantitative trading AI analyst embedded in a live institutional trading platform.
 
-        parts = []
-        if equity is not None:
-            parts.append(f"Portfolio equity: ${equity:,.2f}")
-        if cash is not None:
-            parts.append(f"Available cash: ${cash:,.2f}")
-        if daily_pnl is not None:
-            sign = "+" if daily_pnl >= 0 else ""
-            parts.append(f"Daily P&L: {sign}${daily_pnl:,.2f}")
-        if total_pnl is not None:
-            sign = "+" if total_pnl >= 0 else ""
-            parts.append(f"Total P&L: {sign}${total_pnl:,.2f}")
-        if positions_count is not None:
-            parts.append(f"Open positions: {positions_count}")
+You have access to LIVE system data injected below. Use ONLY these real numbers — never invent metrics.
 
-        if parts:
-            response_text = ". ".join(parts) + "."
-        else:
-            response_text = "Portfolio data is currently unavailable. Please check system connectivity."
-        return CopilotChatResponse(response=response_text, sources=sources)
+ANALYSIS FRAMEWORK (follow this structure for every response):
+1. STATUS: One-line verdict (GREEN/YELLOW/RED) with key metric
+2. ANALYSIS: Data-driven assessment using exact numbers from the live data
+3. RISK FLAGS: Any elevated risk indicators (drawdown > 3%, VaR utilization > 50%, concentration > 25%)
+4. RECOMMENDATION: Specific, actionable next steps a portfolio manager should take
 
-    # --- Risk / Drawdown / VaR queries ---
-    if any(kw in query for kw in ("risk", "drawdown", "var", "value at risk", "exposure")):
-        sources = ["risk"]
-        current_dd = risk_ctx.get("current_drawdown")
-        var_95 = risk_ctx.get("portfolio_var_95")
-        var_99 = risk_ctx.get("portfolio_var_99")
+FORMATTING RULES:
+- Use exact numbers from the data. Format: $1,234.56 for dollars, 2.35% for percentages, 1.5 bps for basis points
+- When risk is elevated, lead with ⚠️ WARNING before anything else
+- Use financial terminology precisely (bps, Sharpe, VaR, CVaR, drawdown, beta, alpha, IR)
+- Bold key metrics and action items with **bold**
+- Use bullet points for clarity
+- Never suggest bypassing risk controls or the kill switch
+- Respond in the same language the user writes in
+- If data is missing or null, explicitly flag it — never guess or hallucinate
+- Think deeply before answering — thorough analysis is valued over speed
+"""
 
-        parts = []
-        if current_dd is not None:
-            parts.append(f"Current drawdown: {current_dd * 100:.2f}%")
-        if var_95 is not None:
-            parts.append(f"VaR (95%): ${var_95:,.2f}")
-        if var_99 is not None:
-            parts.append(f"VaR (99%): ${var_99:,.2f}")
-        if portfolio_ctx.get("positions_count") is not None:
-            parts.append(f"Across {portfolio_ctx['positions_count']} open positions")
+_COPILOT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_portfolio",
+            "description": "Get current portfolio data: equity, cash, buying power, PnL, positions count, exposures",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_positions",
+            "description": "Get all open positions with symbol, quantity, entry price, current price, unrealized PnL",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_risk_metrics",
+            "description": "Get risk metrics: VaR 95/99, current drawdown, max drawdown, sector exposures, beta, correlation risk",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_performance",
+            "description": "Get performance metrics: Sharpe ratio, Sortino ratio, win rate, profit factor, average trade PnL",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_signals",
+            "description": "Get recent trading signals with direction, strength, confidence, and model source",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_alerts",
+            "description": "Get active alerts with severity, type, message, and status",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_model_status",
+            "description": "Get ML model statuses: health, accuracy, drift score, prediction count, champion/challenger",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_system_health",
+            "description": "Get system health: database, redis, broker, data feed, model pipeline status and latency",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_execution_quality",
+            "description": "Get execution quality: fill probability, slippage bps, market impact, rejection rate, arrival price delta",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
 
-        if parts:
-            response_text = ". ".join(parts) + ". Risk boundaries are holding within configured limits."
-        else:
-            response_text = "Risk metrics are currently being computed. Check the Risk dashboard for live data."
-        return CopilotChatResponse(response=response_text, sources=sources)
 
-    # --- Alert / Incident queries ---
-    if any(kw in query for kw in ("alert", "incident", "alarm", "warning", "notification")):
-        sources = ["alerts"]
-        if alerts_count > 0:
-            response_text = (
-                f"There are {alerts_count} active alert(s) in the system. "
-                "Check the Alerts page for details, severity breakdown, and acknowledgment actions."
-            )
-        else:
-            response_text = "No active alerts. All monitored systems are operating within normal parameters."
-        return CopilotChatResponse(response=response_text, sources=sources)
+def _execute_copilot_tool(tool_name: str) -> dict[str, Any]:
+    """Execute a copilot tool by fetching live data from dashboard state."""
+    state = get_dashboard_state()
 
-    # --- Kill switch / Emergency ---
-    if any(kw in query for kw in ("kill", "flatten", "emergency", "stop", "halt")):
-        sources = ["trading_control"]
-        response_text = (
-            "EMERGENCY ACTIONS: Use the Kill Switch on the Trading page to immediately halt all trading "
-            "and flatten positions. Keyboard shortcut: press 'F' on the Execution Terminal. "
-            "This action requires operator-level permissions and will be logged in the audit trail."
-        )
-        return CopilotChatResponse(response=response_text, sources=sources)
+    if tool_name == "get_portfolio":
+        return state._portfolio_data or {"status": "no_data"}
 
-    # --- Model / Signal queries ---
-    if any(kw in query for kw in ("model", "signal", "prediction", "ml", "ai", "alpha")):
-        sources = ["models", "signals"]
-        response_text = (
-            "Check the Models page for model registry status, drift detection, and champion/challenger comparisons. "
-            "Active signals are displayed on the Overview page's signal tape. "
-            "Model explainability (SHAP) is available under Models > Explainability."
-        )
-        return CopilotChatResponse(response=response_text, sources=sources)
+    if tool_name == "get_positions":
+        positions = state._positions
+        if not positions:
+            return {"positions": [], "count": 0}
+        result = []
+        for sym, pos in list(positions.items())[:20]:
+            result.append({
+                "symbol": sym,
+                "quantity": pos.get("quantity", 0),
+                "avg_entry_price": round(float(pos.get("avg_entry_price", 0)), 2),
+                "current_price": round(float(pos.get("current_price", 0)), 2),
+                "unrealized_pnl": round(float(pos.get("unrealized_pnl", 0)), 2),
+                "market_value": round(float(pos.get("market_value", 0)), 2),
+            })
+        return {"positions": result, "count": len(positions)}
 
-    # --- Market data queries ---
-    if any(kw in query for kw in ("market", "price", "quote", "chart", "tape", "order book", "depth")):
-        sources = ["market_data"]
-        response_text = (
-            "Live market data is available on the Overview page: candlestick chart, trade tape, "
-            "order book depth, and dark pool flow. The watchlist tracks 46 symbols across 8 sectors. "
-            "Use the Advanced Chart for technical analysis with RSI overlay and signal markers."
-        )
-        return CopilotChatResponse(response=response_text, sources=sources)
+    if tool_name == "get_risk_metrics":
+        try:
+            pd = state._portfolio_data
+            positions = state._positions
+            risk_data: dict[str, Any] = {}
+            risk_data["current_drawdown"] = pd.get("current_drawdown", 0)
+            risk_data["portfolio_var_95"] = pd.get("portfolio_var_95", 0)
+            risk_data["portfolio_var_99"] = pd.get("portfolio_var_99", 0)
+            risk_data["max_drawdown_30d"] = pd.get("max_drawdown_30d", 0)
+            risk_data["sector_exposures"] = pd.get("sector_exposures", {})
+            risk_data["positions_count"] = len(positions)
+            return risk_data
+        except Exception:
+            return {"status": "no_data"}
 
-    # --- Macro / Alternative data ---
-    if any(kw in query for kw in ("macro", "economic", "vix", "treasury", "fed", "sentiment", "news", "alternative")):
-        sources = ["alternative_data"]
-        response_text = (
-            "Macro indicators (US 10Y, VIX, Fed Funds) and alternative data metrics are on the "
-            "Alternative Data page. NLP-enriched news streams provide real-time sentiment analysis. "
-            "The Economic Calendar shows recent macro data releases with impact ratings."
-        )
-        return CopilotChatResponse(response=response_text, sources=sources)
+    if tool_name == "get_performance":
+        try:
+            pd = state._portfolio_data
+            return {
+                "daily_pnl": pd.get("daily_pnl", 0),
+                "total_pnl": pd.get("total_pnl", 0),
+                "sharpe_ratio_30d": pd.get("sharpe_ratio_30d"),
+                "sortino_ratio_30d": pd.get("sortino_ratio_30d"),
+                "win_rate_30d": pd.get("win_rate_30d"),
+                "profit_factor": pd.get("profit_factor"),
+                "max_drawdown_30d": pd.get("max_drawdown_30d"),
+            }
+        except Exception:
+            return {"status": "no_data"}
 
-    # --- Backtest queries ---
-    if any(kw in query for kw in ("backtest", "historical", "simulation", "replay")):
-        sources = ["backtest"]
-        response_text = (
-            "Run backtests from the Backtest page or via CLI: `python main.py backtest --start 2024-01-01 --end 2024-06-30`. "
-            "Replay mode provides deterministic re-execution with SLO gates. "
-            "Results include Sharpe, Sortino, max drawdown, and performance attribution."
-        )
-        return CopilotChatResponse(response=response_text, sources=sources)
+    if tool_name == "get_signals":
+        signals = list(state._signals)[-10:]
+        return {"signals": signals, "count": len(state._signals)}
 
-    # --- System / Health queries ---
-    if any(kw in query for kw in ("system", "health", "status", "infrastructure", "database", "redis")):
-        sources = ["system"]
-        response_text = (
-            "System health is monitored on the System Status page. Components checked: "
-            "database (TimescaleDB), Redis, event bus, model pipeline, and execution engine. "
-            "SLO tracking and incident management are available under SRE."
-        )
-        return CopilotChatResponse(response=response_text, sources=sources)
+    if tool_name == "get_alerts":
+        try:
+            manager = get_alert_manager()
+            all_alerts = manager.get_alerts()
+            active = [
+                {
+                    "alert_id": str(a.alert_id),
+                    "type": a.alert_type.value if hasattr(a.alert_type, "value") else str(a.alert_type),
+                    "severity": a.severity.value if hasattr(a.severity, "value") else str(a.severity),
+                    "title": a.title,
+                    "message": a.message,
+                    "status": a.status.value if hasattr(a.status, "value") else str(a.status),
+                }
+                for a in all_alerts
+                if str(getattr(a, "status", "")).upper() != "RESOLVED"
+                and (not hasattr(a.status, "value") or a.status.value != "RESOLVED")
+            ]
+            return {"active_alerts": active[:10], "total_active": len(active), "total_all": len(all_alerts)}
+        except Exception:
+            return {"active_alerts": [], "total_active": 0, "total_all": 0}
 
-    # --- Fallback: general contextual response ---
-    sources = ["general"]
+    if tool_name == "get_model_status":
+        models = state._model_status
+        result = []
+        for name, info in models.items():
+            result.append({
+                "name": name,
+                "status": info.get("status", "unknown"),
+                "accuracy": info.get("accuracy"),
+                "prediction_count": info.get("prediction_count", 0),
+            })
+        return {"models": result, "count": len(result)}
+
+    if tool_name == "get_system_health":
+        components = state._components_healthy
+        return {
+            "status": "healthy" if all(components.values()) else "degraded",
+            "components": components,
+            "uptime_seconds": round(state.get_uptime(), 1),
+        }
+
+    if tool_name == "get_execution_quality":
+        pd = state._portfolio_data
+        return {
+            "fill_probability": pd.get("fill_probability"),
+            "slippage_bps": pd.get("slippage_bps"),
+            "market_impact_bps": pd.get("market_impact_bps"),
+            "rejection_rate": pd.get("rejection_rate"),
+        }
+
+    return {"error": f"Unknown tool: {tool_name}"}
+
+
+def _copilot_build_context_summary(context: dict[str, Any]) -> str:
+    """Build a concise context string from frontend-provided snapshot data."""
     parts = []
-    if portfolio_ctx.get("equity") is not None:
-        parts.append(f"Portfolio equity is ${portfolio_ctx['equity']:,.2f}")
-    if risk_ctx.get("current_drawdown") is not None:
-        parts.append(f"drawdown at {risk_ctx['current_drawdown'] * 100:.2f}%")
-    if alerts_count > 0:
-        parts.append(f"{alerts_count} active alert(s)")
-    else:
-        parts.append("no active alerts")
+    p = context.get("portfolio", {})
+    r = context.get("risk", {})
+    if p.get("equity") is not None:
+        parts.append(f"Equity: ${p['equity']:,.2f}")
+    if p.get("daily_pnl") is not None:
+        parts.append(f"Daily PnL: {'+'if p['daily_pnl']>=0 else ''}${p['daily_pnl']:,.2f}")
+    if p.get("total_pnl") is not None:
+        parts.append(f"Total PnL: {'+'if p['total_pnl']>=0 else ''}${p['total_pnl']:,.2f}")
+    if p.get("positions_count") is not None:
+        parts.append(f"Positions: {p['positions_count']}")
+    if r.get("current_drawdown") is not None:
+        parts.append(f"Drawdown: {r['current_drawdown']*100:.2f}%")
+    if r.get("portfolio_var_95") is not None:
+        parts.append(f"VaR95: ${r['portfolio_var_95']:,.2f}")
+    ac = context.get("alerts_count", 0)
+    parts.append(f"Active alerts: {ac}")
+    return " | ".join(parts) if parts else "System data loading..."
 
-    summary = ", ".join(parts) if parts else "System metrics are loading"
-    response_text = (
-        f"Current snapshot: {summary}. "
-        "I can help with portfolio analysis, risk monitoring, signal interpretation, "
-        "market data exploration, and system diagnostics. What would you like to know?"
+
+def _extract_answer_and_thinking(raw: str) -> tuple[str, str | None]:
+    """Separate Qwen 3's reasoning from its final answer.
+
+    Returns (answer, thinking) tuple. The thinking part is preserved
+    for display as "deep analysis" in the UI.
+    """
+    import re as _re
+
+    # 1. Extract <think>...</think> blocks as reasoning
+    think_matches = _re.findall(r"<think>([\s\S]*?)</think>", raw)
+    thinking_text = "\n".join(m.strip() for m in think_matches).strip() if think_matches else None
+
+    # 2. Get the content outside <think> blocks
+    answer = _re.sub(r"<think>[\s\S]*?</think>", "", raw).strip()
+
+    # 3. If no answer outside think blocks, the whole thing IS the answer
+    if not answer and thinking_text:
+        # Model put everything in thinking — extract last meaningful paragraph as answer
+        paragraphs = [p.strip() for p in thinking_text.split("\n\n") if p.strip()]
+        if paragraphs:
+            answer = paragraphs[-1][:1000]
+        else:
+            answer = thinking_text[-500:]
+    elif not answer:
+        answer = raw.strip()[:500]
+
+    return answer, thinking_text
+
+
+async def _copilot_ollama_chat(
+    message: str, context: dict[str, Any]
+) -> CopilotChatResponse:
+    """Call Ollama LLM for intelligent copilot responses.
+
+    Strategy: inject all live data directly into the system prompt (no tool calling)
+    then post-process Qwen 3's reasoning-heavy output to extract the clean answer.
+    """
+    import urllib.request
+    import urllib.error
+
+    # Build rich context from frontend snapshot + live state
+    snapshot = _copilot_build_context_summary(context)
+
+    # Also pull live data from dashboard state for richer context
+    state = get_dashboard_state()
+    extra_context_parts: list[str] = []
+    try:
+        positions = state._positions
+        if positions:
+            pos_lines = []
+            for sym, pos in list(positions.items())[:10]:
+                pnl = float(pos.get("unrealized_pnl", 0))
+                pos_lines.append(
+                    f"  {sym}: qty={pos.get('quantity',0)}, "
+                    f"entry=${float(pos.get('avg_entry_price',0)):.2f}, "
+                    f"current=${float(pos.get('current_price',0)):.2f}, "
+                    f"PnL={'+'if pnl>=0 else ''}${pnl:,.2f}"
+                )
+            if pos_lines:
+                extra_context_parts.append("POSITIONS:\n" + "\n".join(pos_lines))
+    except Exception:
+        pass
+
+    try:
+        components = state._components_healthy
+        health_str = ", ".join(f"{k}={'OK' if v else 'DOWN'}" for k, v in components.items())
+        extra_context_parts.append(f"SYSTEM HEALTH: {health_str}")
+    except Exception:
+        pass
+
+    extra_context = "\n\n".join(extra_context_parts)
+
+    system_msg = (
+        _COPILOT_SYSTEM_PROMPT
+        + f"\n\nLIVE SYSTEM SNAPSHOT:\n{snapshot}"
+        + (f"\n\n{extra_context}" if extra_context else "")
     )
-    return CopilotChatResponse(response=response_text, sources=sources)
+
+    payload = json.dumps({
+        "model": _COPILOT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": message},
+        ],
+        "stream": False,
+        "options": {"num_predict": 2048, "temperature": 0.3},
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{_OLLAMA_BASE_URL}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode())
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logger.warning("Ollama unavailable: %s", exc)
+        return _copilot_fallback_response(message, context)
+
+    assistant_msg = data.get("message", {})
+    content = assistant_msg.get("content", "").strip()
+    thinking = assistant_msg.get("thinking", "").strip()
+
+    # Combine content sources — prefer content, fall back to thinking field
+    raw_text = content if content else thinking
+    if not raw_text:
+        return _copilot_fallback_response(message, context)
+
+    # Separate answer from reasoning chain
+    clean_answer, reasoning = _extract_answer_and_thinking(raw_text)
+
+    # If Ollama returned thinking separately, use that as reasoning
+    if thinking and content:
+        reasoning = thinking
+
+    sources = ["ollama"]
+    msg_lower = message.lower()
+    if "position" in msg_lower or "pozisyon" in msg_lower:
+        sources.append("positions")
+    if any(kw in msg_lower for kw in ("risk", "var", "drawdown", "risk")):
+        sources.append("risk")
+    if any(kw in msg_lower for kw in ("portfolio", "equity", "pnl", "portföy")):
+        sources.append("portfolio")
+    if any(kw in msg_lower for kw in ("model", "ml", "drift", "accuracy")):
+        sources.append("models")
+    if any(kw in msg_lower for kw in ("alert", "alarm", "uyarı")):
+        sources.append("alerts")
+    if any(kw in msg_lower for kw in ("execution", "slippage", "fill", "tca")):
+        sources.append("execution")
+    if any(kw in msg_lower for kw in ("health", "system", "status", "sağlık")):
+        sources.append("system")
+
+    return CopilotChatResponse(response=clean_answer, sources=sources, thinking=reasoning)
+
+
+def _copilot_fallback_response(
+    message: str, context: dict[str, Any]
+) -> CopilotChatResponse:
+    """Fallback when Ollama is unavailable — use context snapshot directly."""
+    snapshot = _copilot_build_context_summary(context)
+    return CopilotChatResponse(
+        response=(
+            f"[Offline mode] Current snapshot: {snapshot}. "
+            "The AI engine is temporarily unavailable. You can still navigate to "
+            "Risk, Models, or Analytics pages for detailed data."
+        ),
+        sources=["fallback"],
+    )
 
 
 @app.post("/copilot/chat", response_model=CopilotChatResponse, tags=["Copilot"])
@@ -7652,9 +7886,9 @@ async def copilot_chat(
     request_body: CopilotChatRequest,
     current_user: AuthenticatedUser,
 ) -> CopilotChatResponse:
-    """AI copilot chat endpoint with real-time system context awareness."""
+    """AI copilot chat endpoint powered by local Qwen 3 LLM via Ollama with tool use."""
     _require_permission(current_user, "read.basic")
-    return _build_copilot_response(request_body.message, request_body.context)
+    return await _copilot_ollama_chat(request_body.message, request_body.context)
 
 
 # =============================================================================
