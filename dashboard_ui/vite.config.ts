@@ -17,6 +17,7 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes("node_modules")) {
+            if (id.includes("@xyflow") || id.includes("reactflow")) return "flow";
             if (id.includes("recharts")) return "charts";
             if (id.includes("lucide-react")) return "icons";
             if (id.includes("react-router")) return "router";

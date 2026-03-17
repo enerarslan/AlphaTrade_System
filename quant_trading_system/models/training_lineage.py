@@ -17,6 +17,7 @@ from pandas.tseries.offsets import CustomBusinessDay
 
 SNAPSHOT_MANIFEST_SCHEMA_VERSION = "1.0.0"
 MODEL_REGISTRY_SCHEMA_VERSION = "1.0.0"
+DATASET_SNAPSHOT_BUNDLE_SCHEMA_VERSION = "1.0.0"
 
 DEFAULT_DATA_QUALITY_THRESHOLDS: dict[str, float] = {
     "missing_bars_ratio_max": 0.01,
@@ -32,6 +33,15 @@ def _canonical_hash(payload: Any) -> str:
     """Create deterministic SHA-256 hash for JSON-like payloads."""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    """Hash a file deterministically."""
+    hasher = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _to_utc_timestamp(value: Any) -> pd.Timestamp | None:
@@ -233,6 +243,66 @@ def compute_data_quality_hash(quality_report: dict[str, Any]) -> str:
     return _canonical_hash(canonical_payload)
 
 
+def compute_frame_content_hash(
+    frame: pd.DataFrame | None,
+    columns: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Compute deterministic content hash for a pandas frame."""
+    requested_columns = [str(column) for column in (columns or [])]
+    if frame is None:
+        return _canonical_hash(
+            {
+                "row_count": 0,
+                "columns": requested_columns,
+                "dtypes": [],
+                "content_hash": "none",
+            }
+        )
+
+    if columns is None:
+        selected_columns = [str(column) for column in frame.columns.tolist()]
+    else:
+        selected_columns = [column for column in requested_columns if column in frame.columns]
+
+    working = frame.loc[:, selected_columns].copy() if selected_columns else pd.DataFrame()
+    working = working.reset_index(drop=True)
+
+    if working.empty and not len(working.columns):
+        return _canonical_hash(
+            {
+                "row_count": int(len(frame)),
+                "columns": selected_columns,
+                "dtypes": [],
+                "content_hash": "empty",
+            }
+        )
+
+    for column in working.columns:
+        series = working[column]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            normalized = pd.to_datetime(series, utc=True, errors="coerce")
+            working[column] = normalized.astype("int64")
+        elif pd.api.types.is_numeric_dtype(series):
+            working[column] = pd.to_numeric(series, errors="coerce")
+        elif pd.api.types.is_bool_dtype(series):
+            working[column] = series.astype(bool)
+        else:
+            working[column] = series.astype(str)
+
+    row_hashes = pd.util.hash_pandas_object(working, index=False).to_numpy(dtype="uint64")
+    frame_basis = {
+        "row_count": int(len(working)),
+        "columns": [str(column) for column in working.columns.tolist()],
+        "dtypes": [str(dtype) for dtype in working.dtypes.tolist()],
+    }
+    return _canonical_hash(
+        {
+            **frame_basis,
+            "row_hashes": hashlib.sha256(row_hashes.tobytes()).hexdigest(),
+        }
+    )
+
+
 def build_snapshot_manifest(
     ohlcv_data: pd.DataFrame,
     feature_names: list[str],
@@ -259,6 +329,12 @@ def build_snapshot_manifest(
     observed_end = _to_iso(df["timestamp"].max())
     sorted_features = sorted({str(name) for name in feature_names})
     feature_schema_version = _canonical_hash(sorted_features)
+    ohlcv_hash_columns = [
+        column
+        for column in ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+        if column in ohlcv_data.columns
+    ]
+    raw_ohlcv_hash = compute_frame_content_hash(ohlcv_data, columns=ohlcv_hash_columns)
 
     snapshot_basis = {
         "symbols": symbols,
@@ -266,6 +342,7 @@ def build_snapshot_manifest(
         "observed_end": observed_end,
         "row_count": int(len(df)),
         "feature_schema_version": feature_schema_version,
+        "raw_ohlcv_hash": raw_ohlcv_hash,
         "data_quality_report_hash": data_quality_report_hash,
         "requested_start_date": requested_start_date or "",
         "requested_end_date": requested_end_date or "",
@@ -291,6 +368,7 @@ def build_snapshot_manifest(
         "feature_count": len(sorted_features),
         "feature_list": sorted_features,
         "feature_schema_version": feature_schema_version,
+        "raw_ohlcv_hash": raw_ohlcv_hash,
         "data_quality_report_hash": data_quality_report_hash,
     }
 
@@ -322,6 +400,210 @@ def persist_snapshot_bundle(
         json.dump(quality_report, f, indent=2, ensure_ascii=True, sort_keys=True, default=str)
 
     return manifest_path, quality_path
+
+
+def persist_dataset_snapshot_bundle(
+    output_dir: Path,
+    snapshot_manifest: dict[str, Any],
+    raw_ohlcv_data: pd.DataFrame | None,
+    development_frame: pd.DataFrame,
+    feature_names: list[str],
+    data_quality_report: dict[str, Any] | None = None,
+    development_sample_weights: np.ndarray | None = None,
+    holdout_frame: pd.DataFrame | None = None,
+    holdout_sample_weights: np.ndarray | None = None,
+    cv_splits: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    label_diagnostics: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Persist immutable training dataset artifacts for deterministic replay."""
+    snapshot_id = str(snapshot_manifest.get("snapshot_id") or "").strip()
+    if not snapshot_id:
+        raise ValueError("Dataset snapshot bundle requires snapshot_manifest.snapshot_id.")
+    if development_frame is None or development_frame.empty:
+        raise ValueError("Dataset snapshot bundle requires a non-empty development frame.")
+
+    bundle_dir = Path(output_dir) / "snapshots" / snapshot_id
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts: dict[str, dict[str, Any]] = {}
+
+    def _persist_frame_artifact(name: str, frame: pd.DataFrame | None) -> None:
+        if frame is None:
+            return
+        artifact_path = bundle_dir / f"{name}.pkl.gz"
+        frame.to_pickle(artifact_path, compression="gzip")
+        artifacts[name] = {
+            "path": artifact_path.name,
+            "sha256": _file_sha256(artifact_path),
+            "row_count": int(len(frame)),
+            "columns": [str(column) for column in frame.columns.tolist()],
+            "frame_hash": compute_frame_content_hash(frame),
+        }
+
+    def _persist_array_artifact(name: str, values: np.ndarray | None) -> None:
+        if values is None:
+            return
+        arr = np.asarray(values)
+        artifact_path = bundle_dir / f"{name}.npy"
+        np.save(artifact_path, arr)
+        artifacts[name] = {
+            "path": artifact_path.name,
+            "sha256": _file_sha256(artifact_path),
+            "length": int(arr.shape[0]) if arr.ndim > 0 else int(arr.size),
+        }
+
+    _persist_frame_artifact("raw_ohlcv", raw_ohlcv_data)
+    _persist_frame_artifact("development_frame", development_frame)
+    _persist_frame_artifact("holdout_frame", holdout_frame)
+    _persist_array_artifact("development_sample_weights", development_sample_weights)
+    _persist_array_artifact("holdout_sample_weights", holdout_sample_weights)
+
+    if cv_splits:
+        cv_payload = [
+            {
+                "train_indices": np.asarray(train_idx, dtype=int).tolist(),
+                "test_indices": np.asarray(test_idx, dtype=int).tolist(),
+            }
+            for train_idx, test_idx in cv_splits
+        ]
+        cv_path = bundle_dir / "cv_splits.json"
+        with cv_path.open("w", encoding="utf-8") as handle:
+            json.dump(cv_payload, handle, indent=2, ensure_ascii=True, sort_keys=True)
+        artifacts["cv_splits"] = {
+            "path": cv_path.name,
+            "sha256": _file_sha256(cv_path),
+            "split_count": int(len(cv_payload)),
+        }
+
+    bundle_manifest = {
+        "schema_version": DATASET_SNAPSHOT_BUNDLE_SCHEMA_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "snapshot_id": snapshot_id,
+        "snapshot_manifest": dict(snapshot_manifest),
+        "feature_names": sorted({str(name) for name in feature_names}),
+        "data_quality_report": dict(data_quality_report or {}),
+        "label_diagnostics": dict(label_diagnostics or {}),
+        "artifacts": artifacts,
+        "development_rows": int(len(development_frame)),
+        "holdout_rows": int(len(holdout_frame)) if holdout_frame is not None else 0,
+    }
+    bundle_manifest["bundle_hash"] = _canonical_hash(
+        {
+            "schema_version": bundle_manifest["schema_version"],
+            "snapshot_id": bundle_manifest["snapshot_id"],
+            "snapshot_manifest": bundle_manifest["snapshot_manifest"],
+            "feature_names": bundle_manifest["feature_names"],
+            "data_quality_report": bundle_manifest["data_quality_report"],
+            "label_diagnostics": bundle_manifest["label_diagnostics"],
+            "artifacts": bundle_manifest["artifacts"],
+            "development_rows": bundle_manifest["development_rows"],
+            "holdout_rows": bundle_manifest["holdout_rows"],
+        }
+    )
+
+    bundle_manifest_path = bundle_dir / "dataset_bundle.manifest.json"
+    with bundle_manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(bundle_manifest, handle, indent=2, ensure_ascii=True, sort_keys=True, default=str)
+
+    return bundle_manifest_path, bundle_manifest
+
+
+def load_dataset_snapshot_bundle(
+    bundle_manifest_path: Path,
+    verify_hashes: bool = True,
+) -> dict[str, Any]:
+    """Load immutable training dataset artifacts from bundle manifest."""
+    manifest_path = Path(bundle_manifest_path)
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    if not isinstance(manifest, dict):
+        raise ValueError("Dataset snapshot bundle manifest must be a JSON object.")
+
+    artifacts = manifest.get("artifacts", {})
+    if not isinstance(artifacts, dict):
+        raise ValueError("Dataset snapshot bundle manifest missing artifacts block.")
+
+    bundle_dir = manifest_path.parent
+
+    def _resolve_path(artifact_name: str) -> Path | None:
+        payload = artifacts.get(artifact_name)
+        if not isinstance(payload, dict):
+            return None
+        raw_path = payload.get("path")
+        if not raw_path:
+            return None
+        candidate = Path(str(raw_path))
+        if candidate.is_absolute():
+            return candidate
+        return bundle_dir / candidate
+
+    def _validate_hash(artifact_name: str, artifact_path: Path) -> None:
+        if not verify_hashes:
+            return
+        payload = artifacts.get(artifact_name, {})
+        expected_hash = str(payload.get("sha256") or "").strip()
+        if expected_hash and _file_sha256(artifact_path) != expected_hash:
+            raise ValueError(f"Snapshot artifact hash mismatch for {artifact_name}: {artifact_path}")
+
+    def _load_frame(artifact_name: str) -> pd.DataFrame | None:
+        artifact_path = _resolve_path(artifact_name)
+        if artifact_path is None or not artifact_path.exists():
+            return None
+        _validate_hash(artifact_name, artifact_path)
+        return pd.read_pickle(artifact_path, compression="gzip")
+
+    def _load_array(artifact_name: str) -> np.ndarray | None:
+        artifact_path = _resolve_path(artifact_name)
+        if artifact_path is None or not artifact_path.exists():
+            return None
+        _validate_hash(artifact_name, artifact_path)
+        return np.load(artifact_path, allow_pickle=False)
+
+    cv_splits_path = _resolve_path("cv_splits")
+    cv_splits: list[tuple[np.ndarray, np.ndarray]] = []
+    if cv_splits_path is not None and cv_splits_path.exists():
+        _validate_hash("cv_splits", cv_splits_path)
+        with cv_splits_path.open("r", encoding="utf-8") as handle:
+            raw_cv = json.load(handle)
+        if isinstance(raw_cv, list):
+            for payload in raw_cv:
+                if not isinstance(payload, dict):
+                    continue
+                train_idx = np.asarray(payload.get("train_indices", []), dtype=int)
+                test_idx = np.asarray(payload.get("test_indices", []), dtype=int)
+                cv_splits.append((train_idx, test_idx))
+
+    return {
+        "bundle_manifest": manifest,
+        "bundle_manifest_path": manifest_path,
+        "snapshot_manifest": (
+            manifest.get("snapshot_manifest", {})
+            if isinstance(manifest.get("snapshot_manifest"), dict)
+            else {}
+        ),
+        "feature_names": [
+            str(name)
+            for name in manifest.get("feature_names", [])
+            if isinstance(name, str) and name.strip()
+        ],
+        "data_quality_report": (
+            manifest.get("data_quality_report", {})
+            if isinstance(manifest.get("data_quality_report"), dict)
+            else {}
+        ),
+        "label_diagnostics": (
+            manifest.get("label_diagnostics", {})
+            if isinstance(manifest.get("label_diagnostics"), dict)
+            else {}
+        ),
+        "raw_ohlcv_data": _load_frame("raw_ohlcv"),
+        "development_frame": _load_frame("development_frame"),
+        "holdout_frame": _load_frame("holdout_frame"),
+        "development_sample_weights": _load_array("development_sample_weights"),
+        "holdout_sample_weights": _load_array("holdout_sample_weights"),
+        "cv_splits": cv_splits,
+    }
 
 
 def _resolve_git_commit_hash(project_root: Path) -> str:
@@ -422,9 +704,14 @@ def register_training_model_version(
                 "snapshot_id": snapshot_manifest.get("snapshot_id"),
                 "snapshot_manifest_hash": _canonical_hash(snapshot_manifest),
                 "feature_schema_version": snapshot_manifest.get("feature_schema_version"),
+                "raw_ohlcv_hash": snapshot_manifest.get("raw_ohlcv_hash"),
                 "data_quality_report_hash": snapshot_manifest.get("data_quality_report_hash"),
                 "snapshot_manifest_path": snapshot_manifest.get("manifest_path"),
                 "snapshot_quality_report_path": snapshot_manifest.get("quality_report_path"),
+                "dataset_snapshot_bundle_path": snapshot_manifest.get(
+                    "dataset_bundle_manifest_path"
+                ),
+                "dataset_snapshot_bundle_hash": snapshot_manifest.get("dataset_bundle_hash"),
             }
         )
 

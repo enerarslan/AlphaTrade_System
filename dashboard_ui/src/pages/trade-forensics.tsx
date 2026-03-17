@@ -17,8 +17,6 @@ import {
   Search,
   ShieldAlert,
   Target,
-  TrendingDown,
-  TrendingUp,
   Zap,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -569,7 +567,7 @@ export default function TradeForensicsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [filterSymbol, setFilterSymbol] = useState("");
+  const [filterSymbol, _setFilterSymbol] = useState("");
   const [filterOutcome, setFilterOutcome] = useState<"all" | "win" | "loss">("all");
   const [filterStrategy, setFilterStrategy] = useState<string>("all");
   const [days, setDays] = useState(30);

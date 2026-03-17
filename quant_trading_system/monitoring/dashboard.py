@@ -101,7 +101,7 @@ app = FastAPI(
 # CORS middleware for frontend access
 # SECURITY: Restrict CORS to specific origins instead of "*"
 # Get allowed origins from environment variable or use safe defaults
-_allowed_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000").split(",")
+_allowed_origins = os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174,http://localhost:3000,http://127.0.0.1:3000").split(",")
 _allowed_origins = [origin.strip() for origin in _allowed_origins if origin.strip()]
 
 app.add_middleware(
@@ -8065,7 +8065,14 @@ async def startup_event() -> None:
         # Initialize EventBus
         _event_bus = EventBus()
         event_bus = _event_bus
+        state = get_dashboard_state()
+        state.bind_event_bus(event_bus)
+        event_bus.subscribe_all(state.handle_event, "dashboard_state_updater")
+    except Exception as e:
+        logger.error(f"Failed to initialize local dashboard services: {e}")
+        return
 
+    try:
         # Initialize and start Redis Bridge
         # We subscribe to "events.dashboard" (trading engine publishes here)
         # And we publish control events to "events.control"
@@ -8075,21 +8082,22 @@ async def startup_event() -> None:
             subscribe_channels=["events.dashboard"]
         )
         await _redis_bridge.start()
-
-        # Subscribe DashboardState to EventBus
-        # The RedisBridge receives "events.dashboard" -> republishes to local EventBus
-        # DashboardState listens to local EventBus -> updates state & WebSocket
-        state = get_dashboard_state()
-        state.bind_event_bus(event_bus)
-        event_bus.subscribe_all(state.handle_event, "dashboard_state_updater")
-        _audit_siem_forwarder.start()
-        
-        logger.info("Dashboard services started successfully")
-
     except Exception as e:
-        logger.error(f"Failed to start dashboard services: {e}")
-        # We don't raise here to allow the API to start even if Redis is down,
-        # but health checks will show it.
+        _redis_bridge = None
+        logger.warning(
+            "Dashboard starting without Redis bridge: %s. Live cross-process events will be degraded.",
+            e,
+        )
+
+    try:
+        _audit_siem_forwarder.start()
+    except Exception as e:
+        logger.error(f"Failed to start audit SIEM forwarder: {e}")
+
+    if _redis_bridge is None:
+        logger.info("Dashboard services started in degraded mode")
+    else:
+        logger.info("Dashboard services started successfully")
 
 
 async def shutdown_event() -> None:

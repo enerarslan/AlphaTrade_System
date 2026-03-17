@@ -21,6 +21,7 @@ from quant_trading_system.monitoring.dashboard import (
     broadcast_order_update,
     broadcast_signal,
     broadcast_alert,
+    startup_event,
 )
 
 
@@ -139,6 +140,33 @@ class TestDashboardEndpoints:
         assert "timestamp" in data
         assert "uptime_seconds" in data
         assert "components" in data
+
+    def test_health_detailed_endpoint(self, client):
+        """Test /health/detailed endpoint."""
+        mock_result = MagicMock()
+        mock_result.to_dict.return_value = {
+            "component": "database",
+            "status": "HEALTHY",
+            "message": "ok",
+            "latency_ms": 1.0,
+            "details": {},
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        mock_checker = MagicMock()
+        mock_checker.run_all_checks = AsyncMock(return_value=[mock_result])
+        mock_checker.get_overall_status.return_value = MagicMock(value="HEALTHY")
+
+        with patch(
+            "quant_trading_system.monitoring.dashboard.SystemHealthChecker",
+            return_value=mock_checker,
+        ):
+            response = client.get("/health/detailed")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "HEALTHY"
+        assert len(data["checks"]) == 1
+        assert data["checks"][0]["component"] == "database"
 
     def test_metrics_endpoint(self, client):
         """Test /metrics endpoint."""
@@ -433,6 +461,42 @@ class TestDashboardFactoryFunctions:
         """Test get_connection_manager function."""
         manager = get_connection_manager()
         assert isinstance(manager, ConnectionManager)
+
+
+class TestDashboardLifecycle:
+    """Tests for dashboard startup/shutdown orchestration."""
+
+    @pytest.mark.asyncio
+    async def test_startup_event_continues_when_redis_unavailable(self):
+        """Dashboard startup should degrade gracefully when Redis is down."""
+        mock_event_bus = MagicMock()
+        mock_state = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.start = AsyncMock(side_effect=RuntimeError("redis unavailable"))
+        mock_forwarder = MagicMock()
+
+        with patch(
+            "quant_trading_system.monitoring.dashboard.EventBus",
+            return_value=mock_event_bus,
+        ), patch(
+            "quant_trading_system.monitoring.dashboard.get_dashboard_state",
+            return_value=mock_state,
+        ), patch(
+            "quant_trading_system.monitoring.dashboard.RedisEventBridge",
+            return_value=mock_bridge,
+        ), patch(
+            "quant_trading_system.monitoring.dashboard._audit_siem_forwarder",
+            mock_forwarder,
+        ):
+            await startup_event()
+
+        mock_state.bind_event_bus.assert_called_once_with(mock_event_bus)
+        mock_event_bus.subscribe_all.assert_called_once_with(
+            mock_state.handle_event,
+            "dashboard_state_updater",
+        )
+        mock_bridge.start.assert_awaited_once()
+        mock_forwarder.start.assert_called_once()
 
 
 class TestBroadcastFunctions:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pandas as pd
 
 from quant_trading_system.models.training_lineage import (
@@ -11,7 +12,9 @@ from quant_trading_system.models.training_lineage import (
     build_snapshot_manifest,
     compute_data_quality_hash,
     estimate_missing_bars_count,
+    load_dataset_snapshot_bundle,
     load_registry_entries,
+    persist_dataset_snapshot_bundle,
     persist_active_model_pointer,
     persist_snapshot_bundle,
     register_training_model_version,
@@ -205,3 +208,95 @@ def test_set_registry_active_version_and_persist_active_model_pointer(tmp_path) 
     assert payload["model_name"] == "lightgbm"
     assert payload["version_id"] == second["version_id"]
     assert payload["updated_by"] == "unit_test"
+    assert payload["reason"] == "auto_benchmark_promotion"
+
+
+def test_persist_and_load_dataset_snapshot_bundle_round_trip(tmp_path) -> None:
+    raw = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "MSFT"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z", "2025-01-01T00:00:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0, 200.0],
+            "high": [101.0, 102.0, 201.0],
+            "low": [99.0, 100.0, 199.0],
+            "close": [100.5, 101.5, 200.5],
+            "volume": [1000.0, 1100.0, 900.0],
+        }
+    )
+    quality_report = build_data_quality_report(raw.loc[:, ["symbol", "timestamp", "close"]])
+    quality_hash = compute_data_quality_hash(quality_report)
+    snapshot_manifest = build_snapshot_manifest(
+        ohlcv_data=raw,
+        feature_names=["f_alpha", "f_beta"],
+        data_quality_report_hash=quality_hash,
+    )
+
+    development_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+                utc=True,
+            ),
+            "symbol": ["AAPL", "AAPL"],
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1100.0],
+            "label": [1, 0],
+            "regime": ["trend_up", "normal_range"],
+            "forward_return_h5": [0.01, -0.02],
+            "triple_barrier_net_return": [0.008, -0.015],
+            "f_alpha": [0.1, 0.2],
+            "f_beta": [1.0, 0.5],
+        }
+    )
+    holdout_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-01-01T00:30:00Z"], utc=True),
+            "symbol": ["AAPL"],
+            "open": [102.0],
+            "high": [103.0],
+            "low": [101.0],
+            "close": [102.5],
+            "volume": [1200.0],
+            "label": [1],
+            "regime": ["high_vol"],
+            "forward_return_h5": [0.03],
+            "triple_barrier_net_return": [0.02],
+            "f_alpha": [0.3],
+            "f_beta": [0.8],
+        }
+    )
+
+    bundle_path, bundle_manifest = persist_dataset_snapshot_bundle(
+        output_dir=tmp_path,
+        snapshot_manifest=snapshot_manifest,
+        raw_ohlcv_data=raw,
+        development_frame=development_frame,
+        holdout_frame=holdout_frame,
+        feature_names=["f_beta", "f_alpha"],
+        data_quality_report=quality_report,
+        development_sample_weights=np.array([1.0, 0.8]),
+        holdout_sample_weights=np.array([0.9]),
+        cv_splits=[(np.array([0]), np.array([1]))],
+        label_diagnostics={"positive_rate": 0.5},
+    )
+
+    assert bundle_path.exists()
+    assert bundle_manifest["snapshot_id"] == snapshot_manifest["snapshot_id"]
+
+    loaded = load_dataset_snapshot_bundle(bundle_path)
+
+    pd.testing.assert_frame_equal(loaded["raw_ohlcv_data"], raw)
+    pd.testing.assert_frame_equal(loaded["development_frame"], development_frame)
+    pd.testing.assert_frame_equal(loaded["holdout_frame"], holdout_frame)
+    assert loaded["feature_names"] == ["f_alpha", "f_beta"]
+    assert loaded["development_sample_weights"].tolist() == [1.0, 0.8]
+    assert loaded["holdout_sample_weights"].tolist() == [0.9]
+    assert loaded["cv_splits"][0][0].tolist() == [0]
+    assert loaded["cv_splits"][0][1].tolist() == [1]
+    assert loaded["data_quality_report"]["summary"]["rows_total"] == 3

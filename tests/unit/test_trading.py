@@ -10,7 +10,6 @@ Tests for:
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,7 +20,6 @@ import pytest
 
 from quant_trading_system.core.data_types import (
     Direction,
-    FeatureVector,
     ModelPrediction,
     OHLCVBar,
     OrderSide,
@@ -35,9 +33,7 @@ from quant_trading_system.trading.strategy import (
     MeanReversionStrategy,
     MLStrategy,
     MomentumStrategy,
-    Strategy,
     StrategyConfig,
-    StrategyMetrics,
     StrategyState,
     StrategyType,
     create_strategy,
@@ -46,9 +42,7 @@ from quant_trading_system.trading.signal_generator import (
     ConflictResolution,
     EnrichedSignal,
     SignalAggregator,
-    SignalFilter,
     SignalGenerator,
-    SignalGeneratorConfig,
     SignalMetadata,
     SignalPriority,
     SignalQueue,
@@ -281,6 +275,7 @@ class TestMLStrategy:
         if signals:
             assert signals[0].symbol == "AAPL"
             assert signals[0].direction == Direction.LONG
+            assert signals[0].metadata["prediction_model_names"] == ["model1"]
 
 
 class TestCompositeStrategy:
@@ -645,6 +640,34 @@ class TestPositionSizer:
         # 5% of $100,000 = $5,000 / $100 = 50 shares
         assert shares == Decimal("50")
 
+    def test_runtime_position_scale_reduces_allocated_shares(self):
+        """Runtime governor canary scaling should reduce capital at sizing time."""
+        config = PositionSizerConfig(
+            method=PositionSizingMethod.PERCENT_EQUITY,
+            percent_of_equity=0.10,
+        )
+        sizer = PositionSizer(config)
+
+        signal = EnrichedSignal(
+            signal=TradeSignal(
+                symbol="AAPL",
+                direction=Direction.LONG,
+                strength=0.8,
+                confidence=1.0,
+                horizon=10,
+                model_source="ml",
+                metadata={"runtime_position_scale": 0.25},
+            ),
+        )
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            buying_power=Decimal("100000"),
+        )
+
+        shares = sizer.calculate_position_size(signal, portfolio, Decimal("100"))
+        assert shares == Decimal("25")
+
     def test_max_position_constraint(self):
         """Test maximum position constraint."""
         config = PositionSizerConfig(
@@ -823,6 +846,46 @@ class TestPortfolioManager:
 
         # 20% target vs ~10% actual = 10% drift > 5% threshold
         assert needs_rebalance is True
+
+    def test_create_order_requests_preserves_runtime_metadata(self):
+        """Signal metadata should survive into order requests for audit/governance."""
+        manager = PortfolioManager()
+        signal = EnrichedSignal(
+            signal=TradeSignal(
+                symbol="AAPL",
+                direction=Direction.LONG,
+                strength=0.7,
+                confidence=0.8,
+                horizon=5,
+                model_source="MLStrategy:test",
+                metadata={
+                    "runtime_selected_model": "lightgbm:v2",
+                    "runtime_model_role": "challenger",
+                    "runtime_position_scale": 0.15,
+                },
+            )
+        )
+        trades = [
+            Trade(
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                quantity=Decimal("10"),
+                current_price=Decimal("150"),
+                target_position=TargetPosition(
+                    symbol="AAPL",
+                    target_weight=0.1,
+                    target_shares=Decimal("10"),
+                    target_value=Decimal("1500"),
+                    signal=signal,
+                ),
+            )
+        ]
+
+        requests = manager.create_order_requests(trades, strategy_id="engine")
+
+        assert requests[0].metadata["runtime_selected_model"] == "lightgbm:v2"
+        assert requests[0].metadata["runtime_model_role"] == "challenger"
+        assert requests[0].metadata["expected_price"] == "150"
 
 
 class TestPortfolioOptimizer:
@@ -1025,6 +1088,83 @@ class TestTradingEngine:
 
                     await engine.stop()
                     assert engine.state == EngineState.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_market_iteration_routes_predictions_through_runtime_governor(self):
+        """Engine should consume routed predictions, not raw challenger/champion mixes."""
+        config = TradingEngineConfig(
+            mode=TradingMode.DRY_RUN,
+            symbols=["AAPL"],
+        )
+        mock_client = MagicMock()
+        mock_order_manager = MagicMock()
+        mock_order_manager.on_fill = MagicMock()
+        mock_order_manager.on_rejection = MagicMock()
+        mock_position_tracker = MagicMock()
+        mock_position_tracker.get_portfolio = MagicMock(return_value=Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            buying_power=Decimal("100000"),
+        ))
+        mock_signal_generator = MagicMock()
+        mock_signal_generator.generate_signals = MagicMock(return_value=[])
+        mock_portfolio_manager = MagicMock()
+        mock_portfolio_manager.build_target_portfolio = MagicMock(return_value=MagicMock())
+        mock_portfolio_manager.check_rebalance_needed = MagicMock(return_value=(False, ""))
+        runtime_governor = MagicMock()
+        routed_predictions = {
+            "routed": ModelPrediction(
+                model_name="lightgbm",
+                symbol="AAPL",
+                prediction=0.4,
+                direction=Direction.LONG,
+                confidence=0.8,
+                horizon=5,
+            )
+        }
+        runtime_governor.route_predictions = MagicMock(return_value=routed_predictions)
+        runtime_governor.govern_signals = MagicMock(side_effect=lambda signals: signals)
+
+        engine = TradingEngine(
+            config=config,
+            client=mock_client,
+            order_manager=mock_order_manager,
+            position_tracker=mock_position_tracker,
+            signal_generator=mock_signal_generator,
+            portfolio_manager=mock_portfolio_manager,
+            event_bus=EventBus(),
+            runtime_governor=runtime_governor,
+        )
+        engine._latest_bars = {
+            "AAPL": OHLCVBar(
+                symbol="AAPL",
+                timestamp=datetime.now(timezone.utc),
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=1000,
+            )
+        }
+        engine._raw_predictions = {
+            "raw": ModelPrediction(
+                model_name="xgboost",
+                symbol="AAPL",
+                prediction=0.2,
+                direction=Direction.LONG,
+                confidence=0.7,
+                horizon=5,
+            )
+        }
+
+        with patch.object(engine, "_update_market_data", AsyncMock()):
+            with patch.object(engine, "_check_risk_limits", return_value=True):
+                with patch.object(engine, "_wait_for_next_bar", AsyncMock()):
+                    await engine._market_hours_iteration()
+
+        runtime_governor.route_predictions.assert_called_once_with(engine._raw_predictions)
+        used_predictions = mock_signal_generator.generate_signals.call_args.kwargs["predictions"]
+        assert used_predictions == routed_predictions
 
     def test_check_risk_limits_passes(self):
         """Test risk limit check when within limits."""

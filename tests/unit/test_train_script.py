@@ -12,7 +12,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from quant_trading_system.models.training_lineage import register_training_model_version
+from quant_trading_system.models.training_lineage import (
+    build_data_quality_report,
+    build_snapshot_manifest,
+    compute_data_quality_hash,
+    persist_dataset_snapshot_bundle,
+    register_training_model_version,
+)
 from scripts import train as train_script
 
 
@@ -2670,6 +2676,186 @@ def test_run_training_replay_manifest_overrides_cli(monkeypatch, tmp_path):
     assert captured["config"].start_date == "2023-01-01"
     assert captured["config"].end_date == "2023-12-31"
     assert captured["config"].model_name.startswith("prod_candidate_replay_")
+
+
+def test_run_training_replay_manifest_passes_dataset_snapshot_bundle(monkeypatch, tmp_path):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    bundle_path = tmp_path / "snapshots" / "snap_123" / "dataset_bundle.manifest.json"
+    replay_path = tmp_path / "replay_manifest.json"
+    replay_path.write_text(
+        json.dumps(
+            {
+                "training_config": {
+                    "model_type": "lightgbm",
+                    "model_name": "prod_candidate",
+                },
+                "dataset_snapshot_bundle_path": str(bundle_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = _base_args(replay_manifest=str(replay_path))
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].dataset_snapshot_bundle_path == str(bundle_path)
+    assert captured["config"].strict_snapshot_replay is True
+
+
+def test_load_training_dataset_snapshot_restores_state(tmp_path):
+    raw = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z", "2025-01-01T00:30:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.5, 101.5, 102.5],
+            "volume": [1000.0, 1100.0, 1200.0],
+        }
+    )
+    quality_report = build_data_quality_report(raw.loc[:, ["symbol", "timestamp", "close"]])
+    quality_hash = compute_data_quality_hash(quality_report)
+    snapshot_manifest = build_snapshot_manifest(
+        ohlcv_data=raw,
+        feature_names=["f_alpha", "f_beta"],
+        data_quality_report_hash=quality_hash,
+    )
+    dev_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+                utc=True,
+            ),
+            "symbol": ["AAPL", "AAPL"],
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1100.0],
+            "label": [1, 0],
+            "regime": ["trend_up", "normal_range"],
+            "forward_return_h5": [0.01, -0.02],
+            "triple_barrier_net_return": [0.008, -0.015],
+            "f_alpha": [0.1, 0.2],
+            "f_beta": [1.0, 0.5],
+        }
+    )
+    holdout_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-01-01T00:30:00Z"], utc=True),
+            "symbol": ["AAPL"],
+            "open": [102.0],
+            "high": [103.0],
+            "low": [101.0],
+            "close": [102.5],
+            "volume": [1200.0],
+            "label": [1],
+            "regime": ["high_vol"],
+            "forward_return_h5": [0.03],
+            "triple_barrier_net_return": [0.02],
+            "f_alpha": [0.3],
+            "f_beta": [0.8],
+        }
+    )
+    bundle_path, _ = persist_dataset_snapshot_bundle(
+        output_dir=tmp_path,
+        snapshot_manifest=snapshot_manifest,
+        raw_ohlcv_data=raw,
+        development_frame=dev_frame,
+        holdout_frame=holdout_frame,
+        feature_names=["f_alpha", "f_beta"],
+        data_quality_report=quality_report,
+        development_sample_weights=np.array([1.0, 0.8]),
+        holdout_sample_weights=np.array([0.9]),
+        cv_splits=[(np.array([0]), np.array([1]))],
+        label_diagnostics={"positive_rate": 0.5},
+    )
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            dataset_snapshot_bundle_path=str(bundle_path),
+            strict_snapshot_replay=True,
+            primary_label_horizon=5,
+        )
+    )
+
+    assert trainer._load_training_dataset_snapshot() is True
+    assert trainer.snapshot_replay_loaded is True
+    assert trainer.features.columns.tolist() == ["f_alpha", "f_beta"]
+    assert trainer.labels.tolist() == [1, 0]
+    assert trainer.holdout_labels.tolist() == [1]
+    assert trainer.sample_weights.tolist() == [1.0, 0.8]
+    assert trainer.holdout_sample_weights.tolist() == [0.9]
+    assert len(trainer.cached_cv_splits) == 1
+
+
+def test_load_features_from_postgres_recomputes_when_ohlcv_hash_changes(monkeypatch):
+    import quant_trading_system.database.connection as conn_module
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            symbols=["AAPL"],
+            timeframe="15Min",
+        )
+    )
+    trainer.data = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1100.0],
+        }
+    )
+    feature_set_id = trainer._resolve_feature_set_id(["AAPL"])
+    schema_payload = {
+        "pipeline_fingerprint": trainer.feature_pipeline_fingerprint,
+        "source_ohlcv_hash": "stale_hash",
+        "feature_names": ["f_alpha"],
+        "feature_groups": sorted(trainer.config.feature_groups),
+        "enable_cross_sectional": bool(trainer.config.enable_cross_sectional),
+        "enable_reference_features": bool(trainer.config.enable_reference_features),
+        "timeframe": trainer.config.timeframe,
+        "feature_set_id": feature_set_id,
+    }
+
+    class FakeRedis:
+        def get(self, key):
+            if "train:features:schema:" in key:
+                return json.dumps(schema_payload)
+            return None
+
+        def set(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(conn_module, "get_db_manager", lambda: MagicMock())
+    monkeypatch.setattr(conn_module, "get_redis_manager", lambda: FakeRedis())
+
+    assert trainer._load_features_from_postgres() is None
 
 
 def test_validate_model_requires_nested_trace_for_promotion():

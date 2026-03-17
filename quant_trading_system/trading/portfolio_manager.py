@@ -19,20 +19,16 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
-from uuid import UUID
 
 import numpy as np
 
 from quant_trading_system.core.data_types import (
     Direction,
-    Order,
     OrderSide,
     OrderType,
     Portfolio,
-    Position,
-    TradeSignal,
 )
-from quant_trading_system.core.events import EventBus, EventType
+from quant_trading_system.core.events import EventBus
 from quant_trading_system.execution.order_manager import OrderPriority, OrderRequest
 from quant_trading_system.trading.signal_generator import EnrichedSignal, SignalPriority
 
@@ -186,6 +182,21 @@ class PositionSizer:
         """
         self.config = config
 
+    def _resolve_position_scale(self, signal: EnrichedSignal) -> Decimal:
+        """Resolve optional runtime position scaling metadata."""
+        metadata = signal.signal.metadata if isinstance(signal.signal.metadata, dict) else {}
+        raw_scale = metadata.get("runtime_position_scale", 1.0)
+        try:
+            scale = Decimal(str(raw_scale))
+        except Exception:
+            return Decimal("1")
+
+        if scale < 0:
+            return Decimal("0")
+        if scale > 1:
+            return Decimal("1")
+        return scale
+
     def calculate_position_size(
         self,
         signal: EnrichedSignal,
@@ -249,6 +260,8 @@ class PositionSizer:
 
         else:
             shares = Decimal("0")
+
+        shares *= self._resolve_position_scale(signal)
 
         # Apply maximum position constraint
         max_value = portfolio.equity * Decimal(str(self.config.max_position_pct))
@@ -626,11 +639,22 @@ class PortfolioManager:
             stop_loss = None
             take_profit = None
             signal_id = None
+            metadata: dict[str, Any] = {}
 
             if trade.target_position and trade.target_position.signal:
                 signal = trade.target_position.signal
                 # Could add stop/take profit based on signal metadata
                 signal_id = signal.signal.signal_id
+                metadata = dict(signal.signal.metadata) if isinstance(signal.signal.metadata, dict) else {}
+                metadata.update(
+                    {
+                        "signal_model_source": signal.signal.model_source,
+                        "signal_confidence": signal.signal.confidence,
+                        "signal_strength": signal.signal.strength,
+                    }
+                )
+
+            metadata.setdefault("expected_price", str(trade.current_price))
 
             request = OrderRequest(
                 symbol=trade.symbol,
@@ -644,6 +668,7 @@ class PortfolioManager:
                 notes=trade.reason,
                 stop_loss_price=stop_loss,
                 take_profit_price=take_profit,
+                metadata=metadata,
             )
             requests.append(request)
 

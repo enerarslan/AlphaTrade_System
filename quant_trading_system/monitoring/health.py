@@ -10,6 +10,7 @@ including:
 - Models & Risk
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -17,11 +18,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Optional
 
 from quant_trading_system.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
+DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS = 2.5
 
 # ============================================================================
 # HEALTH STATUS TYPES
@@ -95,51 +97,57 @@ class SystemHealthChecker:
     async def run_all_checks(self) -> list[HealthCheckResult]:
         """Run all health checks."""
         self.logger.info("Running comprehensive health checks...")
-        results = []
-
-        # Core infrastructure
-        checks = [
-            self.check_database(),
-            self.check_redis(),
-            self.check_gpu(),  # New GPU check
-            self.check_broker(),
-            self.check_data_feed(),
+        checks: list[tuple[str, Awaitable[HealthCheckResult]]] = [
+            ("database", self.check_database()),
+            ("redis", self.check_redis()),
+            ("gpu", self.check_gpu()),
+            ("broker", self.check_broker()),
+            ("data_feed", self.check_data_feed()),
+            ("kill_switch", self.check_kill_switch()),
+            ("circuit_breakers", self.check_circuit_breakers()),
+            ("risk_system", self.check_risk_system()),
+            ("drawdown_monitor", self.check_drawdown_monitor()),
+            ("models", self.check_models()),
+            ("model_staleness", self.check_model_staleness()),
+            ("metrics_collector", self.check_metrics_collector()),
+            ("audit_log", self.check_audit_log()),
         ]
+        tasks = [
+            self._run_check_with_timeout(component, check)
+            for component, check in checks
+        ]
+        return await asyncio.gather(*tasks)
 
-        # Trading systems
-        checks.extend([
-            self.check_kill_switch(),
-            self.check_circuit_breakers(),
-            self.check_risk_system(),
-            self.check_drawdown_monitor(),
-        ])
+    async def _run_check_with_timeout(
+        self,
+        component: str,
+        check: Awaitable[HealthCheckResult],
+        timeout_seconds: float = DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS,
+    ) -> HealthCheckResult:
+        """Run a single check with a bounded timeout.
 
-        # Models
-        checks.extend([
-            self.check_models(),
-            self.check_model_staleness(),
-        ])
-
-        # Monitoring
-        checks.extend([
-            self.check_metrics_collector(),
-            self.check_audit_log(),
-        ])
-
-        # Run all checks
-        for check in checks:
-            try:
-                result = await check
-                results.append(result)
-            except Exception as e:
-                self.logger.error(f"Health check failed unexpectedly: {e}", exc_info=True)
-                results.append(HealthCheckResult(
-                    component="unknown",
-                    status=HealthStatus.UNKNOWN,
-                    message=f"Check failed: {e}",
-                ))
-
-        return results
+        The dashboard calls health frequently; slow external providers should
+        degrade health instead of hanging the entire endpoint.
+        """
+        start = time.time()
+        try:
+            return await asyncio.wait_for(check, timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            return HealthCheckResult(
+                component=component,
+                status=HealthStatus.DEGRADED,
+                message=f"Health check timed out after {timeout_seconds:.1f}s",
+                latency_ms=(time.time() - start) * 1000,
+                details={"timeout_seconds": timeout_seconds},
+            )
+        except Exception as e:
+            self.logger.error(f"Health check failed unexpectedly for {component}: {e}", exc_info=True)
+            return HealthCheckResult(
+                component=component,
+                status=HealthStatus.UNKNOWN,
+                message=f"Check failed: {e}",
+                latency_ms=(time.time() - start) * 1000,
+            )
 
     def get_overall_status(self, results: list[HealthCheckResult]) -> HealthStatus:
         """Get overall system health status from results."""

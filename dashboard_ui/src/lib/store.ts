@@ -629,12 +629,21 @@ function isStatus(error: unknown, status: number) {
 
 const reconnectTimers: Record<string, ReturnType<typeof setTimeout> | null> = {};
 const reconnectAttempts: Record<string, number> = {};
+const desiredSocketState: Record<string, boolean> = {
+  portfolio: false,
+  orders: false,
+  signals: false,
+  alerts: false,
+};
+const intentionalSocketClosures = new WeakSet<WebSocket>();
 let snapshotRefreshInFlight = false;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function connectSocket(channel: keyof WsState, onMessage: (payload: any) => void, setWs: (connected: boolean) => void) {
+  desiredSocketState[channel] = true;
   // Clean up previous
   if (sockets[channel]) {
+    intentionalSocketClosures.add(sockets[channel]!);
     try { sockets[channel]?.close(); } catch { /* noop */ }
     sockets[channel] = null;
   }
@@ -652,7 +661,15 @@ function connectSocket(channel: keyof WsState, onMessage: (payload: any) => void
   };
 
   const scheduleReconnect = () => {
-    setWs(false);
+    const shouldReconnect = desiredSocketState[channel] && !intentionalSocketClosures.has(ws);
+    if (sockets[channel] === ws) {
+      sockets[channel] = null;
+      setWs(false);
+    }
+    if (!shouldReconnect) {
+      reconnectTimers[channel] = null;
+      return;
+    }
     const attempt = (reconnectAttempts[channel] ?? 0);
     if (attempt >= 20) return; // give up after 20 attempts
     const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
@@ -735,11 +752,10 @@ export const useStore = create<DashboardState>((set, get) => ({
       const me = await api.get<UserInfo>("/auth/me");
       const role = resolveRole(me.data);
       set({ user: me.data, role });
-      await get().fetchSnapshot();
-      get().connectLiveChannels();
+      try { await get().fetchSnapshot(); } catch { /* best-effort */ }
     } catch {
       clearAccessToken();
-      set({ token: null, user: null, role: "viewer", authError: "Session expired. Please login again." });
+      set({ token: null, user: null, role: "viewer" });
     } finally {
       set({ isInitializing: false });
     }
@@ -748,15 +764,20 @@ export const useStore = create<DashboardState>((set, get) => ({
   login: async (username: string, password: string) => {
     set({ authError: null, isLoading: true });
     try {
+      console.log("[LOGIN] Attempting login for:", username);
       const response = await api.post<LoginResponse>("/auth/login", { username, password });
+      console.log("[LOGIN] Got token, fetching /auth/me...");
       setAccessToken(response.data.access_token);
       const me = await api.get<UserInfo>("/auth/me");
+      console.log("[LOGIN] /auth/me OK:", me.data);
       const role = resolveRole(me.data);
       set({ token: response.data.access_token, user: me.data, role });
-      await get().fetchSnapshot();
-      get().connectLiveChannels();
+      // Non-critical: don't let post-login fetches block authentication
+      try { await get().fetchSnapshot(); } catch (e) { console.warn("[LOGIN] fetchSnapshot failed (non-critical):", e); }
+      console.log("[LOGIN] Success!");
       return true;
-    } catch {
+    } catch (err) {
+      console.error("[LOGIN] Failed:", err);
       set({ authError: "Login failed. Check username/password or use SSO." });
       return false;
     } finally {
@@ -809,7 +830,6 @@ export const useStore = create<DashboardState>((set, get) => ({
       const role = resolveRole(me.data);
       set({ token, user: me.data, role });
       await get().fetchSnapshot();
-      get().connectLiveChannels();
       return true;
     } catch {
       clearAccessToken();
@@ -880,7 +900,6 @@ export const useStore = create<DashboardState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const tasks: Array<Promise<void>> = [
-        get().fetchHealth(),
         get().fetchPortfolio(),
         get().fetchPerformance(),
         get().fetchPositions(),
@@ -1657,7 +1676,13 @@ export const useStore = create<DashboardState>((set, get) => ({
 
   disconnectLiveChannels: () => {
     (Object.keys(sockets) as Array<keyof typeof sockets>).forEach((key) => {
+      desiredSocketState[key] = false;
+      if (reconnectTimers[key]) {
+        clearTimeout(reconnectTimers[key]!);
+        reconnectTimers[key] = null;
+      }
       if (sockets[key]) {
+        intentionalSocketClosures.add(sockets[key]!);
         sockets[key]?.close();
         sockets[key] = null;
       }

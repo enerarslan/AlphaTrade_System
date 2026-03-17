@@ -60,10 +60,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from quant_trading_system.models.training_lineage import (
     build_data_quality_report,
+    compute_frame_content_hash,
     build_snapshot_manifest,
     compute_data_quality_hash,
     estimate_missing_bars_count,
+    load_dataset_snapshot_bundle,
     load_registry_entries,
+    persist_dataset_snapshot_bundle,
     persist_active_model_pointer,
     persist_snapshot_bundle,
     register_training_model_version,
@@ -552,6 +555,8 @@ class TrainingConfig:
     # Output
     output_dir: str = "models"
     save_artifacts: bool = True
+    dataset_snapshot_bundle_path: str = ""
+    strict_snapshot_replay: bool = False
     quality_missing_bars_threshold: float = 0.01
     quality_duplicate_bars_threshold: float = 0.001
     quality_extreme_move_threshold: float = 0.01
@@ -605,6 +610,10 @@ class TrainingConfig:
         self.timeframe = normalize_timeframe(self.timeframe)
         self.cross_sectional_user_locked = bool(self.cross_sectional_user_locked)
         self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
+        self.dataset_snapshot_bundle_path = (
+            str(self.dataset_snapshot_bundle_path or "").strip()
+        )
+        self.strict_snapshot_replay = bool(self.strict_snapshot_replay)
         self.data_max_abs_return = max(float(self.data_max_abs_return), 0.05)
         self.min_trades = max(1, int(self.min_trades))
         self.objective_weight_trade_activity = max(
@@ -740,6 +749,9 @@ class ModelTrainer:
         self.holdout_regimes: np.ndarray | None = None
         self.holdout_primary_forward_returns: np.ndarray | None = None
         self.holdout_cost_aware_event_returns: np.ndarray | None = None
+        self.holdout_sample_weights: np.ndarray | None = None
+        self.development_frame: pd.DataFrame | None = None
+        self.holdout_frame: pd.DataFrame | None = None
         self.model: Any = None
         self.cv_results: list[dict] = []
         self.validation_results: dict = {}
@@ -755,6 +767,10 @@ class ModelTrainer:
         self.snapshot_manifest: dict[str, Any] | None = None
         self.snapshot_manifest_path: Path | None = None
         self.data_quality_report_path: Path | None = None
+        self.dataset_snapshot_bundle_manifest: dict[str, Any] | None = None
+        self.dataset_snapshot_bundle_manifest_path: Path | None = None
+        self.cached_cv_splits: list[tuple[np.ndarray, np.ndarray]] = []
+        self.snapshot_replay_loaded: bool = False
         self.nested_cv_trace: list[dict[str, Any]] = []
         self.replay_manifest_path: Path | None = None
         self.promotion_package_path: Path | None = None
@@ -777,14 +793,19 @@ class ModelTrainer:
         set_global_seed(self.config.seed)
 
         try:
-            # Phase 1: Load Data
-            self._load_data()
+            loaded_snapshot = False
+            if self.config.dataset_snapshot_bundle_path:
+                loaded_snapshot = self._load_training_dataset_snapshot()
 
-            # Phase 2: Compute Features
-            self._compute_features()
+            if not loaded_snapshot:
+                # Phase 1: Load Data
+                self._load_data()
 
-            # Phase 3: Create Labels
-            self._create_labels()
+                # Phase 2: Compute Features
+                self._compute_features()
+
+                # Phase 3: Create Labels
+                self._create_labels()
 
             # Phase 3.5: Enforce future-leak validation gates
             self._validate_no_future_leakage()
@@ -852,6 +873,11 @@ class ModelTrainer:
                 "feature_schema_version": (
                     str(self.snapshot_manifest.get("feature_schema_version"))
                     if isinstance(self.snapshot_manifest, dict)
+                    else None
+                ),
+                "dataset_snapshot_bundle_path": (
+                    str(self.dataset_snapshot_bundle_manifest_path)
+                    if self.dataset_snapshot_bundle_manifest_path is not None
                     else None
                 ),
                 "label_diagnostics": self.label_diagnostics,
@@ -1581,6 +1607,311 @@ class ModelTrainer:
             f"({self.snapshot_manifest.get('row_count', 0)} rows)"
         )
 
+    def _restore_training_state_from_split_frames(
+        self,
+        dev_frame: pd.DataFrame,
+        holdout_frame: pd.DataFrame | None,
+        label_horizons: list[int],
+        dev_weights: np.ndarray | None,
+        holdout_weights: np.ndarray | None,
+    ) -> None:
+        """Restore trainer matrices from split frames for live runs and snapshot replay."""
+        dev_frame = dev_frame.reset_index(drop=True).copy()
+        holdout_frame = (
+            holdout_frame.reset_index(drop=True).copy()
+            if holdout_frame is not None and not holdout_frame.empty
+            else None
+        )
+        if dev_frame.empty:
+            raise ValueError("Development frame is empty; cannot restore training state.")
+
+        primary_horizon = int(self.config.primary_label_horizon)
+        primary_forward_col = f"forward_return_h{primary_horizon}"
+        target_mode = "classification_label"
+
+        if self._is_regression_model():
+            target_mode = "return_regression"
+            if "triple_barrier_net_return" in dev_frame.columns:
+                dev_target = pd.to_numeric(dev_frame["triple_barrier_net_return"], errors="coerce")
+                holdout_target = (
+                    pd.to_numeric(holdout_frame["triple_barrier_net_return"], errors="coerce")
+                    if holdout_frame is not None
+                    and "triple_barrier_net_return" in holdout_frame.columns
+                    else pd.Series(dtype=float)
+                )
+                target_mode = "triple_barrier_net_return"
+            elif primary_forward_col in dev_frame.columns:
+                dev_target = pd.to_numeric(dev_frame[primary_forward_col], errors="coerce")
+                holdout_target = (
+                    pd.to_numeric(holdout_frame[primary_forward_col], errors="coerce")
+                    if holdout_frame is not None and primary_forward_col in holdout_frame.columns
+                    else pd.Series(dtype=float)
+                )
+                target_mode = primary_forward_col
+            else:
+                raise ValueError(
+                    "Regression challenger requires return target column "
+                    "(triple_barrier_net_return or primary forward return)."
+                )
+
+            dev_target = dev_target.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            dev_target = dev_target.clip(lower=-0.50, upper=0.50).astype(float)
+            self.labels = dev_target.reset_index(drop=True)
+            if len(self.labels) < 50:
+                raise ValueError("Regression target produced insufficient development samples.")
+            self.training_metrics["target_mode"] = target_mode
+            self.training_metrics["target_mean"] = float(np.mean(self.labels))
+            self.training_metrics["target_std"] = float(np.std(self.labels))
+        else:
+            self.labels = dev_frame["label"].astype(int)
+            if int(self.labels.nunique(dropna=True)) < 2:
+                pos_rate = float(np.mean(pd.to_numeric(self.labels, errors="coerce").fillna(0.0)))
+                raise ValueError(
+                    "Label generation produced a single class in development set "
+                    f"(pos_rate={pos_rate:.2%}). Adjust label horizons/thresholds before training."
+                )
+            self.training_metrics["target_mode"] = target_mode
+
+        self.timestamps = dev_frame["timestamp"].to_numpy()
+        self.row_symbols = dev_frame["symbol"].astype(str).to_numpy()
+        self.regimes = (
+            dev_frame["regime"].astype(str).to_numpy()
+            if "regime" in dev_frame.columns
+            else np.full(len(dev_frame), "normal_range", dtype=object)
+        )
+        self.close_prices = dev_frame["close"].reset_index(drop=True)
+        if primary_forward_col in dev_frame.columns:
+            self.primary_forward_returns = np.nan_to_num(
+                pd.to_numeric(dev_frame[primary_forward_col], errors="coerce").to_numpy(
+                    dtype=float
+                ),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        else:
+            self.primary_forward_returns = np.zeros(len(dev_frame), dtype=float)
+        if "triple_barrier_net_return" in dev_frame.columns:
+            self.cost_aware_event_returns = np.nan_to_num(
+                pd.to_numeric(dev_frame["triple_barrier_net_return"], errors="coerce").to_numpy(
+                    dtype=float
+                ),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        else:
+            self.cost_aware_event_returns = np.zeros(len(dev_frame), dtype=float)
+
+        self.development_frame = dev_frame.copy()
+        if dev_weights is None or len(dev_weights) != len(dev_frame):
+            dev_weights = np.ones(len(dev_frame), dtype=float)
+        self.sample_weights = np.asarray(dev_weights, dtype=float)
+
+        self.holdout_features = None
+        self.holdout_labels = None
+        self.holdout_timestamps = None
+        self.holdout_symbols = None
+        self.holdout_regimes = None
+        self.holdout_primary_forward_returns = None
+        self.holdout_cost_aware_event_returns = None
+        self.holdout_sample_weights = None
+        self.holdout_frame = holdout_frame.copy() if holdout_frame is not None else None
+
+        if holdout_frame is not None and not holdout_frame.empty:
+            if self._is_regression_model():
+                holdout_target = holdout_target.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                self.holdout_labels = (
+                    holdout_target.clip(lower=-0.50, upper=0.50)
+                    .astype(float)
+                    .reset_index(drop=True)
+                )
+            else:
+                self.holdout_labels = holdout_frame["label"].astype(int).reset_index(drop=True)
+            self.holdout_timestamps = holdout_frame["timestamp"].to_numpy()
+            self.holdout_symbols = holdout_frame["symbol"].astype(str).to_numpy()
+            self.holdout_regimes = (
+                holdout_frame["regime"].astype(str).to_numpy()
+                if "regime" in holdout_frame.columns
+                else np.full(len(holdout_frame), "normal_range", dtype=object)
+            )
+            if primary_forward_col in holdout_frame.columns:
+                self.holdout_primary_forward_returns = np.nan_to_num(
+                    pd.to_numeric(holdout_frame[primary_forward_col], errors="coerce").to_numpy(
+                        dtype=float
+                    ),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            else:
+                self.holdout_primary_forward_returns = np.zeros(len(holdout_frame), dtype=float)
+            if "triple_barrier_net_return" in holdout_frame.columns:
+                self.holdout_cost_aware_event_returns = np.nan_to_num(
+                    pd.to_numeric(
+                        holdout_frame["triple_barrier_net_return"],
+                        errors="coerce",
+                    ).to_numpy(dtype=float),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            else:
+                self.holdout_cost_aware_event_returns = np.zeros(len(holdout_frame), dtype=float)
+
+            if holdout_weights is None or len(holdout_weights) != len(holdout_frame):
+                holdout_weights = np.ones(len(holdout_frame), dtype=float)
+            self.holdout_sample_weights = np.asarray(holdout_weights, dtype=float)
+            self.training_metrics["holdout_rows"] = float(len(holdout_frame))
+            self.training_metrics["holdout_weight_mean"] = (
+                float(np.mean(self.holdout_sample_weights))
+                if len(self.holdout_sample_weights)
+                else 1.0
+            )
+
+        self.training_metrics["development_rows"] = float(len(dev_frame))
+
+        exclude_cols = [
+            "timestamp",
+            "symbol",
+            "label",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "primary_signal",
+            "barrier_touched",
+            "triple_barrier_label",
+            "triple_barrier_event_return",
+            "triple_barrier_net_return",
+            "holding_period",
+            "regime",
+            "trade_side_label",
+            "binary_trade_label",
+        ]
+        exclude_cols.extend([f"forward_return_h{h}" for h in label_horizons])
+        feature_cols = [c for c in dev_frame.columns if c not in exclude_cols]
+        if not feature_cols:
+            raise ValueError("No model features remain after target engineering exclusion list.")
+        self.features = dev_frame[feature_cols]
+        if holdout_frame is not None and not holdout_frame.empty:
+            self.holdout_features = holdout_frame[feature_cols].reset_index(drop=True)
+        self.feature_names = feature_cols
+        self._apply_model_priors()
+
+    def _load_training_dataset_snapshot(self) -> bool:
+        """Load immutable dataset snapshot bundle for deterministic replay."""
+        bundle_path = Path(self.config.dataset_snapshot_bundle_path)
+        if not bundle_path.exists():
+            if self.config.strict_snapshot_replay:
+                raise FileNotFoundError(f"Dataset snapshot bundle not found: {bundle_path}")
+            self.logger.warning(
+                "Dataset snapshot bundle missing (%s); falling back to live data load.",
+                bundle_path,
+            )
+            return False
+
+        bundle = load_dataset_snapshot_bundle(bundle_path)
+        development_frame = bundle.get("development_frame")
+        if development_frame is None or development_frame.empty:
+            raise ValueError(
+                "Dataset snapshot bundle is missing development_frame artifact for replay."
+            )
+
+        self.logger.info("Phase 1-3: Loading immutable training snapshot bundle...")
+        self.snapshot_replay_loaded = True
+        self.dataset_snapshot_bundle_manifest = bundle.get("bundle_manifest", {})
+        self.dataset_snapshot_bundle_manifest_path = Path(
+            bundle.get("bundle_manifest_path", bundle_path)
+        )
+        self.snapshot_manifest = bundle.get("snapshot_manifest", {}) or None
+        if isinstance(self.snapshot_manifest, dict):
+            manifest_path = self.snapshot_manifest.get("manifest_path")
+            quality_path = self.snapshot_manifest.get("quality_report_path")
+            self.snapshot_manifest_path = Path(manifest_path) if manifest_path else None
+            self.data_quality_report_path = Path(quality_path) if quality_path else None
+            self.data_quality_report_hash = self.snapshot_manifest.get("data_quality_report_hash")
+
+        self.data = bundle.get("raw_ohlcv_data")
+        self.data_quality_report = bundle.get("data_quality_report") or None
+        if (
+            self.data_quality_report is None
+            and self.data_quality_report_path is not None
+            and self.data_quality_report_path.exists()
+        ):
+            try:
+                self.data_quality_report = json.loads(
+                    self.data_quality_report_path.read_text(encoding="utf-8")
+                )
+            except Exception as exc:
+                if self.config.strict_snapshot_replay:
+                    raise ValueError(
+                        f"Failed to load data quality report from snapshot bundle: {exc}"
+                    ) from exc
+        if self.data_quality_report_hash is None and self.data_quality_report is not None:
+            self.data_quality_report_hash = compute_data_quality_hash(self.data_quality_report)
+        self.label_diagnostics = bundle.get("label_diagnostics", {}) or {}
+        if self.label_diagnostics:
+            self.training_metrics["label_positive_rate"] = float(
+                self.label_diagnostics.get("positive_rate", 0.0)
+            )
+            self.training_metrics["label_class_balance_ratio"] = float(
+                self.label_diagnostics.get("class_balance_ratio", 0.0)
+            )
+            self.training_metrics["label_drift_abs"] = float(
+                self.label_diagnostics.get("label_drift_abs", 0.0)
+            )
+            self.training_metrics["label_count"] = float(
+                self.label_diagnostics.get("label_count", 0.0)
+            )
+            self.training_metrics["label_forward_outlier_filtered_count"] = float(
+                self.label_diagnostics.get("forward_outlier_filtered_count", 0.0)
+            )
+            self.training_metrics["label_forward_outlier_filtered_rate"] = float(
+                self.label_diagnostics.get("forward_outlier_filtered_rate", 0.0)
+            )
+            self.training_metrics["label_neutral_filtered_count"] = float(
+                self.label_diagnostics.get("neutral_filtered_count", 0.0)
+            )
+
+        label_horizons = sorted(
+            {
+                int(h)
+                for h in self.config.label_horizons
+                if isinstance(h, (int, np.integer, float, np.floating)) and int(h) > 0
+            }
+        )
+        if not label_horizons:
+            label_horizons = [1, 5, 20]
+        if int(self.config.primary_label_horizon) not in label_horizons:
+            label_horizons.append(int(self.config.primary_label_horizon))
+            label_horizons = sorted(set(label_horizons))
+
+        self.cached_cv_splits = bundle.get("cv_splits", []) or []
+        self.training_metrics["snapshot_bundle_reused"] = True
+        self.training_metrics["snapshot_bundle_cv_split_count"] = float(len(self.cached_cv_splits))
+        self.training_metrics["snapshot_bundle_path"] = str(self.dataset_snapshot_bundle_manifest_path)
+
+        self._restore_training_state_from_split_frames(
+            dev_frame=development_frame,
+            holdout_frame=bundle.get("holdout_frame"),
+            label_horizons=label_horizons,
+            dev_weights=bundle.get("development_sample_weights"),
+            holdout_weights=bundle.get("holdout_sample_weights"),
+        )
+        self.logger.info(
+            "Loaded immutable dataset snapshot %s: dev_rows=%d holdout_rows=%d",
+            (
+                self.snapshot_manifest.get("snapshot_id")
+                if isinstance(self.snapshot_manifest, dict)
+                else "unknown"
+            ),
+            len(self.features) if self.features is not None else 0,
+            len(self.holdout_features) if self.holdout_features is not None else 0,
+        )
+        return True
+
     def _compute_features(self) -> None:
         """Phase 2: Compute features for model training."""
         self.logger.info("Phase 2: Computing features...")
@@ -1873,6 +2204,17 @@ class ModelTrainer:
             f"{cross_sectional_part}:{reference_part}:{self.feature_pipeline_fingerprint}"
         )
 
+    def _current_ohlcv_fingerprint(self) -> str:
+        """Fingerprint current OHLCV panel for safe feature-cache reuse."""
+        if self.data is None or self.data.empty:
+            return ""
+        hash_columns = [
+            column
+            for column in ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+            if column in self.data.columns
+        ]
+        return compute_frame_content_hash(self.data, columns=hash_columns)
+
     def _build_feature_schema_metadata(
         self,
         feature_names: list[str],
@@ -1881,6 +2223,8 @@ class ModelTrainer:
         """Serialize feature schema metadata used for deterministic cache reuse."""
         return {
             "pipeline_fingerprint": self.feature_pipeline_fingerprint,
+            "source_ohlcv_hash": self._current_ohlcv_fingerprint(),
+            "source_ohlcv_rows": int(len(self.data)) if self.data is not None else 0,
             "feature_names": sorted(str(name) for name in feature_names),
             "feature_groups": sorted(str(name) for name in self.config.feature_groups),
             "enable_cross_sectional": bool(self.config.enable_cross_sectional),
@@ -2158,6 +2502,18 @@ class ModelTrainer:
         if schema_payload.get("pipeline_fingerprint") != self.feature_pipeline_fingerprint:
             self.logger.info(
                 "Feature pipeline fingerprint changed since cache write; recomputing features."
+            )
+            return None
+        cached_source_hash = str(schema_payload.get("source_ohlcv_hash") or "").strip()
+        current_source_hash = self._current_ohlcv_fingerprint()
+        if not cached_source_hash:
+            self.logger.info(
+                "Feature cache metadata missing source OHLCV hash; recomputing features."
+            )
+            return None
+        if current_source_hash and cached_source_hash != current_source_hash:
+            self.logger.info(
+                "Feature cache source OHLCV hash changed; recomputing features."
             )
             return None
         if schema_payload.get("timeframe") != timeframe:
@@ -2582,170 +2938,13 @@ class ModelTrainer:
         holdout_frame = labeled_frame.loc[holdout_mask].reset_index(drop=True)
         dev_weights = sample_weights[dev_mask]
         holdout_weights = sample_weights[holdout_mask]
-        primary_forward_col = f"forward_return_h{primary_horizon}"
-        target_mode = "classification_label"
-        if self._is_regression_model():
-            target_mode = "return_regression"
-            if "triple_barrier_net_return" in dev_frame.columns:
-                dev_target = pd.to_numeric(
-                    dev_frame["triple_barrier_net_return"],
-                    errors="coerce",
-                )
-                holdout_target = (
-                    pd.to_numeric(holdout_frame["triple_barrier_net_return"], errors="coerce")
-                    if "triple_barrier_net_return" in holdout_frame.columns
-                    else pd.Series(dtype=float)
-                )
-                target_mode = "triple_barrier_net_return"
-            elif primary_forward_col in dev_frame.columns:
-                dev_target = pd.to_numeric(dev_frame[primary_forward_col], errors="coerce")
-                holdout_target = (
-                    pd.to_numeric(holdout_frame[primary_forward_col], errors="coerce")
-                    if primary_forward_col in holdout_frame.columns
-                    else pd.Series(dtype=float)
-                )
-                target_mode = primary_forward_col
-            else:
-                raise ValueError(
-                    "Regression challenger requires return target column "
-                    "(triple_barrier_net_return or primary forward return)."
-                )
-
-            dev_target = dev_target.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            dev_target = dev_target.clip(lower=-0.50, upper=0.50).astype(float)
-            self.labels = dev_target.reset_index(drop=True)
-            if len(self.labels) < 50:
-                raise ValueError("Regression target produced insufficient development samples.")
-            self.training_metrics["target_mode"] = target_mode
-            self.training_metrics["target_mean"] = float(np.mean(self.labels))
-            self.training_metrics["target_std"] = float(np.std(self.labels))
-        else:
-            self.labels = dev_frame["label"].astype(int)
-            if int(self.labels.nunique(dropna=True)) < 2:
-                pos_rate = float(np.mean(pd.to_numeric(self.labels, errors="coerce").fillna(0.0)))
-                raise ValueError(
-                    "Label generation produced a single class in development set "
-                    f"(pos_rate={pos_rate:.2%}). Adjust label horizons/thresholds before training."
-                )
-            self.training_metrics["target_mode"] = target_mode
-
-        self.timestamps = dev_frame["timestamp"].to_numpy()
-        self.row_symbols = dev_frame["symbol"].astype(str).to_numpy()
-        self.regimes = dev_frame["regime"].astype(str).to_numpy()
-        self.close_prices = dev_frame["close"].reset_index(drop=True)
-        if primary_forward_col in dev_frame.columns:
-            self.primary_forward_returns = np.nan_to_num(
-                pd.to_numeric(dev_frame[primary_forward_col], errors="coerce").to_numpy(
-                    dtype=float
-                ),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-        else:
-            self.primary_forward_returns = np.zeros(len(dev_frame), dtype=float)
-        if "triple_barrier_net_return" in dev_frame.columns:
-            self.cost_aware_event_returns = np.nan_to_num(
-                pd.to_numeric(dev_frame["triple_barrier_net_return"], errors="coerce").to_numpy(
-                    dtype=float
-                ),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-        else:
-            self.cost_aware_event_returns = np.zeros(len(dev_frame), dtype=float)
-        self.sample_weights = dev_weights
-
-        self.holdout_features = None
-        self.holdout_labels = None
-        self.holdout_timestamps = None
-        self.holdout_symbols = None
-        self.holdout_regimes = None
-        self.holdout_primary_forward_returns = None
-        self.holdout_cost_aware_event_returns = None
-        if not holdout_frame.empty:
-            if self._is_regression_model():
-                if "triple_barrier_net_return" in holdout_frame.columns:
-                    holdout_target = pd.to_numeric(
-                        holdout_frame["triple_barrier_net_return"],
-                        errors="coerce",
-                    )
-                elif primary_forward_col in holdout_frame.columns:
-                    holdout_target = pd.to_numeric(
-                        holdout_frame[primary_forward_col], errors="coerce"
-                    )
-                else:
-                    holdout_target = pd.Series(np.zeros(len(holdout_frame), dtype=float))
-                holdout_target = holdout_target.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-                self.holdout_labels = (
-                    holdout_target.clip(lower=-0.50, upper=0.50)
-                    .astype(float)
-                    .reset_index(drop=True)
-                )
-            else:
-                self.holdout_labels = holdout_frame["label"].astype(int).reset_index(drop=True)
-            self.holdout_timestamps = holdout_frame["timestamp"].to_numpy()
-            self.holdout_symbols = holdout_frame["symbol"].astype(str).to_numpy()
-            self.holdout_regimes = holdout_frame["regime"].astype(str).to_numpy()
-            if primary_forward_col in holdout_frame.columns:
-                self.holdout_primary_forward_returns = np.nan_to_num(
-                    pd.to_numeric(holdout_frame[primary_forward_col], errors="coerce").to_numpy(
-                        dtype=float
-                    ),
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-            else:
-                self.holdout_primary_forward_returns = np.zeros(len(holdout_frame), dtype=float)
-            if "triple_barrier_net_return" in holdout_frame.columns:
-                self.holdout_cost_aware_event_returns = np.nan_to_num(
-                    pd.to_numeric(
-                        holdout_frame["triple_barrier_net_return"],
-                        errors="coerce",
-                    ).to_numpy(dtype=float),
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-            else:
-                self.holdout_cost_aware_event_returns = np.zeros(len(holdout_frame), dtype=float)
-            self.training_metrics["holdout_rows"] = float(len(holdout_frame))
-            self.training_metrics["holdout_weight_mean"] = (
-                float(np.mean(holdout_weights)) if len(holdout_weights) else 1.0
-            )
-        self.training_metrics["development_rows"] = float(len(dev_frame))
-
-        # Remove non-feature columns
-        exclude_cols = [
-            "timestamp",
-            "symbol",
-            "label",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "primary_signal",
-            "barrier_touched",
-            "triple_barrier_label",
-            "triple_barrier_event_return",
-            "triple_barrier_net_return",
-            "holding_period",
-            "regime",
-            "trade_side_label",
-            "binary_trade_label",
-        ]
-        exclude_cols.extend([f"forward_return_h{h}" for h in label_horizons])
-        feature_cols = [c for c in dev_frame.columns if c not in exclude_cols]
-        if not feature_cols:
-            raise ValueError("No model features remain after target engineering exclusion list.")
-        self.features = dev_frame[feature_cols]
-        if not holdout_frame.empty:
-            self.holdout_features = holdout_frame[feature_cols].reset_index(drop=True)
-        self.feature_names = feature_cols
-        self._apply_model_priors()
+        self._restore_training_state_from_split_frames(
+            dev_frame=dev_frame,
+            holdout_frame=holdout_frame,
+            label_horizons=label_horizons,
+            dev_weights=dev_weights,
+            holdout_weights=holdout_weights,
+        )
 
         if self._is_regression_model():
             self.logger.info(
@@ -2940,6 +3139,28 @@ class ModelTrainer:
         For panel data (multi-symbol with repeated timestamps), split on unique
         timestamps then map back to row indices to avoid symbol-block leakage.
         """
+        if self.cached_cv_splits:
+            replay_splits: list[tuple[np.ndarray, np.ndarray]] = []
+            for train_idx, test_idx in self.cached_cv_splits:
+                train_arr = np.asarray(train_idx, dtype=int)
+                test_arr = np.asarray(test_idx, dtype=int)
+                if train_arr.size and int(np.max(train_arr)) >= len(X):
+                    self.logger.warning(
+                        "Cached snapshot CV split exceeds current sample count; regenerating splits."
+                    )
+                    replay_splits = []
+                    break
+                if test_arr.size and int(np.max(test_arr)) >= len(X):
+                    self.logger.warning(
+                        "Cached snapshot CV split exceeds current sample count; regenerating splits."
+                    )
+                    replay_splits = []
+                    break
+                replay_splits.append((train_arr.copy(), test_arr.copy()))
+            if replay_splits:
+                self.training_metrics["snapshot_bundle_cv_splits_reused"] = True
+                return replay_splits
+
         if self.timestamps is None or len(self.timestamps) != len(X):
             cv = self._get_cv_splitter(n_samples=len(X))
             candidate_splits = self._split_with_optional_times(cv, X, y, times=None)
@@ -8342,6 +8563,11 @@ class ModelTrainer:
             "snapshot_manifest_path": (
                 str(self.snapshot_manifest_path) if self.snapshot_manifest_path else None
             ),
+            "dataset_snapshot_bundle_path": (
+                str(self.dataset_snapshot_bundle_manifest_path)
+                if self.dataset_snapshot_bundle_manifest_path
+                else None
+            ),
             "data_quality_report_hash": self.data_quality_report_hash,
             "data_quality_report_path": (
                 str(self.data_quality_report_path) if self.data_quality_report_path else None
@@ -8380,6 +8606,11 @@ class ModelTrainer:
             ),
             "snapshot_manifest_path": (
                 str(self.snapshot_manifest_path) if self.snapshot_manifest_path else None
+            ),
+            "dataset_snapshot_bundle_path": (
+                str(self.dataset_snapshot_bundle_manifest_path)
+                if self.dataset_snapshot_bundle_manifest_path
+                else None
             ),
             "data_quality_report_path": (
                 str(self.data_quality_report_path) if self.data_quality_report_path else None
@@ -8433,6 +8664,22 @@ class ModelTrainer:
         self.logger.info(f"Promotion package saved to: {package_path}")
         return package_path
 
+    def _snapshot_bundle_cv_splits(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Return auditable CV splits for immutable dataset snapshot bundles."""
+        if self.cached_cv_splits:
+            return self.cached_cv_splits
+        if self.features is None or self.labels is None:
+            return []
+        try:
+            self.cached_cv_splits = self._generate_cv_splits(
+                self.features.values,
+                self.labels.values,
+            )
+        except Exception as exc:
+            self.logger.warning("Failed to capture CV splits for snapshot bundle: %s", exc)
+            self.cached_cv_splits = []
+        return self.cached_cv_splits
+
     def _save_model(self) -> str:
         """Phase 10: Save trained model and artifacts."""
         self.logger.info("Phase 10: Saving model...")
@@ -8481,6 +8728,48 @@ class ModelTrainer:
             self.data_quality_report_path = quality_path
             self.snapshot_manifest["manifest_path"] = str(manifest_path)
             self.snapshot_manifest["quality_report_path"] = str(quality_path)
+            if self.dataset_snapshot_bundle_manifest_path is None:
+                bundle_manifest_path, bundle_manifest = persist_dataset_snapshot_bundle(
+                    output_dir=output_dir,
+                    snapshot_manifest=self.snapshot_manifest,
+                    raw_ohlcv_data=self.data,
+                    development_frame=(
+                        self.development_frame
+                        if self.development_frame is not None
+                        else self.features
+                    ),
+                    holdout_frame=self.holdout_frame,
+                    feature_names=self.feature_names,
+                    data_quality_report=self.data_quality_report,
+                    development_sample_weights=self.sample_weights,
+                    holdout_sample_weights=self.holdout_sample_weights,
+                    cv_splits=self._snapshot_bundle_cv_splits(),
+                    label_diagnostics=self.label_diagnostics,
+                )
+                self.dataset_snapshot_bundle_manifest_path = bundle_manifest_path
+                self.dataset_snapshot_bundle_manifest = bundle_manifest
+            if isinstance(self.snapshot_manifest, dict):
+                self.snapshot_manifest["dataset_bundle_manifest_path"] = (
+                    str(self.dataset_snapshot_bundle_manifest_path)
+                    if self.dataset_snapshot_bundle_manifest_path
+                    else None
+                )
+                self.snapshot_manifest["dataset_bundle_hash"] = (
+                    self.dataset_snapshot_bundle_manifest.get("bundle_hash")
+                    if isinstance(self.dataset_snapshot_bundle_manifest, dict)
+                    else None
+                )
+            if self.snapshot_manifest_path is not None and isinstance(self.snapshot_manifest, dict):
+                self.snapshot_manifest_path.write_text(
+                    json.dumps(
+                        self.snapshot_manifest,
+                        indent=2,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    encoding="utf-8",
+                )
             self.replay_manifest_path = self._write_replay_manifest(output_dir, model_path)
             self.promotion_package_path = self._write_promotion_package(
                 output_dir=output_dir,
@@ -8501,6 +8790,11 @@ class ModelTrainer:
                 "snapshot_id": self.snapshot_manifest.get("snapshot_id"),
                 "snapshot_manifest": self.snapshot_manifest,
                 "snapshot_manifest_path": str(self.snapshot_manifest_path),
+                "dataset_snapshot_bundle_path": (
+                    str(self.dataset_snapshot_bundle_manifest_path)
+                    if self.dataset_snapshot_bundle_manifest_path
+                    else None
+                ),
                 "data_quality_report_hash": self.data_quality_report_hash,
                 "data_quality_report_path": str(self.data_quality_report_path),
                 "label_diagnostics": self.label_diagnostics,
@@ -8978,10 +9272,25 @@ def run_training(args: argparse.Namespace) -> int:
 
         replay_bundle: dict[str, Any] | None = None
         replay_config: dict[str, Any] = {}
+        replay_snapshot_bundle_path = ""
         replay_manifest_arg = getattr(args, "replay_manifest", None)
         if replay_manifest_arg:
             replay_bundle = _load_replay_manifest(Path(replay_manifest_arg))
             replay_config = replay_bundle["training_config"]
+            replay_manifest_payload = replay_bundle.get("manifest", {})
+            if isinstance(replay_manifest_payload, dict):
+                replay_snapshot_bundle_path = str(
+                    replay_manifest_payload.get("dataset_snapshot_bundle_path") or ""
+                ).strip()
+                if not replay_snapshot_bundle_path and isinstance(
+                    replay_manifest_payload.get("snapshot_manifest"), dict
+                ):
+                    replay_snapshot_bundle_path = str(
+                        replay_manifest_payload["snapshot_manifest"].get(
+                            "dataset_bundle_manifest_path"
+                        )
+                        or ""
+                    ).strip()
             logger.info(f"Replay mode enabled from manifest: {replay_bundle['manifest_path']}")
 
         requested_model = str(replay_config.get("model_type") or getattr(args, "model", "xgboost"))
@@ -9592,6 +9901,19 @@ def run_training(args: argparse.Namespace) -> int:
                     )
                 ),
                 output_dir=str(getattr(args, "output_dir", "models")),
+                dataset_snapshot_bundle_path=str(
+                    _cfg_value(
+                        "dataset_snapshot_bundle_path",
+                        getattr(args, "dataset_snapshot_bundle", "") or replay_snapshot_bundle_path,
+                    )
+                ).strip(),
+                strict_snapshot_replay=bool(
+                    _cfg_value(
+                        "strict_snapshot_replay",
+                        bool(getattr(args, "strict_snapshot_replay", False))
+                        or bool(replay_snapshot_bundle_path),
+                    )
+                ),
                 model_params=model_params,
             )
 
@@ -9602,6 +9924,8 @@ def run_training(args: argparse.Namespace) -> int:
             logger.info(f"Symbols: {config.symbols or 'all available'}")
             logger.info("Data source: PostgreSQL (mandatory)")
             logger.info("Redis cache: enabled (mandatory)")
+            if config.dataset_snapshot_bundle_path:
+                logger.info(f"Dataset snapshot bundle: {config.dataset_snapshot_bundle_path}")
             logger.info(f"CV method: {config.cv_method} ({config.n_splits} splits)")
             logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
             logger.info(f"GPU acceleration enabled: {config.use_gpu}")
@@ -9957,6 +10281,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Replay a prior run from replay/promotion/artifact manifest JSON.",
+    )
+    parser.add_argument(
+        "--dataset-snapshot-bundle",
+        type=Path,
+        default=None,
+        help="Load immutable training dataset bundle directly instead of rebuilding from live data.",
+    )
+    parser.add_argument(
+        "--strict-snapshot-replay",
+        action="store_true",
+        help="Fail instead of falling back when dataset snapshot replay bundle is missing.",
     )
     parser.add_argument(
         "--min-accuracy",

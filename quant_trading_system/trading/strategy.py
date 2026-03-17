@@ -15,11 +15,11 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import numpy as np
 
@@ -29,7 +29,6 @@ from quant_trading_system.core.data_types import (
     ModelPrediction,
     OHLCVBar,
     Portfolio,
-    Position,
     TradeSignal,
 )
 
@@ -342,8 +341,6 @@ class MomentumStrategy(Strategy):
             slow_ma = np.mean(closes[-self.slow_period:])
             rsi = self._calculate_rsi(closes)
 
-            current_price = float(closes[-1])
-
             # Determine signal
             direction = Direction.FLAT
             strength = 0.0
@@ -595,6 +592,7 @@ class MLStrategy(Strategy):
             strength = min(1.0, abs(avg_pred))
 
             if avg_conf >= self.config.confidence_threshold:
+                prediction_model_names = sorted({p.model_name for p in symbol_preds})
                 signal = TradeSignal(
                     symbol=symbol,
                     direction=direction,
@@ -607,6 +605,10 @@ class MLStrategy(Strategy):
                         "num_models": len(symbol_preds),
                         "ensemble_method": self.ensemble_method,
                         "model_predictions": {p.model_name: p.prediction for p in symbol_preds},
+                    },
+                    metadata={
+                        "prediction_model_names": prediction_model_names,
+                        "prediction_model_count": len(prediction_model_names),
                     },
                 )
                 signal = self.record_signal(signal)

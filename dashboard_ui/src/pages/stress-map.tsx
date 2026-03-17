@@ -6,12 +6,9 @@ import {
   ArrowRight,
   ChevronDown,
   Crosshair,
-  Maximize2,
-  Minimize2,
   RotateCcw,
   Shield,
   Target,
-  TrendingDown,
   X,
   Zap,
 } from "lucide-react";
@@ -335,7 +332,7 @@ function BubbleChart({
 }) {
   const [hoveredSymbol, setHoveredSymbol] = useState<string | null>(null);
 
-  const { bubbles, maxAbsPnl, sectorPositions } = useMemo(() => {
+  const { bubbles, sectorPositions } = useMemo(() => {
     const active = isScenarioActive(scenario);
     const stressedPnls = new Map<string, number>();
     positions.forEach((pos) => {
@@ -416,7 +413,7 @@ function BubbleChart({
       });
     });
 
-    return { bubbles: allBubbles, maxAbsPnl: mxAbsPnl, sectorPositions: sectorPos };
+    return { bubbles: allBubbles, sectorPositions: sectorPos };
   }, [positions, scenario, width, height]);
 
   const hovered = bubbles.find((b) => b.pos.symbol === hoveredSymbol);

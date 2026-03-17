@@ -19,6 +19,7 @@ const DatabasePage = lazy(() => import("@/pages/database"));
 const AlternativeDataPage = lazy(() => import("@/pages/alternative-data"));
 const StressMapPage = lazy(() => import("@/pages/stress-map"));
 const TradeForensicsPage = lazy(() => import("@/pages/trade-forensics"));
+const StrategyComposerPage = lazy(() => import("@/pages/strategy-composer"));
 
 function GuardedRoute({ permission, children }: { permission: string; children: import("react").ReactElement }) {
   const role = useStore((state) => state.role);
@@ -131,6 +132,14 @@ function ProtectedApp() {
             element={
               <GuardedRoute permission="read.basic">
                 <TradeForensicsPage />
+              </GuardedRoute>
+            }
+          />
+          <Route
+            path="/composer"
+            element={
+              <GuardedRoute permission="control.jobs.create">
+                <StrategyComposerPage />
               </GuardedRoute>
             }
           />

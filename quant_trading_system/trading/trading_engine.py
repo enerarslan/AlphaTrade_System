@@ -17,12 +17,12 @@ import logging
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable
-from uuid import UUID
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from quant_trading_system.core.data_types import (
@@ -32,7 +32,6 @@ from quant_trading_system.core.data_types import (
     Portfolio,
 )
 from quant_trading_system.core.events import (
-    Event,
     EventBus,
     EventType,
     create_system_event,
@@ -43,12 +42,13 @@ from quant_trading_system.risk.limits import (
     KillSwitch,
     KillSwitchReason,
     PreTradeRiskChecker,
-    RiskLimitsManager,
     RiskLimitsConfig,
+    RiskLimitsManager,
 )
 from quant_trading_system.execution.alpaca_client import AlpacaClient
-from quant_trading_system.execution.order_manager import ManagedOrder, OrderManager, OrderRequest
+from quant_trading_system.execution.order_manager import ManagedOrder, OrderManager
 from quant_trading_system.execution.position_tracker import PositionTracker
+from quant_trading_system.models.runtime_governor import ModelRuntimeGovernor, RuntimeGovernorConfig
 from quant_trading_system.trading.portfolio_manager import PortfolioManager
 from quant_trading_system.trading.signal_generator import EnrichedSignal, SignalGenerator
 
@@ -176,6 +176,7 @@ class TradingEngine:
         signal_generator: SignalGenerator,
         portfolio_manager: PortfolioManager,
         event_bus: EventBus | None = None,
+        runtime_governor: ModelRuntimeGovernor | None = None,
     ) -> None:
         """Initialize trading engine.
 
@@ -195,6 +196,7 @@ class TradingEngine:
         self.signal_generator = signal_generator
         self.portfolio_manager = portfolio_manager
         self.event_bus = event_bus
+        self.runtime_governor = runtime_governor
 
         # State
         self._state = EngineState.STOPPED
@@ -211,6 +213,7 @@ class TradingEngine:
         self._latest_bars: dict[str, OHLCVBar] = {}
         self._latest_features: dict[str, FeatureVector] = {}
         self._latest_predictions: dict[str, ModelPrediction] = {}
+        self._raw_predictions: dict[str, ModelPrediction] = {}
         self._prices: dict[str, Decimal] = {}
 
         # Callbacks
@@ -305,6 +308,9 @@ class TradingEngine:
             self._metrics.current_drawdown = 0.0
             self._metrics.max_drawdown = 0.0
             logger.info(f"Initialized drawdown tracking with peak equity: ${portfolio.equity:.2f}")
+
+            if self.runtime_governor is not None:
+                self.runtime_governor.refresh_deployment_state(force=True)
 
             # Start background tasks
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -648,12 +654,15 @@ class TradingEngine:
 
             # 3. Generate signals
             portfolio = self.position_tracker.get_portfolio()
+            predictions = self._get_governed_predictions()
             signals = self.signal_generator.generate_signals(
                 bars=self._latest_bars,
                 features=self._latest_features,
-                predictions=self._latest_predictions,
+                predictions=predictions,
                 portfolio=portfolio,
             )
+            if self.runtime_governor is not None:
+                signals = self.runtime_governor.govern_signals(signals)
 
             if self._session:
                 self._session.signals_generated += len(signals)
@@ -836,6 +845,8 @@ class TradingEngine:
                         managed=managed,
                         current_price=current_price,
                     )
+                    if self.runtime_governor is not None:
+                        self.runtime_governor.record_order_submission(managed.request.metadata)
 
                 # P0-7 FIX: Acquire lock when modifying session state
                 with self._state_lock:
@@ -971,6 +982,13 @@ class TradingEngine:
         if drawdown_result.result == CheckResult.WARNING:
             logger.warning(drawdown_result.message)
 
+        if self.runtime_governor is not None:
+            self.runtime_governor.record_engine_risk_snapshot(
+                current_drawdown=self._metrics.current_drawdown,
+                max_drawdown=self._metrics.max_drawdown,
+                daily_pnl_pct=daily_pnl_pct,
+            )
+
         return True
 
     async def _wait_for_next_bar(self) -> None:
@@ -1080,6 +1098,14 @@ class TradingEngine:
             strategy_id=managed.request.strategy_id,
         )
 
+        if self.runtime_governor is not None and managed.order.filled_avg_price is not None:
+            expected_price = self._extract_expected_price(managed.request.metadata)
+            self.runtime_governor.record_order_fill(
+                managed.request.metadata,
+                fill_price=managed.order.filled_avg_price,
+                expected_price=expected_price,
+            )
+
     def _on_order_rejection(self, managed: ManagedOrder) -> None:
         """Handle order rejection event.
 
@@ -1092,6 +1118,11 @@ class TradingEngine:
                 self._session.errors.append(
                     f"Order rejected: {managed.order.symbol} - {managed.error_message}"
                 )
+        if self.runtime_governor is not None:
+            self.runtime_governor.record_order_rejection(
+                managed.request.metadata,
+                reason=managed.error_message or "",
+            )
 
     def _is_pre_market(self, current_time: time) -> bool:
         """Check if in pre-market period.
@@ -1373,6 +1404,55 @@ class TradingEngine:
         """Register callback for signal generation."""
         self._signal_callbacks.append(callback)
 
+    def update_features(self, features: dict[str, FeatureVector]) -> None:
+        """Update the latest feature vectors for downstream signal generation."""
+        self._latest_features = dict(features)
+
+    def update_predictions(self, predictions: dict[str, ModelPrediction]) -> None:
+        """Update raw predictions and refresh the currently governed routing view."""
+        self._raw_predictions = dict(predictions)
+        self._latest_predictions = self._get_governed_predictions()
+
+    def record_prediction_outcome(
+        self,
+        model_name: str,
+        prediction: float,
+        actual_return: float,
+        timestamp: datetime | None = None,
+    ) -> None:
+        """Feed realized model outcomes into the runtime governor when enabled."""
+        if self.runtime_governor is None:
+            return
+        self.runtime_governor.record_prediction_outcome(
+            model_name=model_name,
+            prediction=prediction,
+            actual_return=actual_return,
+            timestamp=timestamp,
+        )
+
+    def _get_governed_predictions(self) -> dict[str, ModelPrediction]:
+        """Route raw predictions through the runtime governor when configured."""
+        prediction_source = self._raw_predictions or self._latest_predictions
+        if self.runtime_governor is None:
+            self._latest_predictions = dict(prediction_source)
+            return self._latest_predictions
+
+        routed = self.runtime_governor.route_predictions(prediction_source)
+        self._latest_predictions = routed
+        return routed
+
+    def _extract_expected_price(self, metadata: dict[str, Any] | None) -> Decimal | None:
+        """Parse expected execution price from order metadata."""
+        if not isinstance(metadata, dict):
+            return None
+        raw_value = metadata.get("expected_price")
+        if raw_value is None:
+            return None
+        try:
+            return Decimal(str(raw_value))
+        except Exception:
+            return None
+
     def get_statistics(self) -> dict[str, Any]:
         """Get engine statistics."""
         return {
@@ -1405,6 +1485,11 @@ class TradingEngine:
                 "position_tracker": self.position_tracker.get_statistics(),
                 "signal_generator": self.signal_generator.get_statistics(),
                 "portfolio_manager": self.portfolio_manager.get_statistics(),
+                "runtime_governor": (
+                    self.runtime_governor.get_statistics()
+                    if self.runtime_governor is not None
+                    else None
+                ),
             },
         }
 
@@ -1449,6 +1534,10 @@ def create_trading_engine(
     position_tracker = PositionTracker(client=client, event_bus=event_bus)
     signal_generator = SignalGenerator(event_bus=event_bus)
     portfolio_manager = PortfolioManager(event_bus=event_bus)
+    runtime_governor = ModelRuntimeGovernor(
+        config=RuntimeGovernorConfig(runtime_mode=mode.value),
+        event_bus=event_bus,
+    )
 
     # Create config
     config = TradingEngineConfig(
@@ -1464,4 +1553,5 @@ def create_trading_engine(
         signal_generator=signal_generator,
         portfolio_manager=portfolio_manager,
         event_bus=event_bus,
+        runtime_governor=runtime_governor,
     )
