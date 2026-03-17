@@ -22,8 +22,8 @@ from sqlalchemy import case, func
 from sqlalchemy.dialects.postgresql import insert
 
 from quant_trading_system.database.connection import get_db_manager
+from quant_trading_system.database.migration_runner import run_database_migrations
 from quant_trading_system.database.models import (
-    Base,
     CorporateAction,
     EarningsEvent,
     FundamentalSnapshot,
@@ -32,7 +32,6 @@ from quant_trading_system.database.models import (
     SECFiling,
     SecurityMaster,
 )
-from quant_trading_system.database.schema_sync import ensure_reference_schema_extensions
 from quant_trading_system.data.db_loader import get_db_loader
 from quant_trading_system.execution.alpaca_client import AlpacaClient
 
@@ -142,7 +141,9 @@ def _extract_earnings_reported_date(event: dict[str, Any]) -> date | None:
     return None
 
 
-def _resolve_earnings_availability(event: dict[str, Any], *, captured_at: datetime) -> dict[str, Any]:
+def _resolve_earnings_availability(
+    event: dict[str, Any], *, captured_at: datetime
+) -> dict[str, Any]:
     """Resolve immutable first-seen and earliest trustworthy availability fields."""
     announcement_timestamp = _extract_earnings_timestamp(event)
     reported_date = _extract_earnings_reported_date(event)
@@ -179,7 +180,9 @@ def _coerce_scalar(value: Any) -> Any:
         if pd.isna(value):
             return None
         return value.to_pydatetime()
-    if hasattr(value, "item") and not isinstance(value, (str, bytes, bytearray, Decimal, date, datetime)):
+    if hasattr(value, "item") and not isinstance(
+        value, (str, bytes, bytearray, Decimal, date, datetime)
+    ):
         try:
             return value.item()
         except Exception:
@@ -391,14 +394,14 @@ class InstitutionalDataBootstrapper:
             self.provider_gate.wait(provider)
             response = self.session.get(url, params=params, headers=headers, timeout=timeout)
             if response.status_code == 429:
-                time.sleep(min(2 ** attempt, 15))
+                time.sleep(min(2**attempt, 15))
                 continue
             response.raise_for_status()
             data = response.json()
             if provider == "alpha_vantage" and isinstance(data, dict):
                 message = str(data.get("Note") or data.get("Information") or "")
                 if "rate limit" in message.lower():
-                    time.sleep(max(10.0, 2 ** attempt))
+                    time.sleep(max(10.0, 2**attempt))
                     continue
             return data
         raise RuntimeError(f"{provider} request failed after retries: {url}")
@@ -416,7 +419,7 @@ class InstitutionalDataBootstrapper:
             self.provider_gate.wait(provider)
             response = self.session.get(url, params=params, headers=headers, timeout=timeout)
             if response.status_code == 429:
-                time.sleep(min(2 ** attempt, 15))
+                time.sleep(min(2**attempt, 15))
                 continue
             response.raise_for_status()
             return response.text
@@ -425,9 +428,9 @@ class InstitutionalDataBootstrapper:
     def run(self) -> dict[str, Any]:
         """Execute the bootstrap workflow and return a manifest summary."""
         if self.config.sync_db and self.db_manager is not None:
-            with self.db_manager.engine.begin() as conn:
-                Base.metadata.create_all(bind=conn)
-            ensure_reference_schema_extensions(self.db_manager, force=True)
+            run_database_migrations(
+                database_url=self.db_manager.engine.url.render_as_string(hide_password=False)
+            )
 
         core_symbols = self._load_core_symbols()
         broad_symbols = self._build_broad_universe(core_symbols)
@@ -884,7 +887,9 @@ class InstitutionalDataBootstrapper:
             rows=total_rows,
         )
 
-    def _extract_yfinance_symbol_frame(self, downloaded: pd.DataFrame, yf_symbol: str) -> pd.DataFrame:
+    def _extract_yfinance_symbol_frame(
+        self, downloaded: pd.DataFrame, yf_symbol: str
+    ) -> pd.DataFrame:
         if isinstance(downloaded.columns, pd.MultiIndex):
             if yf_symbol not in downloaded.columns.get_level_values(0):
                 return pd.DataFrame()
@@ -898,7 +903,9 @@ class InstitutionalDataBootstrapper:
     def _normalize_yfinance_daily_frame(self, symbol: str, frame: pd.DataFrame) -> pd.DataFrame:
         timestamp_col = "Date" if "Date" in frame.columns else frame.columns[0]
         normalized = pd.DataFrame()
-        normalized["timestamp"] = pd.to_datetime(frame[timestamp_col], errors="coerce").dt.strftime("%Y-%m-%d")
+        normalized["timestamp"] = pd.to_datetime(frame[timestamp_col], errors="coerce").dt.strftime(
+            "%Y-%m-%d"
+        )
         normalized["timestamp"] = pd.to_datetime(
             normalized["timestamp"] + " 16:00:00",
             utc=False,
@@ -913,13 +920,19 @@ class InstitutionalDataBootstrapper:
         normalized["high"] = pd.to_numeric(frame.get("High"), errors="coerce")
         normalized["low"] = pd.to_numeric(frame.get("Low"), errors="coerce")
         normalized["close"] = pd.to_numeric(frame.get("Close"), errors="coerce")
-        normalized["volume"] = pd.to_numeric(frame.get("Volume"), errors="coerce").fillna(0).astype("int64")
+        normalized["volume"] = (
+            pd.to_numeric(frame.get("Volume"), errors="coerce").fillna(0).astype("int64")
+        )
         normalized["symbol"] = symbol
         normalized = normalized.dropna(subset=["timestamp", "open", "high", "low", "close"])
-        normalized = normalized.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        normalized = normalized.sort_values("timestamp").drop_duplicates(
+            subset=["timestamp"], keep="last"
+        )
         return normalized[["symbol", "timestamp", "open", "high", "low", "close", "volume"]]
 
-    def download_intraday_bars_alpaca(self, symbols: list[str], *, timeframe: str, start_date: date) -> None:
+    def download_intraday_bars_alpaca(
+        self, symbols: list[str], *, timeframe: str, start_date: date
+    ) -> None:
         """Download intraday bars from Alpaca with raw IEX feed."""
         end_dt = datetime.now(timezone.utc)
         start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
@@ -956,7 +969,9 @@ class InstitutionalDataBootstrapper:
                 if not chunks:
                     continue
                 frame = pd.concat(chunks, ignore_index=True)
-                frame = frame.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+                frame = frame.sort_values("timestamp").drop_duplicates(
+                    subset=["timestamp"], keep="last"
+                )
                 total_rows += len(frame)
                 self._save_bar_frame(frame, output_dir / f"{symbol}.parquet")
                 self._upsert_ohlcv(frame, symbol=symbol, timeframe=timeframe)
@@ -975,7 +990,9 @@ class InstitutionalDataBootstrapper:
     def _normalize_alpaca_bars(self, symbol: str, bars: list[dict[str, Any]]) -> pd.DataFrame:
         frame = pd.DataFrame(bars or [])
         if frame.empty:
-            return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(
+                columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+            )
         frame = frame.rename(
             columns={
                 "t": "timestamp",
@@ -1109,17 +1126,17 @@ class InstitutionalDataBootstrapper:
                 accession_clean = accession.replace("-", "")
                 filing_url = None
                 if primary_document:
-                    filing_url = (
-                        f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_clean}/{primary_document}"
-                    )
+                    filing_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_clean}/{primary_document}"
                 records.append(
                     {
                         "accession_number": accession,
                         "symbol": symbol,
                         "cik": cik,
-                        "form": (recent.get("form") or [None])[idx]
-                        if idx < len(recent.get("form") or [])
-                        else None,
+                        "form": (
+                            (recent.get("form") or [None])[idx]
+                            if idx < len(recent.get("form") or [])
+                            else None
+                        ),
                         "filed_date": filing_date,
                         "accepted_at": accepted,
                         "report_date": report_date,
@@ -1127,12 +1144,16 @@ class InstitutionalDataBootstrapper:
                         "report_url": filing_url,
                         "filing_metadata": {
                             "primary_document": primary_document,
-                            "primary_doc_description": (recent.get("primaryDocDescription") or [None])[idx]
-                            if idx < len(recent.get("primaryDocDescription") or [])
-                            else None,
-                            "is_xbrl": (recent.get("isXBRL") or [None])[idx]
-                            if idx < len(recent.get("isXBRL") or [])
-                            else None,
+                            "primary_doc_description": (
+                                (recent.get("primaryDocDescription") or [None])[idx]
+                                if idx < len(recent.get("primaryDocDescription") or [])
+                                else None
+                            ),
+                            "is_xbrl": (
+                                (recent.get("isXBRL") or [None])[idx]
+                                if idx < len(recent.get("isXBRL") or [])
+                                else None
+                            ),
                         },
                         "created_at": now,
                         "updated_at": now,
@@ -1209,11 +1230,15 @@ class InstitutionalDataBootstrapper:
         records: list[dict[str, Any]] = []
         now = _now_utc()
         seen: set[str] = set()
-        start_iso = datetime.combine(
-            self.config.news_start,
-            datetime.min.time(),
-            tzinfo=timezone.utc,
-        ).isoformat().replace("+00:00", "Z")
+        start_iso = (
+            datetime.combine(
+                self.config.news_start,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         end_iso = _now_utc().isoformat().replace("+00:00", "Z")
 
         for batch in _batched(symbols, 8):

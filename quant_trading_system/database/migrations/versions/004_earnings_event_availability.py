@@ -7,6 +7,7 @@ Create Date: 2026-03-14
 
 from typing import Sequence, Union
 
+import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
@@ -21,6 +22,8 @@ def upgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name != "postgresql":
         raise RuntimeError("004_earnings_availability migration requires PostgreSQL.")
+    if not sa.inspect(bind).has_table("earnings_events"):
+        return
 
     op.execute(
         "ALTER TABLE earnings_events ADD COLUMN IF NOT EXISTS announcement_timestamp TIMESTAMPTZ"
@@ -55,6 +58,8 @@ def downgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name != "postgresql":
         raise RuntimeError("004_earnings_availability migration requires PostgreSQL.")
+    if not sa.inspect(bind).has_table("earnings_events"):
+        return
 
     op.execute("DROP INDEX IF EXISTS ix_earnings_events_symbol_first_seen")
     op.execute("DROP INDEX IF EXISTS ix_earnings_events_symbol_availability")

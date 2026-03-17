@@ -28,7 +28,6 @@ from quant_trading_system.database.models import (
     SECFiling,
     ShortSaleVolume,
 )
-from quant_trading_system.database.schema_sync import ensure_reference_schema_extensions
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +37,9 @@ _HOUR_NS = int(pd.Timedelta(hours=1).value)
 _EVENT_AGE_FILL = 9999.0
 _DAILY_MACRO_SERIES = ("VIX", "VIX9D", "VVIX", "OVX", "GVZ", "DGS2", "DGS10")
 _PIT_VINTAGE_SERIES = ("FEDFUNDS", "CPIAUCSL", "UNRATE", "PAYEMS", "RSAFS", "DGORDER", "GDPC1")
-_FTD_ZIP_PATTERN = re.compile(r"cnsfails(?P<year>\d{4})(?P<month>\d{2})(?P<half>[ab])", re.IGNORECASE)
+_FTD_ZIP_PATTERN = re.compile(
+    r"cnsfails(?P<year>\d{4})(?P<month>\d{2})(?P<half>[ab])", re.IGNORECASE
+)
 
 
 @dataclass(slots=True)
@@ -127,7 +128,7 @@ def _normalize_symbol_list(value: Any) -> list[str]:
         stripped = value.strip()
         if not stripped:
             return []
-        for delimiter in ("[", "]", "\"", "'"):
+        for delimiter in ("[", "]", '"', "'"):
             stripped = stripped.replace(delimiter, "")
         if "," in stripped:
             return [part.strip().upper() for part in stripped.split(",") if part.strip()]
@@ -155,7 +156,9 @@ def _infer_ftd_publish_timestamp(
             publish_anchor = date(next_month.year, next_month.month, 15)
         return _next_business_midnight(publish_anchor)
 
-    parsed_settlement = pd.Timestamp(settlement_date).date() if settlement_date is not None else None
+    parsed_settlement = (
+        pd.Timestamp(settlement_date).date() if settlement_date is not None else None
+    )
     if parsed_settlement is None:
         return pd.NaT
     # Conservative fallback when batch metadata is unavailable.
@@ -192,8 +195,6 @@ class ReferenceFeatureBuilder:
         logger_: logging.Logger | None = None,
     ) -> None:
         self.db_manager = db_manager or get_db_manager()
-        if hasattr(self.db_manager, "engine"):
-            ensure_reference_schema_extensions(self.db_manager)
         self.config = config or ReferenceFeatureConfig()
         self.logger = logger_ or logger
         self._warned_sources: set[str] = set()
@@ -289,7 +290,9 @@ class ReferenceFeatureBuilder:
         with self.db_manager.session() as session:
             return list(session.execute(statement).all())
 
-    def _merge_global_asof(self, base: pd.DataFrame, ref: pd.DataFrame, *, right_on: str) -> pd.DataFrame:
+    def _merge_global_asof(
+        self, base: pd.DataFrame, ref: pd.DataFrame, *, right_on: str
+    ) -> pd.DataFrame:
         if ref.empty:
             return base
         left = base.sort_values(["timestamp", "__row_id"]).copy()
@@ -306,7 +309,9 @@ class ReferenceFeatureBuilder:
         )
         return merged.sort_values("__row_id").reset_index(drop=True)
 
-    def _merge_symbol_asof(self, base: pd.DataFrame, ref: pd.DataFrame, *, right_on: str) -> pd.DataFrame:
+    def _merge_symbol_asof(
+        self, base: pd.DataFrame, ref: pd.DataFrame, *, right_on: str
+    ) -> pd.DataFrame:
         if ref.empty:
             return base
         right_only_cols = [column for column in ref.columns if column != "symbol"]
@@ -325,7 +330,11 @@ class ReferenceFeatureBuilder:
                 continue
 
             right[right_on] = _coerce_utc_timestamp(right[right_on])
-            right = right.dropna(subset=[right_on]).drop(columns=["symbol"], errors="ignore").sort_values(right_on)
+            right = (
+                right.dropna(subset=[right_on])
+                .drop(columns=["symbol"], errors="ignore")
+                .sort_values(right_on)
+            )
             if right.empty:
                 for column in right_only_cols:
                     if column not in left.columns:
@@ -342,7 +351,11 @@ class ReferenceFeatureBuilder:
             )
             merged_parts.append(merged_symbol)
 
-        return pd.concat(merged_parts, ignore_index=True).sort_values("__row_id").reset_index(drop=True)
+        return (
+            pd.concat(merged_parts, ignore_index=True)
+            .sort_values("__row_id")
+            .reset_index(drop=True)
+        )
 
     def _augment_macro_features(self, base: pd.DataFrame, *, max_trade_date: date) -> pd.DataFrame:
         daily_rows = self._read_rows(
@@ -389,7 +402,9 @@ class ReferenceFeatureBuilder:
                     .ffill()
                 )
                 daily_pivot = daily_pivot.rename(
-                    columns={series: f"macro_{series.lower()}_level" for series in daily_pivot.columns}
+                    columns={
+                        series: f"macro_{series.lower()}_level" for series in daily_pivot.columns
+                    }
                 )
                 for column in list(daily_pivot.columns):
                     daily_pivot[f"{column}_delta"] = daily_pivot[column].diff()
@@ -414,7 +429,9 @@ class ReferenceFeatureBuilder:
                 columns=["series_id", "observation_date", "realtime_start", "value"],
             )
             vintage["value"] = _series_to_float(vintage["value"])
-            vintage = vintage.dropna(subset=["series_id", "observation_date", "realtime_start", "value"]).copy()
+            vintage = vintage.dropna(
+                subset=["series_id", "observation_date", "realtime_start", "value"]
+            ).copy()
             if not vintage.empty:
                 latest_prints = (
                     vintage.sort_values(["series_id", "realtime_start", "observation_date"])
@@ -436,7 +453,10 @@ class ReferenceFeatureBuilder:
                     .ffill()
                 )
                 vintage_pivot = vintage_pivot.rename(
-                    columns={series: f"macro_{series.lower()}_pit_level" for series in vintage_pivot.columns}
+                    columns={
+                        series: f"macro_{series.lower()}_pit_level"
+                        for series in vintage_pivot.columns
+                    }
                 )
                 for column in list(vintage_pivot.columns):
                     vintage_pivot[f"{column}_delta"] = vintage_pivot[column].diff()
@@ -452,7 +472,9 @@ class ReferenceFeatureBuilder:
             .last()
         )
         merged = self._merge_global_asof(base, macro_ref, right_on="release_timestamp")
-        merged["macro_days_since_release"] = _safe_days_since(merged["timestamp"], merged["release_timestamp"])
+        merged["macro_days_since_release"] = _safe_days_since(
+            merged["timestamp"], merged["release_timestamp"]
+        )
         feature_cols = [
             col
             for col in merged.columns
@@ -460,9 +482,9 @@ class ReferenceFeatureBuilder:
         ]
         for column in feature_cols:
             merged[column] = _series_to_float(merged[column]).fillna(0.0)
-        merged["macro_days_since_release"] = _series_to_float(merged["macro_days_since_release"]).fillna(
-            _EVENT_AGE_FILL
-        )
+        merged["macro_days_since_release"] = _series_to_float(
+            merged["macro_days_since_release"]
+        ).fillna(_EVENT_AGE_FILL)
         return merged.drop(columns=["release_timestamp"], errors="ignore")
 
     def _augment_short_sale_features(
@@ -496,12 +518,9 @@ class ReferenceFeatureBuilder:
         short_df["symbol"] = short_df["symbol"].astype(str).str.upper().str.strip()
         for column in ("short_volume", "short_exempt_volume", "total_volume"):
             short_df[column] = _series_to_float(short_df[column]).fillna(0.0)
-        short_df = (
-            short_df.groupby(["symbol", "trade_date"], as_index=False)[
-                ["short_volume", "short_exempt_volume", "total_volume"]
-            ]
-            .sum()
-        )
+        short_df = short_df.groupby(["symbol", "trade_date"], as_index=False)[
+            ["short_volume", "short_exempt_volume", "total_volume"]
+        ].sum()
         denominator = short_df["total_volume"].replace(0.0, np.nan)
         short_df["ref_short_volume_ratio"] = (
             (short_df["short_volume"] + short_df["short_exempt_volume"]) / denominator
@@ -509,7 +528,9 @@ class ReferenceFeatureBuilder:
         short_df["ref_short_exempt_ratio"] = (
             short_df["short_exempt_volume"] / denominator
         ).replace([np.inf, -np.inf], np.nan)
-        short_df["ref_short_total_volume_log1p"] = np.log1p(short_df["total_volume"].clip(lower=0.0))
+        short_df["ref_short_total_volume_log1p"] = np.log1p(
+            short_df["total_volume"].clip(lower=0.0)
+        )
         short_df["effective_timestamp"] = _coerce_utc_timestamp(
             short_df["trade_date"].map(_next_business_midnight)
         )
@@ -529,7 +550,9 @@ class ReferenceFeatureBuilder:
             ]
         ].copy()
         merged = self._merge_symbol_asof(base, ref, right_on="effective_timestamp")
-        merged["ref_short_days_since_update"] = _safe_days_since(merged["timestamp"], merged["effective_timestamp"])
+        merged["ref_short_days_since_update"] = _safe_days_since(
+            merged["timestamp"], merged["effective_timestamp"]
+        )
         for column in (
             "ref_short_volume_ratio",
             "ref_short_exempt_ratio",
@@ -537,9 +560,9 @@ class ReferenceFeatureBuilder:
             "ref_short_volume_ratio_delta",
         ):
             merged[column] = _series_to_float(merged[column]).fillna(0.0)
-        merged["ref_short_days_since_update"] = _series_to_float(merged["ref_short_days_since_update"]).fillna(
-            _EVENT_AGE_FILL
-        )
+        merged["ref_short_days_since_update"] = _series_to_float(
+            merged["ref_short_days_since_update"]
+        ).fillna(_EVENT_AGE_FILL)
         return merged.drop(columns=["effective_timestamp"], errors="ignore")
 
     def _load_news_articles(
@@ -555,14 +578,17 @@ class ReferenceFeatureBuilder:
                 NewsArticle.symbols,
                 NewsArticle.sentiment,
             ).where(
-                NewsArticle.created_at_source >= (min_timestamp - pd.Timedelta(days=8)).to_pydatetime(),
+                NewsArticle.created_at_source
+                >= (min_timestamp - pd.Timedelta(days=8)).to_pydatetime(),
                 NewsArticle.created_at_source <= max_timestamp.to_pydatetime(),
             )
         )
         if not rows:
             return pd.DataFrame(columns=["article_id", "event_timestamp", "symbol", "sentiment"])
 
-        news_df = pd.DataFrame(rows, columns=["article_id", "created_at_source", "symbols", "sentiment"])
+        news_df = pd.DataFrame(
+            rows, columns=["article_id", "created_at_source", "symbols", "sentiment"]
+        )
         news_df["event_timestamp"] = _coerce_utc_timestamp(news_df["created_at_source"])
         news_df["symbols"] = news_df["symbols"].map(_normalize_symbol_list)
         news_df = news_df.dropna(subset=["event_timestamp"]).copy()
@@ -669,7 +695,9 @@ class ReferenceFeatureBuilder:
         for column, default_value in default_columns.items():
             base[column] = default_value
 
-        filings = self._load_sec_filings(symbols=symbols, min_timestamp=min_timestamp, max_timestamp=max_timestamp)
+        filings = self._load_sec_filings(
+            symbols=symbols, min_timestamp=min_timestamp, max_timestamp=max_timestamp
+        )
         if filings.empty:
             return base
 
@@ -695,7 +723,9 @@ class ReferenceFeatureBuilder:
             base.loc[row_index, "ref_filing_days_since_last"] = age_days
 
             for form_value, (column_name, window_ns) in form_windows.items():
-                form_times = symbol_filings.loc[symbol_filings["form"] == form_value, "event_timestamp"].sort_values()
+                form_times = symbol_filings.loc[
+                    symbol_filings["form"] == form_value, "event_timestamp"
+                ].sort_values()
                 if form_times.empty:
                     continue
                 form_counts, _ = _count_events_in_windows(
@@ -706,7 +736,9 @@ class ReferenceFeatureBuilder:
                 base.loc[row_index, column_name] = form_counts[column_name]
         return base
 
-    def _load_fundamental_snapshots(self, *, symbols: list[str], max_trade_date: date) -> pd.DataFrame:
+    def _load_fundamental_snapshots(
+        self, *, symbols: list[str], max_trade_date: date
+    ) -> pd.DataFrame:
         rows = self._read_rows(
             select(
                 FundamentalSnapshot.symbol,
@@ -810,7 +842,9 @@ class ReferenceFeatureBuilder:
         for column, default_value in default_columns.items():
             base[column] = default_value
 
-        fundamentals = self._load_fundamental_snapshots(symbols=symbols, max_trade_date=max_trade_date)
+        fundamentals = self._load_fundamental_snapshots(
+            symbols=symbols, max_trade_date=max_trade_date
+        )
         if fundamentals.empty:
             return base
 
@@ -852,14 +886,14 @@ class ReferenceFeatureBuilder:
         week_52_high = _series_to_float(merged.get("week_52_high")).replace(0.0, np.nan)
         week_52_low = _series_to_float(merged.get("week_52_low")).replace(0.0, np.nan)
         merged["ref_analyst_target_upside"] = (
-            analyst_target / close - 1.0
-        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            (analyst_target / close - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
         merged["ref_price_to_52w_high"] = (
-            close / week_52_high - 1.0
-        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            (close / week_52_high - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
         merged["ref_price_to_52w_low"] = (
-            close / week_52_low - 1.0
-        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            (close / week_52_low - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
 
         merged["ref_fundamental_days_since_snapshot"] = _series_to_float(
             merged["ref_fundamental_days_since_snapshot"]
@@ -962,9 +996,9 @@ class ReferenceFeatureBuilder:
         frame = frame.dropna(subset=["symbol", "event_timestamp"]).copy()
         frame = frame.sort_values(["symbol", "event_timestamp", "fiscal_date_ending"]).copy()
         frame["ref_earnings_surprise_abs"] = frame["surprise_pct"].abs().fillna(0.0)
-        frame["ref_earnings_positive_surprise"] = (
-            frame["surprise_pct"].fillna(0.0) > 0.0
-        ).astype(float)
+        frame["ref_earnings_positive_surprise"] = (frame["surprise_pct"].fillna(0.0) > 0.0).astype(
+            float
+        )
         frame["ref_earnings_surprise_pct_mean_4q"] = (
             frame.groupby("symbol", sort=False)["surprise_pct"]
             .transform(lambda series: series.fillna(0.0).rolling(4, min_periods=1).mean())
@@ -1019,7 +1053,8 @@ class ReferenceFeatureBuilder:
             base.loc[row_index, "ref_days_since_earnings"] = age_days
 
             latest = self._merge_symbol_asof(
-                base.loc[row_index].drop(
+                base.loc[row_index]
+                .drop(
                     columns=[
                         "ref_last_reported_eps",
                         "ref_last_estimated_eps",
@@ -1030,7 +1065,8 @@ class ReferenceFeatureBuilder:
                         "ref_earnings_surprise_pct_mean_4q",
                     ],
                     errors="ignore",
-                ).copy(),
+                )
+                .copy(),
                 symbol_events[
                     [
                         "symbol",
@@ -1064,7 +1100,9 @@ class ReferenceFeatureBuilder:
                 "ref_last_earnings_positive_surprise",
                 "ref_earnings_surprise_pct_mean_4q",
             ):
-                base.loc[row_index, column] = _series_to_float(latest[column]).fillna(0.0).to_numpy()
+                base.loc[row_index, column] = (
+                    _series_to_float(latest[column]).fillna(0.0).to_numpy()
+                )
 
         return base
 
@@ -1156,21 +1194,31 @@ class ReferenceFeatureBuilder:
             base.loc[row_index, "ref_ftd_days_since_last"] = age_days
 
             latest = self._merge_symbol_asof(
-                base.loc[row_index].drop(
+                base.loc[row_index]
+                .drop(
                     columns=[
                         "ref_ftd_log_quantity",
                         "ref_ftd_notional_log1p",
                         "ref_ftd_price",
                     ],
                     errors="ignore",
-                ).copy(),
+                )
+                .copy(),
                 symbol_ftd[
-                    ["symbol", "event_timestamp", "ref_ftd_log_quantity", "ref_ftd_notional_log1p", "price"]
+                    [
+                        "symbol",
+                        "event_timestamp",
+                        "ref_ftd_log_quantity",
+                        "ref_ftd_notional_log1p",
+                        "price",
+                    ]
                 ].rename(columns={"price": "ref_ftd_price"}),
                 right_on="event_timestamp",
             )
             for column in ("ref_ftd_log_quantity", "ref_ftd_notional_log1p", "ref_ftd_price"):
-                base.loc[row_index, column] = _series_to_float(latest[column]).fillna(0.0).to_numpy()
+                base.loc[row_index, column] = (
+                    _series_to_float(latest[column]).fillna(0.0).to_numpy()
+                )
 
         return base
 
@@ -1190,7 +1238,9 @@ class ReferenceFeatureBuilder:
             )
         )
         if not rows:
-            return pd.DataFrame(columns=["symbol", "action_type", "event_timestamp", "amount", "split_ratio"])
+            return pd.DataFrame(
+                columns=["symbol", "action_type", "event_timestamp", "amount", "split_ratio"]
+            )
 
         actions = pd.DataFrame(
             rows,
@@ -1260,15 +1310,17 @@ class ReferenceFeatureBuilder:
                 base.loc[row_index, "ref_dividend_count_365d"] = div_counts["365d"]
                 base.loc[row_index, "ref_days_since_dividend"] = div_age
                 div_merge = self._merge_symbol_asof(
-                    base.loc[row_index].drop(columns=["ref_last_dividend_amount"], errors="ignore").copy(),
+                    base.loc[row_index]
+                    .drop(columns=["ref_last_dividend_amount"], errors="ignore")
+                    .copy(),
                     dividends[["symbol", "event_timestamp", "amount"]].rename(
                         columns={"amount": "ref_last_dividend_amount"}
                     ),
                     right_on="event_timestamp",
                 )
-                base.loc[row_index, "ref_last_dividend_amount"] = _series_to_float(
-                    div_merge["ref_last_dividend_amount"]
-                ).fillna(0.0).to_numpy()
+                base.loc[row_index, "ref_last_dividend_amount"] = (
+                    _series_to_float(div_merge["ref_last_dividend_amount"]).fillna(0.0).to_numpy()
+                )
 
             splits = symbol_actions[symbol_actions["action_type"] == "SPLIT"].copy()
             if not splits.empty:
@@ -1280,13 +1332,15 @@ class ReferenceFeatureBuilder:
                 base.loc[row_index, "ref_split_count_365d"] = split_counts["365d"]
                 base.loc[row_index, "ref_days_since_split"] = split_age
                 split_merge = self._merge_symbol_asof(
-                    base.loc[row_index].drop(columns=["ref_last_split_ratio"], errors="ignore").copy(),
+                    base.loc[row_index]
+                    .drop(columns=["ref_last_split_ratio"], errors="ignore")
+                    .copy(),
                     splits[["symbol", "event_timestamp", "split_ratio"]].rename(
                         columns={"split_ratio": "ref_last_split_ratio"}
                     ),
                     right_on="event_timestamp",
                 )
-                base.loc[row_index, "ref_last_split_ratio"] = _series_to_float(
-                    split_merge["ref_last_split_ratio"]
-                ).fillna(0.0).to_numpy()
+                base.loc[row_index, "ref_last_split_ratio"] = (
+                    _series_to_float(split_merge["ref_last_split_ratio"]).fillna(0.0).to_numpy()
+                )
         return base

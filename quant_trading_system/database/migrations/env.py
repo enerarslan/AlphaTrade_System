@@ -7,6 +7,7 @@ with our SQLAlchemy models and database connection.
 
 # Load environment variables from .env file first
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
 
 from logging.config import fileConfig
@@ -33,6 +34,10 @@ def get_url():
     """Get database URL from environment, alembic.ini, or settings."""
     import os
 
+    explicit_url = config.attributes.get("database_url")
+    if explicit_url:
+        return explicit_url
+
     # First check environment variable
     url = os.getenv("DATABASE_URL")
     if url:
@@ -49,6 +54,7 @@ def get_url():
     # Fall back to settings
     try:
         from quant_trading_system.config.settings import get_settings
+
         settings = get_settings()
         return settings.database.url
     except Exception:

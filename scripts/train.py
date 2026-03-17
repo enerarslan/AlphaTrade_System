@@ -148,6 +148,81 @@ FORBIDDEN_FEATURE_PREFIXES = ("forward_return_h",)
 REPLAY_MANIFEST_SCHEMA_VERSION = "1.0.0"
 PROMOTION_PACKAGE_SCHEMA_VERSION = "1.0.0"
 
+CORE_TRAINING_SCHEMA_CONTRACT: dict[str, set[str]] = {
+    "ohlcv_bars": {"symbol", "timestamp", "timeframe", "open", "high", "low", "close", "volume"},
+    "features": {"symbol", "timestamp", "timeframe", "feature_name", "feature_set_id", "value"},
+}
+REFERENCE_TRAINING_SCHEMA_CONTRACT: dict[str, set[str]] = {
+    "corporate_actions": {"symbol", "action_type", "ex_date", "amount", "split_from", "split_to"},
+    "fundamental_snapshots": {
+        "symbol",
+        "as_of_date",
+        "created_at",
+        "market_cap",
+        "shares_outstanding",
+        "pe_ratio",
+        "price_to_book",
+        "dividend_per_share",
+        "dividend_yield",
+        "revenue_ttm",
+        "operating_margin_ttm",
+        "profit_margin",
+        "beta",
+        "week_52_high",
+        "week_52_low",
+        "analyst_target_price",
+    },
+    "earnings_events": {
+        "symbol",
+        "fiscal_date_ending",
+        "reported_date",
+        "announcement_timestamp",
+        "availability_timestamp",
+        "first_seen_at",
+        "created_at",
+        "reported_eps",
+        "estimated_eps",
+        "surprise",
+        "surprise_pct",
+    },
+    "sec_filings": {"symbol", "form", "accepted_at", "filed_date"},
+    "macro_observations": {"series_id", "observation_date", "value"},
+    "macro_vintage_observations": {"series_id", "observation_date", "realtime_start", "value"},
+    "news_articles": {"article_id", "created_at_source", "symbols", "sentiment"},
+    "short_sale_volumes": {
+        "symbol",
+        "trade_date",
+        "short_volume",
+        "short_exempt_volume",
+        "total_volume",
+    },
+    "fails_to_deliver": {"symbol", "settlement_date", "quantity", "price", "ftd_metadata"},
+}
+
+
+def _required_training_schema_contract(
+    config: "TrainingConfig | None" = None,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    required = {table: set(columns) for table, columns in CORE_TRAINING_SCHEMA_CONTRACT.items()}
+    optional: dict[str, set[str]] = {}
+
+    if config is None:
+        return required, optional
+
+    if bool(config.adjust_prices_for_corporate_actions):
+        required["corporate_actions"] = set(REFERENCE_TRAINING_SCHEMA_CONTRACT["corporate_actions"])
+
+    if bool(config.enable_reference_features):
+        reference_contract = {
+            table: set(columns) for table, columns in REFERENCE_TRAINING_SCHEMA_CONTRACT.items()
+        }
+        if bool(config.allow_feature_group_fallback):
+            optional.update(reference_contract)
+        else:
+            required.update(reference_contract)
+
+    return required, optional
+
 
 def _compute_feature_pipeline_fingerprint() -> str:
     """Create deterministic fingerprint for feature-engineering code."""
@@ -319,7 +394,7 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
     return params
 
 
-def _verify_institutional_infra() -> None:
+def _verify_institutional_infra(config: "TrainingConfig | None" = None) -> None:
     """Fail-fast infrastructure check for institutional training mode."""
     from quant_trading_system.database.connection import get_db_manager, get_redis_manager
 
@@ -334,16 +409,77 @@ def _verify_institutional_infra() -> None:
         raise RuntimeError("Redis health check failed. Institutional training requires Redis.")
 
     try:
-        available_tables = set(sa_inspect(db_manager.engine).get_table_names())
+        inspector = sa_inspect(db_manager.engine)
+        available_tables = set(inspector.get_table_names())
     except Exception as exc:
         raise RuntimeError(f"Failed to inspect PostgreSQL schema: {exc}") from exc
 
-    required_tables = {"ohlcv_bars"}
-    missing_tables = sorted(required_tables.difference(available_tables))
+    required_contract, optional_contract = _required_training_schema_contract(config)
+
+    missing_tables = sorted(set(required_contract).difference(available_tables))
     if missing_tables:
         raise RuntimeError(
             "PostgreSQL schema validation failed. Missing required tables: "
             f"{', '.join(missing_tables)}."
+        )
+
+    missing_columns_by_table: dict[str, list[str]] = {}
+    for table_name, required_columns in required_contract.items():
+        try:
+            available_columns = {
+                str(column.get("name"))
+                for column in inspector.get_columns(table_name)
+                if column.get("name") is not None
+            }
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to inspect PostgreSQL columns for {table_name}: {exc}"
+            ) from exc
+        missing_columns = sorted(required_columns.difference(available_columns))
+        if missing_columns:
+            missing_columns_by_table[table_name] = missing_columns
+
+    if missing_columns_by_table:
+        detail = "; ".join(
+            f"{table_name} missing [{', '.join(columns)}]"
+            for table_name, columns in sorted(missing_columns_by_table.items())
+        )
+        raise RuntimeError(
+            "PostgreSQL schema validation failed. Missing required columns: " f"{detail}."
+        )
+
+    missing_optional_tables = sorted(set(optional_contract).difference(available_tables))
+    if missing_optional_tables:
+        logger.warning(
+            "Optional reference tables unavailable; training will rely on feature-group fallback: %s",
+            ", ".join(missing_optional_tables),
+        )
+
+    optional_column_gaps: dict[str, list[str]] = {}
+    for table_name, optional_columns in optional_contract.items():
+        if table_name not in available_tables:
+            continue
+        try:
+            available_columns = {
+                str(column.get("name"))
+                for column in inspector.get_columns(table_name)
+                if column.get("name") is not None
+            }
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to inspect PostgreSQL columns for optional table {table_name}: {exc}"
+            ) from exc
+        missing_columns = sorted(optional_columns.difference(available_columns))
+        if missing_columns:
+            optional_column_gaps[table_name] = missing_columns
+
+    if optional_column_gaps:
+        logger.warning(
+            "Optional reference columns unavailable; training will rely on feature-group fallback: %s",
+            "; ".join(
+                f"{table_name} missing [{', '.join(columns)}]"
+                for table_name, columns in sorted(optional_column_gaps.items())
+            ),
         )
 
     try:
@@ -610,9 +746,7 @@ class TrainingConfig:
         self.timeframe = normalize_timeframe(self.timeframe)
         self.cross_sectional_user_locked = bool(self.cross_sectional_user_locked)
         self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
-        self.dataset_snapshot_bundle_path = (
-            str(self.dataset_snapshot_bundle_path or "").strip()
-        )
+        self.dataset_snapshot_bundle_path = str(self.dataset_snapshot_bundle_path or "").strip()
         self.strict_snapshot_replay = bool(self.strict_snapshot_replay)
         self.data_max_abs_return = max(float(self.data_max_abs_return), 0.05)
         self.min_trades = max(1, int(self.min_trades))
@@ -739,6 +873,7 @@ class ModelTrainer:
         self.timestamps: np.ndarray | None = None
         self.row_symbols: np.ndarray | None = None
         self.regimes: np.ndarray | None = None
+        self.primary_event_directions: np.ndarray | None = None
         self.close_prices: pd.Series | None = None
         self.primary_forward_returns: np.ndarray | None = None
         self.cost_aware_event_returns: np.ndarray | None = None
@@ -747,6 +882,7 @@ class ModelTrainer:
         self.holdout_timestamps: np.ndarray | None = None
         self.holdout_symbols: np.ndarray | None = None
         self.holdout_regimes: np.ndarray | None = None
+        self.holdout_primary_event_directions: np.ndarray | None = None
         self.holdout_primary_forward_returns: np.ndarray | None = None
         self.holdout_cost_aware_event_returns: np.ndarray | None = None
         self.holdout_sample_weights: np.ndarray | None = None
@@ -1679,6 +1815,16 @@ class ModelTrainer:
             if "regime" in dev_frame.columns
             else np.full(len(dev_frame), "normal_range", dtype=object)
         )
+        self.primary_event_directions = (
+            np.nan_to_num(
+                pd.to_numeric(dev_frame["primary_signal"], errors="coerce").to_numpy(dtype=float),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            if "primary_signal" in dev_frame.columns
+            else None
+        )
         self.close_prices = dev_frame["close"].reset_index(drop=True)
         if primary_forward_col in dev_frame.columns:
             self.primary_forward_returns = np.nan_to_num(
@@ -1701,7 +1847,7 @@ class ModelTrainer:
                 neginf=0.0,
             )
         else:
-            self.cost_aware_event_returns = np.zeros(len(dev_frame), dtype=float)
+            self.cost_aware_event_returns = None
 
         self.development_frame = dev_frame.copy()
         if dev_weights is None or len(dev_weights) != len(dev_frame):
@@ -1713,6 +1859,7 @@ class ModelTrainer:
         self.holdout_timestamps = None
         self.holdout_symbols = None
         self.holdout_regimes = None
+        self.holdout_primary_event_directions = None
         self.holdout_primary_forward_returns = None
         self.holdout_cost_aware_event_returns = None
         self.holdout_sample_weights = None
@@ -1734,6 +1881,18 @@ class ModelTrainer:
                 holdout_frame["regime"].astype(str).to_numpy()
                 if "regime" in holdout_frame.columns
                 else np.full(len(holdout_frame), "normal_range", dtype=object)
+            )
+            self.holdout_primary_event_directions = (
+                np.nan_to_num(
+                    pd.to_numeric(holdout_frame["primary_signal"], errors="coerce").to_numpy(
+                        dtype=float
+                    ),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if "primary_signal" in holdout_frame.columns
+                else None
             )
             if primary_forward_col in holdout_frame.columns:
                 self.holdout_primary_forward_returns = np.nan_to_num(
@@ -1757,7 +1916,7 @@ class ModelTrainer:
                     neginf=0.0,
                 )
             else:
-                self.holdout_cost_aware_event_returns = np.zeros(len(holdout_frame), dtype=float)
+                self.holdout_cost_aware_event_returns = None
 
             if holdout_weights is None or len(holdout_weights) != len(holdout_frame):
                 holdout_weights = np.ones(len(holdout_frame), dtype=float)
@@ -1891,7 +2050,9 @@ class ModelTrainer:
         self.cached_cv_splits = bundle.get("cv_splits", []) or []
         self.training_metrics["snapshot_bundle_reused"] = True
         self.training_metrics["snapshot_bundle_cv_split_count"] = float(len(self.cached_cv_splits))
-        self.training_metrics["snapshot_bundle_path"] = str(self.dataset_snapshot_bundle_manifest_path)
+        self.training_metrics["snapshot_bundle_path"] = str(
+            self.dataset_snapshot_bundle_manifest_path
+        )
 
         self._restore_training_state_from_split_frames(
             dev_frame=development_frame,
@@ -2512,9 +2673,7 @@ class ModelTrainer:
             )
             return None
         if current_source_hash and cached_source_hash != current_source_hash:
-            self.logger.info(
-                "Feature cache source OHLCV hash changed; recomputing features."
-            )
+            self.logger.info("Feature cache source OHLCV hash changed; recomputing features.")
             return None
         if schema_payload.get("timeframe") != timeframe:
             self.logger.info("Feature cache timeframe changed; recomputing features.")
@@ -3428,6 +3587,12 @@ class ModelTrainer:
                         and len(self.cost_aware_event_returns) == len(y)
                         else None
                     )
+                    fold_event_directions = (
+                        np.asarray(self.primary_event_directions[test_idx], dtype=float)
+                        if isinstance(self.primary_event_directions, np.ndarray)
+                        and len(self.primary_event_directions) == len(y)
+                        else None
+                    )
                     fold_timestamps = (
                         np.asarray(self.timestamps[test_idx], dtype="datetime64[ns]")
                         if self.timestamps is not None and len(self.timestamps) == len(y)
@@ -3453,6 +3618,11 @@ class ModelTrainer:
                         event_net_returns=(
                             fold_event_returns[-eval_len:]
                             if fold_event_returns is not None
+                            else None
+                        ),
+                        event_directions=(
+                            fold_event_directions[-eval_len:]
+                            if fold_event_directions is not None
                             else None
                         ),
                         timestamps=(
@@ -3683,6 +3853,12 @@ class ModelTrainer:
                 and len(self.cost_aware_event_returns) == len(y)
                 else None
             )
+            signal_outer_train = (
+                np.asarray(self.primary_event_directions[outer_train_idx], dtype=float)
+                if isinstance(self.primary_event_directions, np.ndarray)
+                and len(self.primary_event_directions) == len(y)
+                else None
+            )
             forward_outer_test = (
                 np.asarray(self.primary_forward_returns[outer_test_idx], dtype=float)
                 if isinstance(self.primary_forward_returns, np.ndarray)
@@ -3693,6 +3869,12 @@ class ModelTrainer:
                 np.asarray(self.cost_aware_event_returns[outer_test_idx], dtype=float)
                 if isinstance(self.cost_aware_event_returns, np.ndarray)
                 and len(self.cost_aware_event_returns) == len(y)
+                else None
+            )
+            signal_outer_test = (
+                np.asarray(self.primary_event_directions[outer_test_idx], dtype=float)
+                if isinstance(self.primary_event_directions, np.ndarray)
+                and len(self.primary_event_directions) == len(y)
                 else None
             )
 
@@ -3832,6 +4014,11 @@ class ModelTrainer:
                             event_net_returns=(
                                 _event_outer_train[inner_val_idx][-eval_len:]
                                 if _event_outer_train is not None
+                                else None
+                            ),
+                            event_directions=(
+                                signal_outer_train[inner_val_idx][-eval_len:]
+                                if signal_outer_train is not None
                                 else None
                             ),
                             timestamps=(
@@ -4026,6 +4213,9 @@ class ModelTrainer:
                 ),
                 event_net_returns=(
                     event_outer_test[-eval_len:] if event_outer_test is not None else None
+                ),
+                event_directions=(
+                    signal_outer_test[-eval_len:] if signal_outer_test is not None else None
                 ),
                 timestamps=(ts_outer_test[-eval_len:] if ts_outer_test is not None else None),
                 symbols=(
@@ -5274,6 +5464,12 @@ class ModelTrainer:
                 and len(self.cost_aware_event_returns) == len(y)
                 else None
             )
+            fold_event_directions = (
+                np.asarray(self.primary_event_directions[test_idx], dtype=float)
+                if isinstance(self.primary_event_directions, np.ndarray)
+                and len(self.primary_event_directions) == len(y)
+                else None
+            )
             fold_timestamps = (
                 np.asarray(self.timestamps[test_idx], dtype="datetime64[ns]")
                 if self.timestamps is not None and len(self.timestamps) == len(y)
@@ -5294,6 +5490,9 @@ class ModelTrainer:
                 ),
                 event_net_returns=(
                     fold_event_returns[-eval_len:] if fold_event_returns is not None else None
+                ),
+                event_directions=(
+                    fold_event_directions[-eval_len:] if fold_event_directions is not None else None
                 ),
                 timestamps=(fold_timestamps[-eval_len:] if fold_timestamps is not None else None),
                 symbols=(fold_symbols[-eval_len:] if fold_symbols is not None else None),
@@ -5424,6 +5623,12 @@ class ModelTrainer:
                 and len(self.cost_aware_event_returns) == len(y)
                 else None
             )
+            fold_event_directions = (
+                np.asarray(self.primary_event_directions[eval_indices], dtype=float)
+                if isinstance(self.primary_event_directions, np.ndarray)
+                and len(self.primary_event_directions) == len(y)
+                else None
+            )
             fold_timestamps = (
                 np.asarray(self.timestamps[eval_indices], dtype="datetime64[ns]")
                 if self.timestamps is not None and len(self.timestamps) == len(y)
@@ -5442,6 +5647,7 @@ class ModelTrainer:
                 short_threshold=short_threshold,
                 realized_forward_returns=fold_forward_returns,
                 event_net_returns=fold_event_returns,
+                event_directions=fold_event_directions,
                 timestamps=fold_timestamps,
                 symbols=fold_symbols,
             )
@@ -5470,6 +5676,7 @@ class ModelTrainer:
                 short_threshold=short_threshold,
                 realized_forward_returns=fold_forward_returns,
                 event_net_returns=fold_event_returns,
+                event_directions=fold_event_directions,
                 timestamps=fold_timestamps,
                 symbols=fold_symbols,
                 return_details=True,
@@ -5991,6 +6198,7 @@ class ModelTrainer:
         short_threshold: float = 0.45,
         realized_forward_returns: np.ndarray | None = None,
         event_net_returns: np.ndarray | None = None,
+        event_directions: np.ndarray | None = None,
         timestamps: np.ndarray | None = None,
         symbols: np.ndarray | None = None,
     ) -> dict:
@@ -6026,6 +6234,12 @@ class ModelTrainer:
         if event_net_returns is not None:
             event_net_returns = self._align_probabilities(
                 np.asarray(event_net_returns, dtype=float),
+                target_len=len(y_proba),
+                fill_value=0.0,
+            )
+        if event_directions is not None:
+            event_directions = self._align_probabilities(
+                np.asarray(event_directions, dtype=float),
                 target_len=len(y_proba),
                 fill_value=0.0,
             )
@@ -6065,6 +6279,8 @@ class ModelTrainer:
                     realized_forward_returns = realized_forward_returns[sort_idx]
                 if event_net_returns is not None and len(event_net_returns) == len(sort_idx):
                     event_net_returns = event_net_returns[sort_idx]
+                if event_directions is not None and len(event_directions) == len(sort_idx):
+                    event_directions = event_directions[sort_idx]
                 aligned_timestamps = aligned_timestamps[sort_idx]
                 if aligned_symbols is not None and len(aligned_symbols) == len(sort_idx):
                     aligned_symbols = aligned_symbols[sort_idx]
@@ -6102,6 +6318,7 @@ class ModelTrainer:
                 short_threshold=short_threshold,
                 realized_forward_returns=realized_forward_returns,
                 event_net_returns=event_net_returns,
+                event_directions=event_directions,
                 timestamps=aligned_timestamps,
                 symbols=aligned_symbols,
                 return_details=True,
@@ -6659,6 +6876,7 @@ class ModelTrainer:
         long_threshold: float,
         short_threshold: float,
         realized_returns: np.ndarray | None,
+        returns_are_cost_aware: bool,
         timestamps: np.ndarray | None,
         symbols: np.ndarray | None,
     ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -6687,7 +6905,11 @@ class ModelTrainer:
         trading_cost_rate = max(
             0.0005, float(self.config.to_trading_cost_model().execution_cost_rate)
         )
-        trading_cost = turnover_series * trading_cost_rate
+        trading_cost = (
+            np.zeros_like(turnover_series, dtype=float)
+            if returns_are_cost_aware
+            else turnover_series * trading_cost_rate
+        )
         net_returns = np.nan_to_num(
             (raw_alpha - trading_cost).astype(float),
             nan=0.0,
@@ -6762,6 +6984,7 @@ class ModelTrainer:
         short_threshold: float = 0.45,
         realized_forward_returns: np.ndarray | None = None,
         event_net_returns: np.ndarray | None = None,
+        event_directions: np.ndarray | None = None,
         timestamps: np.ndarray | None = None,
         symbols: np.ndarray | None = None,
         return_details: bool = False,
@@ -6791,19 +7014,37 @@ class ModelTrainer:
             long_threshold = 0.55
             short_threshold = 0.45
 
-        realized: np.ndarray | None = None
+        realized_forward: np.ndarray | None = None
         if realized_forward_returns is not None:
-            realized = self._align_probabilities(
+            realized_forward = self._align_probabilities(
                 np.asarray(realized_forward_returns, dtype=float),
                 n_rows,
                 fill_value=0.0,
             )
-        elif event_net_returns is not None:
-            realized = self._align_probabilities(
+        cost_aware_returns: np.ndarray | None = None
+        if event_net_returns is not None:
+            cost_aware_returns = self._align_probabilities(
                 np.asarray(event_net_returns, dtype=float),
                 n_rows,
                 fill_value=0.0,
             )
+        aligned_event_directions: np.ndarray | None = None
+        if event_directions is not None:
+            aligned_event_directions = self._align_probabilities(
+                np.asarray(event_directions, dtype=float),
+                n_rows,
+                fill_value=0.0,
+            )
+
+        realized: np.ndarray | None = realized_forward
+        returns_are_cost_aware = False
+        if cost_aware_returns is not None:
+            realized = cost_aware_returns.copy()
+            if aligned_event_directions is not None and len(aligned_event_directions) == n_rows:
+                direction = np.sign(aligned_event_directions)
+                non_flat = np.abs(direction) > 1e-8
+                realized[non_flat] = cost_aware_returns[non_flat] * direction[non_flat]
+            returns_are_cost_aware = True
 
         timestamp_arr: np.ndarray | None = None
         if timestamps is not None:
@@ -6861,6 +7102,7 @@ class ModelTrainer:
                     long_threshold=long_threshold,
                     short_threshold=short_threshold,
                     realized_returns=symbol_realized,
+                    returns_are_cost_aware=returns_are_cost_aware,
                     timestamps=symbol_timestamps,
                     symbols=None,
                 )
@@ -6908,6 +7150,7 @@ class ModelTrainer:
             long_threshold=long_threshold,
             short_threshold=short_threshold,
             realized_returns=realized,
+            returns_are_cost_aware=returns_are_cost_aware,
             timestamps=timestamp_arr,
             symbols=symbols_arr,
         )
@@ -7221,6 +7464,7 @@ class ModelTrainer:
             short_threshold=short_threshold,
             realized_forward_returns=self.holdout_primary_forward_returns,
             event_net_returns=self.holdout_cost_aware_event_returns,
+            event_directions=self.holdout_primary_event_directions,
             timestamps=self.holdout_timestamps,
             symbols=(
                 np.asarray(self.holdout_symbols, dtype=object)
@@ -7267,6 +7511,12 @@ class ModelTrainer:
                         np.asarray(self.holdout_cost_aware_event_returns, dtype=float)[regime_mask]
                         if self.holdout_cost_aware_event_returns is not None
                         and len(self.holdout_cost_aware_event_returns) == len(y_holdout)
+                        else None
+                    ),
+                    event_directions=(
+                        np.asarray(self.holdout_primary_event_directions, dtype=float)[regime_mask]
+                        if self.holdout_primary_event_directions is not None
+                        and len(self.holdout_primary_event_directions) == len(y_holdout)
                         else None
                     ),
                     timestamps=(
@@ -7330,6 +7580,12 @@ class ModelTrainer:
                         np.asarray(self.holdout_cost_aware_event_returns, dtype=float)[symbol_mask]
                         if self.holdout_cost_aware_event_returns is not None
                         and len(self.holdout_cost_aware_event_returns) == len(y_holdout)
+                        else None
+                    ),
+                    event_directions=(
+                        np.asarray(self.holdout_primary_event_directions, dtype=float)[symbol_mask]
+                        if self.holdout_primary_event_directions is not None
+                        and len(self.holdout_primary_event_directions) == len(y_holdout)
                         else None
                     ),
                     timestamps=(
@@ -9315,7 +9571,6 @@ def run_training(args: argparse.Namespace) -> int:
         global_seed = int(replay_config.get("seed", getattr(args, "seed", 42)))
         set_global_seed(global_seed)
 
-        _verify_institutional_infra()
         resolved_use_gpu = _verify_gpu_stack(model_list)
 
         audit_logger = None
@@ -9916,6 +10171,7 @@ def run_training(args: argparse.Namespace) -> int:
                 ),
                 model_params=model_params,
             )
+            _verify_institutional_infra(config)
 
             logger.info("-" * 80)
             logger.info(f"Run {run_index}/{len(run_specs)}")

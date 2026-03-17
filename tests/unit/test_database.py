@@ -71,6 +71,28 @@ class TestDatabaseManager:
             mock_session.close.assert_called_once()
 
 
+def test_run_database_migrations_uses_explicit_database_url(monkeypatch):
+    captured = {}
+
+    def _fake_upgrade(config, revision):
+        captured["revision"] = revision
+        captured["database_url"] = config.attributes.get("database_url")
+        captured["sqlalchemy_url"] = config.get_main_option("sqlalchemy.url")
+
+    monkeypatch.setattr(
+        "quant_trading_system.database.migration_runner.command.upgrade",
+        _fake_upgrade,
+    )
+
+    from quant_trading_system.database.migration_runner import run_database_migrations
+
+    run_database_migrations(database_url="postgresql://user:pass@localhost:5432/test_db")
+
+    assert captured["revision"] == "head"
+    assert captured["database_url"] == "postgresql://user:pass@localhost:5432/test_db"
+    assert captured["sqlalchemy_url"] == "postgresql://user:pass@localhost:5432/test_db"
+
+
 class TestRedisManager:
     """Tests for RedisManager class."""
 

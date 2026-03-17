@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from argparse import Namespace
 from contextlib import nullcontext
@@ -234,8 +235,14 @@ def test_verify_institutional_infra_rejects_missing_ohlcv_table(monkeypatch):
 
     monkeypatch.setattr(train_script, "sa_inspect", lambda engine: FakeInspector())
 
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        enable_reference_features=False,
+        adjust_prices_for_corporate_actions=False,
+    )
+
     with pytest.raises(RuntimeError, match="Missing required tables: ohlcv_bars"):
-        train_script._verify_institutional_infra()
+        train_script._verify_institutional_infra(config)
 
 
 def test_verify_institutional_infra_rejects_empty_ohlcv_table(monkeypatch):
@@ -256,12 +263,156 @@ def test_verify_institutional_infra_rejects_empty_ohlcv_table(monkeypatch):
 
     class FakeInspector:
         def get_table_names(self):
-            return ["ohlcv_bars"]
+            return ["ohlcv_bars", "features"]
+
+        def get_columns(self, table_name):
+            if table_name == "ohlcv_bars":
+                return [
+                    {"name": name}
+                    for name in (
+                        "symbol",
+                        "timestamp",
+                        "timeframe",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    )
+                ]
+            if table_name == "features":
+                return [
+                    {"name": name}
+                    for name in (
+                        "symbol",
+                        "timestamp",
+                        "timeframe",
+                        "feature_name",
+                        "feature_set_id",
+                        "value",
+                    )
+                ]
+            return []
 
     monkeypatch.setattr(train_script, "sa_inspect", lambda engine: FakeInspector())
 
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        enable_reference_features=False,
+        adjust_prices_for_corporate_actions=False,
+    )
+
     with pytest.raises(RuntimeError, match="ohlcv_bars table is empty"):
-        train_script._verify_institutional_infra()
+        train_script._verify_institutional_infra(config)
+
+
+def test_verify_institutional_infra_rejects_missing_timeframe_schema_columns(monkeypatch):
+    import quant_trading_system.database.connection as conn_module
+
+    fake_db = MagicMock()
+    fake_db.health_check.return_value = True
+    fake_db.engine = object()
+    fake_session = MagicMock()
+    fake_session.execute.return_value.scalar.return_value = 1
+    fake_db.session.return_value = nullcontext(fake_session)
+
+    fake_redis = MagicMock()
+    fake_redis.health_check.return_value = True
+
+    monkeypatch.setattr(conn_module, "get_db_manager", lambda: fake_db)
+    monkeypatch.setattr(conn_module, "get_redis_manager", lambda: fake_redis)
+
+    class FakeInspector:
+        def get_table_names(self):
+            return ["ohlcv_bars", "features"]
+
+        def get_columns(self, table_name):
+            if table_name == "ohlcv_bars":
+                return [
+                    {"name": name}
+                    for name in ("symbol", "timestamp", "open", "high", "low", "close", "volume")
+                ]
+            if table_name == "features":
+                return [{"name": name} for name in ("symbol", "timestamp", "feature_name", "value")]
+            return []
+
+    monkeypatch.setattr(train_script, "sa_inspect", lambda engine: FakeInspector())
+
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        enable_reference_features=False,
+        adjust_prices_for_corporate_actions=False,
+    )
+
+    with pytest.raises(RuntimeError, match="Missing required columns"):
+        train_script._verify_institutional_infra(config)
+
+
+def test_verify_institutional_infra_allows_reference_fallback_when_optional_tables_missing(
+    monkeypatch,
+    caplog,
+):
+    import quant_trading_system.database.connection as conn_module
+
+    fake_db = MagicMock()
+    fake_db.health_check.return_value = True
+    fake_db.engine = object()
+    fake_session = MagicMock()
+    fake_session.execute.return_value.scalar.return_value = 1
+    fake_db.session.return_value = nullcontext(fake_session)
+
+    fake_redis = MagicMock()
+    fake_redis.health_check.return_value = True
+
+    monkeypatch.setattr(conn_module, "get_db_manager", lambda: fake_db)
+    monkeypatch.setattr(conn_module, "get_redis_manager", lambda: fake_redis)
+
+    class FakeInspector:
+        def get_table_names(self):
+            return ["ohlcv_bars", "features"]
+
+        def get_columns(self, table_name):
+            if table_name == "ohlcv_bars":
+                return [
+                    {"name": name}
+                    for name in (
+                        "symbol",
+                        "timestamp",
+                        "timeframe",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                    )
+                ]
+            if table_name == "features":
+                return [
+                    {"name": name}
+                    for name in (
+                        "symbol",
+                        "timestamp",
+                        "timeframe",
+                        "feature_name",
+                        "feature_set_id",
+                        "value",
+                    )
+                ]
+            return []
+
+    monkeypatch.setattr(train_script, "sa_inspect", lambda engine: FakeInspector())
+
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        enable_reference_features=True,
+        allow_feature_group_fallback=True,
+        adjust_prices_for_corporate_actions=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        train_script._verify_institutional_infra(config)
+
+    assert "Optional reference tables unavailable" in caplog.text
 
 
 def test_run_training_uses_start_end_alias(monkeypatch):
@@ -275,7 +426,7 @@ def test_run_training_uses_start_end_alias(monkeypatch):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(start="2024-01-01", end="2024-12-31")
@@ -298,7 +449,7 @@ def test_run_training_maps_feature_pipeline_flags(monkeypatch):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
@@ -335,7 +486,7 @@ def test_run_training_loads_symbols_from_file(monkeypatch, tmp_path):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     symbols_path = tmp_path / "symbols.txt"
@@ -385,7 +536,7 @@ def test_run_training_maps_allow_partial_feature_fallback(monkeypatch):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(allow_partial_feature_fallback=True, strict_feature_groups=False)
@@ -441,7 +592,7 @@ def test_run_training_maps_tail_risk_and_monotonic_flags(monkeypatch):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
@@ -475,7 +626,7 @@ def test_run_training_maps_symbol_concentration_and_quality_filters(monkeypatch)
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
@@ -516,7 +667,7 @@ def test_run_training_maps_horizon_and_meta_threshold_flags(monkeypatch):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(
@@ -546,7 +697,7 @@ def test_run_training_horizon_sweep_dispatch(monkeypatch):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(model="xgboost", name="sweep", primary_horizon_sweep=[1, 5, 10])
@@ -579,7 +730,7 @@ def test_run_training_all_dispatch(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "EnsembleTrainer", DummyEnsembleTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(model="all")
@@ -624,7 +775,7 @@ def test_run_training_all_continues_when_one_model_fails(monkeypatch):
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
     monkeypatch.setattr(train_script, "EnsembleTrainer", DummyEnsembleTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     args = _base_args(model="all")
@@ -1147,6 +1298,7 @@ def test_calculate_fold_metrics_sorts_execution_inputs_by_timestamp(monkeypatch)
         short_threshold=0.45,
         realized_forward_returns=None,
         event_net_returns=None,
+        event_directions=None,
         timestamps=None,
         symbols=None,
         return_details=False,
@@ -1195,6 +1347,7 @@ def test_calculate_fold_metrics_uses_portfolio_aggregated_series(monkeypatch):
         short_threshold=0.45,
         realized_forward_returns=None,
         event_net_returns=None,
+        event_directions=None,
         timestamps=None,
         symbols=None,
         return_details=False,
@@ -2644,7 +2797,7 @@ def test_run_training_replay_manifest_overrides_cli(monkeypatch, tmp_path):
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     replay_path = tmp_path / "replay_manifest.json"
@@ -2689,7 +2842,7 @@ def test_run_training_replay_manifest_passes_dataset_snapshot_bundle(monkeypatch
             return {"success": True, "training_metrics": {}}
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
-    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda: None)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
     bundle_path = tmp_path / "snapshots" / "snap_123" / "dataset_bundle.manifest.json"
@@ -3027,21 +3180,71 @@ def test_train_meta_labeler_uses_oof_predictions(monkeypatch):
     assert trainer.training_metrics["meta_label_dynamic_threshold"] == pytest.approx(1.0)
 
 
-def test_compute_net_returns_prefers_realized_forward_returns():
-    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
-    y_true = np.array([1, 0, 1, 0], dtype=int)
-    y_proba = np.array([0.8, 0.2, 0.6, 0.4], dtype=float)
-    realized = np.array([0.01, -0.02, 0.03, -0.01], dtype=float)
+def test_compute_net_returns_prefers_cost_aware_event_returns_without_double_costs():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            dynamic_no_trade_band=False,
+            execution_cooldown_bars=0,
+        )
+    )
+    y_true = np.array([1, 1, 1, 1], dtype=int)
+    y_proba = np.array([0.8, 0.8, 0.8, 0.8], dtype=float)
+    realized = np.array([0.05, 0.05, 0.05, 0.05], dtype=float)
+    event_net = np.array([0.01, 0.01, 0.01, 0.01], dtype=float)
+    event_directions = np.ones(4, dtype=float)
 
-    net = trainer._compute_net_returns(
+    net, details = trainer._compute_net_returns(
+        y_true=y_true,
+        y_proba=y_proba,
+        realized_forward_returns=realized,
+        event_net_returns=event_net,
+        event_directions=event_directions,
+        return_details=True,
+    )
+    event_only = trainer._compute_net_returns(
+        y_true=y_true,
+        y_proba=y_proba,
+        event_net_returns=event_net,
+        event_directions=event_directions,
+    )
+    raw_only = trainer._compute_net_returns(
         y_true=y_true,
         y_proba=y_proba,
         realized_forward_returns=realized,
     )
 
-    assert net.shape[0] == 4
-    assert np.isfinite(net).all()
-    assert float(np.mean(net)) != 0.0
+    np.testing.assert_allclose(net, np.asarray(event_only, dtype=float), rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        net,
+        np.asarray(details["positions"], dtype=float) * event_net,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert not np.allclose(net, np.asarray(raw_only, dtype=float))
+
+
+def test_compute_net_returns_uses_event_directions_for_short_side_events():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            dynamic_no_trade_band=False,
+            execution_cooldown_bars=0,
+        )
+    )
+    y_true = np.array([1, 1, 1], dtype=int)
+    y_proba = np.array([0.1, 0.1, 0.1], dtype=float)
+    event_net = np.array([0.01, 0.01, 0.01], dtype=float)
+    event_directions = np.full(3, -1.0, dtype=float)
+
+    net = trainer._compute_net_returns(
+        y_true=y_true,
+        y_proba=y_proba,
+        event_net_returns=event_net,
+        event_directions=event_directions,
+    )
+
+    assert np.all(np.asarray(net, dtype=float) > 0.0)
 
 
 def test_compute_net_returns_panel_mode_aggregates_portfolio_series():

@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -151,17 +152,26 @@ class EnvironmentValidator:
         major, minor = sys.version_info[:2]
         passed = major >= 3 and minor >= 11
 
-        self.checks.append({
-            "name": "Python Version",
-            "passed": passed,
-            "message": f"{major}.{minor}" + ("" if passed else " (requires 3.11+)"),
-        })
+        self.checks.append(
+            {
+                "name": "Python Version",
+                "passed": passed,
+                "message": f"{major}.{minor}" + ("" if passed else " (requires 3.11+)"),
+            }
+        )
 
     def _check_required_packages(self) -> None:
         """Check required packages are installed."""
         required = [
-            "numpy", "pandas", "pydantic", "xgboost", "lightgbm",
-            "sklearn", "torch", "redis", "psycopg2",
+            "numpy",
+            "pandas",
+            "pydantic",
+            "xgboost",
+            "lightgbm",
+            "sklearn",
+            "torch",
+            "redis",
+            "psycopg2",
         ]
 
         missing = []
@@ -173,11 +183,13 @@ class EnvironmentValidator:
 
         passed = len(missing) == 0
 
-        self.checks.append({
-            "name": "Required Packages",
-            "passed": passed,
-            "message": "All installed" if passed else f"Missing: {', '.join(missing)}",
-        })
+        self.checks.append(
+            {
+                "name": "Required Packages",
+                "passed": passed,
+                "message": "All installed" if passed else f"Missing: {', '.join(missing)}",
+            }
+        )
 
     def _check_env_variables(self) -> None:
         """Check required environment variables."""
@@ -196,11 +208,13 @@ class EnvironmentValidator:
         else:
             message = f"Missing: {', '.join(missing_required)}"
 
-        self.checks.append({
-            "name": "Environment Variables",
-            "passed": passed,
-            "message": message,
-        })
+        self.checks.append(
+            {
+                "name": "Environment Variables",
+                "passed": passed,
+                "message": message,
+            }
+        )
 
     def _check_docker(self) -> None:
         """Check Docker is available."""
@@ -217,11 +231,13 @@ class EnvironmentValidator:
             passed = False
             version = "Not found"
 
-        self.checks.append({
-            "name": "Docker",
-            "passed": passed,
-            "message": version,
-        })
+        self.checks.append(
+            {
+                "name": "Docker",
+                "passed": passed,
+                "message": version,
+            }
+        )
 
     def _check_project_structure(self) -> None:
         """Check project directory structure."""
@@ -236,11 +252,13 @@ class EnvironmentValidator:
 
         missing = [d for d in required_dirs if not (self.config.project_root / d).exists()]
 
-        self.checks.append({
-            "name": "Project Structure",
-            "passed": len(missing) == 0,
-            "message": "Complete" if len(missing) == 0 else f"Missing: {', '.join(missing)}",
-        })
+        self.checks.append(
+            {
+                "name": "Project Structure",
+                "passed": len(missing) == 0,
+                "message": "Complete" if len(missing) == 0 else f"Missing: {', '.join(missing)}",
+            }
+        )
 
     def _check_config_files(self) -> None:
         """Check configuration files exist."""
@@ -256,11 +274,13 @@ class EnvironmentValidator:
 
         missing = [f for f in config_files if not (self.config.project_root / f).exists()]
 
-        self.checks.append({
-            "name": "Config Files",
-            "passed": len(missing) == 0,
-            "message": "Present" if len(missing) == 0 else f"Missing: {', '.join(missing)}",
-        })
+        self.checks.append(
+            {
+                "name": "Config Files",
+                "passed": len(missing) == 0,
+                "message": "Present" if len(missing) == 0 else f"Missing: {', '.join(missing)}",
+            }
+        )
 
 
 # ============================================================================
@@ -584,18 +604,22 @@ class DatabaseManager:
         self.config = config
         self.logger = logging.getLogger("DatabaseManager")
 
+    def _database_url(self) -> str:
+        user = quote_plus(os.getenv("DATABASE__USER", "postgres"))
+        password = quote_plus(os.getenv("DATABASE__PASSWORD", "postgres"))
+        return (
+            f"postgresql://{user}:{password}@{self.config.db_host}:"
+            f"{int(self.config.db_port)}/{self.config.db_name}"
+        )
+
     def migrate(self) -> bool:
         """Run database migrations."""
         self.logger.info("Running database migrations...")
 
         try:
-            from quant_trading_system.database.connection import DatabaseManager as AppDatabaseManager
-            from quant_trading_system.database.models import Base
+            from quant_trading_system.database.migration_runner import run_database_migrations
 
-            db = AppDatabaseManager()
-            with db.engine.begin() as conn:
-                Base.metadata.create_all(bind=conn)
-            db.close()
+            run_database_migrations(database_url=self._database_url())
             return True
 
         except ImportError:
@@ -701,7 +725,14 @@ class GPUSetup:
         try:
             # Check nvidia-smi in WSL
             result = subprocess.run(
-                ["wsl", "-d", self.config.wsl_distro, "nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"],
+                [
+                    "wsl",
+                    "-d",
+                    self.config.wsl_distro,
+                    "nvidia-smi",
+                    "--query-gpu=name,driver_version,memory.total",
+                    "--format=csv,noheader",
+                ],
                 capture_output=True,
                 text=True,
             )
@@ -1056,7 +1087,7 @@ def cmd_gpu(args: argparse.Namespace) -> int:
         info = gpu.check_gpu()
         print("\nGPU Status:")
         print(f"  Available: {info['available']}")
-        if info['available']:
+        if info["available"]:
             print(f"  Name: {info.get('gpu_name', 'unknown')}")
             print(f"  Driver: {info.get('driver_version', 'unknown')}")
             print(f"  Memory: {info.get('memory', 'unknown')}")
@@ -1124,9 +1155,17 @@ def run_deployment(args: argparse.Namespace) -> int:
             setattr(args, "deploy_command", operation)
     if getattr(args, "docker_action", None) is None and getattr(args, "action", None):
         setattr(args, "docker_action", getattr(args, "action"))
-    if getattr(args, "k8s_action", None) is None and getattr(args, "action", None) and getattr(args, "deploy_command", "") == "k8s":
+    if (
+        getattr(args, "k8s_action", None) is None
+        and getattr(args, "action", None)
+        and getattr(args, "deploy_command", "") == "k8s"
+    ):
         setattr(args, "k8s_action", getattr(args, "action"))
-    if getattr(args, "db_action", None) is None and getattr(args, "action", None) and getattr(args, "deploy_command", "") in {"db", "migrate"}:
+    if (
+        getattr(args, "db_action", None) is None
+        and getattr(args, "action", None)
+        and getattr(args, "deploy_command", "") in {"db", "migrate"}
+    ):
         setattr(args, "db_action", "migrate")
     return run_deploy_command(args)
 
@@ -1162,7 +1201,9 @@ if __name__ == "__main__":
 
     # GPU commands
     gpu_parser = subparsers.add_parser("gpu", help="GPU setup")
-    gpu_parser.add_argument("gpu_action", choices=["check", "setup", "sync"], default="check", nargs="?")
+    gpu_parser.add_argument(
+        "gpu_action", choices=["check", "setup", "sync"], default="check", nargs="?"
+    )
 
     args = parser.parse_args()
     sys.exit(run_deploy_command(args))
