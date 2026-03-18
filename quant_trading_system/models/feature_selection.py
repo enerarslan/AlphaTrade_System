@@ -1,0 +1,218 @@
+"""
+Training-time feature selection for institutional model governance.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+
+@dataclass(slots=True)
+class FeatureSelectionConfig:
+    min_information_coefficient: float = 0.01
+    max_correlation: float = 0.95
+    max_features: int = 250
+    stability_iterations: int = 16
+    stability_subsample_ratio: float = 0.65
+    min_stability_support: float = 0.55
+    random_state: int = 42
+
+
+@dataclass(slots=True)
+class FeatureSelectionResult:
+    selected_features: list[str]
+    information_coefficients: dict[str, float]
+    correlation_pruned_features: list[str]
+    stability_scores: dict[str, float]
+    diagnostics: dict[str, float | int]
+
+
+def _finite_feature_matrix(
+    features: pd.DataFrame,
+) -> pd.DataFrame:
+    working = features.copy()
+    working = working.replace([np.inf, -np.inf], np.nan)
+    numeric = working.apply(pd.to_numeric, errors="coerce")
+    return numeric
+
+
+def compute_information_coefficients(
+    features: pd.DataFrame,
+    target: pd.Series | np.ndarray,
+) -> pd.Series:
+    numeric = _finite_feature_matrix(features)
+    label = pd.Series(pd.to_numeric(target, errors="coerce"), index=numeric.index)
+    scores: dict[str, float] = {}
+    for column in numeric.columns:
+        values = numeric[column]
+        valid = values.notna() & label.notna()
+        if int(valid.sum()) < 20:
+            scores[column] = 0.0
+            continue
+        ic = stats.spearmanr(values.loc[valid], label.loc[valid], nan_policy="omit")[0]
+        scores[column] = float(abs(ic)) if np.isfinite(ic) else 0.0
+    return pd.Series(scores, dtype=float).sort_values(ascending=False)
+
+
+def _prune_correlated_features(
+    features: pd.DataFrame,
+    ranked_features: pd.Series,
+    *,
+    max_correlation: float,
+) -> tuple[list[str], list[str]]:
+    if ranked_features.empty:
+        return [], []
+
+    numeric = _finite_feature_matrix(features[ranked_features.index.tolist()])
+    corr = numeric.corr(method="spearman").abs().fillna(0.0)
+    selected: list[str] = []
+    pruned: list[str] = []
+
+    for feature_name in ranked_features.index.tolist():
+        if not selected:
+            selected.append(feature_name)
+            continue
+        is_correlated = False
+        for retained in selected:
+            if float(corr.loc[feature_name, retained]) >= max_correlation:
+                is_correlated = True
+                pruned.append(feature_name)
+                break
+        if not is_correlated:
+            selected.append(feature_name)
+
+    return selected, pruned
+
+
+def _stability_selection_scores(
+    features: pd.DataFrame,
+    target: pd.Series | np.ndarray,
+    *,
+    config: FeatureSelectionConfig,
+) -> dict[str, float]:
+    if features.empty:
+        return {}
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    numeric = _finite_feature_matrix(features)
+    numeric = numeric.fillna(0.0)
+    label = pd.Series(pd.to_numeric(target, errors="coerce"), index=numeric.index).fillna(0.0)
+    unique_values = set(label.dropna().unique().tolist())
+    if unique_values.difference({0.0, 1.0}):
+        median = float(label.median()) if len(label) else 0.0
+        label = (label > median).astype(float)
+
+    if numeric.shape[0] < 100 or numeric.shape[1] <= 1:
+        return {column: 1.0 for column in numeric.columns}
+
+    rng = np.random.default_rng(config.random_state)
+    sample_size = max(50, int(round(len(numeric) * config.stability_subsample_ratio)))
+    active_counts = dict.fromkeys(numeric.columns.tolist(), 0)
+    successful_iterations = 0
+
+    model = Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "selector",
+                LogisticRegression(
+                    penalty="elasticnet",
+                    l1_ratio=1.0,
+                    solver="saga",
+                    C=0.15,
+                    max_iter=2000,
+                    random_state=config.random_state,
+                ),
+            ),
+        ]
+    )
+
+    for _ in range(max(1, int(config.stability_iterations))):
+        sample_idx = rng.choice(len(numeric), size=sample_size, replace=False)
+        X_sample = numeric.iloc[sample_idx]
+        y_sample = label.iloc[sample_idx]
+        if y_sample.nunique(dropna=True) < 2:
+            continue
+        model.fit(X_sample, y_sample)
+        coefs = np.asarray(model.named_steps["selector"].coef_).reshape(-1)
+        successful_iterations += 1
+        for column, coef in zip(numeric.columns, coefs, strict=False):
+            if abs(float(coef)) > 1e-8:
+                active_counts[column] = int(active_counts[column]) + 1
+
+    if successful_iterations <= 0:
+        return {column: 1.0 for column in numeric.columns}
+
+    return {
+        column: float(int(active_counts[column]) / successful_iterations)
+        for column in numeric.columns
+    }
+
+
+def select_training_features(
+    features: pd.DataFrame,
+    target: pd.Series | np.ndarray,
+    config: FeatureSelectionConfig,
+) -> FeatureSelectionResult:
+    ranked = compute_information_coefficients(features, target)
+    screened = ranked[ranked >= float(config.min_information_coefficient)]
+    if screened.empty:
+        screened = ranked.head(min(int(config.max_features), len(ranked)))
+    if screened.empty:
+        return FeatureSelectionResult(
+            selected_features=list(features.columns),
+            information_coefficients={},
+            correlation_pruned_features=[],
+            stability_scores={},
+            diagnostics={
+                "initial_feature_count": float(features.shape[1]),
+                "selected_feature_count": float(features.shape[1]),
+            },
+        )
+
+    corr_selected, corr_pruned = _prune_correlated_features(
+        features,
+        screened,
+        max_correlation=float(config.max_correlation),
+    )
+    if not corr_selected:
+        corr_selected = screened.index.tolist()
+
+    if len(corr_selected) > int(config.max_features):
+        corr_selected = corr_selected[: int(config.max_features)]
+
+    stability_scores = _stability_selection_scores(
+        features[corr_selected],
+        target,
+        config=config,
+    )
+    stable_selected = [
+        column
+        for column in corr_selected
+        if float(stability_scores.get(column, 1.0)) >= float(config.min_stability_support)
+    ]
+    if stable_selected:
+        final_selected = stable_selected[: int(config.max_features)]
+    else:
+        final_selected = corr_selected[: int(config.max_features)]
+
+    return FeatureSelectionResult(
+        selected_features=final_selected,
+        information_coefficients={key: float(value) for key, value in screened.items()},
+        correlation_pruned_features=corr_pruned,
+        stability_scores=stability_scores,
+        diagnostics={
+            "initial_feature_count": float(features.shape[1]),
+            "ic_screened_feature_count": float(len(screened)),
+            "correlation_pruned_count": float(len(corr_pruned)),
+            "stability_selected_count": float(len(stable_selected)),
+            "selected_feature_count": float(len(final_selected)),
+        },
+    )

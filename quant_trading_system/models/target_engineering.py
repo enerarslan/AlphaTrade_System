@@ -36,6 +36,10 @@ class TargetEngineeringConfig:
     signal_volatility_floor_mult: float = 0.50
     regime_lookback: int = 30
     temporal_weight_decay: float = 0.999
+    apply_uniqueness_weighting: bool = True
+    uniqueness_weight_floor: float = 0.25
+    apply_volatility_inverse_weighting: bool = True
+    volatility_weight_cap: float = 2.5
 
     def __post_init__(self) -> None:
         if not self.horizons:
@@ -56,6 +60,10 @@ class TargetEngineeringConfig:
             raise ValueError("max_abs_forward_return must be positive")
         if self.signal_volatility_floor_mult < 0.0:
             raise ValueError("signal_volatility_floor_mult must be non-negative")
+        if self.uniqueness_weight_floor <= 0.0:
+            raise ValueError("uniqueness_weight_floor must be positive")
+        if self.volatility_weight_cap <= 0.0:
+            raise ValueError("volatility_weight_cap must be positive")
 
     def to_cost_model(self) -> TradingCostModel:
         """Build canonical trading cost model from label configuration."""
@@ -119,6 +127,55 @@ def _class_weights_binary(labels: pd.Series) -> dict[int, float]:
         0: float(total / (2.0 * neg)),
         1: float(total / (2.0 * pos)),
     }
+
+
+def _compute_uniqueness_weights(
+    frame: pd.DataFrame,
+    *,
+    floor: float,
+) -> np.ndarray:
+    weights = np.ones(len(frame), dtype=float)
+    if frame.empty:
+        return weights
+
+    for _, symbol_frame in frame.groupby("symbol", sort=False):
+        local = symbol_frame.reset_index()
+        if local.empty:
+            continue
+        holding_period = (
+            pd.to_numeric(local.get("holding_period"), errors="coerce")
+            .fillna(1.0)
+            .clip(lower=1.0)
+            .astype(int)
+            .to_numpy()
+        )
+        concurrency = np.zeros(len(local), dtype=float)
+        spans: list[tuple[int, int]] = []
+        for start_idx, horizon in enumerate(holding_period):
+            end_idx = min(len(local) - 1, start_idx + int(max(1, horizon)) - 1)
+            spans.append((start_idx, end_idx))
+            concurrency[start_idx : end_idx + 1] += 1.0
+
+        for row_idx, (start_idx, end_idx) in enumerate(spans):
+            active_concurrency = np.maximum(concurrency[start_idx : end_idx + 1], 1.0)
+            avg_uniqueness = float(np.mean(1.0 / active_concurrency))
+            weights[int(local.loc[row_idx, "index"])] = max(avg_uniqueness, floor)
+    return weights
+
+
+def _compute_inverse_volatility_weights(
+    signal_volatility: pd.Series,
+    *,
+    cap: float,
+) -> np.ndarray:
+    vol = pd.to_numeric(signal_volatility, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    positive = vol[vol > 0.0]
+    if positive.empty:
+        return np.ones(len(vol), dtype=float)
+    anchor = float(np.nanmedian(positive))
+    denom = vol.fillna(anchor).clip(lower=anchor / cap, upper=anchor * cap)
+    weights = anchor / denom
+    return np.clip(weights.to_numpy(dtype=float), 1.0 / cap, cap)
 
 
 def generate_targets(
@@ -216,6 +273,7 @@ def generate_targets(
         sdf["triple_barrier_net_return"] = net_ret
         sdf["barrier_touched"] = tb["barrier_touched"].astype("object")
         sdf["holding_period"] = pd.to_numeric(tb["holding_period"], errors="coerce")
+        sdf["signal_volatility"] = rolling_vol.astype(float)
         # Final binary label for model training.
         sdf["label"] = np.where(~np.isnan(sdf["triple_barrier_label"]), cost_label, np.nan)
         # Forward-return outliers are excluded from label set for robustness.
@@ -271,6 +329,22 @@ def generate_targets(
     sample_weights = (
         temporal_weight * class_weight_values * regime_weight_values * edge_weight_values
     )
+    uniqueness_weight_values = np.ones(len(labeled), dtype=float)
+    if bool(config.apply_uniqueness_weighting):
+        uniqueness_weight_values = _compute_uniqueness_weights(
+            labeled,
+            floor=float(config.uniqueness_weight_floor),
+        )
+        sample_weights = sample_weights * uniqueness_weight_values
+
+    inverse_volatility_weight_values = np.ones(len(labeled), dtype=float)
+    if bool(config.apply_volatility_inverse_weighting):
+        inverse_volatility_weight_values = _compute_inverse_volatility_weights(
+            labeled.get("signal_volatility", pd.Series(index=labeled.index, dtype=float)),
+            cap=float(config.volatility_weight_cap),
+        )
+        sample_weights = sample_weights * inverse_volatility_weight_values
+
     sample_weights = np.nan_to_num(sample_weights, nan=1.0, posinf=1.0, neginf=1.0)
     mean_w = float(np.mean(sample_weights)) if len(sample_weights) else 1.0
     if mean_w > 1e-12:
@@ -338,6 +412,18 @@ def generate_targets(
             "stop_loss_threshold": float(config.stop_loss_threshold),
             "max_holding_period": int(config.max_holding_period),
         },
+        "uniqueness_weight_mean": float(np.mean(uniqueness_weight_values))
+        if len(uniqueness_weight_values)
+        else 1.0,
+        "uniqueness_weight_min": float(np.min(uniqueness_weight_values))
+        if len(uniqueness_weight_values)
+        else 1.0,
+        "inverse_volatility_weight_mean": float(np.mean(inverse_volatility_weight_values))
+        if len(inverse_volatility_weight_values)
+        else 1.0,
+        "inverse_volatility_weight_max": float(np.max(inverse_volatility_weight_values))
+        if len(inverse_volatility_weight_values)
+        else 1.0,
     }
 
     logger.info(

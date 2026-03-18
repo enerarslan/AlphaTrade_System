@@ -232,6 +232,9 @@ def _compute_feature_pipeline_fingerprint() -> str:
         PROJECT_ROOT / "quant_trading_system" / "features" / "optimized_pipeline.py",
         PROJECT_ROOT / "quant_trading_system" / "features" / "cross_sectional.py",
         PROJECT_ROOT / "quant_trading_system" / "features" / "reference.py",
+        PROJECT_ROOT / "quant_trading_system" / "features" / "multi_timeframe.py",
+        PROJECT_ROOT / "quant_trading_system" / "features" / "tick_microstructure.py",
+        PROJECT_ROOT / "quant_trading_system" / "data" / "training_bars.py",
     ]
     for file_path in candidate_files:
         if not file_path.exists():
@@ -582,6 +585,7 @@ class TrainingConfig:
     start_date: str = ""
     end_date: str = ""
     timeframe: str = DEFAULT_TIMEFRAME
+    timeframes: list[str] = field(default_factory=list)
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
@@ -708,8 +712,13 @@ class TrainingConfig:
     feature_groups: list[str] = field(
         default_factory=lambda: ["technical", "statistical", "microstructure", "cross_sectional"]
     )
+    training_bar_mode: str = "time"
+    intrinsic_bar_type: str = "volume"
+    intrinsic_bar_threshold: float = 0.0
+    intrinsic_target_bars_per_day: int = 100
     enable_reference_features: bool = True
     adjust_prices_for_corporate_actions: bool = True
+    enable_tick_microstructure_features: bool = True
     enable_cross_sectional: bool = True
     cross_sectional_user_locked: bool = False
     max_cross_sectional_symbols: int = 20
@@ -719,6 +728,12 @@ class TrainingConfig:
     feature_reuse_min_coverage: float = 0.20
     persist_features_to_postgres: bool = True
     feature_set_id: str = "default"
+    enable_feature_selection: bool = True
+    feature_selection_min_ic: float = 0.01
+    feature_selection_max_corr: float = 0.95
+    feature_selection_max_features: int = 250
+    feature_selection_stability_iterations: int = 16
+    feature_selection_min_stability_support: float = 0.55
     windows_force_fallback_features: bool = False
     holdout_pct: float = 0.15
     dynamic_no_trade_band: bool = True
@@ -730,8 +745,15 @@ class TrainingConfig:
     auto_live_profile_enabled: bool = True
     auto_live_profile_symbol_threshold: int = 40
     auto_live_profile_min_years: float = 4.0
+    warm_start_model_path: str = ""
+    label_apply_uniqueness_weighting: bool = True
+    label_uniqueness_weight_floor: float = 0.25
+    label_apply_volatility_inverse_weighting: bool = True
+    label_volatility_weight_cap: float = 2.5
 
     def __post_init__(self):
+        from quant_trading_system.features.multi_timeframe import normalize_timeframes
+
         if not self.model_name:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             self.model_name = f"{self.model_type}_{timestamp}"
@@ -744,6 +766,7 @@ class TrainingConfig:
             max(float(self.feature_reuse_min_coverage), 0.01), 0.95
         )
         self.timeframe = normalize_timeframe(self.timeframe)
+        self.timeframes = normalize_timeframes(self.timeframe, self.timeframes)
         self.cross_sectional_user_locked = bool(self.cross_sectional_user_locked)
         self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
         self.dataset_snapshot_bundle_path = str(self.dataset_snapshot_bundle_path or "").strip()
@@ -826,13 +849,41 @@ class TrainingConfig:
             0.0,
             float(self.symbol_quality_min_median_dollar_volume),
         )
+        self.training_bar_mode = str(self.training_bar_mode or "time").strip().lower()
+        if self.training_bar_mode not in {"time", "intrinsic"}:
+            raise ValueError("training_bar_mode must be either 'time' or 'intrinsic'")
+        self.intrinsic_bar_type = str(self.intrinsic_bar_type or "volume").strip().lower()
+        self.intrinsic_bar_threshold = max(0.0, float(self.intrinsic_bar_threshold))
+        self.intrinsic_target_bars_per_day = max(10, int(self.intrinsic_target_bars_per_day))
         self.feature_groups = [
             str(g).strip().lower() for g in self.feature_groups if str(g).strip()
         ]
         if not self.feature_groups:
             self.feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
         self.enable_reference_features = bool(self.enable_reference_features)
+        self.enable_tick_microstructure_features = bool(self.enable_tick_microstructure_features)
         self.adjust_prices_for_corporate_actions = bool(self.adjust_prices_for_corporate_actions)
+        self.enable_feature_selection = bool(self.enable_feature_selection)
+        self.feature_selection_min_ic = max(0.0, float(self.feature_selection_min_ic))
+        self.feature_selection_max_corr = float(
+            np.clip(float(self.feature_selection_max_corr), 0.50, 0.999)
+        )
+        self.feature_selection_max_features = max(10, int(self.feature_selection_max_features))
+        self.feature_selection_stability_iterations = max(
+            1, int(self.feature_selection_stability_iterations)
+        )
+        self.feature_selection_min_stability_support = float(
+            np.clip(float(self.feature_selection_min_stability_support), 0.0, 1.0)
+        )
+        self.warm_start_model_path = str(self.warm_start_model_path or "").strip()
+        self.label_apply_uniqueness_weighting = bool(self.label_apply_uniqueness_weighting)
+        self.label_uniqueness_weight_floor = max(
+            0.01, float(self.label_uniqueness_weight_floor)
+        )
+        self.label_apply_volatility_inverse_weighting = bool(
+            self.label_apply_volatility_inverse_weighting
+        )
+        self.label_volatility_weight_cap = max(1.0, float(self.label_volatility_weight_cap))
 
     def to_trading_cost_model(self) -> TradingCostModel:
         """Build canonical execution cost model from training configuration."""
@@ -910,6 +961,7 @@ class ModelTrainer:
         self.nested_cv_trace: list[dict[str, Any]] = []
         self.replay_manifest_path: Path | None = None
         self.promotion_package_path: Path | None = None
+        self._warm_start_model_cache: Any | None = None
 
         # Metrics
         self.training_metrics: dict = {}
@@ -942,6 +994,9 @@ class ModelTrainer:
 
                 # Phase 3: Create Labels
                 self._create_labels()
+
+            # Phase 3.25: Feature selection on development set only
+            self._apply_feature_selection()
 
             # Phase 3.5: Enforce future-leak validation gates
             self._validate_no_future_leakage()
@@ -1053,6 +1108,7 @@ class ModelTrainer:
         self._apply_corporate_action_adjustments()
         self._sanitize_loaded_data()
         self._apply_symbol_universe_filters()
+        self._apply_training_bar_mode()
         self._capture_data_quality_report()
         self._apply_live_multi_symbol_profile()
 
@@ -1551,6 +1607,44 @@ class ModelTrainer:
             len(dropped_symbols),
         )
 
+    def _apply_training_bar_mode(self) -> None:
+        """Convert sanitized OHLCV panel into the requested training bar representation."""
+        if self.data is None or self.data.empty:
+            raise ValueError("No data loaded for training bar transformation.")
+        if self.config.training_bar_mode == "time":
+            self.training_metrics["training_bar_mode"] = "time"
+            self.training_metrics["training_bar_input_rows"] = float(len(self.data))
+            self.training_metrics["training_bar_output_rows"] = float(len(self.data))
+            return
+
+        from quant_trading_system.data.training_bars import TrainingBarBuilder, TrainingBarConfig
+
+        builder = TrainingBarBuilder(
+            TrainingBarConfig(
+                mode=self.config.training_bar_mode,
+                intrinsic_bar_type=self.config.intrinsic_bar_type,
+                intrinsic_threshold=self.config.intrinsic_bar_threshold,
+                target_bars_per_day=self.config.intrinsic_target_bars_per_day,
+                use_trade_prints_if_available=True,
+            ),
+            logger_=self.logger,
+        )
+        input_rows = len(self.data)
+        transformed = builder.build(self.data)
+        if transformed is None or transformed.empty:
+            raise ValueError("Intrinsic training bar mode produced no rows.")
+        self.data = transformed.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+        self.training_metrics["training_bar_mode"] = self.config.training_bar_mode
+        self.training_metrics["training_bar_input_rows"] = float(input_rows)
+        self.training_metrics["training_bar_output_rows"] = float(len(self.data))
+        self.training_metrics["training_bar_intrinsic_type"] = self.config.intrinsic_bar_type
+        self.logger.info(
+            "Training bar mode applied: mode=%s rows=%d->%d",
+            self.config.training_bar_mode,
+            input_rows,
+            len(self.data),
+        )
+
     def _load_data_from_postgres(self) -> None:
         """Load OHLCV data from PostgreSQL/TimescaleDB."""
         from sqlalchemy import text
@@ -1948,6 +2042,7 @@ class ModelTrainer:
             "regime",
             "trade_side_label",
             "binary_trade_label",
+            "signal_volatility",
         ]
         exclude_cols.extend([f"forward_return_h{h}" for h in label_horizons])
         feature_cols = [c for c in dev_frame.columns if c not in exclude_cols]
@@ -2356,13 +2451,17 @@ class ModelTrainer:
         groups_part = ",".join(sorted(self.config.feature_groups))
         cross_sectional_part = "1" if self.config.enable_cross_sectional else "0"
         reference_part = "1" if self.config.enable_reference_features else "0"
+        tick_part = "1" if self.config.enable_tick_microstructure_features else "0"
+        timeframes_part = ",".join(self.config.timeframes)
         start_part = start_date.isoformat() if start_date is not None else "none"
         end_part = end_date.isoformat() if end_date is not None else "none"
         return (
             "train:features:schema:v2:"
             f"{symbol_part}:{start_part}:{end_part}:"
             f"{self.config.timeframe}:{feature_set_id}:{groups_part}:"
-            f"{cross_sectional_part}:{reference_part}:{self.feature_pipeline_fingerprint}"
+            f"{cross_sectional_part}:{reference_part}:{tick_part}:{timeframes_part}:"
+            f"{self.config.training_bar_mode}:{self.config.intrinsic_bar_type}:"
+            f"{self.feature_pipeline_fingerprint}"
         )
 
     def _current_ohlcv_fingerprint(self) -> str:
@@ -2390,7 +2489,13 @@ class ModelTrainer:
             "feature_groups": sorted(str(name) for name in self.config.feature_groups),
             "enable_cross_sectional": bool(self.config.enable_cross_sectional),
             "enable_reference_features": bool(self.config.enable_reference_features),
+            "enable_tick_microstructure_features": bool(
+                self.config.enable_tick_microstructure_features
+            ),
             "timeframe": self.config.timeframe,
+            "timeframes": list(self.config.timeframes),
+            "training_bar_mode": self.config.training_bar_mode,
+            "intrinsic_bar_type": self.config.intrinsic_bar_type,
             "feature_set_id": feature_set_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -2423,9 +2528,15 @@ class ModelTrainer:
                 "namespace": namespace,
                 "symbols": sorted(symbols),
                 "timeframe": self.config.timeframe,
+                "timeframes": list(self.config.timeframes),
                 "groups": sorted(self.config.feature_groups),
                 "cross_sectional": bool(self.config.enable_cross_sectional),
                 "reference_features": bool(self.config.enable_reference_features),
+                "tick_microstructure_features": bool(
+                    self.config.enable_tick_microstructure_features
+                ),
+                "training_bar_mode": self.config.training_bar_mode,
+                "intrinsic_bar_type": self.config.intrinsic_bar_type,
                 "pipeline_fingerprint": self.feature_pipeline_fingerprint,
             },
             sort_keys=True,
@@ -2462,8 +2573,49 @@ class ModelTrainer:
                 "deterministic point-in-time reference layer."
             ) from exc
 
-    def _compute_features_full_pipeline(self) -> None:
-        """Compute institutional features with adaptive memory-safe fallback behavior."""
+    def _augment_tick_microstructure_features(self, matrix: pd.DataFrame) -> pd.DataFrame:
+        """Augment bar-aligned training matrix with quote/trade microstructure features."""
+        from quant_trading_system.features.tick_microstructure import (
+            TickMicrostructureFeatureBuilder,
+            TickMicrostructureFeatureConfig,
+        )
+
+        if matrix is None or matrix.empty:
+            return matrix
+
+        try:
+            builder = TickMicrostructureFeatureBuilder(
+                TickMicrostructureFeatureConfig(timeframe=self.config.timeframe),
+                logger_=self.logger,
+            )
+            enriched = builder.augment(matrix)
+            added_cols = [column for column in enriched.columns if column not in matrix.columns]
+            self.logger.info(
+                "Tick microstructure augmentation added %d columns",
+                len(added_cols),
+            )
+            return enriched
+        except Exception as exc:
+            if self.config.allow_feature_group_fallback:
+                self.logger.warning(
+                    "Tick microstructure augmentation skipped due to runtime error: %s",
+                    exc,
+                )
+                return matrix
+            raise RuntimeError(
+                "Tick microstructure augmentation failed; institutional training requires "
+                "deterministic tick/quote enrichment when enabled."
+            ) from exc
+
+    def _compute_symbol_feature_frame(
+        self,
+        *,
+        df: pd.DataFrame,
+        symbol: str,
+        groups_to_compute: list[Any],
+        universe_data: Any,
+        disable_optimized_technical: bool,
+    ) -> pd.DataFrame:
         import polars as pl
         from quant_trading_system.features.feature_pipeline import (
             FeatureConfig,
@@ -2471,6 +2623,213 @@ class ModelTrainer:
             FeaturePipeline,
             NormalizationMethod,
         )
+
+        df = df.copy().sort_values("timestamp").reset_index(drop=True)
+        df_pl = pl.from_pandas(df)
+        combined_features: dict[str, np.ndarray] = {}
+
+        for group in groups_to_compute:
+            group_start = time.perf_counter()
+            self.logger.info("  %s: computing %s feature group...", symbol, group.value)
+            feature_config = FeatureConfig(
+                groups=[group],
+                normalization=NormalizationMethod.NONE,
+                include_targets=False,
+                use_gpu=self.config.use_gpu and group == FeatureGroup.TECHNICAL,
+                use_cache=self.config.use_redis_cache and group == FeatureGroup.TECHNICAL,
+                use_optimized_pipeline=(
+                    group == FeatureGroup.TECHNICAL and not disable_optimized_technical
+                ),
+            )
+            pipeline = FeaturePipeline(feature_config)
+            try:
+                feature_set = pipeline.compute(
+                    df_pl,
+                    symbol=symbol,
+                    universe_data=(universe_data if group == FeatureGroup.CROSS_SECTIONAL else None),
+                    use_cache=feature_config.use_cache,
+                )
+                group_feature_count = len(feature_set.features)
+                combined_features.update(feature_set.features)
+                self.logger.info(
+                    "  %s: %s group produced %d features in %.2fs",
+                    symbol,
+                    group.value,
+                    group_feature_count,
+                    time.perf_counter() - group_start,
+                )
+            except Exception as e:
+                if self.config.allow_feature_group_fallback and group == FeatureGroup.CROSS_SECTIONAL:
+                    self.logger.warning(
+                        "%s: cross-sectional features skipped due to runtime error: %s",
+                        symbol,
+                        e,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"Feature pipeline failed for {symbol} group={group.value}; "
+                    "institutional mode requires deterministic feature materialization."
+                ) from e
+            finally:
+                del pipeline
+                gc.collect()
+
+        if not combined_features:
+            raise RuntimeError(f"No features computed for symbol {symbol}")
+
+        feature_df = pd.DataFrame(combined_features, index=df.index)
+        features_df = pd.concat([df, feature_df], axis=1)
+        features_df["symbol"] = symbol
+        return features_df
+
+    def _compute_symbol_multitimeframe_feature_frame(
+        self,
+        *,
+        df: pd.DataFrame,
+        symbol: str,
+        groups_to_compute: list[Any],
+        universe_data: Any,
+        disable_optimized_technical: bool,
+    ) -> pd.DataFrame:
+        from quant_trading_system.features.feature_pipeline import FeatureGroup
+        from quant_trading_system.features.multi_timeframe import MultiTimeframeFeatureEngine
+
+        engine = MultiTimeframeFeatureEngine(
+            base_timeframe=self.config.timeframe,
+            timeframes=self.config.timeframes,
+        )
+        ohlcv_frames = engine.build_ohlcv_frames(df)
+        feature_frames: dict[str, pd.DataFrame] = {}
+        base_timeframe = normalize_timeframe(self.config.timeframe)
+
+        for timeframe in engine.normalized_timeframes():
+            timeframe_frame = ohlcv_frames.get(timeframe)
+            if timeframe_frame is None or timeframe_frame.empty:
+                self.logger.warning("%s: timeframe %s produced no rows", symbol, timeframe)
+                continue
+
+            timeframe_groups = list(groups_to_compute)
+            if timeframe != base_timeframe:
+                timeframe_groups = [
+                    group for group in timeframe_groups if group != FeatureGroup.CROSS_SECTIONAL
+                ]
+            if not timeframe_groups:
+                feature_frames[timeframe] = timeframe_frame.copy()
+                continue
+
+            self.logger.info(
+                "  %s: computing multi-timeframe layer %s (%d rows)",
+                symbol,
+                timeframe,
+                len(timeframe_frame),
+            )
+            feature_frames[timeframe] = self._compute_symbol_feature_frame(
+                df=timeframe_frame,
+                symbol=symbol,
+                groups_to_compute=timeframe_groups,
+                universe_data=(universe_data if timeframe == base_timeframe else None),
+                disable_optimized_technical=disable_optimized_technical,
+            )
+
+        if base_timeframe not in feature_frames:
+            raise RuntimeError(f"Base timeframe {base_timeframe} features missing for symbol {symbol}")
+
+        aligned = engine.align_feature_frames(
+            base_frame=feature_frames[base_timeframe],
+            feature_frames=feature_frames,
+            include_resampled_ohlcv=True,
+        )
+        aligned["symbol"] = symbol
+        return aligned
+
+    def _apply_feature_selection(self) -> None:
+        """Run development-set feature screening without touching holdout labels."""
+        from quant_trading_system.models.feature_selection import (
+            FeatureSelectionConfig,
+            select_training_features,
+        )
+
+        if not self.config.enable_feature_selection:
+            return
+        if self.features is None or self.features.empty or self.labels is None or len(self.labels) == 0:
+            return
+
+        old_feature_names = [str(name) for name in self.feature_names]
+        if len(old_feature_names) <= 1:
+            return
+
+        selection_result = select_training_features(
+            self.features,
+            self.labels,
+            FeatureSelectionConfig(
+                min_information_coefficient=self.config.feature_selection_min_ic,
+                max_correlation=self.config.feature_selection_max_corr,
+                max_features=self.config.feature_selection_max_features,
+                stability_iterations=self.config.feature_selection_stability_iterations,
+                min_stability_support=self.config.feature_selection_min_stability_support,
+                random_state=self.config.seed,
+            ),
+        )
+        selected_features = [
+            feature for feature in selection_result.selected_features if feature in self.features.columns
+        ]
+        if not selected_features:
+            self.logger.warning("Feature selection returned no candidates; keeping original matrix.")
+            return
+
+        self.features = self.features[selected_features].copy()
+        if self.holdout_features is not None and not self.holdout_features.empty:
+            self.holdout_features = self.holdout_features[selected_features].copy()
+        self.feature_names = selected_features
+
+        keep_selected = set(selected_features)
+        for attr in ("development_frame", "holdout_frame"):
+            frame = getattr(self, attr, None)
+            if frame is None or frame.empty:
+                continue
+            retain_cols = [column for column in frame.columns if column not in old_feature_names]
+            retain_cols.extend([column for column in old_feature_names if column in keep_selected])
+            setattr(self, attr, frame[retain_cols].copy())
+
+        diagnostics = selection_result.diagnostics
+        self.training_metrics["feature_selection_applied"] = True
+        self.training_metrics["feature_selection_initial_feature_count"] = float(
+            diagnostics.get("initial_feature_count", len(old_feature_names))
+        )
+        self.training_metrics["feature_selection_selected_feature_count"] = float(
+            diagnostics.get("selected_feature_count", len(selected_features))
+        )
+        self.training_metrics["feature_selection_correlation_pruned_count"] = float(
+            diagnostics.get("correlation_pruned_count", 0.0)
+        )
+        self.training_metrics["feature_selection_stability_selected_count"] = float(
+            diagnostics.get("stability_selected_count", 0.0)
+        )
+        self.training_metrics["feature_selection_min_ic"] = float(
+            self.config.feature_selection_min_ic
+        )
+        self.training_metrics["feature_selection_selected_features"] = selected_features
+        self.training_metrics["feature_selection_top_information_coefficients"] = {
+            str(name): float(value)
+            for name, value in list(selection_result.information_coefficients.items())[:20]
+        }
+        self.training_metrics["feature_selection_stability_scores"] = {
+            str(name): float(score)
+            for name, score in selection_result.stability_scores.items()
+            if name in keep_selected
+        }
+        self.logger.info(
+            "Feature selection reduced development matrix from %d to %d columns",
+            len(old_feature_names),
+            len(selected_features),
+        )
+        if self.data_quality_report_hash is not None:
+            self._build_training_snapshot_manifest()
+
+    def _compute_features_full_pipeline(self) -> None:
+        """Compute institutional features with adaptive memory-safe fallback behavior."""
+        import polars as pl
+        from quant_trading_system.features.feature_pipeline import FeatureGroup
 
         features_list = []
         symbols = sorted(self.data["symbol"].dropna().unique().tolist())
@@ -2507,6 +2866,9 @@ class ModelTrainer:
                 "Disabling optimized technical feature pipeline on Windows; "
                 "using standard deterministic calculators to avoid runtime stalls."
             )
+        multi_timeframe_enabled = len(self.config.timeframes) > 1
+        if multi_timeframe_enabled:
+            self.logger.info("Multi-timeframe feature fusion enabled: %s", self.config.timeframes)
 
         universe_data: dict[str, pl.DataFrame] | None = None
         if FeatureGroup.CROSS_SECTIONAL in groups_to_compute:
@@ -2528,76 +2890,44 @@ class ModelTrainer:
                 .sort_values("timestamp")
                 .reset_index(drop=True)
             )
-
-            df_pl = pl.from_pandas(df)
-
-            combined_features: dict[str, np.ndarray] = {}
-            for group in groups_to_compute:
-                group_start = time.perf_counter()
-                self.logger.info(f"  {symbol}: computing {group.value} feature group...")
-                feature_config = FeatureConfig(
-                    groups=[group],
-                    normalization=NormalizationMethod.NONE,
-                    include_targets=False,
-                    use_gpu=self.config.use_gpu and group == FeatureGroup.TECHNICAL,
-                    use_cache=self.config.use_redis_cache and group == FeatureGroup.TECHNICAL,
-                    use_optimized_pipeline=(
-                        group == FeatureGroup.TECHNICAL and not disable_optimized_technical
-                    ),
+            if multi_timeframe_enabled:
+                features_df = self._compute_symbol_multitimeframe_feature_frame(
+                    df=df,
+                    symbol=symbol,
+                    groups_to_compute=groups_to_compute,
+                    universe_data=universe_data,
+                    disable_optimized_technical=disable_optimized_technical,
                 )
-                pipeline = FeaturePipeline(feature_config)
-                try:
-                    feature_set = pipeline.compute(
-                        df_pl,
-                        symbol=symbol,
-                        universe_data=(
-                            universe_data if group == FeatureGroup.CROSS_SECTIONAL else None
-                        ),
-                        use_cache=feature_config.use_cache,
-                    )
-                    group_feature_count = len(feature_set.features)
-                    combined_features.update(feature_set.features)
-                    self.logger.info(
-                        "  %s: %s group produced %d features in %.2fs",
-                        symbol,
-                        group.value,
-                        group_feature_count,
-                        time.perf_counter() - group_start,
-                    )
-                except Exception as e:
-                    if (
-                        self.config.allow_feature_group_fallback
-                        and group == FeatureGroup.CROSS_SECTIONAL
-                    ):
-                        self.logger.warning(
-                            f"{symbol}: cross-sectional features skipped due to runtime error: {e}"
-                        )
-                        continue
-                    raise RuntimeError(
-                        f"Feature pipeline failed for {symbol} group={group.value}; "
-                        "institutional mode requires deterministic feature materialization."
-                    ) from e
-                finally:
-                    del pipeline
-                    gc.collect()
-
-            if not combined_features:
-                raise RuntimeError(f"No features computed for symbol {symbol}")
-
-            feature_df = pd.DataFrame(combined_features, index=df.index)
-            features_df = pd.concat([df, feature_df], axis=1)
-            features_df["symbol"] = symbol
+            else:
+                features_df = self._compute_symbol_feature_frame(
+                    df=df,
+                    symbol=symbol,
+                    groups_to_compute=groups_to_compute,
+                    universe_data=universe_data,
+                    disable_optimized_technical=disable_optimized_technical,
+                )
             features_list.append(features_df)
-            self.logger.info(f"  {symbol}: {len(combined_features)} features computed")
-
-            del df_pl
-            gc.collect()
+            feature_count = max(
+                0,
+                len(
+                    [
+                        column
+                        for column in features_df.columns
+                        if column not in {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
+                    ]
+                ),
+            )
+            self.logger.info("  %s: %d features computed", symbol, feature_count)
 
         if features_list:
             raw_features = pd.concat(features_list, ignore_index=True)
             if self.config.enable_reference_features:
                 raw_features = self._augment_reference_features(raw_features)
+            if self.config.enable_tick_microstructure_features:
+                raw_features = self._augment_tick_microstructure_features(raw_features)
             self.features = self._finalize_feature_matrix(raw_features)
+            self.training_metrics["multi_timeframe_enabled"] = bool(multi_timeframe_enabled)
+            self.training_metrics["multi_timeframe_scopes"] = list(self.config.timeframes)
             self.logger.info(
                 f"Total: {len(self.features.columns)} columns for {len(features_list)} symbols"
             )
@@ -2677,6 +3007,22 @@ class ModelTrainer:
             return None
         if schema_payload.get("timeframe") != timeframe:
             self.logger.info("Feature cache timeframe changed; recomputing features.")
+            return None
+        if list(schema_payload.get("timeframes", [])) != list(self.config.timeframes):
+            self.logger.info("Feature cache multi-timeframe scope changed; recomputing features.")
+            return None
+        if schema_payload.get("training_bar_mode") != self.config.training_bar_mode:
+            self.logger.info("Feature cache training bar mode changed; recomputing features.")
+            return None
+        if schema_payload.get("intrinsic_bar_type") != self.config.intrinsic_bar_type:
+            self.logger.info("Feature cache intrinsic bar type changed; recomputing features.")
+            return None
+        if bool(schema_payload.get("enable_tick_microstructure_features", False)) != bool(
+            self.config.enable_tick_microstructure_features
+        ):
+            self.logger.info(
+                "Feature cache tick microstructure scope changed; recomputing features."
+            )
             return None
         if schema_payload.get("feature_set_id") != feature_set_id:
             self.logger.info("Feature cache scope changed; recomputing features.")
@@ -3032,6 +3378,12 @@ class ModelTrainer:
             regime_lookback=int(self.config.label_regime_lookback),
             temporal_weight_decay=float(self.config.label_temporal_weight_decay),
             edge_cost_buffer_bps=float(self.config.label_edge_cost_buffer_bps),
+            apply_uniqueness_weighting=bool(self.config.label_apply_uniqueness_weighting),
+            uniqueness_weight_floor=float(self.config.label_uniqueness_weight_floor),
+            apply_volatility_inverse_weighting=bool(
+                self.config.label_apply_volatility_inverse_weighting
+            ),
+            volatility_weight_cap=float(self.config.label_volatility_weight_cap),
         )
         target_result = generate_targets(self.features, target_config)
         label_valid_mask = target_result.frame["label"].notna().to_numpy()
@@ -6007,6 +6359,7 @@ class ModelTrainer:
         sample_weights: np.ndarray | None = None,
         train_timestamps: np.ndarray | None = None,
         val_timestamps: np.ndarray | None = None,
+        warm_start_model: Any | None = None,
     ) -> None:
         """Fit model with best-effort support for sample weights and validation sets."""
         if self.config.model_type in ["lstm", "transformer", "tcn"]:
@@ -6050,6 +6403,21 @@ class ModelTrainer:
                 ({},),
             ]
         )
+        if warm_start_model is not None:
+            warm_variants: list[tuple[dict[str, Any], ...]] = []
+            for (kwargs,) in candidate_calls:
+                warm_kwargs = dict(kwargs)
+                warm_kwargs["warm_start_model"] = warm_start_model
+                warm_variants.append((warm_kwargs,))
+                if self.config.model_type in {"xgboost", "xgboost_regressor"}:
+                    xgb_kwargs = dict(kwargs)
+                    xgb_kwargs["xgb_model"] = warm_start_model
+                    warm_variants.append((xgb_kwargs,))
+                elif self._is_lightgbm_family_model():
+                    init_kwargs = dict(kwargs)
+                    init_kwargs["init_model"] = warm_start_model
+                    warm_variants.append((init_kwargs,))
+            candidate_calls = warm_variants + candidate_calls
 
         last_error: Exception | None = None
         for (kwargs,) in candidate_calls:
@@ -6058,6 +6426,10 @@ class ModelTrainer:
                 call_kwargs.setdefault("feature_names", fit_feature_names)
             try:
                 model.fit(X_train, y_train, **call_kwargs)
+                if warm_start_model is not None and any(
+                    key in call_kwargs for key in ("warm_start_model", "xgb_model", "init_model")
+                ):
+                    self.training_metrics["warm_start_applied"] = True
                 return
             except TypeError as exc:
                 last_error = exc
@@ -6141,6 +6513,22 @@ class ModelTrainer:
         if last_error is not None:
             raise last_error
         model.fit(X_train, y_train, group=train_group)
+
+    def _load_warm_start_model(self) -> Any | None:
+        """Load optional prior model artifact for final production refit only."""
+        warm_start_path = str(getattr(self.config, "warm_start_model_path", "") or "").strip()
+        if not warm_start_path:
+            return None
+        if self._warm_start_model_cache is not None:
+            return self._warm_start_model_cache
+
+        path = Path(warm_start_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Warm-start model not found: {path}")
+        with path.open("rb") as handle:
+            self._warm_start_model_cache = pickle.load(handle)
+        self.training_metrics["warm_start_model_path"] = str(path)
+        return self._warm_start_model_cache
 
     def _train_deep_learning_model(self, model, X_train, y_train, X_val, y_val) -> None:
         """Train deep learning model with early stopping."""
@@ -7227,6 +7615,7 @@ class ModelTrainer:
         X: np.ndarray,
         y: np.ndarray,
         sample_weights: np.ndarray | None,
+        warm_start_model: Any | None = None,
     ) -> None:
         """Fit final production model on full dataset with robust kwargs handling."""
         full_timestamps = (
@@ -7259,6 +7648,7 @@ class ModelTrainer:
                 val_timestamps=(
                     full_timestamps[split_idx + gap :] if full_timestamps is not None else None
                 ),
+                warm_start_model=warm_start_model,
             )
             return
 
@@ -7279,6 +7669,21 @@ class ModelTrainer:
                 ]
             )
         candidate_calls.append({})
+        if warm_start_model is not None:
+            warm_calls: list[dict[str, Any]] = []
+            for kwargs in candidate_calls:
+                warm_kwargs = dict(kwargs)
+                warm_kwargs["warm_start_model"] = warm_start_model
+                warm_calls.append(warm_kwargs)
+                if self.config.model_type in {"xgboost", "xgboost_regressor"}:
+                    xgb_kwargs = dict(kwargs)
+                    xgb_kwargs["xgb_model"] = warm_start_model
+                    warm_calls.append(xgb_kwargs)
+                elif self._is_lightgbm_family_model():
+                    init_kwargs = dict(kwargs)
+                    init_kwargs["init_model"] = warm_start_model
+                    warm_calls.append(init_kwargs)
+            candidate_calls = warm_calls + candidate_calls
 
         last_error: Exception | None = None
         for kwargs in candidate_calls:
@@ -7287,6 +7692,10 @@ class ModelTrainer:
                 call_kwargs.setdefault("feature_names", fit_feature_names)
             try:
                 model.fit(X, y, **call_kwargs)
+                if warm_start_model is not None and any(
+                    key in call_kwargs for key in ("warm_start_model", "xgb_model", "init_model")
+                ):
+                    self.training_metrics["warm_start_applied"] = True
                 return
             except (TypeError, ValueError) as exc:
                 last_error = exc
@@ -7316,6 +7725,7 @@ class ModelTrainer:
             val_timestamps=(
                 full_timestamps[split_idx + gap :] if full_timestamps is not None else None
             ),
+            warm_start_model=warm_start_model,
         )
 
     def _fit_final_model_full_data(self) -> None:
@@ -7332,7 +7742,16 @@ class ModelTrainer:
         final_params = self._prepare_params_for_train_size(self.config.model_params, len(X))
         final_params = self._augment_params_for_train_labels(final_params, y)
         final_model = self._create_model(params=final_params)
-        self._fit_model_full_dataset(final_model, X, y, weights)
+        warm_start_model = None
+        self.training_metrics["warm_start_applied"] = False
+        if self.config.warm_start_model_path and self.config.model_type in {
+            "xgboost",
+            "xgboost_regressor",
+            "lightgbm",
+            "lightgbm_regressor",
+        }:
+            warm_start_model = self._load_warm_start_model()
+        self._fit_model_full_dataset(final_model, X, y, weights, warm_start_model=warm_start_model)
         self.model = final_model
         self.training_metrics["final_refit_samples"] = float(len(X))
         self.logger.info(f"Final production model refit completed on {len(X)} samples")
@@ -9713,6 +10132,13 @@ def run_training(args: argparse.Namespace) -> int:
                     "timeframe",
                     getattr(args, "timeframe", DEFAULT_TIMEFRAME),
                 ),
+                timeframes=list(
+                    _cfg_value(
+                        "timeframes",
+                        getattr(args, "timeframes", []),
+                    )
+                    or []
+                ),
                 cv_method=_cfg_value("cv_method", getattr(args, "cv_method", "purged_kfold")),
                 n_splits=int(_cfg_value("n_splits", getattr(args, "n_splits", 5))),
                 embargo_pct=max(
@@ -9987,7 +10413,57 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "label_edge_cost_buffer_bps", 2.0),
                     )
                 ),
+                label_apply_uniqueness_weighting=bool(
+                    _cfg_value(
+                        "label_apply_uniqueness_weighting",
+                        not bool(getattr(args, "disable_uniqueness_weighting", False)),
+                    )
+                ),
+                label_uniqueness_weight_floor=float(
+                    _cfg_value(
+                        "label_uniqueness_weight_floor",
+                        getattr(args, "label_uniqueness_weight_floor", 0.25),
+                    )
+                ),
+                label_apply_volatility_inverse_weighting=bool(
+                    _cfg_value(
+                        "label_apply_volatility_inverse_weighting",
+                        not bool(
+                            getattr(args, "disable_volatility_inverse_weighting", False)
+                        ),
+                    )
+                ),
+                label_volatility_weight_cap=float(
+                    _cfg_value(
+                        "label_volatility_weight_cap",
+                        getattr(args, "label_volatility_weight_cap", 2.5),
+                    )
+                ),
                 feature_groups=feature_groups,
+                training_bar_mode=str(
+                    _cfg_value(
+                        "training_bar_mode",
+                        getattr(args, "training_bar_mode", "time"),
+                    )
+                ),
+                intrinsic_bar_type=str(
+                    _cfg_value(
+                        "intrinsic_bar_type",
+                        getattr(args, "intrinsic_bar_type", "volume"),
+                    )
+                ),
+                intrinsic_bar_threshold=float(
+                    _cfg_value(
+                        "intrinsic_bar_threshold",
+                        getattr(args, "intrinsic_bar_threshold", 0.0),
+                    )
+                ),
+                intrinsic_target_bars_per_day=int(
+                    _cfg_value(
+                        "intrinsic_target_bars_per_day",
+                        getattr(args, "intrinsic_target_bars_per_day", 100),
+                    )
+                ),
                 enable_symbol_quality_filter=bool(
                     _cfg_value(
                         "enable_symbol_quality_filter",
@@ -10036,6 +10512,20 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_cross_sectional", False)),
                     )
                 ),
+                enable_reference_features=bool(
+                    _cfg_value(
+                        "enable_reference_features",
+                        not bool(getattr(args, "disable_reference_features", False)),
+                    )
+                ),
+                enable_tick_microstructure_features=bool(
+                    _cfg_value(
+                        "enable_tick_microstructure_features",
+                        not bool(
+                            getattr(args, "disable_tick_microstructure_features", False)
+                        ),
+                    )
+                ),
                 cross_sectional_user_locked=bool(
                     ("enable_cross_sectional" in replay_config)
                     or bool(getattr(args, "disable_cross_sectional", False))
@@ -10081,6 +10571,42 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "feature_set_id",
                         getattr(args, "feature_set_id", "default"),
+                    )
+                ),
+                enable_feature_selection=bool(
+                    _cfg_value(
+                        "enable_feature_selection",
+                        not bool(getattr(args, "disable_feature_selection", False)),
+                    )
+                ),
+                feature_selection_min_ic=float(
+                    _cfg_value(
+                        "feature_selection_min_ic",
+                        getattr(args, "feature_selection_min_ic", 0.01),
+                    )
+                ),
+                feature_selection_max_corr=float(
+                    _cfg_value(
+                        "feature_selection_max_corr",
+                        getattr(args, "feature_selection_max_corr", 0.95),
+                    )
+                ),
+                feature_selection_max_features=int(
+                    _cfg_value(
+                        "feature_selection_max_features",
+                        getattr(args, "feature_selection_max_features", 250),
+                    )
+                ),
+                feature_selection_stability_iterations=int(
+                    _cfg_value(
+                        "feature_selection_stability_iterations",
+                        getattr(args, "feature_selection_stability_iterations", 16),
+                    )
+                ),
+                feature_selection_min_stability_support=float(
+                    _cfg_value(
+                        "feature_selection_min_stability_support",
+                        getattr(args, "feature_selection_min_stability_support", 0.55),
                     )
                 ),
                 windows_force_fallback_features=bool(
@@ -10156,6 +10682,12 @@ def run_training(args: argparse.Namespace) -> int:
                     )
                 ),
                 output_dir=str(getattr(args, "output_dir", "models")),
+                warm_start_model_path=str(
+                    _cfg_value(
+                        "warm_start_model_path",
+                        getattr(args, "warm_start_model", "") or "",
+                    )
+                ).strip(),
                 dataset_snapshot_bundle_path=str(
                     _cfg_value(
                         "dataset_snapshot_bundle_path",
@@ -10502,6 +11034,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", "--end-date", dest="end_date", type=str, default="")
     parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)
     parser.add_argument(
+        "--timeframes",
+        nargs="+",
+        default=[],
+        help="Optional multi-timeframe fusion scope (for example: 15Min 1Hour 1Day).",
+    )
+    parser.add_argument(
         "--cv-method",
         choices=["purged_kfold", "combinatorial", "walk_forward"],
         default="purged_kfold",
@@ -10621,6 +11159,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label-regime-lookback", type=int, default=30)
     parser.add_argument("--label-temporal-weight-decay", type=float, default=0.999)
     parser.add_argument(
+        "--disable-uniqueness-weighting",
+        action="store_true",
+        help="Disable event-overlap uniqueness weighting during target engineering.",
+    )
+    parser.add_argument("--label-uniqueness-weight-floor", type=float, default=0.25)
+    parser.add_argument(
+        "--disable-volatility-inverse-weighting",
+        action="store_true",
+        help="Disable inverse-volatility sample reweighting during target engineering.",
+    )
+    parser.add_argument("--label-volatility-weight-cap", type=float, default=2.5)
+    parser.add_argument(
         "--meta-label-min-confidence",
         type=float,
         default=0.55,
@@ -10638,6 +11188,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Feature groups to compute (default: technical statistical microstructure cross_sectional)",
     )
     parser.add_argument(
+        "--training-bar-mode",
+        choices=["time", "intrinsic"],
+        default="time",
+        help="Input bar representation for training (default: time).",
+    )
+    parser.add_argument(
+        "--intrinsic-bar-type",
+        choices=[
+            "tick",
+            "volume",
+            "dollar",
+            "tick_imbalance",
+            "volume_imbalance",
+            "tick_run",
+            "volume_run",
+        ],
+        default="volume",
+        help="Intrinsic bar family when --training-bar-mode intrinsic.",
+    )
+    parser.add_argument("--intrinsic-bar-threshold", type=float, default=0.0)
+    parser.add_argument("--intrinsic-target-bars-per-day", type=int, default=100)
+    parser.add_argument(
         "--disable-symbol-quality-filter",
         action="store_true",
         help="Disable symbol-level quality universe filtering before feature generation.",
@@ -10654,6 +11226,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-cross-sectional",
         action="store_true",
         help="Disable cross-sectional features explicitly.",
+    )
+    parser.add_argument(
+        "--disable-reference-features",
+        action="store_true",
+        help="Disable point-in-time reference/event feature augmentation.",
+    )
+    parser.add_argument(
+        "--disable-tick-microstructure-features",
+        action="store_true",
+        help="Disable stock_quotes/stock_trades microstructure enrichment.",
     )
     parser.add_argument(
         "--strict-feature-groups",
@@ -10704,6 +11286,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional namespace seed for feature cache scoping.",
     )
     parser.add_argument(
+        "--disable-feature-selection",
+        action="store_true",
+        help="Disable IC/correlation/stability feature selection on the development set.",
+    )
+    parser.add_argument("--feature-selection-min-ic", type=float, default=0.01)
+    parser.add_argument("--feature-selection-max-corr", type=float, default=0.95)
+    parser.add_argument("--feature-selection-max-features", type=int, default=250)
+    parser.add_argument("--feature-selection-stability-iterations", type=int, default=16)
+    parser.add_argument("--feature-selection-min-stability-support", type=float, default=0.55)
+    parser.add_argument(
         "--windows-fallback-features",
         action="store_true",
         help="Force deterministic basic feature fallback on Windows instead of full feature pipeline.",
@@ -10723,6 +11315,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pbo", type=float, default=0.45)
     parser.add_argument("--min-white-reality-stat", type=float, default=0.0)
     parser.add_argument("--max-white-reality-pvalue", type=float, default=0.10)
+    parser.add_argument(
+        "--warm-start-model",
+        type=Path,
+        default=None,
+        help="Optional prior model artifact used only during final production refit.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("models"))
     return parser
 

@@ -34,6 +34,7 @@ def _base_args(**overrides):
         "start_date": "",
         "end_date": "",
         "timeframe": "15Min",
+        "timeframes": [],
         "cv_method": "purged_kfold",
         "n_splits": 2,
         "embargo_pct": 0.01,
@@ -67,6 +68,10 @@ def _base_args(**overrides):
         "label_horizons": [1, 5, 20],
         "primary_horizon": 5,
         "primary_horizon_sweep": [],
+        "disable_uniqueness_weighting": False,
+        "label_uniqueness_weight_floor": 0.25,
+        "disable_volatility_inverse_weighting": False,
+        "label_volatility_weight_cap": 2.5,
         "meta_label_min_confidence": 0.55,
         "disable_meta_dynamic_threshold": False,
         "holdout_pct": 0.15,
@@ -82,6 +87,10 @@ def _base_args(**overrides):
         "auto_live_profile_symbol_threshold": 40,
         "auto_live_profile_min_years": 4.0,
         "feature_groups": ["technical", "statistical", "microstructure", "cross_sectional"],
+        "training_bar_mode": "time",
+        "intrinsic_bar_type": "volume",
+        "intrinsic_bar_threshold": 0.0,
+        "intrinsic_target_bars_per_day": 100,
         "disable_symbol_quality_filter": False,
         "symbol_quality_min_rows": 1200,
         "symbol_quality_min_symbols": 8,
@@ -90,6 +99,8 @@ def _base_args(**overrides):
         "symbol_quality_max_corporate_action_ratio": 0.02,
         "symbol_quality_min_median_dollar_volume": 1_000_000.0,
         "disable_cross_sectional": False,
+        "disable_reference_features": False,
+        "disable_tick_microstructure_features": False,
         "strict_feature_groups": False,
         "allow_partial_feature_fallback": False,
         "max_cross_sectional_symbols": 20,
@@ -98,12 +109,19 @@ def _base_args(**overrides):
         "feature_reuse_min_coverage": 0.20,
         "skip_feature_persist": False,
         "feature_set_id": "default",
+        "disable_feature_selection": False,
+        "feature_selection_min_ic": 0.01,
+        "feature_selection_max_corr": 0.95,
+        "feature_selection_max_features": 250,
+        "feature_selection_stability_iterations": 16,
+        "feature_selection_min_stability_support": 0.55,
         "windows_fallback_features": False,
         "disable_dynamic_no_trade_band": False,
         "execution_vol_target_daily": 0.012,
         "execution_turnover_cap": 0.90,
         "execution_cooldown_bars": 2,
         "execution_max_symbol_entry_share": 0.68,
+        "warm_start_model": None,
         "min_accuracy": 0.45,
         "min_trades": 100,
         "min_deflated_sharpe": 0.10,
@@ -121,6 +139,18 @@ def test_extract_base_symbol():
     assert train_script.ModelTrainer._extract_base_symbol("AAPL_15MIN") == "AAPL"
     assert train_script.ModelTrainer._extract_base_symbol("BRK.B_15MIN") == "BRK.B"
     assert train_script.ModelTrainer._extract_base_symbol("MSFT") == "MSFT"
+
+
+def test_training_config_normalizes_timeframes_and_modes():
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        timeframes=["1d", "1h", "15m"],
+        training_bar_mode="intrinsic",
+        intrinsic_bar_type="volume",
+    )
+
+    assert config.timeframes == ["15Min", "1Hour", "1Day"]
+    assert config.training_bar_mode == "intrinsic"
 
 
 def test_symbol_missing_ratio_ignores_daily_weekends():

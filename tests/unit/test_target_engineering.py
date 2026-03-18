@@ -112,3 +112,14 @@ def test_generate_targets_logs_filter_diagnostics(caplog) -> None:
 
     assert "TARGET_ENGINEERING_DIAGNOSTICS" in caplog.text
     assert "TARGET_ENGINEERING_OUTLIER_RATE_HIGH" in caplog.text
+
+
+def test_generate_targets_reports_uniqueness_and_inverse_volatility_weights() -> None:
+    frame = _sample_frame(n=220)
+    result = generate_targets(frame, TargetEngineeringConfig())
+
+    diagnostics = result.diagnostics
+    assert diagnostics["uniqueness_weight_mean"] > 0.0
+    assert diagnostics["uniqueness_weight_min"] > 0.0
+    assert diagnostics["inverse_volatility_weight_mean"] > 0.0
+    assert diagnostics["inverse_volatility_weight_max"] >= 1.0

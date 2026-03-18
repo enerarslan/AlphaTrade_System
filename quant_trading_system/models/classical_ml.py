@@ -165,6 +165,14 @@ class XGBoostModel(TradingModel):
         fit_params: dict[str, Any] = {}
         if sample_weights is not None:
             fit_params["sample_weight"] = sample_weights
+        warm_start_model = kwargs.get("warm_start_model", kwargs.get("xgb_model"))
+        if warm_start_model is not None:
+            if hasattr(warm_start_model, "_model"):
+                warm_start_model = getattr(warm_start_model, "_model")
+            if hasattr(warm_start_model, "get_booster"):
+                fit_params["xgb_model"] = warm_start_model.get_booster()
+            else:
+                fit_params["xgb_model"] = warm_start_model
 
         if validation_data is not None:
             X_val, y_val = validation_data
@@ -360,6 +368,14 @@ class LightGBMModel(TradingModel):
             fit_params["sample_weight"] = sample_weights
         if categorical_features:
             fit_params["categorical_feature"] = categorical_features
+        warm_start_model = kwargs.get("warm_start_model", kwargs.get("init_model"))
+        if warm_start_model is not None:
+            if hasattr(warm_start_model, "_model"):
+                warm_start_model = getattr(warm_start_model, "_model")
+            if hasattr(warm_start_model, "booster_"):
+                fit_params["init_model"] = warm_start_model.booster_
+            else:
+                fit_params["init_model"] = warm_start_model
 
         if validation_data is not None:
             X_val, y_val = validation_data
