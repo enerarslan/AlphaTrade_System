@@ -1229,6 +1229,7 @@ class DataManager:
                     rows = db_loader.upsert_dataframe(
                         df=df,
                         symbol=symbol,
+                        timeframe=getattr(self.config, "timeframe", None),
                         batch_size=max(100, int(batch_size)),
                         source_timezone="UTC",
                     )

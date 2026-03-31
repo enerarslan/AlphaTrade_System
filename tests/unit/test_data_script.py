@@ -137,6 +137,44 @@ def test_cmd_download_incremental_sync_uses_latest_db_timestamp(monkeypatch):
     assert mgr.sync_calls == [(["MSFT"], 2048)]
 
 
+def test_sync_to_database_passes_configured_timeframe(monkeypatch):
+    captured: list[dict[str, object]] = []
+
+    class _FakeDbLoader:
+        def upsert_dataframe(self, **kwargs):
+            captured.append(kwargs)
+            return len(kwargs["df"])
+
+    from quant_trading_system.data import db_loader as db_loader_module
+
+    manager = data_script.DataManager(
+        data_script.DataConfig(
+            symbols=["AAPL"],
+            timeframe="1Min",
+            use_database=True,
+        )
+    )
+    monkeypatch.setattr(db_loader_module, "get_db_loader", lambda: _FakeDbLoader())
+
+    frame = pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "timestamp": [datetime(2026, 3, 14, 13, 30, tzinfo=timezone.utc)],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1000],
+        }
+    )
+
+    synced_rows = asyncio.run(manager.sync_to_database({"AAPL": frame}, batch_size=2048))
+
+    assert synced_rows == 1
+    assert captured[0]["timeframe"] == "1Min"
+    assert captured[0]["batch_size"] == 2048
+
+
 def test_download_data_uses_alpaca_next_page_token(monkeypatch):
     pages = [
         {
