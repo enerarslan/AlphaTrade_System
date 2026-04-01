@@ -717,6 +717,7 @@ def register_training_model_version(
 
     config_fields = [
         "model_type",
+        "training_profile",
         "symbols",
         "start_date",
         "end_date",

@@ -35,6 +35,7 @@ Version: 1.3.0
 import argparse
 import gc
 import hashlib
+import io
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -118,6 +119,104 @@ SUPPORTED_MODELS = [
     "tcn",
     "ensemble",
 ]
+
+DEFAULT_PRIMARY_MODEL = "lightgbm"
+SUPPORTED_TRAINING_PROFILES = ("promotion", "research")
+PROFILE_TUNABLE_ARG_DEFAULTS: dict[str, Any] = {
+    "n_splits": 5,
+    "n_trials": 100,
+    "nested_outer_splits": 4,
+    "nested_inner_splits": 3,
+    "no_shap": False,
+    "disable_meta_labeling": False,
+    "disable_auto_live_profile": False,
+    "feature_selection_stability_iterations": 16,
+}
+TRAINING_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "promotion": {},
+    "research": {
+        "n_splits": 3,
+        "n_trials": 20,
+        "nested_outer_splits": 2,
+        "nested_inner_splits": 2,
+        "use_meta_labeling": False,
+        "compute_shap": False,
+        "auto_live_profile_enabled": False,
+        "feature_selection_stability_iterations": 8,
+        "require_nested_trace_for_promotion": False,
+        "require_objective_breakdown_for_promotion": False,
+    },
+}
+
+
+def _normalize_training_profile(value: Any) -> str:
+    """Normalize named training profile selection."""
+    profile = str(value or "promotion").strip().lower()
+    if profile not in SUPPORTED_TRAINING_PROFILES:
+        supported = ", ".join(SUPPORTED_TRAINING_PROFILES)
+        raise ValueError(f"training_profile must be one of: {supported}")
+    return profile
+
+
+def _resolve_profiled_value(
+    *,
+    replay_config: dict[str, Any],
+    config_key: str,
+    args: argparse.Namespace,
+    profile_defaults: dict[str, Any],
+    fallback: Any,
+    arg_dest: str | None = None,
+    arg_transform: Callable[[Any], Any] | None = None,
+) -> Any:
+    """Resolve config values with replay-config precedence, CLI overrides, then profile presets."""
+    if config_key in replay_config:
+        return replay_config[config_key]
+    if arg_dest and hasattr(args, arg_dest):
+        arg_value = getattr(args, arg_dest)
+        if arg_value != PROFILE_TUNABLE_ARG_DEFAULTS.get(arg_dest, object()):
+            return arg_transform(arg_value) if arg_transform else arg_value
+    if config_key in profile_defaults:
+        return profile_defaults[config_key]
+    if arg_dest and hasattr(args, arg_dest):
+        arg_value = getattr(args, arg_dest)
+        return arg_transform(arg_value) if arg_transform else arg_value
+    return fallback
+
+
+def _running_in_wsl() -> bool:
+    """Return whether the current Python process is running inside WSL."""
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    proc_version = Path("/proc/version")
+    if not proc_version.exists():
+        return False
+    try:
+        return "microsoft" in proc_version.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
+
+def _log_training_environment_guidance(profile: str) -> None:
+    """Emit filesystem/runtime guidance aligned with the training execution plan."""
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = Path.cwd()
+
+    if os.name == "nt":
+        logger.warning(
+            "Training is running on Windows. For feature-heavy %s runs, prefer WSL Ubuntu with the "
+            "repo on the Linux filesystem (for example ~/AlphaTrade).",
+            profile,
+        )
+        return
+
+    if _running_in_wsl() and cwd.as_posix().startswith("/mnt/"):
+        logger.warning(
+            "Training is running from %s inside WSL. Move the repo under ~/AlphaTrade or another "
+            "Linux-native path to avoid Windows mount filesystem overhead.",
+            cwd,
+        )
 LIGHTGBM_FAMILY_MODELS = {"lightgbm", "lightgbm_ranker", "lightgbm_regressor"}
 RANKING_MODELS = {"lightgbm_ranker"}
 REGRESSION_MODELS = {"xgboost_regressor", "lightgbm_regressor"}
@@ -505,27 +604,31 @@ def _verify_gpu_stack(model_list: list[str]) -> bool:
     """Return whether GPU acceleration is usable for the requested sweep."""
     deep_models = {"lstm", "transformer", "tcn"}
     requires_torch = bool(deep_models.intersection(model_list))
+    torch_cuda_available = False
 
     try:
         import torch
     except ImportError as exc:
         if requires_torch:
             raise RuntimeError("PyTorch is required to train deep models.") from exc
-        logger.info("PyTorch not installed; falling back to CPU-compatible training backends.")
-        return False
+        torch = None
+        logger.info("PyTorch not installed; probing non-deep GPU backends directly.")
 
-    if not torch.cuda.is_available():
-        if requires_torch:
+    if torch is not None:
+        torch_cuda_available = bool(torch.cuda.is_available())
+        if torch_cuda_available:
+            gpu_name = torch.cuda.get_device_name(0)
+            logger.info(f"CUDA GPU detected: {gpu_name}")
+
+            # Validate tensor ops on device for deep learning stack.
+            if requires_torch:
+                _ = torch.randn((16, 8), device="cuda")
+        elif requires_torch:
             raise RuntimeError("CUDA GPU not detected. Deep learning models require PyTorch CUDA.")
-        logger.info("CUDA not available; training will run on CPU-compatible backends.")
-        return False
+        else:
+            logger.info("PyTorch CUDA not available; probing non-deep GPU backends directly.")
 
-    gpu_name = torch.cuda.get_device_name(0)
-    logger.info(f"CUDA GPU detected: {gpu_name}")
-
-    # Validate tensor ops on device for deep learning stack.
-    if requires_torch:
-        _ = torch.randn((16, 8), device="cuda")
+    gpu_backend_available = False
 
     if {"xgboost", "xgboost_regressor", "ensemble"}.intersection(model_list):
         try:
@@ -541,6 +644,7 @@ def _verify_gpu_stack(model_list: list[str]) -> bool:
                 eval_metric="logloss",
             )
             probe.fit(X, y)
+            gpu_backend_available = True
         except Exception:
             logger.warning("XGBoost GPU backend unavailable; falling back to CPU parameters.")
             return False
@@ -558,11 +662,15 @@ def _verify_gpu_stack(model_list: list[str]) -> bool:
                 verbosity=-1,
             )
             probe.fit(X, y)
+            gpu_backend_available = True
         except Exception:
             logger.warning("LightGBM GPU backend unavailable; falling back to CPU parameters.")
             return False
 
-    return True
+    if requires_torch:
+        return True
+
+    return gpu_backend_available or torch_cuda_available
 
 
 # ============================================================================
@@ -579,6 +687,7 @@ class TrainingConfig:
         "xgboost"  # xgboost, lightgbm, lightgbm_ranker, xgboost_regressor, lightgbm_regressor, random_forest, elastic_net, lstm, transformer, tcn, ensemble
     )
     model_name: str = ""  # Custom name for the model
+    training_profile: str = "promotion"
 
     # Data configuration
     symbols: list[str] = field(default_factory=list)
@@ -757,6 +866,7 @@ class TrainingConfig:
         if not self.model_name:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             self.model_name = f"{self.model_type}_{timestamp}"
+        self.training_profile = _normalize_training_profile(self.training_profile)
         self.feature_materialization_batch_rows = max(
             250, int(self.feature_materialization_batch_rows)
         )
@@ -962,9 +1072,12 @@ class ModelTrainer:
         self.replay_manifest_path: Path | None = None
         self.promotion_package_path: Path | None = None
         self._warm_start_model_cache: Any | None = None
+        self.feature_cache_reused: bool = False
+        self.features_materialized_in_run: bool = False
+        self.features_persisted_to_postgres: bool = False
 
         # Metrics
-        self.training_metrics: dict = {}
+        self.training_metrics: dict = {"training_profile": self.config.training_profile}
         self.start_time: datetime | None = None
         self.feature_pipeline_fingerprint = _compute_feature_pipeline_fingerprint()
 
@@ -997,6 +1110,9 @@ class ModelTrainer:
 
             # Phase 3.25: Feature selection on development set only
             self._apply_feature_selection()
+
+            # Phase 3.3: Persist the post-selection feature cache for deterministic reuse.
+            self._persist_features_to_postgres_if_needed()
 
             # Phase 3.5: Enforce future-leak validation gates
             self._validate_no_future_leakage()
@@ -2171,10 +2287,14 @@ class ModelTrainer:
     def _compute_features(self) -> None:
         """Phase 2: Compute features for model training."""
         self.logger.info("Phase 2: Computing features...")
+        self.feature_cache_reused = False
+        self.features_materialized_in_run = False
+        self.features_persisted_to_postgres = False
         # 1) Reuse previously computed features from PostgreSQL when available.
         cached = self._load_features_from_postgres()
         if cached is not None and not cached.empty:
             self.features = cached
+            self.feature_cache_reused = True
             self.logger.info("Using feature matrix loaded from PostgreSQL features table")
             return
 
@@ -2185,6 +2305,7 @@ class ModelTrainer:
                 "--windows-fallback-features is enabled."
             )
             self._compute_features_fallback()
+            self.features_materialized_in_run = bool(self.features is not None and not self.features.empty)
             return
         if os.name == "nt":
             self.logger.info("Windows runtime detected: enforcing full feature pipeline.")
@@ -2199,6 +2320,9 @@ class ModelTrainer:
                         exc,
                     )
                     self._compute_features_fallback()
+                    self.features_materialized_in_run = bool(
+                        self.features is not None and not self.features.empty
+                    )
                     return
                 raise RuntimeError(
                     "Full feature pipeline failed on Windows and partial fallback is disabled. "
@@ -2208,11 +2332,23 @@ class ModelTrainer:
         else:
             self._compute_features_full_pipeline()
 
-        # 3) Persist computed features to PostgreSQL for deterministic reuse.
-        if self.config.persist_features_to_postgres:
-            self._store_features_to_postgres()
-        else:
+        self.features_materialized_in_run = bool(self.features is not None and not self.features.empty)
+
+    def _persist_features_to_postgres_if_needed(self) -> None:
+        """Persist only freshly materialized post-selection features."""
+        if not self.config.persist_features_to_postgres:
             self.logger.info("Skipping feature persistence to PostgreSQL for this run")
+            return
+        if self.snapshot_replay_loaded:
+            self.logger.info("Skipping feature persistence because snapshot replay supplied features")
+            return
+        if self.feature_cache_reused:
+            self.logger.info("Skipping feature persistence because PostgreSQL feature cache was reused")
+            return
+        if not self.features_materialized_in_run:
+            self.logger.info("Skipping feature persistence because no new feature matrix was materialized")
+            return
+        self._store_features_to_postgres()
 
     def _resolve_feature_groups(self) -> list[Any]:
         """Resolve configured feature groups into FeatureGroup enum values."""
@@ -2456,13 +2592,33 @@ class ModelTrainer:
         start_part = start_date.isoformat() if start_date is not None else "none"
         end_part = end_date.isoformat() if end_date is not None else "none"
         return (
-            "train:features:schema:v2:"
+            "train:features:schema:v3:"
             f"{symbol_part}:{start_part}:{end_part}:"
             f"{self.config.timeframe}:{feature_set_id}:{groups_part}:"
             f"{cross_sectional_part}:{reference_part}:{tick_part}:{timeframes_part}:"
             f"{self.config.training_bar_mode}:{self.config.intrinsic_bar_type}:"
             f"{self.feature_pipeline_fingerprint}"
         )
+
+    def _feature_selection_schema_signature(self) -> dict[str, Any]:
+        """Serialize feature-selection knobs that change the persisted cache contract."""
+        label_horizons = sorted(
+            {
+                int(h)
+                for h in self.config.label_horizons
+                if isinstance(h, (int, np.integer, float, np.floating)) and int(h) > 0
+            }
+        )
+        return {
+            "enabled": bool(self.config.enable_feature_selection),
+            "min_information_coefficient": float(self.config.feature_selection_min_ic),
+            "max_correlation": float(self.config.feature_selection_max_corr),
+            "max_features": int(self.config.feature_selection_max_features),
+            "stability_iterations": int(self.config.feature_selection_stability_iterations),
+            "min_stability_support": float(self.config.feature_selection_min_stability_support),
+            "primary_label_horizon": int(self.config.primary_label_horizon),
+            "label_horizons": label_horizons,
+        }
 
     def _current_ohlcv_fingerprint(self) -> str:
         """Fingerprint current OHLCV panel for safe feature-cache reuse."""
@@ -2497,6 +2653,8 @@ class ModelTrainer:
             "training_bar_mode": self.config.training_bar_mode,
             "intrinsic_bar_type": self.config.intrinsic_bar_type,
             "feature_set_id": feature_set_id,
+            "cache_stage": "post_selection",
+            "feature_selection_signature": self._feature_selection_schema_signature(),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -3027,6 +3185,12 @@ class ModelTrainer:
         if schema_payload.get("feature_set_id") != feature_set_id:
             self.logger.info("Feature cache scope changed; recomputing features.")
             return None
+        if schema_payload.get("cache_stage") != "post_selection":
+            self.logger.info("Feature cache stage changed; recomputing features.")
+            return None
+        if schema_payload.get("feature_selection_signature") != self._feature_selection_schema_signature():
+            self.logger.info("Feature selection cache signature changed; recomputing features.")
+            return None
 
         query = text("""
             SELECT
@@ -3132,7 +3296,6 @@ class ModelTrainer:
 
     def _store_features_to_postgres(self) -> None:
         """Persist computed features to PostgreSQL `features` table (upsert)."""
-        from sqlalchemy import text
         from quant_trading_system.database.connection import get_db_manager, get_redis_manager
 
         if self.features is None or self.features.empty:
@@ -3152,86 +3315,146 @@ class ModelTrainer:
         feature_set_id = self._resolve_feature_set_id(
             sorted(export_df["symbol"].dropna().unique().tolist())
         )
-
-        upsert = text("""
-            INSERT INTO features (symbol, timestamp, timeframe, feature_name, feature_set_id, value)
-            VALUES (:symbol, :timestamp, :timeframe, :feature_name, :feature_set_id, :value)
-            ON CONFLICT (symbol, timestamp, timeframe, feature_name, feature_set_id)
-            DO UPDATE SET value = EXCLUDED.value
-            """)
+        symbols = sorted(export_df["symbol"].dropna().unique().tolist())
+        start_date = (
+            pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
+        )
+        end_date = pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
 
         db_manager = get_db_manager()
         checkpoint_file = self._feature_materialization_checkpoint_path()
         total_source_rows = len(export_df)
-        resume_offset = min(self._read_materialization_offset(checkpoint_file), total_source_rows)
+        feature_count = len(feature_cols)
+        estimated_feature_rows = int(total_source_rows * max(feature_count, 1))
+        checkpoint_payload = self._read_materialization_checkpoint(checkpoint_file)
+        resume_offset = min(int(checkpoint_payload.get("next_offset", 0)), total_source_rows)
+        if checkpoint_payload:
+            checkpoint_feature_count = int(checkpoint_payload.get("feature_count", -1))
+            checkpoint_stage = str(checkpoint_payload.get("cache_stage") or "")
+            if checkpoint_feature_count != feature_count or checkpoint_stage != "post_selection":
+                self.logger.info(
+                    "Discarding stale feature materialization checkpoint because cache semantics changed"
+                )
+                resume_offset = 0
+                if checkpoint_file.exists():
+                    checkpoint_file.unlink()
         if resume_offset > 0:
             self.logger.info(
-                f"Resuming feature materialization from source row offset "
+                "Resuming feature materialization from source row offset "
                 f"{resume_offset}/{total_source_rows}"
             )
 
+        source_batch_rows = self._resolve_feature_materialization_source_batch_rows(
+            feature_count=len(feature_cols)
+        )
+        self.training_metrics["feature_cache_stage"] = "post_selection"
+        self.training_metrics["feature_cache_selected_feature_count"] = float(len(feature_cols))
+        self.training_metrics["feature_cache_estimated_row_count"] = float(estimated_feature_rows)
+
         total_upserted_rows = 0
-        requested_source_batch_rows = max(250, int(self.config.feature_materialization_batch_rows))
-        source_batch_rows = min(requested_source_batch_rows, 1000)
-        if source_batch_rows < requested_source_batch_rows:
-            self.logger.info(
-                "Capping feature materialization source batch rows "
-                f"from {requested_source_batch_rows} to {source_batch_rows} for DB lock safety"
-            )
-        with db_manager.session() as session:
-            session.execute(text("SET max_parallel_workers_per_gather = 0"))
-            session.execute(text("SET statement_timeout = '120000ms'"))
-
-            for i in range(resume_offset, total_source_rows, source_batch_rows):
-                source_batch = export_df.iloc[i : i + source_batch_rows]
-                long_batch = source_batch.melt(
-                    id_vars=["symbol", "timestamp"],
-                    value_vars=feature_cols,
-                    var_name="feature_name",
-                    value_name="value",
-                ).dropna(subset=["value"])
-
-                if not long_batch.empty:
-                    write_batch_size = min(2000, max(500, source_batch_rows * 2))
-                    for offset in range(0, len(long_batch), write_batch_size):
-                        chunk_df = long_batch.iloc[offset : offset + write_batch_size]
-                        write_chunk = [
-                            {
-                                "symbol": row.symbol,
-                                "timestamp": (
-                                    row.timestamp.to_pydatetime()
-                                    if hasattr(row.timestamp, "to_pydatetime")
-                                    else row.timestamp
-                                ),
-                                "timeframe": timeframe,
-                                "feature_name": row.feature_name,
-                                "feature_set_id": feature_set_id,
-                                "value": float(row.value),
-                            }
-                            for row in chunk_df.itertuples(index=False)
-                        ]
-                        if not write_chunk:
-                            continue
-                        session.execute(upsert, write_chunk)
-                        session.commit()
-                        total_upserted_rows += len(write_chunk)
-
-                self._write_materialization_offset(
-                    checkpoint_file=checkpoint_file,
-                    next_offset=i + len(source_batch),
-                    total_rows=total_source_rows,
+        raw_conn = db_manager.engine.raw_connection()
+        stage_table = "tmp_training_features_stage"
+        try:
+            with raw_conn.cursor() as cursor:
+                cursor.execute("SET statement_timeout = '600000ms'")
+                cursor.execute("SET synchronous_commit = OFF")
+                cursor.execute(
+                    f"""
+                    CREATE TEMP TABLE IF NOT EXISTS {stage_table} (
+                        symbol TEXT NOT NULL,
+                        timestamp TIMESTAMPTZ NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        feature_name TEXT NOT NULL,
+                        feature_set_id TEXT NOT NULL,
+                        value DOUBLE PRECISION NOT NULL
+                    )
+                    """
                 )
+                raw_conn.commit()
+
+                if resume_offset == 0:
+                    cursor.execute(
+                        """
+                        DELETE FROM features
+                        WHERE symbol = ANY(%s)
+                          AND timeframe = %s
+                          AND feature_set_id = %s
+                          AND (%s IS NULL OR timestamp >= %s)
+                          AND (%s IS NULL OR timestamp <= %s)
+                        """,
+                        (
+                            symbols,
+                            timeframe,
+                            feature_set_id,
+                            start_date,
+                            start_date,
+                            end_date,
+                            end_date,
+                        ),
+                    )
+                    raw_conn.commit()
+
+                for i in range(resume_offset, total_source_rows, source_batch_rows):
+                    source_batch = export_df.iloc[i : i + source_batch_rows]
+                    long_batch = source_batch.melt(
+                        id_vars=["symbol", "timestamp"],
+                        value_vars=feature_cols,
+                        var_name="feature_name",
+                        value_name="value",
+                    ).dropna(subset=["value"])
+
+                    if not long_batch.empty:
+                        staged_rows = self._copy_feature_rows_to_stage(
+                            cursor=cursor,
+                            stage_table=stage_table,
+                            long_batch=long_batch,
+                            timeframe=timeframe,
+                            feature_set_id=feature_set_id,
+                        )
+                        if staged_rows > 0:
+                            cursor.execute(
+                                f"""
+                                INSERT INTO features (
+                                    symbol,
+                                    timestamp,
+                                    timeframe,
+                                    feature_name,
+                                    feature_set_id,
+                                    value
+                                )
+                                SELECT
+                                    symbol,
+                                    timestamp,
+                                    timeframe,
+                                    feature_name,
+                                    feature_set_id,
+                                    value
+                                FROM {stage_table}
+                                ON CONFLICT (symbol, timestamp, timeframe, feature_name, feature_set_id)
+                                DO UPDATE SET value = EXCLUDED.value
+                                """
+                            )
+                            cursor.execute(f"TRUNCATE TABLE {stage_table}")
+                            total_upserted_rows += staged_rows
+
+                    self._write_materialization_offset(
+                        checkpoint_file=checkpoint_file,
+                        next_offset=i + len(source_batch),
+                        total_rows=total_source_rows,
+                        feature_count=feature_count,
+                    )
+                    raw_conn.commit()
+
+                cursor.execute(f"DROP TABLE IF EXISTS {stage_table}")
+                raw_conn.commit()
+        finally:
+            raw_conn.close()
 
         if checkpoint_file.exists():
             checkpoint_file.unlink()
 
         redis_mgr = get_redis_manager()
         redis_mgr.delete(f"train:ohlcv_symbols:{timeframe}")
-        symbols = sorted(export_df["symbol"].dropna().unique().tolist())
-        start_date = (
-            pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
-        )
-        end_date = pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
         schema_key = self._feature_schema_cache_key(
             symbols=symbols,
             start_date=start_date,
@@ -3241,7 +3464,74 @@ class ModelTrainer:
         redis_mgr.set(
             schema_key, json.dumps(schema_metadata, ensure_ascii=True), expire_seconds=604800
         )
+        self.features_persisted_to_postgres = True
         self.logger.info(f"Persisted {total_upserted_rows} feature rows to PostgreSQL")
+
+    def _resolve_feature_materialization_source_batch_rows(self, feature_count: int) -> int:
+        """Cap source batches by estimated staged long rows instead of a fixed tiny batch."""
+        requested = max(250, int(self.config.feature_materialization_batch_rows))
+        if feature_count <= 0:
+            return requested
+        max_long_rows = 1_000_000
+        adaptive_limit = max(250, int(max_long_rows / max(feature_count, 1)))
+        source_batch_rows = min(requested, adaptive_limit)
+        if source_batch_rows < requested:
+            self.logger.info(
+                "Capping feature materialization source batch rows "
+                f"from {requested} to {source_batch_rows} to keep staged writes bounded"
+            )
+        return source_batch_rows
+
+    def _copy_feature_rows_to_stage(
+        self,
+        cursor: Any,
+        stage_table: str,
+        long_batch: pd.DataFrame,
+        timeframe: str,
+        feature_set_id: str,
+    ) -> int:
+        """COPY a melted feature batch into a temporary staging table."""
+        stage_df = long_batch.copy()
+        stage_df["timestamp"] = pd.to_datetime(stage_df["timestamp"], utc=True, errors="coerce")
+        stage_df["value"] = pd.to_numeric(stage_df["value"], errors="coerce")
+        stage_df = stage_df.dropna(subset=["timestamp", "feature_name", "value"])
+        if stage_df.empty:
+            return 0
+
+        stage_df = stage_df.assign(
+            timeframe=timeframe,
+            feature_set_id=feature_set_id,
+            symbol=stage_df["symbol"].astype(str),
+            feature_name=stage_df["feature_name"].astype(str),
+        )[
+            ["symbol", "timestamp", "timeframe", "feature_name", "feature_set_id", "value"]
+        ]
+
+        buffer = io.StringIO()
+        stage_df.to_csv(
+            buffer,
+            sep="\t",
+            index=False,
+            header=False,
+            na_rep="\\N",
+            date_format="%Y-%m-%d %H:%M:%S%z",
+        )
+        buffer.seek(0)
+        cursor.copy_from(
+            buffer,
+            stage_table,
+            sep="\t",
+            null="\\N",
+            columns=(
+                "symbol",
+                "timestamp",
+                "timeframe",
+                "feature_name",
+                "feature_set_id",
+                "value",
+            ),
+        )
+        return int(len(stage_df))
 
     def _feature_materialization_checkpoint_path(self) -> Path:
         """Checkpoint path for resumable feature materialization."""
@@ -3258,20 +3548,23 @@ class ModelTrainer:
         return state_dir / f"features_{snapshot_id}_{fingerprint}.json"
 
     @staticmethod
-    def _read_materialization_offset(checkpoint_file: Path) -> int:
+    def _read_materialization_checkpoint(checkpoint_file: Path) -> dict[str, Any]:
         if not checkpoint_file.exists():
-            return 0
+            return {}
         try:
             payload = json.loads(checkpoint_file.read_text(encoding="utf-8"))
-            return max(0, int(payload.get("next_offset", 0)))
+            if isinstance(payload, dict):
+                return payload
+            return {}
         except Exception:
-            return 0
+            return {}
 
     def _write_materialization_offset(
         self,
         checkpoint_file: Path,
         next_offset: int,
         total_rows: int,
+        feature_count: int,
     ) -> None:
         payload = {
             "snapshot_id": (
@@ -3280,6 +3573,8 @@ class ModelTrainer:
                 else None
             ),
             "model_name": self.config.model_name,
+            "cache_stage": "post_selection",
+            "feature_count": int(feature_count),
             "next_offset": int(next_offset),
             "total_rows": int(total_rows),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -9940,8 +10235,6 @@ def run_training(args: argparse.Namespace) -> int:
             logger.warning("`--gpu/--use-gpu` is deprecated; GPU acceleration is auto-detected.")
         if getattr(args, "no_database", False) or getattr(args, "no_redis_cache", False):
             raise ValueError("Institutional mode does not allow disabling PostgreSQL or Redis.")
-        if getattr(args, "no_shap", False):
-            raise ValueError("Institutional mode requires SHAP explainability.")
         if getattr(args, "disable_nested_walk_forward", False):
             raise ValueError("Institutional mode requires nested walk-forward optimization trace.")
 
@@ -9968,7 +10261,17 @@ def run_training(args: argparse.Namespace) -> int:
                     ).strip()
             logger.info(f"Replay mode enabled from manifest: {replay_bundle['manifest_path']}")
 
-        requested_model = str(replay_config.get("model_type") or getattr(args, "model", "xgboost"))
+        training_profile = _normalize_training_profile(
+            replay_config.get("training_profile") or getattr(args, "training_profile", "promotion")
+        )
+        if getattr(args, "no_shap", False) and training_profile == "promotion":
+            raise ValueError("Promotion profile requires SHAP explainability.")
+        if getattr(args, "disable_meta_labeling", False) and training_profile == "promotion":
+            raise ValueError("Promotion profile requires meta-labeling.")
+
+        requested_model = str(
+            replay_config.get("model_type") or getattr(args, "model", DEFAULT_PRIMARY_MODEL)
+        )
         model_list = (
             [
                 "xgboost",
@@ -9986,6 +10289,11 @@ def run_training(args: argparse.Namespace) -> int:
             if requested_model == "all"
             else [requested_model]
         )
+        if training_profile == "research" and requested_model == "all":
+            logger.warning(
+                "Research profile is intended for focused candidate runs. "
+                "`--model all` will still execute the full broad sweep."
+            )
 
         global_seed = int(replay_config.get("seed", getattr(args, "seed", 42)))
         set_global_seed(global_seed)
@@ -10008,6 +10316,7 @@ def run_training(args: argparse.Namespace) -> int:
         results: list[tuple[str, dict[str, Any]]] = []
         replay_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         configured_name = str(getattr(args, "name", "") or "").strip()
+        profile_defaults = TRAINING_PROFILE_DEFAULTS[training_profile]
 
         def _cfg_value(key: str, fallback: Any) -> Any:
             value = replay_config.get(key, fallback)
@@ -10116,9 +10425,112 @@ def run_training(args: argparse.Namespace) -> int:
             else:
                 feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
 
+            use_meta_labeling = bool(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="use_meta_labeling",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=True,
+                    arg_dest="disable_meta_labeling",
+                    arg_transform=lambda disabled: not bool(disabled),
+                )
+            )
+            compute_shap = bool(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="compute_shap",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=True,
+                    arg_dest="no_shap",
+                    arg_transform=lambda disabled: not bool(disabled),
+                )
+            )
+            n_splits = int(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="n_splits",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=5,
+                    arg_dest="n_splits",
+                )
+            )
+            n_trials = int(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="n_trials",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=100,
+                    arg_dest="n_trials",
+                )
+            )
+            nested_outer_splits = int(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="nested_outer_splits",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=4,
+                    arg_dest="nested_outer_splits",
+                )
+            )
+            nested_inner_splits = int(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="nested_inner_splits",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=3,
+                    arg_dest="nested_inner_splits",
+                )
+            )
+            auto_live_profile_enabled = bool(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="auto_live_profile_enabled",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=True,
+                    arg_dest="disable_auto_live_profile",
+                    arg_transform=lambda disabled: not bool(disabled),
+                )
+            )
+            feature_selection_stability_iterations = int(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="feature_selection_stability_iterations",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=16,
+                    arg_dest="feature_selection_stability_iterations",
+                )
+            )
+            require_nested_trace_for_promotion = bool(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="require_nested_trace_for_promotion",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=True,
+                )
+            )
+            require_objective_breakdown_for_promotion = bool(
+                _resolve_profiled_value(
+                    replay_config=replay_config,
+                    config_key="require_objective_breakdown_for_promotion",
+                    args=args,
+                    profile_defaults=profile_defaults,
+                    fallback=True,
+                )
+            )
+
             config = TrainingConfig(
                 model_type=model_type,
                 model_name=model_name,
+                training_profile=training_profile,
                 symbols=symbols,
                 start_date=_cfg_value(
                     "start_date",
@@ -10140,13 +10552,13 @@ def run_training(args: argparse.Namespace) -> int:
                     or []
                 ),
                 cv_method=_cfg_value("cv_method", getattr(args, "cv_method", "purged_kfold")),
-                n_splits=int(_cfg_value("n_splits", getattr(args, "n_splits", 5))),
+                n_splits=n_splits,
                 embargo_pct=max(
                     float(_cfg_value("embargo_pct", getattr(args, "embargo_pct", 0.01))), 0.01
                 ),  # P1-H1: Min 1%
                 optimize=True,
                 optimizer="optuna",
-                n_trials=int(_cfg_value("n_trials", getattr(args, "n_trials", 100))),
+                n_trials=n_trials,
                 n_jobs=int(
                     _cfg_value(
                         "n_jobs",
@@ -10155,18 +10567,8 @@ def run_training(args: argparse.Namespace) -> int:
                 ),
                 seed=int(_cfg_value("seed", getattr(args, "seed", global_seed))),
                 use_nested_walk_forward=True,
-                nested_outer_splits=int(
-                    _cfg_value(
-                        "nested_outer_splits",
-                        getattr(args, "nested_outer_splits", 4),
-                    )
-                ),
-                nested_inner_splits=int(
-                    _cfg_value(
-                        "nested_inner_splits",
-                        getattr(args, "nested_inner_splits", 3),
-                    )
-                ),
+                nested_outer_splits=nested_outer_splits,
+                nested_inner_splits=nested_inner_splits,
                 nested_outer_stability_ratio_cap=float(
                     _cfg_value(
                         "nested_outer_stability_ratio_cap",
@@ -10179,8 +10581,8 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "nested_outer_stability_min_trials", 8),
                     )
                 ),
-                require_nested_trace_for_promotion=True,
-                require_objective_breakdown_for_promotion=True,
+                require_nested_trace_for_promotion=require_nested_trace_for_promotion,
+                require_objective_breakdown_for_promotion=require_objective_breakdown_for_promotion,
                 objective_weight_sharpe=float(
                     _cfg_value(
                         "objective_weight_sharpe",
@@ -10247,7 +10649,7 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value("learning_rate", getattr(args, "learning_rate", 0.001))
                 ),
                 primary_horizon_sweep=primary_horizon_sweep,
-                use_meta_labeling=True,
+                use_meta_labeling=use_meta_labeling,
                 meta_label_min_confidence=float(
                     _cfg_value(
                         "meta_label_min_confidence",
@@ -10265,7 +10667,7 @@ def run_training(args: argparse.Namespace) -> int:
                 use_gpu=resolved_use_gpu,
                 use_database=True,
                 use_redis_cache=True,
-                compute_shap=True,
+                compute_shap=compute_shap,
                 min_accuracy=float(
                     _cfg_value(
                         "min_accuracy",
@@ -10597,12 +10999,7 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "feature_selection_max_features", 250),
                     )
                 ),
-                feature_selection_stability_iterations=int(
-                    _cfg_value(
-                        "feature_selection_stability_iterations",
-                        getattr(args, "feature_selection_stability_iterations", 16),
-                    )
-                ),
+                feature_selection_stability_iterations=feature_selection_stability_iterations,
                 feature_selection_min_stability_support=float(
                     _cfg_value(
                         "feature_selection_min_stability_support",
@@ -10663,12 +11060,7 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_lightgbm_monotonic_constraints", False)),
                     )
                 ),
-                auto_live_profile_enabled=bool(
-                    _cfg_value(
-                        "auto_live_profile_enabled",
-                        not bool(getattr(args, "disable_auto_live_profile", False)),
-                    )
-                ),
+                auto_live_profile_enabled=auto_live_profile_enabled,
                 auto_live_profile_symbol_threshold=int(
                     _cfg_value(
                         "auto_live_profile_symbol_threshold",
@@ -10704,10 +11096,12 @@ def run_training(args: argparse.Namespace) -> int:
                 model_params=model_params,
             )
             _verify_institutional_infra(config)
+            _log_training_environment_guidance(config.training_profile)
 
             logger.info("-" * 80)
             logger.info(f"Run {run_index}/{len(run_specs)}")
             logger.info(f"Model type: {config.model_type}")
+            logger.info(f"Training profile: {config.training_profile}")
             logger.info(f"Primary horizon: {config.primary_label_horizon}")
             logger.info(f"Symbols: {config.symbols or 'all available'}")
             logger.info("Data source: PostgreSQL (mandatory)")
@@ -10718,8 +11112,10 @@ def run_training(args: argparse.Namespace) -> int:
             logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
             logger.info(f"GPU acceleration enabled: {config.use_gpu}")
             logger.info(
-                "Institutional stack: Nested Walk-Forward + Optuna + Meta-Labeling + "
-                "Multiple-Testing + SHAP + Leak-Validation"
+                "Training stack: Nested Walk-Forward + Optuna + Meta-Labeling=%s + "
+                "Multiple-Testing + SHAP=%s + Leak-Validation",
+                "on" if config.use_meta_labeling else "off",
+                "on" if config.compute_shap else "off",
             )
             logger.info(
                 f"Nested CV: outer={config.nested_outer_splits}, inner={config.nested_inner_splits}"
@@ -10736,11 +11132,14 @@ def run_training(args: argparse.Namespace) -> int:
                     model_name=config.model_type,
                     model_version=config.model_name,
                     config={
+                        "training_profile": config.training_profile,
                         "cv_method": config.cv_method,
                         "n_splits": config.n_splits,
                         "embargo_pct": config.embargo_pct,
                         "n_trials": config.n_trials,
                         "use_gpu": config.use_gpu,
+                        "use_meta_labeling": config.use_meta_labeling,
+                        "compute_shap": config.compute_shap,
                         "holdout_pct": config.holdout_pct,
                         "execution_turnover_cap": config.execution_turnover_cap,
                         "execution_cooldown_bars": config.execution_cooldown_bars,
@@ -11021,8 +11420,20 @@ def validate_model(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI parser for training script."""
     parser = argparse.ArgumentParser(description="AlphaTrade Model Training")
-    parser.add_argument("--model", type=str, default="xgboost", choices=SUPPORTED_MODELS + ["all"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_PRIMARY_MODEL,
+        choices=SUPPORTED_MODELS + ["all"],
+    )
     parser.add_argument("--name", type=str, default="")
+    parser.add_argument(
+        "--training-profile",
+        type=str,
+        choices=list(SUPPORTED_TRAINING_PROFILES),
+        default="promotion",
+        help="Named training preset: promotion for final candidates, research for fast iteration.",
+    )
     parser.add_argument("--symbols", nargs="+", default=[])
     parser.add_argument(
         "--symbols-file",
@@ -11133,7 +11544,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-shap",
         action="store_true",
-        help="Forbidden in institutional mode; kept for explicit fail-fast validation.",
+        help="Disable SHAP explainability. Allowed only in research profile.",
     )
     parser.add_argument("--label-horizons", nargs="+", type=int, default=[1, 5, 20])
     parser.add_argument("--primary-horizon", type=int, default=5)
@@ -11180,6 +11591,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-meta-dynamic-threshold",
         action="store_true",
         help="Disable horizon/regime-adaptive meta-label confidence thresholding.",
+    )
+    parser.add_argument(
+        "--disable-meta-labeling",
+        action="store_true",
+        help="Disable meta-labeling. Allowed only in research profile.",
     )
     parser.add_argument(
         "--feature-groups",

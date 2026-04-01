@@ -814,14 +814,20 @@ For more information, visit: https://github.com/alphatrade/docs
             "ensemble",
             "all",
         ],
-        default="xgboost",
-        help="Model type to train (default: xgboost)",
+        default="lightgbm",
+        help="Model type to train (default: lightgbm)",
     )
     train_parser.add_argument(
         "--name",
         type=str,
         default="",
         help="Optional model name/version suffix",
+    )
+    train_parser.add_argument(
+        "--training-profile",
+        choices=["promotion", "research"],
+        default="promotion",
+        help="Named training preset: promotion for final candidates, research for fast iteration",
     )
     train_parser.add_argument(
         "--symbols",
@@ -977,6 +983,17 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Replay a prior training run from replay/promotion/artifact manifest JSON",
     )
     train_parser.add_argument(
+        "--dataset-snapshot-bundle",
+        type=Path,
+        default=None,
+        help="Load immutable training dataset bundle instead of rebuilding from live data",
+    )
+    train_parser.add_argument(
+        "--strict-snapshot-replay",
+        action="store_true",
+        help="Fail instead of falling back when a requested dataset snapshot bundle is missing",
+    )
+    train_parser.add_argument(
         "--gpu",
         action="store_true",
         help="Deprecated: training auto-detects GPU acceleration",
@@ -999,7 +1016,7 @@ For more information, visit: https://github.com/alphatrade/docs
     train_parser.add_argument(
         "--no-shap",
         action="store_true",
-        help="Forbidden in institutional mode; kept for explicit fail-fast validation",
+        help="Disable SHAP explainability. Allowed only in research profile",
     )
     train_parser.add_argument(
         "--epochs",
@@ -1218,6 +1235,33 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Disable horizon/regime-adaptive meta-label confidence thresholding",
     )
     train_parser.add_argument(
+        "--disable-meta-labeling",
+        action="store_true",
+        help="Disable meta-labeling. Allowed only in research profile",
+    )
+    train_parser.add_argument(
+        "--disable-uniqueness-weighting",
+        action="store_true",
+        help="Disable event-overlap uniqueness weighting during target engineering",
+    )
+    train_parser.add_argument(
+        "--label-uniqueness-weight-floor",
+        type=float,
+        default=0.25,
+        help="Floor for uniqueness weighting when enabled (default: 0.25)",
+    )
+    train_parser.add_argument(
+        "--disable-volatility-inverse-weighting",
+        action="store_true",
+        help="Disable inverse-volatility sample reweighting during target engineering",
+    )
+    train_parser.add_argument(
+        "--label-volatility-weight-cap",
+        type=float,
+        default=2.5,
+        help="Cap for inverse-volatility sample reweighting (default: 2.5)",
+    )
+    train_parser.add_argument(
         "--feature-groups",
         nargs="+",
         default=["technical", "statistical", "microstructure", "cross_sectional"],
@@ -1273,9 +1317,51 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Disable cross-sectional features explicitly",
     )
     train_parser.add_argument(
+        "--disable-reference-features",
+        action="store_true",
+        help="Disable point-in-time reference/event feature augmentation",
+    )
+    train_parser.add_argument(
+        "--disable-tick-microstructure-features",
+        action="store_true",
+        help="Disable stock_quotes/stock_trades microstructure enrichment",
+    )
+    train_parser.add_argument(
         "--strict-feature-groups",
         action="store_true",
         help="Fail training if any requested feature group cannot be materialized",
+    )
+    train_parser.add_argument(
+        "--training-bar-mode",
+        choices=["time", "intrinsic"],
+        default="time",
+        help="Input bar representation for training (default: time)",
+    )
+    train_parser.add_argument(
+        "--intrinsic-bar-type",
+        choices=[
+            "tick",
+            "volume",
+            "dollar",
+            "tick_imbalance",
+            "volume_imbalance",
+            "tick_run",
+            "volume_run",
+        ],
+        default="volume",
+        help="Intrinsic bar family when --training-bar-mode intrinsic",
+    )
+    train_parser.add_argument(
+        "--intrinsic-bar-threshold",
+        type=float,
+        default=0.0,
+        help="Manual intrinsic bar threshold override (default: 0.0)",
+    )
+    train_parser.add_argument(
+        "--intrinsic-target-bars-per-day",
+        type=int,
+        default=100,
+        help="Target intrinsic bars per day when auto-thresholding (default: 100)",
     )
     train_parser.add_argument(
         "--allow-partial-feature-fallback",
@@ -1319,6 +1405,41 @@ For more information, visit: https://github.com/alphatrade/docs
         type=str,
         default="default",
         help="Optional namespace seed for feature cache scoping",
+    )
+    train_parser.add_argument(
+        "--disable-feature-selection",
+        action="store_true",
+        help="Disable IC/correlation/stability feature selection on the development set",
+    )
+    train_parser.add_argument(
+        "--feature-selection-min-ic",
+        type=float,
+        default=0.01,
+        help="Minimum absolute information coefficient to keep a feature (default: 0.01)",
+    )
+    train_parser.add_argument(
+        "--feature-selection-max-corr",
+        type=float,
+        default=0.95,
+        help="Maximum allowed pairwise correlation after pruning (default: 0.95)",
+    )
+    train_parser.add_argument(
+        "--feature-selection-max-features",
+        type=int,
+        default=250,
+        help="Maximum number of selected features to retain (default: 250)",
+    )
+    train_parser.add_argument(
+        "--feature-selection-stability-iterations",
+        type=int,
+        default=16,
+        help="Bootstrap stability-selection iterations (default: 16)",
+    )
+    train_parser.add_argument(
+        "--feature-selection-min-stability-support",
+        type=float,
+        default=0.55,
+        help="Minimum stability support ratio required to keep a feature (default: 0.55)",
     )
     train_parser.add_argument(
         "--windows-fallback-features",
@@ -1394,6 +1515,12 @@ For more information, visit: https://github.com/alphatrade/docs
         type=Path,
         default=Path("models"),
         help="Output directory for trained models",
+    )
+    train_parser.add_argument(
+        "--warm-start-model",
+        type=Path,
+        default=None,
+        help="Optional prior model artifact used only during final production refit",
     )
     train_parser.set_defaults(func=cmd_train)
 

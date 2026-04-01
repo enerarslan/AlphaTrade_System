@@ -123,6 +123,8 @@ class TestParseArgs:
             "train",
             "--model",
             "lightgbm_ranker",
+            "--training-profile",
+            "research",
             "--name",
             "elastic_v1",
             "--timeframe",
@@ -140,6 +142,7 @@ class TestParseArgs:
             args = parse_args()
             assert args.command == "train"
             assert args.model == "lightgbm_ranker"
+            assert args.training_profile == "research"
             assert args.name == "elastic_v1"
             assert args.timeframe == "1D"
             assert args.feature_set_id == "universe_a"
@@ -157,6 +160,9 @@ class TestParseArgs:
                 "train",
                 "--replay-manifest",
                 "models/replays/example.replay_manifest.json",
+                "--dataset-snapshot-bundle",
+                "models/snapshots/snap_123/dataset_bundle.manifest.json",
+                "--strict-snapshot-replay",
                 "--nested-outer-splits",
                 "5",
                 "--nested-inner-splits",
@@ -168,6 +174,8 @@ class TestParseArgs:
             args = parse_args()
             assert args.command == "train"
             assert str(args.replay_manifest).endswith("example.replay_manifest.json")
+            assert str(args.dataset_snapshot_bundle).endswith("dataset_bundle.manifest.json")
+            assert args.strict_snapshot_replay is True
             assert args.nested_outer_splits == 5
             assert args.nested_inner_splits == 3
             assert args.seed == 7
@@ -212,6 +220,7 @@ class TestParseArgs:
                 "4.5",
                 "--label-edge-cost-buffer-bps",
                 "3.0",
+                "--disable-meta-labeling",
                 "--disable-symbol-quality-filter",
                 "--symbol-quality-min-rows",
                 "1600",
@@ -242,6 +251,11 @@ class TestParseArgs:
                 "--meta-label-min-confidence",
                 "0.61",
                 "--disable-meta-dynamic-threshold",
+                "--disable-feature-selection",
+                "--feature-selection-stability-iterations",
+                "7",
+                "--warm-start-model",
+                "models/lightgbm_prev.pkl",
             ],
         ):
             args = parse_args()
@@ -259,6 +273,7 @@ class TestParseArgs:
             assert args.max_regime_shift == pytest.approx(0.3)
             assert args.max_symbol_concentration_hhi == pytest.approx(0.57)
             assert args.disable_auto_live_profile is True
+            assert args.disable_meta_labeling is True
             assert args.auto_live_profile_symbol_threshold == 45
             assert args.auto_live_profile_min_years == pytest.approx(4.5)
             assert args.disable_symbol_quality_filter is True
@@ -278,6 +293,9 @@ class TestParseArgs:
             assert args.primary_horizon_sweep == [1, 5, 20]
             assert args.meta_label_min_confidence == pytest.approx(0.61)
             assert args.disable_meta_dynamic_threshold is True
+            assert args.disable_feature_selection is True
+            assert args.feature_selection_stability_iterations == 7
+            assert str(args.warm_start_model).endswith("lightgbm_prev.pkl")
 
     def test_parse_data_download_alias_and_sync_flags(self):
         with patch.object(

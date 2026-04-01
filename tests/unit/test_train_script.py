@@ -27,6 +27,7 @@ def _base_args(**overrides):
     args = {
         "model": "xgboost",
         "name": "",
+        "training_profile": "promotion",
         "symbols": [],
         "symbols_file": None,
         "start": "",
@@ -59,6 +60,8 @@ def _base_args(**overrides):
         "objective_weight_symbol_concentration": 0.20,
         "objective_expected_shortfall_cap": 0.012,
         "replay_manifest": None,
+        "dataset_snapshot_bundle": None,
+        "strict_snapshot_replay": False,
         "gpu": False,
         "use_gpu": False,
         "no_database": False,
@@ -74,6 +77,7 @@ def _base_args(**overrides):
         "label_volatility_weight_cap": 2.5,
         "meta_label_min_confidence": 0.55,
         "disable_meta_dynamic_threshold": False,
+        "disable_meta_labeling": False,
         "holdout_pct": 0.15,
         "min_holdout_sharpe": 0.0,
         "min_holdout_regime_sharpe": -0.10,
@@ -139,6 +143,47 @@ def test_extract_base_symbol():
     assert train_script.ModelTrainer._extract_base_symbol("AAPL_15MIN") == "AAPL"
     assert train_script.ModelTrainer._extract_base_symbol("BRK.B_15MIN") == "BRK.B"
     assert train_script.ModelTrainer._extract_base_symbol("MSFT") == "MSFT"
+
+
+def test_verify_gpu_stack_allows_tree_gpu_without_torch_cuda(monkeypatch):
+    class _FakeCuda:
+        @staticmethod
+        def is_available():
+            return False
+
+    class _FakeTorch:
+        cuda = _FakeCuda()
+
+    class _FakeLGBMClassifier:
+        def __init__(self, **kwargs):
+            assert kwargs["device_type"] == "gpu"
+
+        def fit(self, X, y):
+            assert len(X) == 128
+            assert len(y) == 128
+
+    class _FakeLightGBMModule:
+        LGBMClassifier = _FakeLGBMClassifier
+
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch())
+    monkeypatch.setitem(sys.modules, "lightgbm", _FakeLightGBMModule())
+
+    assert train_script._verify_gpu_stack(["lightgbm"]) is True
+
+
+def test_verify_gpu_stack_requires_cuda_for_deep_models(monkeypatch):
+    class _FakeCuda:
+        @staticmethod
+        def is_available():
+            return False
+
+    class _FakeTorch:
+        cuda = _FakeCuda()
+
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch())
+
+    with pytest.raises(RuntimeError, match="CUDA GPU not detected"):
+        train_script._verify_gpu_stack(["tcn"])
 
 
 def test_training_config_normalizes_timeframes_and_modes():
@@ -825,10 +870,79 @@ def test_run_training_rejects_optional_disable_flags():
     assert exit_code == 1
 
 
+def test_run_training_promotion_profile_rejects_optional_governance_disables():
+    assert train_script.run_training(_base_args(no_shap=True)) == 1
+    assert train_script.run_training(_base_args(disable_meta_labeling=True)) == 1
+
+
 def test_run_training_rejects_disable_nested_flag():
     args = _base_args(disable_nested_walk_forward=True)
     exit_code = train_script.run_training(args)
     assert exit_code == 1
+
+
+def test_run_training_research_profile_applies_fast_presets(monkeypatch):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    args = _base_args(
+        training_profile="research",
+        model="lightgbm",
+        n_trials=100,
+        n_splits=5,
+        nested_outer_splits=4,
+        nested_inner_splits=3,
+        feature_selection_stability_iterations=16,
+    )
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].training_profile == "research"
+    assert captured["config"].n_trials == 20
+    assert captured["config"].n_splits == 3
+    assert captured["config"].nested_outer_splits == 2
+    assert captured["config"].nested_inner_splits == 2
+    assert captured["config"].use_meta_labeling is False
+    assert captured["config"].compute_shap is False
+    assert captured["config"].auto_live_profile_enabled is False
+    assert captured["config"].feature_selection_stability_iterations == 8
+
+
+def test_run_training_research_profile_preserves_explicit_budget_overrides(monkeypatch):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    args = _base_args(
+        training_profile="research",
+        model="lightgbm",
+        n_trials=9,
+        feature_selection_stability_iterations=5,
+    )
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].n_trials == 9
+    assert captured["config"].feature_selection_stability_iterations == 5
 
 
 def test_get_cv_splitter_walk_forward_applies_purge_gap():
@@ -1798,6 +1912,93 @@ def test_compute_features_windows_allows_partial_fallback_when_enabled(monkeypat
     assert fallback_called["value"] is True
 
 
+def test_compute_features_defers_postgres_persistence_until_after_selection(monkeypatch):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            persist_features_to_postgres=True,
+        )
+    )
+    trainer.data = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 4,
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC"),
+            "open": [1.0, 1.0, 1.0, 1.0],
+            "high": [1.0, 1.0, 1.0, 1.0],
+            "low": [1.0, 1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0, 1.0],
+            "volume": [100, 110, 120, 130],
+        }
+    )
+
+    monkeypatch.setattr(train_script.os, "name", "posix", raising=False)
+    monkeypatch.setattr(trainer, "_load_features_from_postgres", lambda: None)
+    monkeypatch.setattr(
+        trainer,
+        "_compute_features_full_pipeline",
+        lambda: setattr(
+            trainer,
+            "features",
+            trainer.data.assign(feature_alpha=np.array([0.1, 0.2, 0.3, 0.4])),
+        ),
+    )
+    persist_called = {"value": False}
+    monkeypatch.setattr(
+        trainer,
+        "_store_features_to_postgres",
+        lambda: persist_called.__setitem__("value", True),
+    )
+
+    trainer._compute_features()
+
+    assert persist_called["value"] is False
+    assert trainer.feature_cache_reused is False
+    assert trainer.features_materialized_in_run is True
+
+
+def test_persist_features_to_postgres_if_needed_skips_reused_cache(monkeypatch):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            persist_features_to_postgres=True,
+        )
+    )
+    trainer.features_materialized_in_run = True
+    trainer.feature_cache_reused = True
+    persist_calls = {"count": 0}
+    monkeypatch.setattr(
+        trainer,
+        "_store_features_to_postgres",
+        lambda: persist_calls.__setitem__("count", persist_calls["count"] + 1),
+    )
+
+    trainer._persist_features_to_postgres_if_needed()
+
+    assert persist_calls["count"] == 0
+
+
+def test_persist_features_to_postgres_if_needed_persists_fresh_selected_features(monkeypatch):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            persist_features_to_postgres=True,
+        )
+    )
+    trainer.features_materialized_in_run = True
+    trainer.feature_cache_reused = False
+    trainer.snapshot_replay_loaded = False
+    persist_calls = {"count": 0}
+    monkeypatch.setattr(
+        trainer,
+        "_store_features_to_postgres",
+        lambda: persist_calls.__setitem__("count", persist_calls["count"] + 1),
+    )
+
+    trainer._persist_features_to_postgres_if_needed()
+
+    assert persist_calls["count"] == 1
+
+
 def test_finalize_feature_matrix_preserves_rows_with_sparse_full_features():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -1874,6 +2075,32 @@ def test_build_parser_supports_institutional_failfast_flags_and_name():
     assert args.no_database is True
     assert args.no_redis_cache is True
     assert args.no_shap is True
+
+
+def test_build_parser_supports_training_profiles_and_snapshot_flags():
+    parser = train_script.build_parser()
+    args = parser.parse_args(
+        [
+            "--training-profile",
+            "research",
+            "--dataset-snapshot-bundle",
+            "models/snapshots/snap_123/dataset_bundle.manifest.json",
+            "--strict-snapshot-replay",
+            "--disable-meta-labeling",
+            "--disable-feature-selection",
+            "--feature-selection-stability-iterations",
+            "6",
+            "--warm-start-model",
+            "models/lightgbm_prev.pkl",
+        ]
+    )
+    assert args.training_profile == "research"
+    assert str(args.dataset_snapshot_bundle).endswith("dataset_bundle.manifest.json")
+    assert args.strict_snapshot_replay is True
+    assert args.disable_meta_labeling is True
+    assert args.disable_feature_selection is True
+    assert args.feature_selection_stability_iterations == 6
+    assert str(args.warm_start_model).endswith("lightgbm_prev.pkl")
 
 
 def test_build_parser_supports_feature_pipeline_flags():
@@ -3024,6 +3251,70 @@ def test_load_features_from_postgres_recomputes_when_ohlcv_hash_changes(monkeypa
         "enable_reference_features": bool(trainer.config.enable_reference_features),
         "timeframe": trainer.config.timeframe,
         "feature_set_id": feature_set_id,
+    }
+
+    class FakeRedis:
+        def get(self, key):
+            if "train:features:schema:" in key:
+                return json.dumps(schema_payload)
+            return None
+
+        def set(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(conn_module, "get_db_manager", lambda: MagicMock())
+    monkeypatch.setattr(conn_module, "get_redis_manager", lambda: FakeRedis())
+
+    assert trainer._load_features_from_postgres() is None
+
+
+def test_load_features_from_postgres_recomputes_when_feature_selection_signature_changes(
+    monkeypatch,
+):
+    import quant_trading_system.database.connection as conn_module
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            symbols=["AAPL"],
+            timeframe="15Min",
+        )
+    )
+    trainer.data = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1100.0],
+        }
+    )
+    feature_set_id = trainer._resolve_feature_set_id(["AAPL"])
+    schema_payload = {
+        "pipeline_fingerprint": trainer.feature_pipeline_fingerprint,
+        "source_ohlcv_hash": trainer._current_ohlcv_fingerprint(),
+        "feature_names": ["f_alpha"],
+        "feature_groups": sorted(trainer.config.feature_groups),
+        "enable_cross_sectional": bool(trainer.config.enable_cross_sectional),
+        "enable_reference_features": bool(trainer.config.enable_reference_features),
+        "enable_tick_microstructure_features": bool(
+            trainer.config.enable_tick_microstructure_features
+        ),
+        "timeframe": trainer.config.timeframe,
+        "timeframes": list(trainer.config.timeframes),
+        "training_bar_mode": trainer.config.training_bar_mode,
+        "intrinsic_bar_type": trainer.config.intrinsic_bar_type,
+        "feature_set_id": feature_set_id,
+        "cache_stage": "post_selection",
+        "feature_selection_signature": {
+            **trainer._feature_selection_schema_signature(),
+            "max_features": trainer.config.feature_selection_max_features - 1,
+        },
     }
 
     class FakeRedis:
