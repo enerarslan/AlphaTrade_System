@@ -52,8 +52,8 @@ def _base_args(**overrides):
         "disable_nested_walk_forward": False,
         "objective_weight_sharpe": 1.0,
         "objective_weight_drawdown": 0.5,
-        "objective_weight_turnover": 0.1,
-        "objective_weight_calibration": 0.25,
+        "objective_weight_turnover": 0.2,
+        "objective_weight_calibration": 0.35,
         "objective_weight_trade_activity": 1.0,
         "objective_weight_cvar": 0.4,
         "objective_weight_skew": 0.1,
@@ -80,6 +80,8 @@ def _base_args(**overrides):
         "meta_label_min_confidence": 0.55,
         "disable_meta_dynamic_threshold": False,
         "disable_meta_labeling": False,
+        "disable_probability_calibration": False,
+        "probability_calibration_method": "isotonic",
         "holdout_pct": 0.15,
         "min_holdout_sharpe": 0.0,
         "min_holdout_regime_sharpe": -0.10,
@@ -118,17 +120,18 @@ def _base_args(**overrides):
         "skip_feature_persist": False,
         "feature_set_id": "default",
         "disable_feature_selection": False,
-        "feature_selection_min_ic": 0.01,
-        "feature_selection_max_corr": 0.95,
-        "feature_selection_max_features": 250,
+        "feature_selection_min_ic": 0.015,
+        "feature_selection_max_corr": 0.90,
+        "feature_selection_max_features": 180,
         "feature_selection_stability_iterations": 16,
-        "feature_selection_min_stability_support": 0.55,
+        "feature_selection_min_stability_support": 0.60,
         "windows_fallback_features": False,
         "disable_dynamic_no_trade_band": False,
         "execution_vol_target_daily": 0.012,
-        "execution_turnover_cap": 0.90,
+        "execution_turnover_cap": 0.60,
         "execution_cooldown_bars": 2,
         "execution_max_symbol_entry_share": 0.68,
+        "min_confidence_position_scale": 0.20,
         "warm_start_model": None,
         "min_accuracy": 0.45,
         "min_trades": 100,
@@ -1091,14 +1094,14 @@ def test_run_training_research_profile_applies_fast_presets(monkeypatch):
 
     assert exit_code == 0
     assert captured["config"].training_profile == "research"
-    assert captured["config"].n_trials == 20
+    assert captured["config"].n_trials == 30
     assert captured["config"].n_splits == 3
     assert captured["config"].nested_outer_splits == 2
     assert captured["config"].nested_inner_splits == 2
     assert captured["config"].use_meta_labeling is False
     assert captured["config"].compute_shap is False
     assert captured["config"].auto_live_profile_enabled is False
-    assert captured["config"].feature_selection_stability_iterations == 8
+    assert captured["config"].feature_selection_stability_iterations == 12
 
 
 def test_run_training_research_profile_preserves_explicit_budget_overrides(monkeypatch):
@@ -2873,11 +2876,19 @@ def test_build_parser_supports_horizon_sweep_and_meta_threshold_flags():
             "--meta-label-min-confidence",
             "0.63",
             "--disable-meta-dynamic-threshold",
+            "--probability-calibration-method",
+            "sigmoid",
+            "--disable-probability-calibration",
+            "--min-confidence-position-scale",
+            "0.3",
         ]
     )
     assert args.primary_horizon_sweep == [1, 5, 20]
     assert args.meta_label_min_confidence == pytest.approx(0.63)
     assert args.disable_meta_dynamic_threshold is True
+    assert args.probability_calibration_method == "sigmoid"
+    assert args.disable_probability_calibration is True
+    assert args.min_confidence_position_scale == pytest.approx(0.3)
 
 
 def test_build_parser_supports_white_reality_gate_flags():
@@ -2947,6 +2958,8 @@ def test_training_config_normalizes_limits_and_exports_cost_model():
         model_type="xgboost",
         feature_reuse_min_coverage=2.5,
         execution_turnover_cap=2.0,
+        min_confidence_position_scale=2.0,
+        probability_calibration_method="SIGMOID",
         primary_horizon_sweep=[-1, 5, 0, 3],
         label_spread_bps=1.5,
         label_slippage_bps=2.0,
@@ -2955,8 +2968,57 @@ def test_training_config_normalizes_limits_and_exports_cost_model():
 
     assert cfg.feature_reuse_min_coverage == pytest.approx(0.95)
     assert cfg.execution_turnover_cap == pytest.approx(1.0)
+    assert cfg.min_confidence_position_scale == pytest.approx(1.0)
+    assert cfg.probability_calibration_method == "sigmoid"
     assert cfg.primary_horizon_sweep == [3, 5]
     assert cfg.to_trading_cost_model().execution_cost_bps == pytest.approx(7.0)
+
+
+def test_fit_probability_calibrator_uses_resolved_method_when_attached():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm",
+            probability_calibration_method="isotonic",
+        )
+    )
+    trainer.oof_primary_proba = np.tile(np.array([0.15, 0.25, 0.35, 0.65, 0.75, 0.85]), 20)
+    trainer.labels = pd.Series(np.tile(np.array([0, 0, 0, 1, 1, 1]), 20))
+
+    trainer._fit_probability_calibrator_from_oof()
+
+    assert trainer.probability_calibrator is not None
+    assert trainer.training_metrics["probability_calibration_enabled"] == pytest.approx(1.0)
+    assert trainer.training_metrics["probability_calibration_method"] == "sigmoid"
+
+    fitted_model = SimpleNamespace()
+    trainer._attach_probability_calibrator_to_model(fitted_model)
+
+    payload = fitted_model._alphatrade_probability_calibration
+    assert payload["method"] == "sigmoid"
+    assert payload["calibrator"] is trainer.probability_calibrator
+
+
+def test_get_predictions_proba_applies_attached_probability_calibration():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm"))
+
+    class DummyCalibrator:
+        def predict(self, x):
+            return np.clip(np.asarray(x, dtype=float) + 0.10, 0.0, 1.0)
+
+    class DummyModel:
+        def __init__(self):
+            self._alphatrade_probability_calibration = {
+                "method": "isotonic",
+                "calibrator": DummyCalibrator(),
+            }
+
+        def predict_proba(self, X):
+            raw = np.array([0.20, 0.55, 0.80], dtype=float)
+            return np.column_stack([1.0 - raw, raw])
+
+    calibrated = trainer._get_predictions_proba(DummyModel(), np.zeros((3, 2)))
+
+    assert np.allclose(calibrated, np.array([0.30, 0.65, 0.90]))
 
 
 def test_build_ranking_groups_segments_by_timestamp():

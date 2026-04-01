@@ -12,11 +12,20 @@ import pandas as pd
 from sqlalchemy import select
 
 from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
-from quant_trading_system.features.multi_timeframe import timeframe_to_rule
 from quant_trading_system.database.connection import DatabaseManager, get_db_manager
 from quant_trading_system.database.models import StockQuote, StockTrade
+from quant_trading_system.features.multi_timeframe import timeframe_to_rule
 
 logger = logging.getLogger(__name__)
+_FLOW_LOOKBACK_BARS_SHORT = 3
+_FLOW_LOOKBACK_BARS_LONG = 12
+_FLOW_MIN_BASELINE_BARS = 3
+_BLOCK_TRADE_SIZE_THRESHOLD = 1000.0
+
+
+def _relative_to_history(series: pd.Series, window: int) -> pd.Series:
+    baseline = series.shift(1).rolling(window, min_periods=_FLOW_MIN_BASELINE_BARS).mean()
+    return ((series / baseline.replace(0.0, np.nan)) - 1.0).replace([np.inf, -np.inf], np.nan)
 
 
 @dataclass(slots=True)
@@ -43,11 +52,13 @@ class TickMicrostructureFeatureBuilder:
             return feature_matrix
 
         base = feature_matrix.copy()
+        base["__row_id"] = np.arange(len(base), dtype=np.int64)
         base["symbol"] = base["symbol"].astype(str).str.upper().str.strip()
         base["timestamp"] = pd.to_datetime(base["timestamp"], utc=True, errors="coerce")
         base = base.dropna(subset=["symbol", "timestamp"]).copy()
         if base.empty:
             return feature_matrix
+        base = base.sort_values(["symbol", "timestamp", "__row_id"]).reset_index(drop=True)
 
         quotes = self._aggregate_quotes(base)
         trades = self._aggregate_trades(base)
@@ -56,6 +67,7 @@ class TickMicrostructureFeatureBuilder:
             base = base.merge(quotes, on=["symbol", "timestamp"], how="left")
         if not trades.empty:
             base = base.merge(trades, on=["symbol", "timestamp"], how="left")
+        base = self._augment_flow_regime_features(base)
 
         feature_cols = [column for column in base.columns if column.startswith("tick_")]
         for column in feature_cols:
@@ -66,7 +78,11 @@ class TickMicrostructureFeatureBuilder:
             if column.endswith("_days_since_last"):
                 default = 9999.0
             base[column] = base[column].fillna(default)
-        return base
+        return (
+            base.sort_values("__row_id")
+            .drop(columns=["__row_id"], errors="ignore")
+            .reset_index(drop=True)
+        )
 
     def _load_quotes(self, symbols: list[str], min_timestamp: pd.Timestamp, max_timestamp: pd.Timestamp) -> pd.DataFrame:
         try:
@@ -186,6 +202,11 @@ class TickMicrostructureFeatureBuilder:
         trades = trades.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
         trades["timestamp"] = trades["timestamp"].dt.ceil(rule)
         trades["tick_trade_dollar_volume"] = trades["price"] * trades["size"]
+        trades["tick_trade_block_volume"] = np.where(
+            trades["size"] >= _BLOCK_TRADE_SIZE_THRESHOLD,
+            trades["size"],
+            0.0,
+        )
         trades["price_delta"] = trades.groupby("symbol", sort=False)["price"].diff().fillna(0.0)
         signed_size = np.sign(trades["price_delta"]).replace(0.0, np.nan)
         signed_size = signed_size.groupby(trades["symbol"], sort=False).ffill().fillna(1.0)
@@ -198,6 +219,7 @@ class TickMicrostructureFeatureBuilder:
                 tick_trade_volume=("size", "sum"),
                 tick_trade_avg_size=("size", "mean"),
                 tick_trade_dollar_volume=("tick_trade_dollar_volume", "sum"),
+                tick_trade_block_volume=("tick_trade_block_volume", "sum"),
                 tick_trade_first_price=("price", "first"),
                 tick_trade_last_price=("price", "last"),
                 tick_trade_signed_volume=("signed_size", "sum"),
@@ -218,7 +240,139 @@ class TickMicrostructureFeatureBuilder:
             * 10_000.0
             / (agg["tick_trade_dollar_volume"].replace(0.0, np.nan) / 1_000_000.0)
         ).replace([np.inf, -np.inf], np.nan)
+        agg["tick_trade_block_volume_share"] = (
+            agg["tick_trade_block_volume"]
+            / agg["tick_trade_volume"].replace(0.0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan)
+        agg["tick_trade_vwap"] = (
+            agg["tick_trade_dollar_volume"]
+            / agg["tick_trade_volume"].replace(0.0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan)
+        agg["tick_trade_return_bps"] = (
+            (
+                agg["tick_trade_last_price"]
+                / agg["tick_trade_first_price"].replace(0.0, np.nan)
+                - 1.0
+            )
+            * 10_000.0
+        ).replace([np.inf, -np.inf], np.nan)
+        agg["tick_trade_vwap_deviation_bps"] = (
+            (
+                agg["tick_trade_last_price"]
+                / agg["tick_trade_vwap"].replace(0.0, np.nan)
+                - 1.0
+            )
+            * 10_000.0
+        ).replace([np.inf, -np.inf], np.nan)
         return agg.drop(
-            columns=["tick_trade_first_price", "tick_trade_last_price", "tick_trade_signed_volume"],
+            columns=[
+                "tick_trade_first_price",
+                "tick_trade_last_price",
+                "tick_trade_signed_volume",
+                "tick_trade_block_volume",
+                "tick_trade_vwap",
+            ],
             errors="ignore",
         )
+
+    def _augment_flow_regime_features(self, base: pd.DataFrame) -> pd.DataFrame:
+        derived_columns = (
+            "tick_quote_spread_bps_change",
+            "tick_quote_spread_bps_ema_3",
+            "tick_quote_spread_bps_burst_12",
+            "tick_quote_imbalance_change",
+            "tick_quote_imbalance_ema_3",
+            "tick_quote_update_intensity_12",
+            "tick_trade_signed_volume_ratio_change",
+            "tick_trade_signed_volume_ratio_ema_3",
+            "tick_trade_volume_burst_12",
+            "tick_trade_count_burst_12",
+            "tick_trade_flow_imbalance_gap",
+            "tick_trade_pressure_alignment",
+        )
+        for column in derived_columns:
+            base[column] = np.nan
+
+        grouped_rows = base.groupby("symbol", sort=False).groups
+        for row_index in grouped_rows.values():
+            ordered_index = base.loc[row_index].sort_values("timestamp").index
+
+            if "tick_quote_spread_bps_mean" in base.columns:
+                spread = pd.to_numeric(base.loc[ordered_index, "tick_quote_spread_bps_mean"], errors="coerce")
+                base.loc[ordered_index, "tick_quote_spread_bps_change"] = spread.diff().to_numpy()
+                base.loc[ordered_index, "tick_quote_spread_bps_ema_3"] = (
+                    spread.ewm(
+                        span=_FLOW_LOOKBACK_BARS_SHORT,
+                        adjust=False,
+                        min_periods=1,
+                    ).mean().to_numpy()
+                )
+                base.loc[ordered_index, "tick_quote_spread_bps_burst_12"] = (
+                    _relative_to_history(spread, _FLOW_LOOKBACK_BARS_LONG).to_numpy()
+                )
+
+            if "tick_quote_imbalance_last" in base.columns:
+                imbalance = pd.to_numeric(base.loc[ordered_index, "tick_quote_imbalance_last"], errors="coerce")
+                base.loc[ordered_index, "tick_quote_imbalance_change"] = imbalance.diff().to_numpy()
+                base.loc[ordered_index, "tick_quote_imbalance_ema_3"] = (
+                    imbalance.ewm(
+                        span=_FLOW_LOOKBACK_BARS_SHORT,
+                        adjust=False,
+                        min_periods=1,
+                    ).mean().to_numpy()
+                )
+
+            if "tick_quote_update_count" in base.columns:
+                quote_updates = pd.to_numeric(base.loc[ordered_index, "tick_quote_update_count"], errors="coerce")
+                base.loc[ordered_index, "tick_quote_update_intensity_12"] = (
+                    _relative_to_history(quote_updates, _FLOW_LOOKBACK_BARS_LONG).to_numpy()
+                )
+
+            if "tick_trade_signed_volume_ratio" in base.columns:
+                signed_ratio = pd.to_numeric(
+                    base.loc[ordered_index, "tick_trade_signed_volume_ratio"],
+                    errors="coerce",
+                )
+                base.loc[ordered_index, "tick_trade_signed_volume_ratio_change"] = (
+                    signed_ratio.diff().to_numpy()
+                )
+                base.loc[ordered_index, "tick_trade_signed_volume_ratio_ema_3"] = (
+                    signed_ratio.ewm(
+                        span=_FLOW_LOOKBACK_BARS_SHORT,
+                        adjust=False,
+                        min_periods=1,
+                    ).mean().to_numpy()
+                )
+
+            if "tick_trade_volume" in base.columns:
+                trade_volume = pd.to_numeric(base.loc[ordered_index, "tick_trade_volume"], errors="coerce")
+                base.loc[ordered_index, "tick_trade_volume_burst_12"] = (
+                    _relative_to_history(trade_volume, _FLOW_LOOKBACK_BARS_LONG).to_numpy()
+                )
+
+            if "tick_trade_count" in base.columns:
+                trade_count = pd.to_numeric(base.loc[ordered_index, "tick_trade_count"], errors="coerce")
+                base.loc[ordered_index, "tick_trade_count_burst_12"] = (
+                    _relative_to_history(trade_count, _FLOW_LOOKBACK_BARS_LONG).to_numpy()
+                )
+
+            if (
+                "tick_trade_signed_volume_ratio" in base.columns
+                and "tick_quote_imbalance_last" in base.columns
+            ):
+                signed_ratio = pd.to_numeric(
+                    base.loc[ordered_index, "tick_trade_signed_volume_ratio"],
+                    errors="coerce",
+                )
+                imbalance = pd.to_numeric(
+                    base.loc[ordered_index, "tick_quote_imbalance_last"],
+                    errors="coerce",
+                )
+                base.loc[ordered_index, "tick_trade_flow_imbalance_gap"] = (
+                    signed_ratio - imbalance
+                ).to_numpy()
+                base.loc[ordered_index, "tick_trade_pressure_alignment"] = (
+                    signed_ratio * imbalance
+                ).to_numpy()
+
+        return base

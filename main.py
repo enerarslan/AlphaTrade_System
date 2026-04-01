@@ -956,14 +956,14 @@ For more information, visit: https://github.com/alphatrade/docs
     train_parser.add_argument(
         "--objective-weight-turnover",
         type=float,
-        default=0.1,
-        help="Multi-objective turnover penalty weight (default: 0.1)",
+        default=0.2,
+        help="Multi-objective turnover penalty weight (default: 0.2)",
     )
     train_parser.add_argument(
         "--objective-weight-calibration",
         type=float,
-        default=0.25,
-        help="Multi-objective calibration penalty weight (default: 0.25)",
+        default=0.35,
+        help="Multi-objective calibration penalty weight (default: 0.35)",
     )
     train_parser.add_argument(
         "--objective-weight-trade-activity",
@@ -1208,20 +1208,20 @@ For more information, visit: https://github.com/alphatrade/docs
     train_parser.add_argument(
         "--label-min-signal-abs-return-bps",
         type=float,
-        default=8.0,
-        help="Minimum absolute forward return for signal candidacy in bps (default: 8.0)",
+        default=10.0,
+        help="Minimum absolute forward return for signal candidacy in bps (default: 10.0)",
     )
     train_parser.add_argument(
         "--label-neutral-buffer-bps",
         type=float,
-        default=4.0,
-        help="Neutral edge buffer around zero net return in bps (default: 4.0)",
+        default=5.0,
+        help="Neutral edge buffer around zero net return in bps (default: 5.0)",
     )
     train_parser.add_argument(
         "--label-edge-cost-buffer-bps",
         type=float,
-        default=2.0,
-        help="Additional edge-over-cost buffer in bps for durable labels (default: 2.0)",
+        default=3.0,
+        help="Additional edge-over-cost buffer in bps for durable labels (default: 3.0)",
     )
     train_parser.add_argument(
         "--label-max-abs-forward-return",
@@ -1268,6 +1268,17 @@ For more information, visit: https://github.com/alphatrade/docs
         "--disable-meta-labeling",
         action="store_true",
         help="Disable meta-labeling. Allowed only in research profile",
+    )
+    train_parser.add_argument(
+        "--disable-probability-calibration",
+        action="store_true",
+        help="Disable post-hoc probability calibration on out-of-fold predictions",
+    )
+    train_parser.add_argument(
+        "--probability-calibration-method",
+        choices=["isotonic", "sigmoid"],
+        default="isotonic",
+        help="Post-hoc probability calibration method (default: isotonic)",
     )
     train_parser.add_argument(
         "--disable-uniqueness-weighting",
@@ -1456,20 +1467,20 @@ For more information, visit: https://github.com/alphatrade/docs
     train_parser.add_argument(
         "--feature-selection-min-ic",
         type=float,
-        default=0.01,
-        help="Minimum absolute information coefficient to keep a feature (default: 0.01)",
+        default=0.015,
+        help="Minimum absolute information coefficient to keep a feature (default: 0.015)",
     )
     train_parser.add_argument(
         "--feature-selection-max-corr",
         type=float,
-        default=0.95,
-        help="Maximum allowed pairwise correlation after pruning (default: 0.95)",
+        default=0.90,
+        help="Maximum allowed pairwise correlation after pruning (default: 0.90)",
     )
     train_parser.add_argument(
         "--feature-selection-max-features",
         type=int,
-        default=250,
-        help="Maximum number of selected features to retain (default: 250)",
+        default=180,
+        help="Maximum number of selected features to retain (default: 180)",
     )
     train_parser.add_argument(
         "--feature-selection-stability-iterations",
@@ -1480,8 +1491,8 @@ For more information, visit: https://github.com/alphatrade/docs
     train_parser.add_argument(
         "--feature-selection-min-stability-support",
         type=float,
-        default=0.55,
-        help="Minimum stability support ratio required to keep a feature (default: 0.55)",
+        default=0.60,
+        help="Minimum stability support ratio required to keep a feature (default: 0.60)",
     )
     train_parser.add_argument(
         "--windows-fallback-features",
@@ -1502,8 +1513,8 @@ For more information, visit: https://github.com/alphatrade/docs
     train_parser.add_argument(
         "--execution-turnover-cap",
         type=float,
-        default=0.90,
-        help="Maximum average turnover cap used in execution-aware evaluation (default: 0.90)",
+        default=0.60,
+        help="Maximum average turnover cap used in execution-aware evaluation (default: 0.60)",
     )
     train_parser.add_argument(
         "--execution-cooldown-bars",
@@ -1516,6 +1527,12 @@ For more information, visit: https://github.com/alphatrade/docs
         type=float,
         default=0.68,
         help="Maximum allowed symbol share of executed entries during evaluation (default: 0.68)",
+    )
+    train_parser.add_argument(
+        "--min-confidence-position-scale",
+        type=float,
+        default=0.20,
+        help="Minimum fractional position scale for lower-confidence signals (default: 0.20)",
     )
     train_parser.add_argument(
         "--disable-lightgbm-monotonic-constraints",

@@ -142,13 +142,13 @@ TRAINING_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "promotion": {},
     "research": {
         "n_splits": 3,
-        "n_trials": 20,
+        "n_trials": 30,
         "nested_outer_splits": 2,
         "nested_inner_splits": 2,
         "use_meta_labeling": False,
         "compute_shap": False,
         "auto_live_profile_enabled": False,
-        "feature_selection_stability_iterations": 8,
+        "feature_selection_stability_iterations": 12,
         "require_nested_trace_for_promotion": False,
         "require_objective_breakdown_for_promotion": False,
     },
@@ -889,8 +889,8 @@ class TrainingConfig:
     require_objective_breakdown_for_promotion: bool = True
     objective_weight_sharpe: float = 1.0
     objective_weight_drawdown: float = 0.5
-    objective_weight_turnover: float = 0.1
-    objective_weight_calibration: float = 0.25
+    objective_weight_turnover: float = 0.2
+    objective_weight_calibration: float = 0.35
     objective_weight_trade_activity: float = 1.0
     objective_weight_cvar: float = 0.4
     objective_weight_skew: float = 0.1
@@ -941,20 +941,22 @@ class TrainingConfig:
     label_spread_bps: float = 1.0
     label_slippage_bps: float = 3.0
     label_impact_bps: float = 2.0
-    label_min_signal_abs_return_bps: float = 8.0
-    label_neutral_buffer_bps: float = 4.0
+    label_min_signal_abs_return_bps: float = 10.0
+    label_neutral_buffer_bps: float = 5.0
     label_max_abs_forward_return: float = 0.35
     label_signal_volatility_floor_mult: float = 0.50
     label_volatility_lookback: int = 20
     label_regime_lookback: int = 30
     label_temporal_weight_decay: float = 0.999
-    label_edge_cost_buffer_bps: float = 2.0
+    label_edge_cost_buffer_bps: float = 3.0
 
     # Meta-labeling (P2-3.5)
     use_meta_labeling: bool = True
     meta_model_type: str = "xgboost"
     meta_label_min_confidence: float = 0.55
     meta_label_dynamic_threshold: bool = True
+    enable_probability_calibration: bool = True
+    probability_calibration_method: str = "isotonic"
 
     # Multiple testing correction (P1-3.1)
     apply_multiple_testing: bool = True
@@ -1015,18 +1017,19 @@ class TrainingConfig:
     persist_features_to_postgres: bool = True
     feature_set_id: str = "default"
     enable_feature_selection: bool = True
-    feature_selection_min_ic: float = 0.01
-    feature_selection_max_corr: float = 0.95
-    feature_selection_max_features: int = 250
+    feature_selection_min_ic: float = 0.015
+    feature_selection_max_corr: float = 0.90
+    feature_selection_max_features: int = 180
     feature_selection_stability_iterations: int = 16
-    feature_selection_min_stability_support: float = 0.55
+    feature_selection_min_stability_support: float = 0.60
     windows_force_fallback_features: bool = False
     holdout_pct: float = 0.15
     dynamic_no_trade_band: bool = True
     execution_vol_target_daily: float = 0.012
-    execution_turnover_cap: float = 0.90
+    execution_turnover_cap: float = 0.60
     execution_cooldown_bars: int = 2
     execution_max_symbol_entry_share: float = 0.68
+    min_confidence_position_scale: float = 0.20
     lightgbm_use_monotonic_constraints: bool = True
     auto_live_profile_enabled: bool = True
     auto_live_profile_symbol_threshold: int = 40
@@ -1092,12 +1095,20 @@ class TrainingConfig:
             np.clip(float(self.meta_label_min_confidence), 0.45, 0.95)
         )
         self.meta_label_dynamic_threshold = bool(self.meta_label_dynamic_threshold)
+        self.enable_probability_calibration = bool(self.enable_probability_calibration)
+        calibration_method = str(self.probability_calibration_method or "isotonic").strip().lower()
+        if calibration_method not in {"isotonic", "sigmoid"}:
+            raise ValueError("probability_calibration_method must be 'isotonic' or 'sigmoid'")
+        self.probability_calibration_method = calibration_method
         self.holdout_pct = min(max(float(self.holdout_pct), 0.05), 0.35)
         self.execution_vol_target_daily = max(float(self.execution_vol_target_daily), 1e-4)
         self.execution_turnover_cap = min(max(float(self.execution_turnover_cap), 0.05), 1.0)
         self.execution_cooldown_bars = max(0, int(self.execution_cooldown_bars))
         self.execution_max_symbol_entry_share = float(
             np.clip(float(self.execution_max_symbol_entry_share), 0.50, 0.95)
+        )
+        self.min_confidence_position_scale = float(
+            np.clip(float(self.min_confidence_position_scale), 0.0, 1.0)
         )
         self.max_regime_shift = min(max(float(self.max_regime_shift), 0.0), 1.0)
         self.max_symbol_concentration_hhi = min(
@@ -1242,6 +1253,8 @@ class ModelTrainer:
         self.validation_results: dict = {}
         self.shap_values: np.ndarray | None = None
         self.meta_model: Any = None
+        self.probability_calibrator: Any = None
+        self.probability_calibration_method_resolved: str | None = None
         self.oof_primary_proba: np.ndarray | None = None
         self.cv_return_series: list[np.ndarray] = []
         self.cv_active_return_series: list[np.ndarray] = []
@@ -6789,6 +6802,7 @@ class ModelTrainer:
 
         # Calculate aggregate metrics
         self._calculate_aggregate_metrics()
+        self._fit_probability_calibrator_from_oof()
         self._fit_final_model_full_data()
         self._evaluate_holdout_performance()
 
@@ -7270,8 +7284,151 @@ class ModelTrainer:
             fallback_model.fit(X_train, y_train)
             self.model = fallback_model
 
-    def _get_predictions_proba(self, model, X) -> np.ndarray:
-        """Get prediction probabilities from model."""
+    def _supports_probability_calibration(self) -> bool:
+        """Return whether this model family supports probability calibration."""
+        if not bool(self.config.enable_probability_calibration):
+            return False
+        if self.config.model_type in {"xgboost_regressor", "lightgbm_regressor"}:
+            return False
+        return True
+
+    @staticmethod
+    def _resolve_probability_calibration_target(model: Any) -> Any:
+        """Return the object on which calibration state should be persisted."""
+        wrapped_model = getattr(model, "_model", None)
+        return wrapped_model if wrapped_model is not None else model
+
+    def _resolve_probability_calibration_payload(self, model: Any) -> dict[str, Any] | None:
+        """Read attached probability calibration metadata from wrapper or raw model."""
+        for candidate in (model, getattr(model, "_model", None)):
+            payload = getattr(candidate, "_alphatrade_probability_calibration", None)
+            if isinstance(payload, dict) and payload.get("calibrator") is not None:
+                return payload
+        return None
+
+    def _apply_probability_calibration(
+        self,
+        values: np.ndarray,
+        payload: dict[str, Any],
+    ) -> np.ndarray:
+        """Apply attached post-hoc probability calibration to raw prediction scores."""
+        calibrator = payload.get("calibrator")
+        method = str(payload.get("method") or "isotonic").strip().lower()
+        x = np.asarray(values, dtype=float).reshape(-1)
+        if x.size == 0 or calibrator is None:
+            return x
+        if method == "isotonic":
+            calibrated = calibrator.predict(x)
+        else:
+            calibrated = calibrator.predict_proba(x.reshape(-1, 1))[:, 1]
+        return np.clip(np.asarray(calibrated, dtype=float).reshape(-1), 0.0, 1.0)
+
+    def _attach_probability_calibrator_to_model(self, model: Any) -> None:
+        """Attach fitted probability calibration state to the saved model artifact."""
+        if model is None:
+            return
+        calibration_target = self._resolve_probability_calibration_target(model)
+        if self.probability_calibrator is None:
+            if hasattr(calibration_target, "_alphatrade_probability_calibration"):
+                delattr(calibration_target, "_alphatrade_probability_calibration")
+            return
+        calibration_target._alphatrade_probability_calibration = {
+            "method": str(
+                self.probability_calibration_method_resolved
+                or self.config.probability_calibration_method
+            ),
+            "calibrator": self.probability_calibrator,
+        }
+
+    def _fit_probability_calibrator_from_oof(self) -> None:
+        """Fit a post-hoc probability calibrator from out-of-fold predictions only."""
+        self.probability_calibrator = None
+        self.probability_calibration_method_resolved = None
+        self.training_metrics["probability_calibration_enabled"] = 0.0
+        if not self._supports_probability_calibration():
+            self.training_metrics["probability_calibration_reason"] = "disabled_or_unsupported"
+            return
+        if self.oof_primary_proba is None or self.labels is None:
+            self.training_metrics["probability_calibration_reason"] = "missing_oof_predictions"
+            return
+
+        raw_values = np.asarray(self.oof_primary_proba, dtype=float).reshape(-1)
+        labels = pd.to_numeric(self.labels, errors="coerce").to_numpy(dtype=float).reshape(-1)
+        if raw_values.size != labels.size or raw_values.size == 0:
+            self.training_metrics["probability_calibration_reason"] = "shape_mismatch"
+            return
+
+        mask = np.isfinite(raw_values) & np.isfinite(labels)
+        if not np.any(mask):
+            self.training_metrics["probability_calibration_reason"] = "no_finite_rows"
+            return
+
+        X_cal = np.clip(raw_values[mask], 0.0, 1.0)
+        y_cal = labels[mask]
+        unique_labels = sorted({int(v) for v in np.unique(y_cal) if v in {0.0, 1.0}})
+        if len(unique_labels) < 2:
+            self.training_metrics["probability_calibration_reason"] = "single_class_oof"
+            return
+        if len(X_cal) < 60:
+            self.training_metrics["probability_calibration_reason"] = "insufficient_samples"
+            return
+
+        sample_weight = None
+        if self.sample_weights is not None and len(self.sample_weights) == len(raw_values):
+            sample_weight = np.asarray(self.sample_weights, dtype=float)[mask]
+            sample_weight = np.clip(sample_weight, 1e-6, None)
+
+        requested_method = str(self.config.probability_calibration_method)
+        resolved_method = requested_method
+        if requested_method == "isotonic" and len(X_cal) < 200:
+            resolved_method = "sigmoid"
+
+        if resolved_method == "isotonic":
+            from sklearn.isotonic import IsotonicRegression
+
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            calibrator.fit(X_cal, y_cal, sample_weight=sample_weight)
+            calibrated = calibrator.predict(X_cal)
+        else:
+            from sklearn.linear_model import LogisticRegression
+
+            calibrator = LogisticRegression()
+            calibrator.fit(X_cal.reshape(-1, 1), y_cal.astype(int), sample_weight=sample_weight)
+            calibrated = calibrator.predict_proba(X_cal.reshape(-1, 1))[:, 1]
+
+        calibrated = np.clip(np.asarray(calibrated, dtype=float).reshape(-1), 0.0, 1.0)
+        brier_before = float(np.mean((X_cal - y_cal) ** 2))
+        brier_after = float(np.mean((calibrated - y_cal) ** 2))
+        if brier_after > (brier_before + 1e-4):
+            self.training_metrics["probability_calibration_reason"] = "brier_not_improved"
+            self.training_metrics["probability_calibration_brier_before"] = brier_before
+            self.training_metrics["probability_calibration_brier_after"] = brier_after
+            return
+
+        self.probability_calibrator = calibrator
+        self.probability_calibration_method_resolved = resolved_method
+        self.oof_primary_proba[mask] = calibrated
+        self.training_metrics["probability_calibration_enabled"] = 1.0
+        self.training_metrics["probability_calibration_method"] = resolved_method
+        self.training_metrics["probability_calibration_requested_method"] = requested_method
+        self.training_metrics["probability_calibration_sample_count"] = float(len(X_cal))
+        self.training_metrics["probability_calibration_brier_before"] = brier_before
+        self.training_metrics["probability_calibration_brier_after"] = brier_after
+        self.training_metrics["probability_calibration_brier_improvement"] = float(
+            brier_before - brier_after
+        )
+        self.training_metrics["probability_calibration_reason"] = "applied"
+        self.logger.info(
+            "Probability calibration applied using %s on %d OOF rows "
+            "(Brier %.6f -> %.6f)",
+            resolved_method,
+            len(X_cal),
+            brier_before,
+            brier_after,
+        )
+
+    def _get_raw_predictions_proba(self, model, X) -> np.ndarray:
+        """Get raw prediction probabilities from model before post-hoc calibration."""
         if self._is_ranker_model():
             raw_scores = np.asarray(model.predict(X), dtype=float).reshape(-1)
             clipped = np.clip(raw_scores, -20.0, 20.0)
@@ -7296,6 +7453,14 @@ class ModelTrainer:
             return predictions
 
         return np.zeros(len(X))
+
+    def _get_predictions_proba(self, model, X) -> np.ndarray:
+        """Get prediction probabilities from model, applying attached calibration when present."""
+        raw_values = np.asarray(self._get_raw_predictions_proba(model, X), dtype=float).reshape(-1)
+        payload = self._resolve_probability_calibration_payload(model)
+        if payload is None:
+            return raw_values
+        return self._apply_probability_calibration(raw_values, payload)
 
     def _calculate_fold_metrics(
         self,
@@ -8461,6 +8626,7 @@ class ModelTrainer:
             self.logger.warning(
                 "Dataset too small for final full-data refit; using selected fold model."
             )
+            self._attach_probability_calibrator_to_model(self.model)
             return
 
         weights = self.sample_weights if self.sample_weights is not None else None
@@ -8478,6 +8644,7 @@ class ModelTrainer:
             warm_start_model = self._load_warm_start_model()
         self._fit_model_full_dataset(final_model, X, y, weights, warm_start_model=warm_start_model)
         self.model = final_model
+        self._attach_probability_calibrator_to_model(self.model)
         self.training_metrics["final_refit_samples"] = float(len(X))
         self.logger.info(f"Final production model refit completed on {len(X)} samples")
 
@@ -10075,6 +10242,13 @@ class ModelTrainer:
                 "meta_label_dynamic_threshold": bool(
                     self.training_metrics.get("meta_label_dynamic_threshold", 0.0)
                 ),
+                "probability_calibration_enabled": bool(
+                    self.training_metrics.get("probability_calibration_enabled", 0.0)
+                ),
+                "probability_calibration_method": self.training_metrics.get(
+                    "probability_calibration_method",
+                    self.training_metrics.get("probability_calibration_requested_method"),
+                ),
                 "model_source": f"promotion_package:{self.config.model_name}",
             },
             "execution_cost_model": {
@@ -10087,7 +10261,7 @@ class ModelTrainer:
                 "max_position_pct": 0.10,
                 "max_total_positions": 20,
                 "confidence_position_sizing": True,
-                "min_confidence_position_scale": 0.0,
+                "min_confidence_position_scale": float(self.config.min_confidence_position_scale),
             },
             "promotion_passed": bool(self.validation_results.get("all_passed", False)),
             "snapshot_id": (
@@ -11124,13 +11298,13 @@ def run_training(args: argparse.Namespace) -> int:
                 objective_weight_turnover=float(
                     _cfg_value(
                         "objective_weight_turnover",
-                        getattr(args, "objective_weight_turnover", 0.1),
+                        getattr(args, "objective_weight_turnover", 0.2),
                     )
                 ),
                 objective_weight_calibration=float(
                     _cfg_value(
                         "objective_weight_calibration",
-                        getattr(args, "objective_weight_calibration", 0.25),
+                        getattr(args, "objective_weight_calibration", 0.35),
                     )
                 ),
                 objective_weight_trade_activity=float(
@@ -11186,6 +11360,18 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "meta_label_dynamic_threshold",
                         not bool(getattr(args, "disable_meta_dynamic_threshold", False)),
+                    )
+                ),
+                enable_probability_calibration=bool(
+                    _cfg_value(
+                        "enable_probability_calibration",
+                        not bool(getattr(args, "disable_probability_calibration", False)),
+                    )
+                ),
+                probability_calibration_method=str(
+                    _cfg_value(
+                        "probability_calibration_method",
+                        getattr(args, "probability_calibration_method", "isotonic"),
                     )
                 ),
                 apply_multiple_testing=True,
@@ -11299,13 +11485,13 @@ def run_training(args: argparse.Namespace) -> int:
                 label_min_signal_abs_return_bps=float(
                     _cfg_value(
                         "label_min_signal_abs_return_bps",
-                        getattr(args, "label_min_signal_abs_return_bps", 8.0),
+                        getattr(args, "label_min_signal_abs_return_bps", 10.0),
                     )
                 ),
                 label_neutral_buffer_bps=float(
                     _cfg_value(
                         "label_neutral_buffer_bps",
-                        getattr(args, "label_neutral_buffer_bps", 4.0),
+                        getattr(args, "label_neutral_buffer_bps", 5.0),
                     )
                 ),
                 label_max_abs_forward_return=float(
@@ -11338,7 +11524,7 @@ def run_training(args: argparse.Namespace) -> int:
                 label_edge_cost_buffer_bps=float(
                     _cfg_value(
                         "label_edge_cost_buffer_bps",
-                        getattr(args, "label_edge_cost_buffer_bps", 2.0),
+                        getattr(args, "label_edge_cost_buffer_bps", 3.0),
                     )
                 ),
                 label_apply_uniqueness_weighting=bool(
@@ -11522,26 +11708,26 @@ def run_training(args: argparse.Namespace) -> int:
                 feature_selection_min_ic=float(
                     _cfg_value(
                         "feature_selection_min_ic",
-                        getattr(args, "feature_selection_min_ic", 0.01),
+                        getattr(args, "feature_selection_min_ic", 0.015),
                     )
                 ),
                 feature_selection_max_corr=float(
                     _cfg_value(
                         "feature_selection_max_corr",
-                        getattr(args, "feature_selection_max_corr", 0.95),
+                        getattr(args, "feature_selection_max_corr", 0.90),
                     )
                 ),
                 feature_selection_max_features=int(
                     _cfg_value(
                         "feature_selection_max_features",
-                        getattr(args, "feature_selection_max_features", 250),
+                        getattr(args, "feature_selection_max_features", 180),
                     )
                 ),
                 feature_selection_stability_iterations=feature_selection_stability_iterations,
                 feature_selection_min_stability_support=float(
                     _cfg_value(
                         "feature_selection_min_stability_support",
-                        getattr(args, "feature_selection_min_stability_support", 0.55),
+                        getattr(args, "feature_selection_min_stability_support", 0.60),
                     )
                 ),
                 windows_force_fallback_features=bool(
@@ -11577,7 +11763,7 @@ def run_training(args: argparse.Namespace) -> int:
                 execution_turnover_cap=float(
                     _cfg_value(
                         "execution_turnover_cap",
-                        getattr(args, "execution_turnover_cap", 0.90),
+                        getattr(args, "execution_turnover_cap", 0.60),
                     )
                 ),
                 execution_cooldown_bars=int(
@@ -11590,6 +11776,12 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "execution_max_symbol_entry_share",
                         getattr(args, "execution_max_symbol_entry_share", 0.68),
+                    )
+                ),
+                min_confidence_position_scale=float(
+                    _cfg_value(
+                        "min_confidence_position_scale",
+                        getattr(args, "min_confidence_position_scale", 0.20),
                     )
                 ),
                 lightgbm_use_monotonic_constraints=bool(
@@ -12026,8 +12218,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--objective-weight-sharpe", type=float, default=1.0)
     parser.add_argument("--objective-weight-drawdown", type=float, default=0.5)
-    parser.add_argument("--objective-weight-turnover", type=float, default=0.1)
-    parser.add_argument("--objective-weight-calibration", type=float, default=0.25)
+    parser.add_argument("--objective-weight-turnover", type=float, default=0.2)
+    parser.add_argument("--objective-weight-calibration", type=float, default=0.35)
     parser.add_argument("--objective-weight-trade-activity", type=float, default=1.0)
     parser.add_argument("--objective-weight-cvar", type=float, default=0.4)
     parser.add_argument("--objective-weight-skew", type=float, default=0.1)
@@ -12122,9 +12314,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spread-bps", type=float, default=1.0)
     parser.add_argument("--slippage-bps", type=float, default=3.0)
     parser.add_argument("--impact-bps", type=float, default=2.0)
-    parser.add_argument("--label-min-signal-abs-return-bps", type=float, default=8.0)
-    parser.add_argument("--label-neutral-buffer-bps", type=float, default=4.0)
-    parser.add_argument("--label-edge-cost-buffer-bps", type=float, default=2.0)
+    parser.add_argument("--label-min-signal-abs-return-bps", type=float, default=10.0)
+    parser.add_argument("--label-neutral-buffer-bps", type=float, default=5.0)
+    parser.add_argument("--label-edge-cost-buffer-bps", type=float, default=3.0)
     parser.add_argument("--label-max-abs-forward-return", type=float, default=0.35)
     parser.add_argument("--label-signal-volatility-floor-mult", type=float, default=0.50)
     parser.add_argument("--label-volatility-lookback", type=int, default=20)
@@ -12157,6 +12349,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-meta-labeling",
         action="store_true",
         help="Disable meta-labeling. Allowed only in research profile.",
+    )
+    parser.add_argument(
+        "--disable-probability-calibration",
+        action="store_true",
+        help="Disable post-hoc probability calibration on out-of-fold predictions.",
+    )
+    parser.add_argument(
+        "--probability-calibration-method",
+        choices=["isotonic", "sigmoid"],
+        default="isotonic",
+        help="Post-hoc probability calibration method (default: isotonic).",
     )
     parser.add_argument(
         "--feature-groups",
@@ -12282,11 +12485,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable IC/correlation/stability feature selection on the development set.",
     )
-    parser.add_argument("--feature-selection-min-ic", type=float, default=0.01)
-    parser.add_argument("--feature-selection-max-corr", type=float, default=0.95)
-    parser.add_argument("--feature-selection-max-features", type=int, default=250)
+    parser.add_argument("--feature-selection-min-ic", type=float, default=0.015)
+    parser.add_argument("--feature-selection-max-corr", type=float, default=0.90)
+    parser.add_argument("--feature-selection-max-features", type=int, default=180)
     parser.add_argument("--feature-selection-stability-iterations", type=int, default=16)
-    parser.add_argument("--feature-selection-min-stability-support", type=float, default=0.55)
+    parser.add_argument("--feature-selection-min-stability-support", type=float, default=0.60)
     parser.add_argument(
         "--windows-fallback-features",
         action="store_true",
@@ -12294,9 +12497,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--disable-dynamic-no-trade-band", action="store_true")
     parser.add_argument("--execution-vol-target-daily", type=float, default=0.012)
-    parser.add_argument("--execution-turnover-cap", type=float, default=0.90)
+    parser.add_argument("--execution-turnover-cap", type=float, default=0.60)
     parser.add_argument("--execution-cooldown-bars", type=int, default=2)
     parser.add_argument("--execution-max-symbol-entry-share", type=float, default=0.68)
+    parser.add_argument(
+        "--min-confidence-position-scale",
+        type=float,
+        default=0.20,
+        help="Minimum fractional position scale for lower-confidence signals (default: 0.20).",
+    )
     parser.add_argument(
         "--disable-lightgbm-monotonic-constraints",
         action="store_true",

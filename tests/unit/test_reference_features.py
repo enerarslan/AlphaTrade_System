@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import pandas as pd
+import pytest
 
 from quant_trading_system.features.reference import (
     ReferenceFeatureBuilder,
@@ -78,7 +78,8 @@ def test_news_features_respect_event_timestamps(monkeypatch: pytest.MonkeyPatch)
                 utc=True,
             ),
             "symbol": ["AAPL", "AAPL"],
-            "sentiment": [None, None],
+            "sentiment": [0.4, -0.2],
+            "source": ["reuters", "bloomberg"],
         }
     )
     monkeypatch.setattr(builder, "_load_news_articles", lambda **kwargs: news)
@@ -93,6 +94,17 @@ def test_news_features_respect_event_timestamps(monkeypatch: pytest.MonkeyPatch)
     assert result["ref_news_count_6h"].tolist() == [0.0, 1.0, 1.0]
     assert result["ref_news_count_1d"].tolist() == [0.0, 1.0, 2.0]
     assert result.loc[1, "ref_news_days_since_last"] == pytest.approx(1.0 / 24.0)
+    assert result["ref_news_sentiment_mean_6h"].tolist() == [0.0, 0.4, -0.2]
+    assert result.loc[2, "ref_news_sentiment_mean_1d"] == pytest.approx(0.1)
+    assert result.loc[2, "ref_news_sentiment_abs_mean_1d"] == pytest.approx(0.3)
+    assert result.loc[2, "ref_news_positive_count_1d"] == pytest.approx(1.0)
+    assert result.loc[2, "ref_news_negative_count_1d"] == pytest.approx(1.0)
+    assert result["ref_news_source_breadth_1d"].tolist() == [0.0, 1.0, 2.0]
+    assert result.loc[1, "ref_news_last_sentiment"] == pytest.approx(0.4)
+    assert result.loc[1, "ref_news_recency_weighted_sentiment"] == pytest.approx(
+        0.4 * np.exp(-np.log(2.0) / 24.0)
+    )
+    assert result.loc[2, "ref_news_sentiment_momentum"] == pytest.approx(-0.3)
 
 
 def test_corporate_action_features_carry_last_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -188,7 +200,7 @@ def test_load_fundamental_snapshots_uses_created_at_gate(monkeypatch: pytest.Mon
             (
                 "AAPL",
                 date(2024, 12, 31),
-                datetime(2025, 1, 2, 14, 0, tzinfo=timezone.utc),
+                datetime(2025, 1, 2, 14, 0, tzinfo=UTC),
                 1000.0,
                 10.0,
                 20.0,
@@ -264,8 +276,8 @@ def test_load_earnings_events_uses_created_at_gate(monkeypatch: pytest.MonkeyPat
                 date(2024, 12, 31),
                 None,
                 None,
-                datetime(2025, 1, 2, 14, 0, tzinfo=timezone.utc),
-                datetime(2025, 1, 2, 14, 0, tzinfo=timezone.utc),
+                datetime(2025, 1, 2, 14, 0, tzinfo=UTC),
+                datetime(2025, 1, 2, 14, 0, tzinfo=UTC),
                 1.2,
                 1.0,
                 0.2,
@@ -293,10 +305,10 @@ def test_load_earnings_events_prefers_announcement_timestamp(monkeypatch: pytest
                 "AAPL",
                 date(2024, 12, 31),
                 date(2025, 1, 2),
-                datetime(2025, 1, 2, 12, 30, tzinfo=timezone.utc),
-                datetime(2025, 1, 2, 12, 30, tzinfo=timezone.utc),
-                datetime(2025, 1, 2, 14, 0, tzinfo=timezone.utc),
-                datetime(2025, 1, 2, 14, 0, tzinfo=timezone.utc),
+                datetime(2025, 1, 2, 12, 30, tzinfo=UTC),
+                datetime(2025, 1, 2, 12, 30, tzinfo=UTC),
+                datetime(2025, 1, 2, 14, 0, tzinfo=UTC),
+                datetime(2025, 1, 2, 14, 0, tzinfo=UTC),
                 1.2,
                 1.0,
                 0.2,

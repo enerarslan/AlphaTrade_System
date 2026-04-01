@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, time, timezone, timedelta
+from datetime import UTC, date, time, timedelta
 from typing import Any
 
 import numpy as np
@@ -35,6 +35,8 @@ _US_TRADING_DAY = CustomBusinessDay(calendar=USFederalHolidayCalendar())
 _DAY_NS = int(pd.Timedelta(days=1).value)
 _HOUR_NS = int(pd.Timedelta(hours=1).value)
 _EVENT_AGE_FILL = 9999.0
+_NEWS_SENTIMENT_NEUTRAL_TOLERANCE = 0.05
+_NEWS_RECENCY_HALF_LIFE_DAYS = 1.0
 _DAILY_MACRO_SERIES = ("VIX", "VIX9D", "VVIX", "OVX", "GVZ", "DGS2", "DGS10")
 _PIT_VINTAGE_SERIES = ("FEDFUNDS", "CPIAUCSL", "UNRATE", "PAYEMS", "RSAFS", "DGORDER", "GDPC1")
 _FTD_ZIP_PATTERN = re.compile(
@@ -108,7 +110,7 @@ def _date_end_of_day(value: Any) -> pd.Timestamp:
     return pd.Timestamp.combine(
         pd.Timestamp(value).date(),
         time(hour=23, minute=59, second=59),
-        tzinfo=timezone.utc,
+        tzinfo=UTC,
     )
 
 
@@ -185,6 +187,63 @@ def _count_events_in_windows(
         left = np.searchsorted(event_ns, bar_ns - window_ns, side="left")
         counts[label] = (right - left).astype(float)
     return counts, age_days
+
+
+def _window_sum_from_prefix(prefix: np.ndarray, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    return prefix[right] - prefix[left]
+
+
+def _window_mean_from_prefix(
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> np.ndarray:
+    value_prefix = np.concatenate(([0.0], np.cumsum(values, dtype=float)))
+    valid_prefix = np.concatenate(([0.0], np.cumsum(valid_mask, dtype=float)))
+    sums = _window_sum_from_prefix(value_prefix, left, right)
+    counts = _window_sum_from_prefix(valid_prefix, left, right)
+    means = np.zeros(len(right), dtype=float)
+    nonzero = counts > 0.0
+    means[nonzero] = sums[nonzero] / counts[nonzero]
+    return means
+
+
+def _rolling_unique_count_in_window(
+    bar_ns: np.ndarray,
+    event_ns: np.ndarray,
+    labels: np.ndarray,
+    window_ns: int,
+) -> np.ndarray:
+    unique_counts = np.zeros(len(bar_ns), dtype=float)
+    if len(bar_ns) == 0 or len(event_ns) == 0 or len(labels) == 0:
+        return unique_counts
+
+    active_counts: dict[str, int] = {}
+    left = 0
+    right = 0
+    label_values = [str(label).strip().lower() for label in labels]
+
+    for idx, bar_value in enumerate(bar_ns):
+        while right < len(event_ns) and event_ns[right] <= bar_value:
+            label = label_values[right]
+            if label:
+                active_counts[label] = active_counts.get(label, 0) + 1
+            right += 1
+
+        cutoff = bar_value - window_ns
+        while left < right and event_ns[left] < cutoff:
+            label = label_values[left]
+            if label:
+                remaining = active_counts.get(label, 0) - 1
+                if remaining > 0:
+                    active_counts[label] = remaining
+                else:
+                    active_counts.pop(label, None)
+            left += 1
+
+        unique_counts[idx] = float(len(active_counts))
+    return unique_counts
 
 
 class ReferenceFeatureBuilder:
@@ -577,6 +636,7 @@ class ReferenceFeatureBuilder:
                 NewsArticle.created_at_source,
                 NewsArticle.symbols,
                 NewsArticle.sentiment,
+                NewsArticle.source,
             ).where(
                 NewsArticle.created_at_source
                 >= (min_timestamp - pd.Timedelta(days=8)).to_pydatetime(),
@@ -584,21 +644,27 @@ class ReferenceFeatureBuilder:
             )
         )
         if not rows:
-            return pd.DataFrame(columns=["article_id", "event_timestamp", "symbol", "sentiment"])
+            return pd.DataFrame(
+                columns=["article_id", "event_timestamp", "symbol", "sentiment", "source"]
+            )
 
         news_df = pd.DataFrame(
-            rows, columns=["article_id", "created_at_source", "symbols", "sentiment"]
+            rows,
+            columns=["article_id", "created_at_source", "symbols", "sentiment", "source"],
         )
         news_df["event_timestamp"] = _coerce_utc_timestamp(news_df["created_at_source"])
         news_df["symbols"] = news_df["symbols"].map(_normalize_symbol_list)
         news_df = news_df.dropna(subset=["event_timestamp"]).copy()
         news_df = news_df[news_df["symbols"].map(bool)].copy()
         if news_df.empty:
-            return pd.DataFrame(columns=["article_id", "event_timestamp", "symbol", "sentiment"])
+            return pd.DataFrame(
+                columns=["article_id", "event_timestamp", "symbol", "sentiment", "source"]
+            )
         news_df = news_df.explode("symbols").rename(columns={"symbols": "symbol"})
         news_df["symbol"] = news_df["symbol"].astype(str).str.upper().str.strip()
         news_df["sentiment"] = _series_to_float(news_df["sentiment"])
-        return news_df[["article_id", "event_timestamp", "symbol", "sentiment"]].copy()
+        news_df["source"] = news_df["source"].astype(str).str.strip()
+        return news_df[["article_id", "event_timestamp", "symbol", "sentiment", "source"]].copy()
 
     def _augment_news_features(
         self,
@@ -608,10 +674,26 @@ class ReferenceFeatureBuilder:
         min_timestamp: pd.Timestamp,
         max_timestamp: pd.Timestamp,
     ) -> pd.DataFrame:
-        base["ref_news_count_6h"] = 0.0
-        base["ref_news_count_1d"] = 0.0
-        base["ref_news_count_7d"] = 0.0
-        base["ref_news_days_since_last"] = _EVENT_AGE_FILL
+        default_columns = {
+            "ref_news_count_6h": 0.0,
+            "ref_news_count_1d": 0.0,
+            "ref_news_count_7d": 0.0,
+            "ref_news_days_since_last": _EVENT_AGE_FILL,
+            "ref_news_sentiment_mean_6h": 0.0,
+            "ref_news_sentiment_mean_1d": 0.0,
+            "ref_news_sentiment_mean_7d": 0.0,
+            "ref_news_sentiment_abs_mean_1d": 0.0,
+            "ref_news_sentiment_abs_mean_7d": 0.0,
+            "ref_news_positive_count_1d": 0.0,
+            "ref_news_negative_count_1d": 0.0,
+            "ref_news_source_breadth_1d": 0.0,
+            "ref_news_source_breadth_7d": 0.0,
+            "ref_news_last_sentiment": 0.0,
+            "ref_news_recency_weighted_sentiment": 0.0,
+            "ref_news_sentiment_momentum": 0.0,
+        }
+        for column, default_value in default_columns.items():
+            base[column] = default_value
 
         news_df = self._load_news_articles(min_timestamp=min_timestamp, max_timestamp=max_timestamp)
         if news_df.empty:
@@ -623,19 +705,124 @@ class ReferenceFeatureBuilder:
 
         windows_ns = {"6h": 6 * _HOUR_NS, "1d": 24 * _HOUR_NS, "7d": 7 * _DAY_NS}
         for symbol, row_index in base.groupby("symbol", sort=False).groups.items():
-            event_times = news_df.loc[news_df["symbol"] == symbol, "event_timestamp"].sort_values()
-            if event_times.empty:
+            symbol_news = (
+                news_df.loc[news_df["symbol"] == symbol]
+                .sort_values("event_timestamp")
+                .reset_index(drop=True)
+            )
+            if symbol_news.empty:
                 continue
             bar_ns = _timestamp_ns_array(base.loc[row_index, "timestamp"])
+            event_times = symbol_news["event_timestamp"]
+            event_ns = _timestamp_ns_array(event_times)
             counts, age_days = _count_events_in_windows(
                 bar_ns,
-                _timestamp_ns_array(event_times),
+                event_ns,
                 windows_ns,
             )
+            right = np.searchsorted(event_ns, bar_ns, side="right")
+            window_left = {
+                label: np.searchsorted(event_ns, bar_ns - window_ns, side="left")
+                for label, window_ns in windows_ns.items()
+            }
+            sentiment_values = symbol_news["sentiment"].to_numpy(dtype=float)
+            valid_sentiment = np.isfinite(sentiment_values).astype(float)
+            sentiment_filled = np.nan_to_num(sentiment_values, nan=0.0)
+            absolute_sentiment = np.abs(sentiment_filled)
+            positive_events = (
+                sentiment_filled > _NEWS_SENTIMENT_NEUTRAL_TOLERANCE
+            ).astype(float)
+            negative_events = (
+                sentiment_filled < -_NEWS_SENTIMENT_NEUTRAL_TOLERANCE
+            ).astype(float)
+            positive_prefix = np.concatenate(([0.0], np.cumsum(positive_events, dtype=float)))
+            negative_prefix = np.concatenate(([0.0], np.cumsum(negative_events, dtype=float)))
+
+            sentiment_mean_6h = _window_mean_from_prefix(
+                sentiment_filled,
+                valid_sentiment,
+                window_left["6h"],
+                right,
+            )
+            sentiment_mean_1d = _window_mean_from_prefix(
+                sentiment_filled,
+                valid_sentiment,
+                window_left["1d"],
+                right,
+            )
+            sentiment_mean_7d = _window_mean_from_prefix(
+                sentiment_filled,
+                valid_sentiment,
+                window_left["7d"],
+                right,
+            )
+            sentiment_abs_mean_1d = _window_mean_from_prefix(
+                absolute_sentiment,
+                valid_sentiment,
+                window_left["1d"],
+                right,
+            )
+            sentiment_abs_mean_7d = _window_mean_from_prefix(
+                absolute_sentiment,
+                valid_sentiment,
+                window_left["7d"],
+                right,
+            )
+            positive_count_1d = _window_sum_from_prefix(
+                positive_prefix,
+                window_left["1d"],
+                right,
+            )
+            negative_count_1d = _window_sum_from_prefix(
+                negative_prefix,
+                window_left["1d"],
+                right,
+            )
+            source_breadth_1d = _rolling_unique_count_in_window(
+                bar_ns,
+                event_ns,
+                symbol_news["source"].to_numpy(dtype=object),
+                windows_ns["1d"],
+            )
+            source_breadth_7d = _rolling_unique_count_in_window(
+                bar_ns,
+                event_ns,
+                symbol_news["source"].to_numpy(dtype=object),
+                windows_ns["7d"],
+            )
+            last_sentiment = np.zeros(len(bar_ns), dtype=float)
+            has_prior_event = right > 0
+            if np.any(has_prior_event):
+                last_sentiment[has_prior_event] = np.nan_to_num(
+                    sentiment_values[right[has_prior_event] - 1],
+                    nan=0.0,
+                )
+            recency_weighted = np.zeros(len(bar_ns), dtype=float)
+            valid_age = age_days < _EVENT_AGE_FILL
+            if np.any(valid_age):
+                decay = np.exp(
+                    -np.log(2.0) * (age_days[valid_age] / _NEWS_RECENCY_HALF_LIFE_DAYS)
+                )
+                recency_weighted[valid_age] = last_sentiment[valid_age] * decay
+
             base.loc[row_index, "ref_news_count_6h"] = counts["6h"]
             base.loc[row_index, "ref_news_count_1d"] = counts["1d"]
             base.loc[row_index, "ref_news_count_7d"] = counts["7d"]
             base.loc[row_index, "ref_news_days_since_last"] = age_days
+            base.loc[row_index, "ref_news_sentiment_mean_6h"] = sentiment_mean_6h
+            base.loc[row_index, "ref_news_sentiment_mean_1d"] = sentiment_mean_1d
+            base.loc[row_index, "ref_news_sentiment_mean_7d"] = sentiment_mean_7d
+            base.loc[row_index, "ref_news_sentiment_abs_mean_1d"] = sentiment_abs_mean_1d
+            base.loc[row_index, "ref_news_sentiment_abs_mean_7d"] = sentiment_abs_mean_7d
+            base.loc[row_index, "ref_news_positive_count_1d"] = positive_count_1d
+            base.loc[row_index, "ref_news_negative_count_1d"] = negative_count_1d
+            base.loc[row_index, "ref_news_source_breadth_1d"] = source_breadth_1d
+            base.loc[row_index, "ref_news_source_breadth_7d"] = source_breadth_7d
+            base.loc[row_index, "ref_news_last_sentiment"] = last_sentiment
+            base.loc[row_index, "ref_news_recency_weighted_sentiment"] = recency_weighted
+            base.loc[row_index, "ref_news_sentiment_momentum"] = (
+                sentiment_mean_6h - sentiment_mean_7d
+            )
         return base
 
     def _load_sec_filings(

@@ -317,6 +317,8 @@ class TestParseArgs:
                 "4",
                 "--execution-max-symbol-entry-share",
                 "0.63",
+                "--min-confidence-position-scale",
+                "0.28",
                 "--primary-horizon-sweep",
                 "1",
                 "5",
@@ -324,6 +326,9 @@ class TestParseArgs:
                 "--meta-label-min-confidence",
                 "0.61",
                 "--disable-meta-dynamic-threshold",
+                "--probability-calibration-method",
+                "sigmoid",
+                "--disable-probability-calibration",
                 "--disable-feature-selection",
                 "--feature-selection-stability-iterations",
                 "7",
@@ -363,9 +368,12 @@ class TestParseArgs:
             assert args.execution_turnover_cap == pytest.approx(0.7)
             assert args.execution_cooldown_bars == 4
             assert args.execution_max_symbol_entry_share == pytest.approx(0.63)
+            assert args.min_confidence_position_scale == pytest.approx(0.28)
             assert args.primary_horizon_sweep == [1, 5, 20]
             assert args.meta_label_min_confidence == pytest.approx(0.61)
             assert args.disable_meta_dynamic_threshold is True
+            assert args.probability_calibration_method == "sigmoid"
+            assert args.disable_probability_calibration is True
             assert args.disable_feature_selection is True
             assert args.feature_selection_stability_iterations == 7
             assert str(args.warm_start_model).endswith("lightgbm_prev.pkl")

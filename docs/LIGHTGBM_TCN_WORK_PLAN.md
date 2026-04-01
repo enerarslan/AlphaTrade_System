@@ -1,44 +1,64 @@
 # AlphaTrade LightGBM + TCN Work Plan
 
 **Date:** 2026-04-01
-**Status:** Ready to execute
-**Scope:** Backtest and paper-trading model program after Ubuntu / WSL migration
+**Status:** Updated after pre-run performance hardening
+**Scope:** Produce one serious LightGBM primary candidate and one TCN challenger without contaminating comparisons
 
 ## 1. Objective
 
-Build a disciplined training program for AlphaTrade that:
+Wave 1 should maximize real trading edge, not just backtest score. The program must:
 
-- uses the multi-layer PostgreSQL dataset as the source of truth
-- produces one strong primary paper-trading model
-- trains one serious challenger on the exact same dataset snapshot
-- promotes models only after institutional validation, replay, and paper-trading evidence
+- use the PostgreSQL multi-layer dataset as the source of truth
+- freeze one dataset snapshot and compare models only on that snapshot
+- prefer cleaner trade selection over raw trade count
+- promote only after validation gates, replay, and paper-trading evidence
 
-The working assumption for Wave 1 is:
+Wave 1 working stack:
 
-- **Primary:** `lightgbm_ranker` for multi-symbol training
-- **Fallback primary:** `lightgbm` when the universe is too small for ranking
+- **Primary candidate:** `lightgbm_ranker`
+- **Fallback primary:** `lightgbm`
 - **Challenger:** `tcn`
 - **Filter layer:** existing meta-labeling flow in `scripts/train.py`
 
-## 2. Principles
+## 2. What Changed In Code Before The Next Run
 
-1. Do not compare models trained on different datasets. Freeze one snapshot and compare on that snapshot.
-2. Do not start with multi-timeframe fusion. First stabilize `15Min` only.
-3. Do not use `--model all` for normal work. Research should be narrow and repeatable.
-4. Do not optimize TCN before LightGBM has a stable baseline.
-5. Do not promote from backtest alone. Promotion requires validation gates, replay, and paper trading.
-6. Run heavy training on the Linux filesystem inside WSL / Ubuntu, not on `/mnt/c/...`.
+The repo now hardens the pre-run edge stack before any new LightGBM training:
 
-## 3. Wave 1 Target Design
+- richer reference/news features in `quant_trading_system/features/reference.py`
+- richer quote/trade flow regime features in `quant_trading_system/features/tick_microstructure.py`
+- tighter default label thresholds, feature-selection thresholds, and turnover discipline in `scripts/train.py`
+- out-of-fold probability calibration for probability-producing models
+- non-zero minimum confidence position sizing floor for execution-aware evaluation and promotion packages
 
-Use the existing cost-aware institutional target path already implemented in:
+Implication:
 
-- `quant_trading_system/models/target_engineering.py`
-- `scripts/train.py`
+- earlier smoke runs and invalid runs are not decision inputs
+- the next LightGBM run should be treated as the first serious post-hardening candidate
 
-Wave 1 target config:
+## 3. Core Principles
+
+1. Do not compare runs across different snapshots.
+2. Do not use smoke tests as evidence.
+3. Research profile is diagnostic only; promotion profile determines serious candidates.
+4. Optimize trade quality, calibration, and turnover before expanding the universe.
+5. TCN does not get tuned against a moving target; it must reuse the best LightGBM snapshot.
+6. Run heavy training from the Linux filesystem inside WSL, not from `/mnt/c/...`.
+
+## 4. Wave 1 Training Policy
+
+### 4.1 Base Scope
 
 - `timeframe=15Min`
+- core universe: `SPY QQQ AAPL MSFT NVDA AMD AMZN META GOOGL JPM XOM GLD`
+- feature groups: `technical statistical microstructure cross_sectional`
+- reference features enabled
+- tick microstructure features enabled
+- feature selection enabled
+
+### 4.2 Label Policy
+
+Default post-hardening target thresholds:
+
 - `label_horizons=[1, 5, 20]`
 - `primary_label_horizon=5`
 - `profit_taking=0.015`
@@ -56,59 +76,15 @@ Wave 1 target config:
 - `label_apply_uniqueness_weighting=true`
 - `label_apply_volatility_inverse_weighting=true`
 
-Rationale:
+These defaults are the floor, not the ceiling. If turnover or weak-edge churn remains high, the next adjustment band is:
 
-- `h=5` on `15Min` is a practical first paper-trading horizon
-- the target already includes costs, neutral filtering, and volatility-aware signal floors
-- we avoid inventing a new label before the current institutional path is exhausted
+- `label_min_signal_abs_return_bps=12-16`
+- `label_neutral_buffer_bps=6-8`
+- `label_edge_cost_buffer_bps=4-6`
 
-## 4. Universe Plan
+### 4.3 Feature-Selection Policy
 
-### 4.1 Research Universe
-
-Start with a core 12-symbol intraday universe:
-
-- `SPY`
-- `QQQ`
-- `AAPL`
-- `MSFT`
-- `NVDA`
-- `AMD`
-- `AMZN`
-- `META`
-- `GOOGL`
-- `JPM`
-- `XOM`
-- `GLD`
-
-Why:
-
-- liquid names
-- broad sector spread
-- strong intraday data coverage
-- enough cross-sectional signal to justify ranking
-
-### 4.2 Promotion Universe
-
-After the research baseline is stable:
-
-- expand to top 24 names
-- then expand to the full 48-symbol `1Min/15Min` universe only if symbol-quality gates remain healthy
-
-Do not jump directly to 48 symbols before the first baseline is understood.
-
-## 5. Feature Policy
-
-Wave 1 feature policy:
-
-- keep `technical`
-- keep `statistical`
-- keep `microstructure`
-- keep `cross_sectional`
-- keep reference features enabled
-- keep feature selection enabled
-
-Wave 1 feature-selection settings:
+Wave 1 default feature-selection settings:
 
 - `feature_selection_min_ic=0.015`
 - `feature_selection_max_corr=0.90`
@@ -116,51 +92,74 @@ Wave 1 feature-selection settings:
 - `feature_selection_stability_iterations=16`
 - `feature_selection_min_stability_support=0.60`
 
-Do not disable entire feature groups unless an ablation run proves they are low-value.
+If the first serious candidate still overfits, the first tightening move is:
+
+- `feature_selection_min_ic=0.02`
+- `feature_selection_max_features=120-140`
+- `feature_selection_min_stability_support=0.65-0.75`
+
+### 4.4 Execution-Aware Discipline
+
+Wave 1 execution-aware defaults now assume that overtrading is a bug:
+
+- `objective_weight_turnover=0.20`
+- `objective_weight_calibration=0.35`
+- `execution_turnover_cap=0.60`
+- `min_confidence_position_scale=0.20`
+- probability calibration enabled
+- `probability_calibration_method=isotonic`
+
+Implementation note:
+
+- calibration is fit only from out-of-fold predictions
+- if OOF sample size is too small for stable isotonic calibration, the pipeline falls back to sigmoid calibration automatically
+
+## 5. Horizon Policy
+
+Do not assume `h=5` is optimal just because it is the current default. The next serious LightGBM diagnostic pass should benchmark:
+
+- `primary_horizon_sweep=3 5 8 12`
+
+Decision rule:
+
+- keep the horizon that best balances holdout Sharpe, turnover, and holdout symbol breadth
+- do not select a horizon only because CV improves if holdout quality degrades
 
 ## 6. Phase Plan
 
-### Phase 0: Pre-flight
+### Phase 0: WSL Pre-Flight
 
 Goal:
 
-- confirm the Ubuntu / WSL training path is the default operator path
-- confirm PostgreSQL, Redis, artifacts, and snapshot reuse all work from Linux-side storage
-
-Checklist:
-
-1. Work from `~/AlphaTrade`.
-2. Confirm the Python environment is the Linux-side virtualenv.
-3. Confirm PostgreSQL and Redis health from WSL.
-4. Confirm the training run writes under the Linux filesystem.
-5. Confirm a dataset snapshot bundle is created and reusable.
+- confirm the training path is `~/AlphaTrade`
+- confirm PostgreSQL, Redis, artifact writes, and snapshot reuse all work from Linux-side storage
+- do not touch any still-running training process until it completes
 
 Exit criteria:
 
-- one `research` training run completes end-to-end
-- one snapshot bundle is created
-- the run is repeatable from the same snapshot bundle
+- one clean snapshot bundle is created from WSL
+- the same bundle can be replayed with `--strict-snapshot-replay`
 
-### Phase 1: LightGBM Research Baseline
+### Phase 1: LightGBM Diagnostic Sweep
 
 Goal:
 
-- build the first real primary-model baseline on the core 12-symbol universe
+- produce one clean frozen snapshot and decide the best horizon / model family before full promotion
 
-Model choice:
+Allowed models:
 
-- use `lightgbm_ranker` because the objective is cross-sectional symbol selection per timestamp
+- `lightgbm_ranker`
+- `lightgbm`
 
-Research budget:
+Rules:
 
-- `training-profile=research`
-- `n_splits=3`
-- `n_trials=30`
-- `holdout_pct=0.15`
-- SHAP off via profile
-- meta-labeling off via profile
+- same symbols
+- same timeframe
+- same snapshot
+- one variable changed at a time
+- research profile outputs are diagnostic only
 
-Research command template:
+Recommended diagnostic command template:
 
 ```bash
 python main.py train \
@@ -173,70 +172,7 @@ python main.py train \
   --n-trials 30 \
   --holdout-pct 0.15 \
   --label-horizons 1 5 20 \
-  --primary-horizon 5 \
-  --profit-taking 0.015 \
-  --stop-loss 0.010 \
-  --max-holding 20 \
-  --spread-bps 1 \
-  --slippage-bps 3 \
-  --impact-bps 2 \
-  --label-min-signal-abs-return-bps 10 \
-  --label-neutral-buffer-bps 5 \
-  --label-edge-cost-buffer-bps 3 \
-  --feature-groups technical statistical microstructure cross_sectional \
-  --feature-selection-min-ic 0.015 \
-  --feature-selection-max-corr 0.90 \
-  --feature-selection-max-features 180 \
-  --feature-selection-min-stability-support 0.60
-```
-
-What to review after Phase 1:
-
-- `mean_sharpe`
-- `mean_max_drawdown`
-- `mean_trade_count`
-- `label_positive_rate`
-- `label_drift_abs`
-- holdout symbol coverage
-- feature count after selection
-
-Exit criteria:
-
-- no leakage or snapshot errors
-- no feature-materialization instability
-- a sensible trade count
-- no obvious overfitting blow-up between CV and holdout
-
-### Phase 2: LightGBM Promotion Candidate
-
-Goal:
-
-- retrain the same primary idea under full institutional promotion settings
-
-Promotion budget:
-
-- `training-profile=promotion`
-- `n_splits=5`
-- `n_trials=120`
-- nested walk-forward on
-- SHAP on
-- meta-labeling on
-- snapshot reuse on
-
-Promotion command template:
-
-```bash
-python main.py train \
-  --model lightgbm_ranker \
-  --training-profile promotion \
-  --symbols SPY QQQ AAPL MSFT NVDA AMD AMZN META GOOGL JPM XOM GLD \
-  --timeframe 15Min \
-  --cv-method purged_kfold \
-  --n-splits 5 \
-  --n-trials 120 \
-  --holdout-pct 0.15 \
-  --label-horizons 1 5 20 \
-  --primary-horizon 5 \
+  --primary-horizon-sweep 3 5 8 12 \
   --profit-taking 0.015 \
   --stop-loss 0.010 \
   --max-holding 20 \
@@ -251,10 +187,31 @@ python main.py train \
   --feature-selection-max-corr 0.90 \
   --feature-selection-max-features 180 \
   --feature-selection-min-stability-support 0.60 \
-  --meta-label-min-confidence 0.55
+  --objective-weight-turnover 0.20 \
+  --objective-weight-calibration 0.35 \
+  --execution-turnover-cap 0.60 \
+  --min-confidence-position-scale 0.20 \
+  --probability-calibration-method isotonic
 ```
 
-If the previous research run already produced a clean dataset bundle, prefer replaying the exact bundle:
+Review after Phase 1:
+
+- `holdout_sharpe`
+- `effective_holdout_sharpe_gate_metric`
+- `holdout_symbol_coverage_ratio`
+- `holdout_symbol_underwater_ratio`
+- `mean_trade_count`
+- `execution_turnover_cap` utilization
+- `probability_calibration_brier_improvement`
+- `label_drift_abs`
+
+### Phase 2: LightGBM Serious Candidate
+
+Goal:
+
+- run the best Phase 1 setup under full institutional promotion settings
+
+Promotion command template:
 
 ```bash
 python main.py train \
@@ -263,37 +220,54 @@ python main.py train \
   --dataset-snapshot-bundle <PATH_TO_DATASET_BUNDLE_MANIFEST> \
   --strict-snapshot-replay \
   --n-splits 5 \
-  --n-trials 120
+  --n-trials 120 \
+  --label-horizons 1 5 20 \
+  --primary-horizon <WINNING_HORIZON> \
+  --label-min-signal-abs-return-bps 10 \
+  --label-neutral-buffer-bps 5 \
+  --label-edge-cost-buffer-bps 3 \
+  --feature-selection-min-ic 0.015 \
+  --feature-selection-max-corr 0.90 \
+  --feature-selection-max-features 180 \
+  --feature-selection-min-stability-support 0.60 \
+  --objective-weight-turnover 0.20 \
+  --objective-weight-calibration 0.35 \
+  --execution-turnover-cap 0.60 \
+  --min-confidence-position-scale 0.20 \
+  --probability-calibration-method isotonic \
+  --meta-label-min-confidence 0.55
 ```
 
-Promotion gate expectation:
+If Phase 1 still shows excessive churn or holdout fragility, do one tightened challenger before moving on:
 
-- built-in validation gates must pass
-- holdout metrics must not collapse relative to CV
-- symbol coverage must remain broad enough to justify ranking
+- `label_min_signal_abs_return_bps=12`
+- `label_neutral_buffer_bps=6`
+- `label_edge_cost_buffer_bps=4`
+- `feature_selection_min_ic=0.02`
+- `feature_selection_max_features=140`
+- `feature_selection_min_stability_support=0.70`
+
+Promotion pass conditions:
+
+- built-in validation gates pass
+- holdout quality does not collapse relative to CV
+- probability calibration does not worsen Brier score
+- turnover remains within cap without starving trade count
+- symbol breadth remains sufficient for ranking
 
 ### Phase 3: TCN Challenger On The Same Snapshot
 
 Goal:
 
-- evaluate whether sequence modeling adds real incremental edge over the LightGBM primary
+- test whether sequence modeling adds incremental edge beyond the hardened LightGBM candidate
 
-Rule:
+Rules:
 
-- TCN must use the exact same dataset snapshot bundle as the promoted LightGBM candidate
+- exact same dataset snapshot bundle as the LightGBM serious candidate
+- no silent universe or date-range changes
+- no new feature-policy change between LightGBM and TCN comparison
 
-Initial TCN shape:
-
-- `lookback_window=60`
-- `num_channels=[64, 128, 128, 64]`
-- `kernel_size=3`
-- `dropout=0.20`
-- `learning_rate=0.001`
-- `batch_size=64`
-- `epochs=100`
-- `patience=15`
-
-TCN research command template:
+TCN research template:
 
 ```bash
 python main.py train \
@@ -308,7 +282,7 @@ python main.py train \
   --learning-rate 0.001
 ```
 
-TCN promotion command template:
+TCN promotion template:
 
 ```bash
 python main.py train \
@@ -323,50 +297,16 @@ python main.py train \
   --learning-rate 0.001
 ```
 
-TCN replacement criteria:
+TCN only replaces LightGBM if it improves holdout and replay quality without materially worsening turnover, drawdown, or symbol breadth.
 
-- holdout Sharpe at least `+5%` vs primary LightGBM
-- drawdown no worse than primary by more than `0.02`
-- turnover no worse than primary by more than `10%`
-- symbol coverage does not shrink materially
-- replay and paper metrics are at least as robust as primary
+### Phase 4: Replay And Paper Trading
 
-If these are not met, TCN stays a challenger only.
+Replay is mandatory before paper promotion. Minimum replay requirements:
 
-### Phase 4: Final Primary + Meta-Label Filter
-
-Goal:
-
-- turn the best base model into a paper-trading candidate with signal filtering
-
-Preferred order:
-
-1. choose base winner: `lightgbm_ranker` or `tcn`
-2. rerun promotion with meta-labeling enabled
-3. preserve the same target horizon and same snapshot scope
-
-Meta-label policy:
-
-- keep `meta_label_dynamic_threshold=true`
-- start from `meta_label_min_confidence=0.55`
-- do not increase confidence aggressively before paper-trading evidence exists
-
-Why:
-
-- early over-filtering can make backtests look clean while starving live trade count
-
-### Phase 5: Replay
-
-Goal:
-
-- test whether the promoted candidate survives deterministic replay before paper trading
-
-Required replay window:
-
-- at least 3 separate windows
-- include one trend-up window
-- include one high-volatility window
-- include one mixed / range window
+- three windows
+- one trending window
+- one high-volatility window
+- one mixed/range window
 
 Suggested first replay windows:
 
@@ -374,133 +314,69 @@ Suggested first replay windows:
 - `2024-08-01` to `2024-08-09`
 - `2025-03-03` to `2025-03-14`
 
-Baseline command:
+Paper-trading minimum:
 
-```bash
-python main.py replay --start 2024-01-01 --end 2024-01-05 --symbols SPY QQQ AAPL MSFT NVDA AMD AMZN META GOOGL JPM XOM GLD
-```
-
-Replay pass conditions:
-
-- no replay SLO failure
-- no risk-escalation instability
-- no kill-switch surprise
-- no unrealistic concentration in one or two symbols
-
-### Phase 6: Paper Trading
-
-Goal:
-
-- verify the candidate under broker semantics before any further escalation
-
-Minimum paper-trading period:
-
-- 2 weeks minimum
-- 4 weeks preferred before declaring the model stable
+- `2` weeks minimum
+- `4` weeks preferred before declaring the model stable
 
 Track daily:
 
 - net PnL
 - turnover
-- fill / rejection rate
 - slippage
+- fill / rejection rate
 - symbol concentration
+- risk warnings
 - no-trade band behavior
-- kill-switch or risk warnings
 
-Paper pass conditions:
+## 7. Operating Rules
 
-- stable trade count
-- stable latency and execution quality
-- no repeated risk or order-management anomalies
-- realized turnover within expected cap
+Allowed as evidence:
 
-## 7. Operating Cadence
+- promotion run on a frozen snapshot
+- replay on the same promoted artifact
+- paper-trading observations on the promoted artifact
 
-### Daily / Frequent Research
+Not allowed as evidence:
 
-- run `research` profile on the frozen or auto-reused snapshot
-- test feature, target-threshold, and universe variants
-- compare only 1 variable at a time
+- smoke tests
+- AAPL-only shortcuts
+- repeated runs on silently changed snapshots
+- CV-only wins with holdout collapse
 
-### Weekly Promotion
-
-- promote only the best research candidate
-- run full promotion once per week or after a clearly justified change
-
-### Monthly Expansion
-
-- expand from 12 symbols to 24 symbols
-- then consider 48-symbol intraday scope
-- only after the smaller universe is stable
-
-## 8. Go / No-Go Rules
-
-Go to the next phase only if the previous phase is stable.
-
-No-Go conditions:
-
-- unstable snapshot reuse
-- feature-materialization drift between runs
-- holdout collapse after optimization
-- paper trade starvation due to over-filtering
-- concentration risk dominated by a small subset of symbols
-- TCN improvement visible only in CV but not in holdout / replay / paper
-
-## 9. Deliverables
-
-Each serious candidate should produce:
-
-- model artifact
-- dataset snapshot bundle manifest
-- snapshot ID
-- validation report
-- replay evidence
-- model card / deployment plan
-- paper-trading observation notes
-
-## 10. Recommended First 4 Runs
+## 8. Recommended Next 4 Runs
 
 Run 1:
 
 - `lightgbm_ranker`
 - `research`
-- core 12-symbol universe
+- frozen snapshot creation
+- `primary_horizon_sweep=3 5 8 12`
 
 Run 2:
 
-- `lightgbm_ranker`
-- `promotion`
-- same universe or same snapshot
+- `lightgbm`
+- `research`
+- exact same snapshot as Run 1
+- same horizon sweep for fallback comparison
 
 Run 3:
 
-- `tcn`
-- `research`
-- exact same snapshot as Run 2
+- best LightGBM family from Runs 1-2
+- `promotion`
+- same frozen snapshot
 
 Run 4:
 
 - `tcn`
 - `promotion`
-- exact same snapshot as Run 2
+- exact same snapshot as Run 3
 
 After Run 4:
 
-- choose the base winner
-- rerun with meta-labeling as the paper-trading candidate
+- keep the strongest base model
+- use replay and paper trading to validate the winner
 
-## 11. Short Summary
+## 9. Short Summary
 
-Wave 1 should not try to do everything at once.
-
-The correct first program is:
-
-1. stabilize `15Min` target engineering
-2. train `lightgbm_ranker` as the primary baseline
-3. freeze and reuse the dataset snapshot
-4. train `tcn` on the exact same snapshot
-5. keep the winner, add meta-labeling, then run replay
-6. move to paper trading
-
-That path is the fastest way to get a strong model without breaking institutional discipline.
+The next LightGBM run should not be another loose experiment. It should be the first serious post-hardening candidate on a frozen snapshot, with tighter label discipline, tighter turnover control, out-of-fold probability calibration, and a non-zero confidence sizing floor. Only after that baseline is credible should TCN be judged against it.
