@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from quant_trading_system.backtest.engine import BacktestState, PandasDataHandler, Trade
 from quant_trading_system.backtest.promotion import PromotionSignalAdapter, load_promotion_package
@@ -26,6 +27,12 @@ class DummyProbabilityModel:
         X = np.asarray(X, dtype=float)
         prob = np.clip(X[:, 0], 0.0, 1.0)
         return np.column_stack([1.0 - prob, prob])
+
+
+class DummyOffsetCalibrator:
+    def predict(self, values):
+        values = np.asarray(values, dtype=float)
+        return np.clip(values + 0.15, 0.0, 1.0)
 
 
 class DummyMetaModel:
@@ -61,6 +68,168 @@ def test_promotion_signal_adapter_uses_training_parity_for_ranker_scores():
     expected = 1.0 / (1.0 + np.exp(-np.array([-2.0, 0.0, 2.0], dtype=float)))
     np.testing.assert_allclose(raw_scores, np.array([-2.0, 0.0, 2.0], dtype=float))
     np.testing.assert_allclose(probabilities, expected)
+
+
+def test_promotion_signal_adapter_applies_attached_probability_calibration():
+    adapter = PromotionSignalAdapter(SimpleNamespace(model_type="lightgbm"))
+    model = DummyProbabilityModel()
+    model._alphatrade_probability_calibration = {
+        "method": "isotonic",
+        "calibrator": DummyOffsetCalibrator(),
+    }
+
+    probabilities, raw_scores = adapter._predict_model_probabilities(
+        model,
+        np.array([[0.50, 0.0], [0.35, 0.0]], dtype=float),
+    )
+
+    np.testing.assert_allclose(raw_scores, np.array([0.50, 0.35], dtype=float))
+    np.testing.assert_allclose(probabilities, np.array([0.65, 0.50], dtype=float))
+
+
+def test_promotion_signal_adapter_computes_multi_timeframe_feature_layers():
+    contract = SimpleNamespace(
+        feature_groups=("statistical",),
+        enable_cross_sectional=False,
+        timeframe="15Min",
+        timeframes=("15Min", "1Hour"),
+        enable_reference_features=False,
+        enable_tick_microstructure_features=False,
+    )
+    adapter = PromotionSignalAdapter(contract)
+    timestamps = pd.date_range("2025-01-02T09:15:00Z", periods=12, freq="15min")
+    frame = pd.DataFrame(
+        {
+            "open": np.arange(100.0, 112.0, dtype=float),
+            "high": np.arange(101.0, 113.0, dtype=float),
+            "low": np.arange(99.5, 111.5, dtype=float),
+            "close": np.arange(100.5, 112.5, dtype=float),
+            "volume": np.arange(10.0, 130.0, 10.0, dtype=float),
+        },
+        index=pd.DatetimeIndex(timestamps),
+    )
+
+    feature_frames = adapter.compute_features({"AAPL": frame})
+
+    assert "AAPL" in feature_frames
+    symbol_frame = feature_frames["AAPL"]
+    assert "tf1h_close" in symbol_frame.columns
+    assert "tf1h_bar_return" in symbol_frame.columns
+    assert symbol_frame.loc[4, "tf1h_close"] == 103.5
+    assert pd.notna(symbol_frame.loc[4, "tf1h_bar_return"])
+
+
+def test_promotion_signal_adapter_applies_asymmetric_side_policy():
+    adapter = PromotionSignalAdapter(
+        SimpleNamespace(
+            model_type="lightgbm",
+            feature_names=("feat_a",),
+            long_threshold=0.60,
+            short_threshold=0.40,
+            horizon_bars=5,
+            model_source="promotion_package:test_model",
+            meta_label_enabled=False,
+            meta_label_threshold=None,
+            take_profit_pct=0.03,
+            stop_loss_pct=0.02,
+            max_holding_bars=6,
+            long_side_policy={
+                "enabled": True,
+                "signal_scale": 0.8,
+                "confidence_scale": 0.9,
+                "threshold_adjustment": 0.02,
+            },
+            short_side_policy={
+                "enabled": False,
+                "signal_scale": 0.0,
+                "confidence_scale": 0.0,
+                "threshold_adjustment": -0.03,
+            },
+            enable_universe_quality_gate=False,
+            universe_quality_policy={},
+        )
+    )
+    adapter._model = DummyProbabilityModel()
+    timestamps = pd.to_datetime(
+        ["2025-01-02T14:30:00Z", "2025-01-02T14:45:00Z"],
+        utc=True,
+    )
+    features = {"AAPL": pd.DataFrame({"timestamp": timestamps, "feat_a": [0.65, 0.20]})}
+    raw_frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.5],
+            "high": [101.0, 101.5],
+            "low": [99.0, 99.5],
+            "close": [100.5, 100.0],
+            "volume": [1000.0, 1200.0],
+        },
+        index=pd.DatetimeIndex(timestamps),
+    )
+    signal_frames = adapter.generate_signal_frames({"AAPL": raw_frame}, features=features)
+
+    signal_frame = signal_frames["AAPL"]
+    assert signal_frame.loc[0, "long_threshold"] == pytest.approx(0.62)
+    assert signal_frame.loc[0, "signal"] == pytest.approx(((0.65 - 0.62) / 0.38) * 0.8)
+    assert signal_frame.loc[0, "confidence"] == pytest.approx(abs(0.65 - 0.5) * 2.0 * 0.9)
+    assert signal_frame.loc[1, "short_threshold"] == pytest.approx(0.37)
+    assert signal_frame.loc[1, "signal"] == pytest.approx(0.0)
+    assert signal_frame.loc[1, "confidence"] == pytest.approx(0.0)
+
+
+def test_promotion_signal_adapter_blocks_ineligible_universe_symbol():
+    adapter = PromotionSignalAdapter(
+        SimpleNamespace(
+            model_type="lightgbm",
+            feature_names=("feat_a",),
+            long_threshold=0.60,
+            short_threshold=0.40,
+            horizon_bars=5,
+            model_source="promotion_package:test_model",
+            meta_label_enabled=False,
+            meta_label_threshold=None,
+            take_profit_pct=0.03,
+            stop_loss_pct=0.02,
+            max_holding_bars=6,
+            long_side_policy={},
+            short_side_policy={},
+            enable_universe_quality_gate=True,
+            universe_quality_policy={
+                "enabled": True,
+                "min_rows": 3,
+                "max_missing_ratio": 1.0,
+                "max_extreme_move_ratio": 1.0,
+                "max_corporate_action_ratio": 1.0,
+                "min_median_dollar_volume": 1_000_000.0,
+                "selected_symbols": ["AAPL"],
+            },
+            symbols=("AAPL",),
+            raw_payload={},
+        )
+    )
+    adapter._model = DummyProbabilityModel()
+    timestamps = pd.to_datetime(
+        ["2025-01-02T14:30:00Z", "2025-01-02T14:45:00Z"],
+        utc=True,
+    )
+    features = {"AAPL": pd.DataFrame({"timestamp": timestamps, "feat_a": [0.8, 0.8]})}
+    raw_frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.5],
+            "high": [101.0, 101.5],
+            "low": [99.0, 99.5],
+            "close": [100.5, 101.0],
+            "volume": [100.0, 120.0],
+        },
+        index=pd.DatetimeIndex(timestamps),
+    )
+
+    signal_frames = adapter.generate_signal_frames({"AAPL": raw_frame}, features=features)
+
+    signal_frame = signal_frames["AAPL"]
+    assert signal_frame["signal"].eq(0.0).all()
+    assert signal_frame["confidence"].eq(0.0).all()
+    assert bool(signal_frame.loc[0, "universe_eligible"]) is False
+    assert "insufficient_rows" in signal_frame.loc[0, "universe_quality_reasons"]
 
 
 def test_performance_attribution_compute_attribution_accepts_backtest_state():
@@ -323,6 +492,15 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
         "model_name": "test_model",
         "model_type": "lightgbm",
         "model_path": str(model_path),
+        "signal_policy": {
+            "long_side_policy": {"enabled": True, "signal_scale": 1.1},
+            "short_side_policy": {"enabled": False, "signal_scale": 0.0},
+        },
+        "universe_quality_policy": {
+            "enabled": True,
+            "min_rows": 900,
+            "selected_symbols": ["AAPL"],
+        },
         "training_config": {
             "symbols": ["AAPL"],
             "timeframe": "15Min",
@@ -351,6 +529,10 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
     assert package.max_position_pct == 0.12
     assert package.max_total_positions == 8
     assert package.min_confidence_position_scale == 0.15
+    assert package.long_side_policy["signal_scale"] == pytest.approx(1.1)
+    assert package.short_side_policy["enabled"] is False
+    assert package.enable_universe_quality_gate is True
+    assert package.universe_quality_policy["min_rows"] == 900
 
 
 def test_backtest_runner_generates_signals_from_promotion_package(tmp_path: Path):

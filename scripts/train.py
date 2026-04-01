@@ -64,7 +64,6 @@ from quant_trading_system.models.training_lineage import (
     compute_frame_content_hash,
     build_snapshot_manifest,
     compute_data_quality_hash,
-    estimate_missing_bars_count,
     load_dataset_snapshot_bundle,
     load_registry_entries,
     persist_dataset_snapshot_bundle,
@@ -73,6 +72,11 @@ from quant_trading_system.models.training_lineage import (
     register_training_model_version,
     set_registry_active_version,
 )
+from quant_trading_system.models.symbol_quality import (
+    SymbolQualityThresholds,
+    assess_symbol_quality,
+)
+from quant_trading_system.models.signal_policy import derive_asymmetric_signal_policy
 from quant_trading_system.models.statistical_validation import (
     calculate_deflated_sharpe_ratio,
     calculate_probability_of_backtest_overfitting,
@@ -1773,22 +1777,6 @@ class ModelTrainer:
             adjusted_row_operations,
         )
 
-    @staticmethod
-    def _symbol_missing_ratio(group: pd.DataFrame) -> float:
-        """Estimate missing-bar ratio for one symbol stream."""
-        if group is None or group.empty:
-            return 1.0
-        ts = pd.to_datetime(group["timestamp"], utc=True, errors="coerce").dropna().sort_values()
-        if len(ts) < 2:
-            return 0.0
-        missing_count, inferred_bar_seconds = estimate_missing_bars_count(ts)
-        if inferred_bar_seconds is None or inferred_bar_seconds <= 0.0:
-            return 0.0
-        expected_rows = float(len(ts) + missing_count)
-        if expected_rows <= 0.0:
-            return 0.0
-        return float(np.clip(missing_count / expected_rows, 0.0, 1.0))
-
     def _apply_symbol_universe_filters(self) -> None:
         """Apply symbol-level quality filter before feature generation."""
         if self.data is None or self.data.empty:
@@ -1796,81 +1784,28 @@ class ModelTrainer:
         if not self.config.enable_symbol_quality_filter:
             return
 
+        thresholds = SymbolQualityThresholds(
+            min_rows=int(self.config.symbol_quality_min_rows),
+            max_missing_ratio=float(self.config.symbol_quality_max_missing_ratio),
+            max_extreme_move_ratio=float(self.config.symbol_quality_max_extreme_move_ratio),
+            max_corporate_action_ratio=float(self.config.symbol_quality_max_corporate_action_ratio),
+            min_median_dollar_volume=float(self.config.symbol_quality_min_median_dollar_volume),
+        )
         records: list[dict[str, Any]] = []
         for symbol, group in self.data.groupby("symbol", sort=True):
             g = group.sort_values("timestamp").reset_index(drop=True)
-            returns = pd.to_numeric(g["close"], errors="coerce").pct_change()
-            returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
-            ret_obs = int(len(returns))
-            extreme_ratio = float((returns.abs() > 0.20).mean()) if ret_obs > 0 else 1.0
-            corporate_ratio = float((returns.abs() > 0.35).mean()) if ret_obs > 0 else 1.0
-            missing_ratio = self._symbol_missing_ratio(g)
-            median_dollar_volume = float(
-                np.nanmedian(
-                    np.nan_to_num(
-                        pd.to_numeric(g["close"], errors="coerce").to_numpy(dtype=float)
-                        * pd.to_numeric(g["volume"], errors="coerce").to_numpy(dtype=float),
-                        nan=0.0,
-                        posinf=0.0,
-                        neginf=0.0,
-                    )
-                )
-            )
-            rows = int(len(g))
-            passes = (
-                rows >= int(self.config.symbol_quality_min_rows)
-                and missing_ratio <= float(self.config.symbol_quality_max_missing_ratio)
-                and extreme_ratio <= float(self.config.symbol_quality_max_extreme_move_ratio)
-                and corporate_ratio <= float(self.config.symbol_quality_max_corporate_action_ratio)
-                and median_dollar_volume
-                >= float(self.config.symbol_quality_min_median_dollar_volume)
-            )
-            score = (
-                min(1.0, float(rows) / float(max(1, self.config.symbol_quality_min_rows))) * 0.35
-                + max(
-                    0.0,
-                    1.0
-                    - (
-                        missing_ratio
-                        / max(1e-9, float(self.config.symbol_quality_max_missing_ratio))
-                    ),
-                )
-                * 0.25
-                + max(
-                    0.0,
-                    1.0
-                    - (
-                        extreme_ratio
-                        / max(1e-9, float(self.config.symbol_quality_max_extreme_move_ratio))
-                    ),
-                )
-                * 0.20
-                + max(
-                    0.0,
-                    1.0
-                    - (
-                        corporate_ratio
-                        / max(1e-9, float(self.config.symbol_quality_max_corporate_action_ratio))
-                    ),
-                )
-                * 0.10
-                + min(
-                    1.0,
-                    median_dollar_volume
-                    / max(1.0, float(self.config.symbol_quality_min_median_dollar_volume)),
-                )
-                * 0.10
-            )
+            assessment = assess_symbol_quality(g, thresholds)
             records.append(
                 {
                     "symbol": str(symbol),
-                    "rows": rows,
-                    "missing_ratio": float(missing_ratio),
-                    "extreme_move_ratio": float(extreme_ratio),
-                    "corporate_action_ratio": float(corporate_ratio),
-                    "median_dollar_volume": float(median_dollar_volume),
-                    "passes": bool(passes),
-                    "quality_score": float(np.clip(score, 0.0, 1.0)),
+                    "rows": int(assessment["rows"]),
+                    "missing_ratio": float(assessment["missing_ratio"]),
+                    "extreme_move_ratio": float(assessment["extreme_move_ratio"]),
+                    "corporate_action_ratio": float(assessment["corporate_action_ratio"]),
+                    "median_dollar_volume": float(assessment["median_dollar_volume"]),
+                    "passes": bool(assessment["passes"]),
+                    "quality_score": float(assessment["quality_score"]),
+                    "reasons": list(assessment.get("reasons", [])),
                 }
             )
 
@@ -1914,6 +1849,7 @@ class ModelTrainer:
                 "median_dollar_volume": float(r["median_dollar_volume"]),
                 "passes": bool(r["passes"]),
                 "quality_score": float(r["quality_score"]),
+                "reasons": list(r.get("reasons", [])),
             }
             for r in records
         }
@@ -1923,6 +1859,24 @@ class ModelTrainer:
             len(records),
             len(dropped_symbols),
         )
+
+    @staticmethod
+    def _symbol_missing_ratio(group: pd.DataFrame) -> float:
+        """Backwards-compatible helper for tests and diagnostics."""
+        from quant_trading_system.models.training_lineage import estimate_missing_bars_count
+
+        if group is None or group.empty:
+            return 1.0
+        ts = pd.to_datetime(group["timestamp"], utc=True, errors="coerce").dropna().sort_values()
+        if len(ts) < 2:
+            return 0.0
+        missing_count, inferred_bar_seconds = estimate_missing_bars_count(ts)
+        if inferred_bar_seconds is None or inferred_bar_seconds <= 0.0:
+            return 0.0
+        expected_rows = float(len(ts) + missing_count)
+        if expected_rows <= 0.0:
+            return 0.0
+        return float(np.clip(missing_count / expected_rows, 0.0, 1.0))
 
     def _apply_training_bar_mode(self) -> None:
         """Convert sanitized OHLCV panel into the requested training bar representation."""
@@ -8990,6 +8944,43 @@ class ModelTrainer:
         self.training_metrics["holdout_rows"] = float(len(y_holdout))
         self.training_metrics["holdout_long_threshold"] = float(long_threshold)
         self.training_metrics["holdout_short_threshold"] = float(short_threshold)
+        side_policy_returns = (
+            np.asarray(holdout_cost_aware_event_returns, dtype=float)
+            if holdout_cost_aware_event_returns is not None
+            and len(holdout_cost_aware_event_returns) == len(y_holdout_proba)
+            else (
+                np.asarray(holdout_primary_forward_returns, dtype=float)
+                if holdout_primary_forward_returns is not None
+                and len(holdout_primary_forward_returns) == len(y_holdout_proba)
+                else None
+            )
+        )
+        holdout_side_policy = derive_asymmetric_signal_policy(
+            y_holdout_proba,
+            side_policy_returns,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+        )
+        self.training_metrics["holdout_side_policy"] = holdout_side_policy
+        for side_name in ("long", "short"):
+            policy = holdout_side_policy.get(side_name, {}) if isinstance(holdout_side_policy, dict) else {}
+            for metric_name in (
+                "enabled",
+                "signal_scale",
+                "confidence_scale",
+                "threshold_adjustment",
+                "trade_count",
+                "active_rate",
+                "mean_signed_return",
+                "win_rate",
+                "score",
+                "sample_confidence",
+            ):
+                value = policy.get(metric_name)
+                if isinstance(value, bool):
+                    self.training_metrics[f"holdout_{side_name}_{metric_name}"] = float(value)
+                elif isinstance(value, (int, float, np.floating, np.integer)):
+                    self.training_metrics[f"holdout_{side_name}_{metric_name}"] = float(value)
 
         self.logger.info(
             "Holdout metrics - Accuracy: %.4f, Sharpe: %.4f, WorstRegimeSharpe: %.4f, "
@@ -10249,6 +10240,16 @@ class ModelTrainer:
                     "probability_calibration_method",
                     self.training_metrics.get("probability_calibration_requested_method"),
                 ),
+                "long_side_policy": (
+                    self.training_metrics.get("holdout_side_policy", {}).get("long", {})
+                    if isinstance(self.training_metrics.get("holdout_side_policy"), dict)
+                    else {}
+                ),
+                "short_side_policy": (
+                    self.training_metrics.get("holdout_side_policy", {}).get("short", {})
+                    if isinstance(self.training_metrics.get("holdout_side_policy"), dict)
+                    else {}
+                ),
                 "model_source": f"promotion_package:{self.config.model_name}",
             },
             "execution_cost_model": {
@@ -10281,6 +10282,24 @@ class ModelTrainer:
                 str(self.data_quality_report_path) if self.data_quality_report_path else None
             ),
             "data_quality_report_hash": self.data_quality_report_hash,
+            "universe_quality_policy": {
+                "enabled": bool(self.config.enable_symbol_quality_filter),
+                "min_rows": int(self.config.symbol_quality_min_rows),
+                "min_symbols": int(self.config.symbol_quality_min_symbols),
+                "max_missing_ratio": float(self.config.symbol_quality_max_missing_ratio),
+                "max_extreme_move_ratio": float(self.config.symbol_quality_max_extreme_move_ratio),
+                "max_corporate_action_ratio": float(
+                    self.config.symbol_quality_max_corporate_action_ratio
+                ),
+                "min_median_dollar_volume": float(
+                    self.config.symbol_quality_min_median_dollar_volume
+                ),
+                "selected_symbols": list(self.training_metrics.get("symbol_quality_universe", [])),
+                "dropped_symbols": list(
+                    self.training_metrics.get("symbol_quality_dropped_list", [])
+                ),
+                "symbol_quality_report": self.training_metrics.get("symbol_quality_report", {}),
+            },
             "validation_results": self.validation_results,
             "objective_component_summary": self.training_metrics.get(
                 "objective_component_summary", {}

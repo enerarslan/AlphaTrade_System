@@ -109,9 +109,15 @@ def test_promotion_package_signal_source_dedupes_bars_and_sets_hold_contract_met
                         "confidence": [0.9],
                         "horizon": [3],
                         "model_source": ["promotion_package:pkg_model"],
+                        "probability": [0.82],
+                        "raw_prediction": [0.67],
+                        "meta_confidence": [0.88],
                         "max_holding_bars": [4],
                         "take_profit_pct": [0.05],
                         "stop_loss_pct": [0.02],
+                        "universe_eligible": [True],
+                        "universe_quality_score": [0.91],
+                        "long_side_policy_scale": [1.05],
                     }
                 )
             }
@@ -146,5 +152,11 @@ def test_promotion_package_signal_source_dedupes_bars_and_sets_hold_contract_met
     assert signal.metadata["max_holding_bars"] == 4
     assert signal.metadata["take_profit_pct"] == 0.05
     assert signal.metadata["stop_loss_pct"] == 0.02
+    assert signal.metadata["probability"] == 0.82
+    assert signal.metadata["raw_prediction"] == 0.67
+    assert signal.metadata["meta_confidence"] == 0.88
+    assert signal.metadata["universe_eligible"] is True
+    assert signal.metadata["universe_quality_score"] == 0.91
+    assert signal.metadata["long_side_policy_scale"] == 1.05
 
     assert source.generate({"AAPL": bar}) == []

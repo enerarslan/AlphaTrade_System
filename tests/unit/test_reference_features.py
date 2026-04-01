@@ -107,6 +107,30 @@ def test_news_features_respect_event_timestamps(monkeypatch: pytest.MonkeyPatch)
     assert result.loc[2, "ref_news_sentiment_momentum"] == pytest.approx(-0.3)
 
 
+def test_reference_interaction_features_capture_cross_source_pressure() -> None:
+    builder = _builder()
+    base = _base_frame(["2025-01-03T21:00:00Z"])
+    base["ref_news_recency_weighted_sentiment"] = [0.4]
+    base["ref_news_sentiment_mean_1d"] = [0.2]
+    base["ref_news_sentiment_momentum"] = [-0.3]
+    base["ref_filing_count_7d"] = [3.0]
+    base["ref_short_volume_ratio"] = [0.6]
+    base["ref_last_earnings_surprise_pct"] = [12.0]
+    base["ref_ftd_log_quantity"] = [2.5]
+    base["ref_analyst_target_upside"] = [0.15]
+    base["macro_vix_level"] = [20.0]
+
+    result = builder._augment_interaction_features(base.copy())
+
+    assert result.loc[0, "ref_news_filing_sentiment_pressure"] == pytest.approx(
+        -0.3 * np.log1p(3.0)
+    )
+    assert result.loc[0, "ref_earnings_short_pressure"] == pytest.approx(7.2)
+    assert result.loc[0, "ref_ftd_short_pressure"] == pytest.approx(1.5)
+    assert result.loc[0, "ref_news_analyst_alignment"] == pytest.approx(0.03)
+    assert result.loc[0, "ref_macro_news_stress"] == pytest.approx(8.0)
+
+
 def test_corporate_action_features_carry_last_values(monkeypatch: pytest.MonkeyPatch) -> None:
     builder = _builder()
     base = _base_frame(

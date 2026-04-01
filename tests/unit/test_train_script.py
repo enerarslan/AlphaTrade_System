@@ -2573,6 +2573,13 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     trainer.training_metrics = {
         "holdout_long_threshold": 0.61,
         "holdout_short_threshold": 0.39,
+        "holdout_side_policy": {
+            "long": {"enabled": True, "signal_scale": 1.10},
+            "short": {"enabled": False, "signal_scale": 0.0},
+        },
+        "symbol_quality_universe": ["AAPL", "MSFT"],
+        "symbol_quality_dropped_list": ["TSLA"],
+        "symbol_quality_report": {"AAPL": {"passes": True, "quality_score": 0.92}},
     }
     trainer.validation_results = {"all_passed": True}
     trainer.snapshot_manifest = {"feature_schema_version": "schema-1", "snapshot_id": "snap-1"}
@@ -2588,6 +2595,10 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     assert payload["position_sizing_policy"]["use_portfolio_target_sizing"] is True
     assert payload["position_sizing_policy"]["max_position_pct"] == pytest.approx(0.10)
     assert payload["position_sizing_policy"]["max_total_positions"] == 20
+    assert payload["signal_policy"]["long_side_policy"]["signal_scale"] == pytest.approx(1.10)
+    assert payload["signal_policy"]["short_side_policy"]["enabled"] is False
+    assert payload["universe_quality_policy"]["selected_symbols"] == ["AAPL", "MSFT"]
+    assert payload["universe_quality_policy"]["dropped_symbols"] == ["TSLA"]
 
 
 def test_build_parser_supports_institutional_failfast_flags_and_name():

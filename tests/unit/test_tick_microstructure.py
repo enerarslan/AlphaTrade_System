@@ -85,3 +85,44 @@ def test_tick_microstructure_builder_aggregates_quotes_and_trades(monkeypatch) -
     assert enriched.loc[2, "tick_trade_signed_volume_ratio_change"] == pytest.approx(-0.4)
     assert enriched.loc[2, "tick_quote_imbalance_change"] < 0.0
     assert enriched.loc[2, "tick_trade_flow_imbalance_gap"] > 0.8
+
+
+def test_tick_microstructure_builder_adds_reference_interaction_features() -> None:
+    base = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 4,
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-02T09:45:00Z",
+                    "2025-01-02T10:00:00Z",
+                    "2025-01-02T10:15:00Z",
+                    "2025-01-02T10:30:00Z",
+                ],
+                utc=True,
+            ),
+            "tick_quote_spread_bps_mean": [10.0, 12.0, 14.0, 40.0],
+            "tick_quote_imbalance_last": [0.05, 0.10, 0.15, 0.20],
+            "tick_trade_signed_volume_ratio": [0.10, 0.20, 0.30, 0.50],
+            "tick_trade_count": [10.0, 12.0, 14.0, 40.0],
+            "tick_trade_volume": [100.0, 120.0, 140.0, 300.0],
+            "ref_news_recency_weighted_sentiment": [0.2, 0.2, -0.1, -0.3],
+            "ref_last_earnings_surprise_pct": [4.0, 4.0, 8.0, 10.0],
+            "ref_short_volume_ratio": [0.4, 0.4, 0.5, 0.7],
+            "ref_ftd_log_quantity": [1.0, 1.0, 1.5, 2.0],
+            "ref_filing_count_7d": [1.0, 1.0, 2.0, 3.0],
+        }
+    )
+
+    builder = TickMicrostructureFeatureBuilder(TickMicrostructureFeatureConfig(timeframe="15Min"))
+    enriched = builder._augment_flow_regime_features(base.copy())
+
+    assert "tick_news_flow_alignment" in enriched.columns
+    assert "tick_earnings_flow_alignment" in enriched.columns
+    assert "tick_short_spread_pressure" in enriched.columns
+    assert "tick_ftd_spread_pressure" in enriched.columns
+    assert "tick_filing_flow_pressure" in enriched.columns
+    assert enriched.loc[3, "tick_news_flow_alignment"] < 0.0
+    assert enriched.loc[3, "tick_earnings_flow_alignment"] > 0.0
+    assert enriched.loc[3, "tick_short_spread_pressure"] > 0.0
+    assert enriched.loc[3, "tick_ftd_spread_pressure"] > 0.0
+    assert enriched.loc[3, "tick_filing_flow_pressure"] > 0.0

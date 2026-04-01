@@ -19,12 +19,18 @@ from quant_trading_system.features.feature_pipeline import (
     FeatureConfig,
     FeatureGroup,
     FeaturePipeline,
+    NormalizationMethod,
 )
+from quant_trading_system.features.multi_timeframe import MultiTimeframeFeatureEngine
 from quant_trading_system.features.optimized_pipeline import (
     CUDF_AVAILABLE,
     ComputeMode,
     OptimizedFeaturePipeline,
     OptimizedPipelineConfig,
+)
+from quant_trading_system.models.symbol_quality import (
+    SymbolQualityThresholds,
+    assess_symbol_quality,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,12 +109,16 @@ class PromotionPackageContract:
     meta_label_enabled: bool
     meta_label_threshold: float | None
     model_source: str
+    long_side_policy: dict[str, Any]
+    short_side_policy: dict[str, Any]
     cost_model: dict[str, float]
     use_portfolio_target_sizing: bool
     max_position_pct: float
     max_total_positions: int
     confidence_position_sizing: bool
     min_confidence_position_scale: float
+    enable_universe_quality_gate: bool
+    universe_quality_policy: dict[str, Any]
 
 
 def load_promotion_package(package_path: str | Path) -> PromotionPackageContract:
@@ -156,6 +166,10 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     position_sizing_policy = raw_payload.get("position_sizing_policy", {})
     if not isinstance(position_sizing_policy, dict):
         position_sizing_policy = {}
+
+    universe_quality_policy = raw_payload.get("universe_quality_policy", {})
+    if not isinstance(universe_quality_policy, dict):
+        universe_quality_policy = {}
 
     raw_feature_names = _coalesce(
         feature_contract.get("selected_features"),
@@ -315,6 +329,19 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     model_source = str(
         _coalesce(signal_policy.get("model_source"), f"promotion_package:{model_name}")
     ).strip()
+    long_side_policy = signal_policy.get("long_side_policy", {})
+    if not isinstance(long_side_policy, dict):
+        long_side_policy = {}
+    short_side_policy = signal_policy.get("short_side_policy", {})
+    if not isinstance(short_side_policy, dict):
+        short_side_policy = {}
+    enable_universe_quality_gate = bool(
+        _coalesce(
+            universe_quality_policy.get("enabled"),
+            training_config.get("enable_symbol_quality_filter"),
+            False,
+        )
+    )
     feature_schema_version = _coalesce(
         feature_contract.get("feature_schema_version"),
         raw_payload.get("feature_schema_version"),
@@ -357,12 +384,16 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         meta_label_enabled=meta_label_enabled,
         meta_label_threshold=meta_label_threshold,
         model_source=model_source,
+        long_side_policy=long_side_policy,
+        short_side_policy=short_side_policy,
         cost_model=cost_model,
         use_portfolio_target_sizing=use_portfolio_target_sizing,
         max_position_pct=max_position_pct,
         max_total_positions=max_total_positions,
         confidence_position_sizing=confidence_position_sizing,
         min_confidence_position_scale=min_confidence_position_scale,
+        enable_universe_quality_gate=enable_universe_quality_gate,
+        universe_quality_policy=universe_quality_policy,
     )
 
 
@@ -448,14 +479,18 @@ class PromotionSignalAdapter:
 
     def _load_model(self) -> Any:
         if self._model is None:
-            self._model = _load_pickle(self.contract.model_path)
+            model_path = getattr(self.contract, "model_path", None)
+            if model_path is None:
+                raise ValueError("Promotion contract missing model_path for model load.")
+            self._model = _load_pickle(model_path)
         return self._model
 
     def _load_meta_model(self) -> Any | None:
-        if self.contract.meta_model_path is None:
+        meta_model_path = getattr(self.contract, "meta_model_path", None)
+        if meta_model_path is None:
             return None
         if self._meta_model is None:
-            self._meta_model = _load_pickle(self.contract.meta_model_path)
+            self._meta_model = _load_pickle(meta_model_path)
         return self._meta_model
 
     def _choose_pipeline(self) -> Any:
@@ -469,43 +504,293 @@ class PromotionSignalAdapter:
         self.feature_pipeline = pipeline
         return pipeline
 
+    def _resolve_side_policy(self, side: str) -> dict[str, Any]:
+        """Return normalized long/short inference policy."""
+        raw_policy = (
+            getattr(self.contract, "long_side_policy", {})
+            if str(side).strip().lower() == "long"
+            else getattr(self.contract, "short_side_policy", {})
+        )
+        if not isinstance(raw_policy, dict):
+            raw_policy = {}
+        return {
+            "enabled": bool(raw_policy.get("enabled", True)),
+            "signal_scale": float(np.clip(float(raw_policy.get("signal_scale", 1.0)), 0.0, 1.25)),
+            "confidence_scale": float(
+                np.clip(float(raw_policy.get("confidence_scale", 1.0)), 0.0, 1.20)
+            ),
+            "threshold_adjustment": float(
+                np.clip(float(raw_policy.get("threshold_adjustment", 0.0)), -0.08, 0.08)
+            ),
+            "trade_count": int(max(0, int(float(raw_policy.get("trade_count", 0))))),
+            "score": float(raw_policy.get("score", 0.0) or 0.0),
+            "mean_signed_return": float(raw_policy.get("mean_signed_return", 0.0) or 0.0),
+            "sample_confidence": float(raw_policy.get("sample_confidence", 0.0) or 0.0),
+        }
+
+    def _effective_thresholds(self) -> tuple[float, float]:
+        """Resolve threshold adjustments from side-specific inference policy."""
+        long_policy = self._resolve_side_policy("long")
+        short_policy = self._resolve_side_policy("short")
+        long_threshold = float(
+            np.clip(
+                float(self.contract.long_threshold) + float(long_policy["threshold_adjustment"]),
+                0.51,
+                0.99,
+            )
+        )
+        short_threshold = float(
+            np.clip(
+                float(self.contract.short_threshold) + float(short_policy["threshold_adjustment"]),
+                0.01,
+                0.49,
+            )
+        )
+        if long_threshold <= short_threshold:
+            return float(self.contract.long_threshold), float(self.contract.short_threshold)
+        return long_threshold, short_threshold
+
+    def _resolve_symbol_quality_thresholds(self) -> SymbolQualityThresholds | None:
+        """Return runtime symbol quality thresholds when universe gating is enabled."""
+        if not bool(getattr(self.contract, "enable_universe_quality_gate", False)):
+            return None
+        policy = (
+            getattr(self.contract, "universe_quality_policy", {})
+            if isinstance(getattr(self.contract, "universe_quality_policy", {}), dict)
+            else {}
+        )
+        return SymbolQualityThresholds(
+            min_rows=int(
+                float(
+                    _coalesce(
+                        policy.get("min_rows"),
+                        getattr(self.contract, "raw_payload", {}).get("training_config", {}).get("symbol_quality_min_rows")
+                        if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                        else None,
+                        1200,
+                    )
+                )
+            ),
+            max_missing_ratio=float(
+                _coalesce(
+                    policy.get("max_missing_ratio"),
+                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
+                        "symbol_quality_max_missing_ratio"
+                    )
+                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                    else None,
+                    0.12,
+                )
+            ),
+            max_extreme_move_ratio=float(
+                _coalesce(
+                    policy.get("max_extreme_move_ratio"),
+                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
+                        "symbol_quality_max_extreme_move_ratio"
+                    )
+                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                    else None,
+                    0.08,
+                )
+            ),
+            max_corporate_action_ratio=float(
+                _coalesce(
+                    policy.get("max_corporate_action_ratio"),
+                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
+                        "symbol_quality_max_corporate_action_ratio"
+                    )
+                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                    else None,
+                    0.02,
+                )
+            ),
+            min_median_dollar_volume=float(
+                _coalesce(
+                    policy.get("min_median_dollar_volume"),
+                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
+                        "symbol_quality_min_median_dollar_volume"
+                    )
+                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                    else None,
+                    1_000_000.0,
+                )
+            ),
+        )
+
+    def _assess_runtime_symbol_quality(self, data: dict[str, pd.DataFrame]) -> dict[str, dict[str, Any]]:
+        """Assess symbol quality for promotion-package backtest/paper inference."""
+        thresholds = self._resolve_symbol_quality_thresholds()
+        if thresholds is None:
+            return {
+                symbol: {"passes": True, "quality_score": 1.0, "reasons": []}
+                for symbol in data.keys()
+            }
+
+        policy = (
+            getattr(self.contract, "universe_quality_policy", {})
+            if isinstance(getattr(self.contract, "universe_quality_policy", {}), dict)
+            else {}
+        )
+        selected_symbols = {
+            value.upper()
+            for value in _normalize_string_list(policy.get("selected_symbols"))
+        }
+        contract_symbols = getattr(self.contract, "symbols", ())
+        if not selected_symbols and contract_symbols:
+            selected_symbols = {str(symbol).strip().upper() for symbol in contract_symbols}
+
+        assessments: dict[str, dict[str, Any]] = {}
+        for symbol, frame in data.items():
+            assessment = assess_symbol_quality(frame, thresholds)
+            reasons = list(assessment.get("reasons", []))
+            in_training_universe = True
+            if selected_symbols and str(symbol).strip().upper() not in selected_symbols:
+                in_training_universe = False
+                reasons.append("not_in_training_universe")
+            assessment["in_training_universe"] = in_training_universe
+            assessment["passes"] = bool(assessment.get("passes", False) and in_training_universe)
+            assessment["reasons"] = reasons
+            assessments[str(symbol).strip().upper()] = assessment
+        return assessments
+
+    @staticmethod
+    def _resolve_probability_calibration_payload(model: Any) -> dict[str, Any] | None:
+        """Read attached probability calibration metadata from wrapper or raw model."""
+        for candidate in (model, getattr(model, "_model", None)):
+            payload = getattr(candidate, "_alphatrade_probability_calibration", None)
+            if isinstance(payload, dict) and payload.get("calibrator") is not None:
+                return payload
+        return None
+
+    @staticmethod
+    def _apply_probability_calibration(values: np.ndarray, payload: dict[str, Any]) -> np.ndarray:
+        """Apply attached post-hoc calibration to probability-like model outputs."""
+        calibrator = payload.get("calibrator")
+        method = str(payload.get("method") or "isotonic").strip().lower()
+        raw_values = np.asarray(values, dtype=float).reshape(-1)
+        if raw_values.size == 0 or calibrator is None:
+            return raw_values
+        if method == "isotonic":
+            calibrated = calibrator.predict(raw_values)
+        else:
+            calibrated = calibrator.predict_proba(raw_values.reshape(-1, 1))[:, 1]
+        return np.clip(np.asarray(calibrated, dtype=float).reshape(-1), 0.0, 1.0)
+
+    def _compute_symbol_feature_frame(
+        self,
+        *,
+        df: pd.DataFrame,
+        symbol: str,
+        groups: list[FeatureGroup],
+        universe_data: dict[str, Any] | None,
+    ) -> pd.DataFrame:
+        """Compute a deterministic feature frame using the same group semantics as training."""
+        import polars as pl
+
+        ordered = df.copy().sort_values("timestamp").reset_index(drop=True)
+        ordered["symbol"] = symbol
+        if not groups:
+            return ordered
+
+        df_pl = pl.from_pandas(ordered)
+        combined_features: dict[str, np.ndarray] = {}
+        for group in groups:
+            feature_config = FeatureConfig(
+                groups=[group],
+                normalization=NormalizationMethod.NONE,
+                include_targets=False,
+                use_gpu=self.use_gpu and group == FeatureGroup.TECHNICAL,
+                use_cache=False,
+                use_optimized_pipeline=(group == FeatureGroup.TECHNICAL),
+            )
+            pipeline = FeaturePipeline(feature_config)
+            feature_set = pipeline.compute(
+                df_pl,
+                symbol=symbol,
+                universe_data=(universe_data if group == FeatureGroup.CROSS_SECTIONAL else None),
+                use_cache=False,
+            )
+            combined_features.update(feature_set.features)
+
+        if not combined_features:
+            return ordered
+
+        feature_df = pd.DataFrame(combined_features, index=ordered.index)
+        features = pd.concat([ordered, feature_df], axis=1)
+        features["symbol"] = symbol
+        return features
+
     def compute_features(self, data: dict[str, Any]) -> dict[str, pd.DataFrame]:
         """Compute package-compatible feature frames from raw market data."""
         import polars as pl
 
-        pipeline = self._choose_pipeline()
         groups = resolve_feature_groups(self.contract)
+        normalized_data: dict[str, pd.DataFrame] = {}
+        for raw_symbol, frame in data.items():
+            symbol = str(raw_symbol).strip().upper()
+            pdf = _to_pandas_frame(frame).copy()
+            pdf["symbol"] = symbol
+            normalized_data[symbol] = pdf.sort_values("timestamp").reset_index(drop=True)
+        quality_assessments = self._assess_runtime_symbol_quality(normalized_data)
+
         universe_data: dict[str, pl.DataFrame] | None = None
         if FeatureGroup.CROSS_SECTIONAL in groups:
             universe_data = {
-                str(symbol).strip().upper(): pl.from_pandas(_to_pandas_frame(frame))
-                for symbol, frame in data.items()
+                symbol: pl.from_pandas(frame)
+                for symbol, frame in normalized_data.items()
+                if quality_assessments.get(symbol, {}).get("passes", True)
             }
 
         feature_frames: dict[str, pd.DataFrame] = {}
-        for raw_symbol, frame in data.items():
-            symbol = str(raw_symbol).strip().upper()
-            pdf = _to_pandas_frame(frame)
-            df_pl = pl.from_pandas(pdf)
-            if hasattr(pipeline, "compute"):
-                feature_set = pipeline.compute(df_pl, symbol=symbol, universe_data=universe_data)
-                feature_count = int(getattr(feature_set, "num_features", 0))
-                features = (
-                    feature_set.to_polars().to_pandas()
-                    if feature_count > 0
-                    else df_pl.to_pandas()
-                )
-            else:
-                features = pipeline.compute_features(pdf, symbol=symbol)
+        timeframes = tuple(self.contract.timeframes or (self.contract.timeframe,))
+        if len(timeframes) > 1:
+            engine = MultiTimeframeFeatureEngine(
+                base_timeframe=self.contract.timeframe,
+                timeframes=list(timeframes),
+            )
+            base_timeframe = normalize_timeframe(self.contract.timeframe, default=DEFAULT_TIMEFRAME)
+            for symbol, pdf in normalized_data.items():
+                if not quality_assessments.get(symbol, {}).get("passes", True):
+                    continue
+                ohlcv_frames = engine.build_ohlcv_frames(pdf)
+                layered_frames: dict[str, pd.DataFrame] = {}
+                for timeframe in engine.normalized_timeframes():
+                    timeframe_frame = ohlcv_frames.get(timeframe)
+                    if timeframe_frame is None or timeframe_frame.empty:
+                        continue
+                    timeframe_groups = list(groups)
+                    if timeframe != base_timeframe:
+                        timeframe_groups = [
+                            group for group in timeframe_groups if group != FeatureGroup.CROSS_SECTIONAL
+                        ]
+                    layered_frames[timeframe] = self._compute_symbol_feature_frame(
+                        df=timeframe_frame,
+                        symbol=symbol,
+                        groups=timeframe_groups,
+                        universe_data=(universe_data if timeframe == base_timeframe else None),
+                    )
 
-            features = features.copy().reset_index(drop=True)
-            timestamps = _extract_timestamps(pdf).reindex(range(len(features)))
-            if "timestamp" not in features.columns:
-                features.insert(0, "timestamp", timestamps)
-            else:
-                features["timestamp"] = pd.to_datetime(features["timestamp"], utc=True, errors="coerce")
-            features["symbol"] = symbol
-            feature_frames[symbol] = features
+                if base_timeframe not in layered_frames:
+                    raise ValueError(
+                        f"Promotion package features missing base timeframe {base_timeframe} for {symbol}"
+                    )
+                aligned = engine.align_feature_frames(
+                    base_frame=layered_frames[base_timeframe],
+                    feature_frames=layered_frames,
+                    include_resampled_ohlcv=True,
+                )
+                aligned["symbol"] = symbol
+                feature_frames[symbol] = aligned.reset_index(drop=True)
+        else:
+            for symbol, pdf in normalized_data.items():
+                if not quality_assessments.get(symbol, {}).get("passes", True):
+                    continue
+                feature_frames[symbol] = self._compute_symbol_feature_frame(
+                    df=pdf,
+                    symbol=symbol,
+                    groups=groups,
+                    universe_data=universe_data,
+                ).reset_index(drop=True)
 
         if not feature_frames:
             return feature_frames
@@ -552,6 +837,9 @@ class PromotionSignalAdapter:
             raw_scores = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
             clipped = np.clip(raw_scores, -20.0, 20.0)
             score = 1.0 / (1.0 + np.exp(-clipped))
+            payload = self._resolve_probability_calibration_payload(model)
+            if payload is not None:
+                score = self._apply_probability_calibration(score, payload)
             return score.astype(float), raw_scores.astype(float)
 
         try:
@@ -561,13 +849,20 @@ class PromotionSignalAdapter:
                     score = probabilities[:, -1] if probabilities.shape[1] >= 2 else probabilities[:, 0]
                 else:
                     score = probabilities.reshape(-1)
-                return score.astype(float), score.astype(float)
+                raw_score = score.astype(float)
+                payload = self._resolve_probability_calibration_payload(model)
+                if payload is not None:
+                    score = self._apply_probability_calibration(score, payload)
+                return score.astype(float), raw_score
         except (AttributeError, NotImplementedError):
             pass
 
         raw_prediction = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
         clipped = np.clip(raw_prediction, -1.0, 1.0)
         score = (clipped + 1.0) / 2.0
+        payload = self._resolve_probability_calibration_payload(model)
+        if payload is not None:
+            score = self._apply_probability_calibration(score, payload)
         return score.astype(float), raw_prediction.astype(float)
 
     @staticmethod
@@ -597,8 +892,53 @@ class PromotionSignalAdapter:
             )
 
         feature_frames = features or self.compute_features(data)
+        normalized_data = {
+            str(symbol).strip().upper(): _to_pandas_frame(frame)
+            for symbol, frame in data.items()
+        }
+        quality_assessments = self._assess_runtime_symbol_quality(normalized_data)
+        effective_long_threshold, effective_short_threshold = self._effective_thresholds()
+        long_policy = self._resolve_side_policy("long")
+        short_policy = self._resolve_side_policy("short")
         signal_frames: dict[str, pd.DataFrame] = {}
-        for symbol, feature_df in feature_frames.items():
+        for symbol, raw_frame in normalized_data.items():
+            quality = quality_assessments.get(
+                symbol,
+                {"passes": True, "quality_score": 1.0, "reasons": []},
+            )
+            timestamps = _extract_timestamps(raw_frame)
+            if not bool(quality.get("passes", True)):
+                signal_frames[symbol] = pd.DataFrame(
+                    {
+                        "timestamp": timestamps,
+                        "signal": np.zeros(len(timestamps), dtype=float),
+                        "confidence": np.zeros(len(timestamps), dtype=float),
+                        "horizon": int(self.contract.horizon_bars),
+                        "model_source": self.contract.model_source,
+                        "probability": np.full(len(timestamps), np.nan, dtype=float),
+                        "raw_prediction": np.full(len(timestamps), np.nan, dtype=float),
+                        "long_threshold": float(effective_long_threshold),
+                        "short_threshold": float(effective_short_threshold),
+                        "base_long_threshold": float(self.contract.long_threshold),
+                        "base_short_threshold": float(self.contract.short_threshold),
+                        "meta_confidence": np.full(len(timestamps), np.nan, dtype=float),
+                        "take_profit_pct": float(self.contract.take_profit_pct),
+                        "stop_loss_pct": float(self.contract.stop_loss_pct),
+                        "max_holding_bars": int(self.contract.max_holding_bars),
+                        "universe_eligible": False,
+                        "universe_quality_score": float(quality.get("quality_score", 0.0)),
+                        "universe_quality_reasons": "|".join(
+                            str(reason) for reason in quality.get("reasons", [])
+                        ),
+                        "long_side_policy_scale": float(long_policy["signal_scale"]),
+                        "short_side_policy_scale": float(short_policy["signal_scale"]),
+                    }
+                )
+                continue
+
+            feature_df = feature_frames.get(symbol)
+            if feature_df is None:
+                raise ValueError(f"Missing feature frame for promotion symbol {symbol}")
             symbol_frame = feature_df.copy().reset_index(drop=True)
             missing_features = [
                 feature_name for feature_name in required_features if feature_name not in symbol_frame.columns
@@ -625,30 +965,59 @@ class PromotionSignalAdapter:
                 probability[valid_mask.to_numpy()] = np.clip(score, 0.0, 1.0)
                 raw_prediction[valid_mask.to_numpy()] = raw
 
-            long_mask = probability >= self.contract.long_threshold
-            short_mask = probability <= self.contract.short_threshold
+            long_mask = probability >= effective_long_threshold
+            short_mask = probability <= effective_short_threshold
             signal_values = np.zeros(len(X_df), dtype=float)
-            long_scale = max(1e-6, 1.0 - self.contract.long_threshold)
-            short_scale = max(1e-6, self.contract.short_threshold)
+            long_scale = max(1e-6, 1.0 - effective_long_threshold)
+            short_scale = max(1e-6, effective_short_threshold)
             signal_values[long_mask] = np.clip(
-                (probability[long_mask] - self.contract.long_threshold) / long_scale,
+                (probability[long_mask] - effective_long_threshold) / long_scale,
                 0.0,
                 1.0,
             )
             signal_values[short_mask] = -np.clip(
-                (self.contract.short_threshold - probability[short_mask]) / short_scale,
+                (effective_short_threshold - probability[short_mask]) / short_scale,
                 0.0,
                 1.0,
             )
 
             confidence = np.clip(np.abs(probability - 0.5) * 2.0, 0.0, 1.0)
+            if not bool(long_policy["enabled"]):
+                signal_values[long_mask] = 0.0
+                confidence[long_mask] = 0.0
+            else:
+                signal_values[long_mask] = np.clip(
+                    signal_values[long_mask] * float(long_policy["signal_scale"]),
+                    0.0,
+                    1.0,
+                )
+                confidence[long_mask] = np.clip(
+                    confidence[long_mask] * float(long_policy["confidence_scale"]),
+                    0.0,
+                    1.0,
+                )
+            if not bool(short_policy["enabled"]):
+                signal_values[short_mask] = 0.0
+                confidence[short_mask] = 0.0
+            else:
+                signal_values[short_mask] = -np.clip(
+                    np.abs(signal_values[short_mask]) * float(short_policy["signal_scale"]),
+                    0.0,
+                    1.0,
+                )
+                confidence[short_mask] = np.clip(
+                    confidence[short_mask] * float(short_policy["confidence_scale"]),
+                    0.0,
+                    1.0,
+                )
+
             meta_confidence = np.full(len(X_df), np.nan, dtype=float)
             if (
                 meta_model is not None
                 and self.contract.meta_label_enabled
                 and hasattr(meta_model, "filter_signals")
             ):
-                close_series = self._extract_close_series(data[symbol], len(X_df))
+                close_series = self._extract_close_series(raw_frame, len(X_df))
                 primary_direction = pd.Series(np.sign(signal_values), dtype=float)
                 filtered = meta_model.filter_signals(
                     X_df.fillna(0.0),
@@ -683,18 +1052,27 @@ class PromotionSignalAdapter:
             signal_frames[symbol] = pd.DataFrame(
                 {
                     "timestamp": timestamps,
-                    "signal": signal_values,
+                    "signal": np.clip(signal_values, -1.0, 1.0),
                     "confidence": confidence,
                     "horizon": int(self.contract.horizon_bars),
                     "model_source": self.contract.model_source,
                     "probability": probability,
                     "raw_prediction": raw_prediction,
-                    "long_threshold": float(self.contract.long_threshold),
-                    "short_threshold": float(self.contract.short_threshold),
+                    "long_threshold": float(effective_long_threshold),
+                    "short_threshold": float(effective_short_threshold),
+                    "base_long_threshold": float(self.contract.long_threshold),
+                    "base_short_threshold": float(self.contract.short_threshold),
                     "meta_confidence": meta_confidence,
                     "take_profit_pct": float(self.contract.take_profit_pct),
                     "stop_loss_pct": float(self.contract.stop_loss_pct),
                     "max_holding_bars": int(self.contract.max_holding_bars),
+                    "universe_eligible": True,
+                    "universe_quality_score": float(quality.get("quality_score", 1.0)),
+                    "universe_quality_reasons": "|".join(
+                        str(reason) for reason in quality.get("reasons", [])
+                    ),
+                    "long_side_policy_scale": float(long_policy["signal_scale"]),
+                    "short_side_policy_scale": float(short_policy["signal_scale"]),
                 }
             )
         return signal_frames

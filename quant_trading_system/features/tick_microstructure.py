@@ -289,6 +289,11 @@ class TickMicrostructureFeatureBuilder:
             "tick_trade_count_burst_12",
             "tick_trade_flow_imbalance_gap",
             "tick_trade_pressure_alignment",
+            "tick_news_flow_alignment",
+            "tick_earnings_flow_alignment",
+            "tick_short_spread_pressure",
+            "tick_ftd_spread_pressure",
+            "tick_filing_flow_pressure",
         )
         for column in derived_columns:
             base[column] = np.nan
@@ -296,6 +301,9 @@ class TickMicrostructureFeatureBuilder:
         grouped_rows = base.groupby("symbol", sort=False).groups
         for row_index in grouped_rows.values():
             ordered_index = base.loc[row_index].sort_values("timestamp").index
+            spread_burst = pd.Series(np.nan, index=ordered_index, dtype=float)
+            signed_ratio_ema = pd.Series(np.nan, index=ordered_index, dtype=float)
+            trade_count_burst = pd.Series(np.nan, index=ordered_index, dtype=float)
 
             if "tick_quote_spread_bps_mean" in base.columns:
                 spread = pd.to_numeric(base.loc[ordered_index, "tick_quote_spread_bps_mean"], errors="coerce")
@@ -307,9 +315,8 @@ class TickMicrostructureFeatureBuilder:
                         min_periods=1,
                     ).mean().to_numpy()
                 )
-                base.loc[ordered_index, "tick_quote_spread_bps_burst_12"] = (
-                    _relative_to_history(spread, _FLOW_LOOKBACK_BARS_LONG).to_numpy()
-                )
+                spread_burst = _relative_to_history(spread, _FLOW_LOOKBACK_BARS_LONG)
+                base.loc[ordered_index, "tick_quote_spread_bps_burst_12"] = spread_burst.to_numpy()
 
             if "tick_quote_imbalance_last" in base.columns:
                 imbalance = pd.to_numeric(base.loc[ordered_index, "tick_quote_imbalance_last"], errors="coerce")
@@ -336,12 +343,13 @@ class TickMicrostructureFeatureBuilder:
                 base.loc[ordered_index, "tick_trade_signed_volume_ratio_change"] = (
                     signed_ratio.diff().to_numpy()
                 )
+                signed_ratio_ema = signed_ratio.ewm(
+                    span=_FLOW_LOOKBACK_BARS_SHORT,
+                    adjust=False,
+                    min_periods=1,
+                ).mean()
                 base.loc[ordered_index, "tick_trade_signed_volume_ratio_ema_3"] = (
-                    signed_ratio.ewm(
-                        span=_FLOW_LOOKBACK_BARS_SHORT,
-                        adjust=False,
-                        min_periods=1,
-                    ).mean().to_numpy()
+                    signed_ratio_ema.to_numpy()
                 )
 
             if "tick_trade_volume" in base.columns:
@@ -352,9 +360,8 @@ class TickMicrostructureFeatureBuilder:
 
             if "tick_trade_count" in base.columns:
                 trade_count = pd.to_numeric(base.loc[ordered_index, "tick_trade_count"], errors="coerce")
-                base.loc[ordered_index, "tick_trade_count_burst_12"] = (
-                    _relative_to_history(trade_count, _FLOW_LOOKBACK_BARS_LONG).to_numpy()
-                )
+                trade_count_burst = _relative_to_history(trade_count, _FLOW_LOOKBACK_BARS_LONG)
+                base.loc[ordered_index, "tick_trade_count_burst_12"] = trade_count_burst.to_numpy()
 
             if (
                 "tick_trade_signed_volume_ratio" in base.columns
@@ -373,6 +380,51 @@ class TickMicrostructureFeatureBuilder:
                 ).to_numpy()
                 base.loc[ordered_index, "tick_trade_pressure_alignment"] = (
                     signed_ratio * imbalance
+                ).to_numpy()
+
+            if "ref_news_recency_weighted_sentiment" in base.columns:
+                news_sentiment = pd.to_numeric(
+                    base.loc[ordered_index, "ref_news_recency_weighted_sentiment"],
+                    errors="coerce",
+                ).fillna(0.0)
+                base.loc[ordered_index, "tick_news_flow_alignment"] = (
+                    signed_ratio_ema.fillna(0.0) * news_sentiment
+                ).to_numpy()
+
+            if "ref_last_earnings_surprise_pct" in base.columns:
+                earnings_surprise = pd.to_numeric(
+                    base.loc[ordered_index, "ref_last_earnings_surprise_pct"],
+                    errors="coerce",
+                ).fillna(0.0)
+                base.loc[ordered_index, "tick_earnings_flow_alignment"] = (
+                    signed_ratio_ema.fillna(0.0) * earnings_surprise
+                ).to_numpy()
+
+            if "ref_short_volume_ratio" in base.columns:
+                short_ratio = pd.to_numeric(
+                    base.loc[ordered_index, "ref_short_volume_ratio"],
+                    errors="coerce",
+                ).fillna(0.0)
+                base.loc[ordered_index, "tick_short_spread_pressure"] = (
+                    spread_burst.fillna(0.0) * short_ratio
+                ).to_numpy()
+
+            if "ref_ftd_log_quantity" in base.columns:
+                ftd_pressure = pd.to_numeric(
+                    base.loc[ordered_index, "ref_ftd_log_quantity"],
+                    errors="coerce",
+                ).fillna(0.0)
+                base.loc[ordered_index, "tick_ftd_spread_pressure"] = (
+                    spread_burst.fillna(0.0) * ftd_pressure
+                ).to_numpy()
+
+            if "ref_filing_count_7d" in base.columns:
+                filing_count = pd.to_numeric(
+                    base.loc[ordered_index, "ref_filing_count_7d"],
+                    errors="coerce",
+                ).fillna(0.0)
+                base.loc[ordered_index, "tick_filing_flow_pressure"] = (
+                    trade_count_burst.fillna(0.0) * filing_count
                 ).to_numpy()
 
         return base

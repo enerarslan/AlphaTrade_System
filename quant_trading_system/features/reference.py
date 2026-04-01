@@ -328,6 +328,7 @@ class ReferenceFeatureBuilder:
                 symbols=symbols,
                 max_trade_date=max_trade_date,
             )
+        base = self._augment_interaction_features(base)
 
         self._warn_unsafe_sources()
         return (
@@ -1530,4 +1531,47 @@ class ReferenceFeatureBuilder:
                 base.loc[row_index, "ref_last_split_ratio"] = (
                     _series_to_float(split_merge["ref_last_split_ratio"]).fillna(0.0).to_numpy()
                 )
+        return base
+
+    def _augment_interaction_features(self, base: pd.DataFrame) -> pd.DataFrame:
+        """Build cross-source interaction features from already materialized reference layers."""
+
+        def _series(column: str) -> pd.Series:
+            if column not in base.columns:
+                return pd.Series(0.0, index=base.index, dtype=float)
+            return (
+                pd.to_numeric(base[column], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .astype(float)
+            )
+
+        news_sentiment = _series("ref_news_recency_weighted_sentiment")
+        news_sentiment_mean_1d = _series("ref_news_sentiment_mean_1d")
+        news_momentum = _series("ref_news_sentiment_momentum")
+        filing_count_7d = _series("ref_filing_count_7d").clip(lower=0.0)
+        short_ratio = _series("ref_short_volume_ratio")
+        earnings_surprise_pct = _series("ref_last_earnings_surprise_pct")
+        ftd_log_quantity = _series("ref_ftd_log_quantity")
+        analyst_target_upside = _series("ref_analyst_target_upside")
+        macro_vix_level = _series("macro_vix_level")
+
+        base["ref_news_filing_sentiment_pressure"] = news_momentum * np.log1p(filing_count_7d)
+        base["ref_earnings_short_pressure"] = earnings_surprise_pct * short_ratio
+        base["ref_ftd_short_pressure"] = ftd_log_quantity * short_ratio
+        base["ref_news_analyst_alignment"] = analyst_target_upside * news_sentiment_mean_1d
+        base["ref_macro_news_stress"] = np.abs(news_sentiment) * macro_vix_level
+
+        for column in (
+            "ref_news_filing_sentiment_pressure",
+            "ref_earnings_short_pressure",
+            "ref_ftd_short_pressure",
+            "ref_news_analyst_alignment",
+            "ref_macro_news_stress",
+        ):
+            base[column] = (
+                pd.to_numeric(base[column], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+            )
         return base
