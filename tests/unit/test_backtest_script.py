@@ -51,6 +51,35 @@ class DummyMetaModel:
         )
 
 
+class DummyExpectedEdgeModel:
+    def predict_policy(
+        self,
+        feature_frame,
+        *,
+        probabilities,
+        long_threshold,
+        short_threshold,
+        raw_predictions=None,
+        signal_values=None,
+        confidence=None,
+    ):
+        del feature_frame, long_threshold, short_threshold, raw_predictions, confidence
+        probabilities = np.asarray(probabilities, dtype=float).reshape(-1)
+        signal_values = np.asarray(signal_values, dtype=float).reshape(-1)
+        passed = (probabilities >= 0.64) & (np.abs(signal_values) > 0.0)
+        scale = np.where(passed, 0.5, 0.0)
+        pass_probability = np.where(passed, 0.90, 0.20)
+        return pd.DataFrame(
+            {
+                "expected_edge": np.where(passed, 0.012, -0.004),
+                "edge_pass_probability": pass_probability,
+                "edge_loss_probability": 1.0 - pass_probability,
+                "edge_policy_pass": passed,
+                "edge_policy_scale": scale,
+            }
+        )
+
+
 class DummyRankerModel:
     def predict(self, X):
         del X
@@ -230,6 +259,62 @@ def test_promotion_signal_adapter_blocks_ineligible_universe_symbol():
     assert signal_frame["confidence"].eq(0.0).all()
     assert bool(signal_frame.loc[0, "universe_eligible"]) is False
     assert "insufficient_rows" in signal_frame.loc[0, "universe_quality_reasons"]
+
+
+def test_promotion_signal_adapter_applies_expected_edge_policy_gate_and_scale():
+    adapter = PromotionSignalAdapter(
+        SimpleNamespace(
+            model_type="lightgbm",
+            feature_names=("feat_a",),
+            long_threshold=0.60,
+            short_threshold=0.40,
+            horizon_bars=5,
+            model_source="promotion_package:test_model",
+            meta_label_enabled=False,
+            meta_label_threshold=None,
+            take_profit_pct=0.03,
+            stop_loss_pct=0.02,
+            max_holding_bars=6,
+            long_side_policy={},
+            short_side_policy={},
+            expected_edge_policy_enabled=True,
+            expected_edge_policy={},
+            enable_universe_quality_gate=False,
+            universe_quality_policy={},
+        )
+    )
+    adapter._model = DummyProbabilityModel()
+    adapter._load_expected_edge_model = lambda: DummyExpectedEdgeModel()
+    timestamps = pd.to_datetime(
+        ["2025-01-02T14:30:00Z", "2025-01-02T14:45:00Z"],
+        utc=True,
+    )
+    features = {"AAPL": pd.DataFrame({"timestamp": timestamps, "feat_a": [0.65, 0.61]})}
+    raw_frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.5],
+            "high": [101.0, 101.5],
+            "low": [99.0, 99.5],
+            "close": [100.5, 101.0],
+            "volume": [1000.0, 1200.0],
+        },
+        index=pd.DatetimeIndex(timestamps),
+    )
+
+    signal_frames = adapter.generate_signal_frames({"AAPL": raw_frame}, features=features)
+
+    signal_frame = signal_frames["AAPL"]
+    base_signal = (0.65 - 0.60) / 0.40
+    assert signal_frame.loc[0, "signal"] == pytest.approx(base_signal * 0.5)
+    assert signal_frame.loc[0, "confidence"] == pytest.approx(
+        ((abs(0.65 - 0.5) * 2.0) * 0.5) + (0.90 * 0.5)
+    )
+    assert bool(signal_frame.loc[0, "edge_policy_pass"]) is True
+    assert signal_frame.loc[0, "edge_policy_scale"] == pytest.approx(0.5)
+    assert signal_frame.loc[0, "expected_edge"] == pytest.approx(0.012)
+    assert signal_frame.loc[1, "signal"] == pytest.approx(0.0)
+    assert signal_frame.loc[1, "confidence"] == pytest.approx(0.0)
+    assert bool(signal_frame.loc[1, "edge_policy_pass"]) is False
 
 
 def test_performance_attribution_compute_attribution_accepts_backtest_state():
@@ -471,10 +556,13 @@ def test_run_backtest_rejects_csv_mode():
 def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
     model_path = tmp_path / "test_model.pkl"
     artifacts_path = tmp_path / "test_model_artifacts.json"
+    expected_edge_model_path = tmp_path / "test_model_expected_edge.pkl"
     package_path = tmp_path / "test_model.promotion_package.json"
 
     with model_path.open("wb") as handle:
         pickle.dump(DummyProbabilityModel(), handle)
+    with expected_edge_model_path.open("wb") as handle:
+        pickle.dump(DummyExpectedEdgeModel(), handle)
 
     artifacts_payload = {
         "feature_names": ["feat_a", "feat_b"],
@@ -495,6 +583,11 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
         "signal_policy": {
             "long_side_policy": {"enabled": True, "signal_scale": 1.1},
             "short_side_policy": {"enabled": False, "signal_scale": 0.0},
+        },
+        "expected_edge_model_path": str(expected_edge_model_path),
+        "expected_edge_policy": {
+            "enabled": True,
+            "min_pass_probability": 0.56,
         },
         "universe_quality_policy": {
             "enabled": True,
@@ -531,6 +624,8 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
     assert package.min_confidence_position_scale == 0.15
     assert package.long_side_policy["signal_scale"] == pytest.approx(1.1)
     assert package.short_side_policy["enabled"] is False
+    assert package.expected_edge_policy_enabled is True
+    assert package.expected_edge_policy["min_pass_probability"] == pytest.approx(0.56)
     assert package.enable_universe_quality_gate is True
     assert package.universe_quality_policy["min_rows"] == 900
 

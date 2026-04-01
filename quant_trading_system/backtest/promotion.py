@@ -78,6 +78,24 @@ def _normalize_string_list(values: Any) -> list[str]:
     return [value] if value else []
 
 
+def _align_vector(values: Any, length: int, fill_value: float = 0.0) -> np.ndarray:
+    """Align arbitrary scalar/1D values to the requested output length."""
+    if length <= 0:
+        return np.array([], dtype=float)
+    if values is None:
+        return np.full(length, fill_value, dtype=float)
+    arr = np.asarray(values).reshape(-1)
+    if arr.size == length:
+        return arr
+    if arr.size == 0:
+        return np.full(length, fill_value, dtype=float)
+    if arr.size < length:
+        aligned = np.full(length, fill_value, dtype=arr.dtype if arr.dtype != object else object)
+        aligned[-arr.size :] = arr
+        return aligned
+    return arr[-length:]
+
+
 @dataclass(frozen=True, slots=True)
 class PromotionPackageContract:
     """Resolved promotion package contract used by backtest and replay."""
@@ -91,6 +109,7 @@ class PromotionPackageContract:
     model_path: Path
     artifacts_path: Path | None
     meta_model_path: Path | None
+    expected_edge_model_path: Path | None
     feature_names: tuple[str, ...]
     feature_groups: tuple[str, ...]
     symbols: tuple[str, ...]
@@ -117,6 +136,8 @@ class PromotionPackageContract:
     max_total_positions: int
     confidence_position_sizing: bool
     min_confidence_position_scale: float
+    expected_edge_policy_enabled: bool
+    expected_edge_policy: dict[str, Any]
     enable_universe_quality_gate: bool
     universe_quality_policy: dict[str, Any]
 
@@ -162,6 +183,10 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     signal_policy = raw_payload.get("signal_policy", {})
     if not isinstance(signal_policy, dict):
         signal_policy = {}
+
+    expected_edge_policy = raw_payload.get("expected_edge_policy", {})
+    if not isinstance(expected_edge_policy, dict):
+        expected_edge_policy = {}
 
     position_sizing_policy = raw_payload.get("position_sizing_policy", {})
     if not isinstance(position_sizing_policy, dict):
@@ -276,6 +301,15 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     if meta_model_path is not None and not meta_model_path.exists():
         meta_model_path = None
 
+    explicit_expected_edge_path = _resolve_optional_path(
+        package_dir,
+        raw_payload.get("expected_edge_model_path"),
+    )
+    default_expected_edge_path = model_path.with_name(f"{model_path.stem}_expected_edge.pkl")
+    expected_edge_model_path = explicit_expected_edge_path or default_expected_edge_path
+    if expected_edge_model_path is not None and not expected_edge_model_path.exists():
+        expected_edge_model_path = None
+
     meta_label_enabled = bool(
         _coalesce(signal_policy.get("meta_label_enabled"), meta_model_path is not None)
     ) and meta_model_path is not None
@@ -323,6 +357,9 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         _coalesce(position_sizing_policy.get("min_confidence_position_scale"), 0.0)
     )
     min_confidence_position_scale = min(1.0, max(0.0, min_confidence_position_scale))
+    expected_edge_policy_enabled = bool(
+        _coalesce(expected_edge_policy.get("enabled"), expected_edge_model_path is not None)
+    ) and expected_edge_model_path is not None
 
     model_name = str(_coalesce(raw_payload.get("model_name"), model_path.stem)).strip()
     model_type = str(_coalesce(raw_payload.get("model_type"), training_config.get("model_type"), "")).strip()
@@ -366,6 +403,7 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         model_path=model_path,
         artifacts_path=artifacts_path,
         meta_model_path=meta_model_path,
+        expected_edge_model_path=expected_edge_model_path,
         feature_names=feature_names,
         feature_groups=feature_groups,
         symbols=symbols,
@@ -392,6 +430,8 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         max_total_positions=max_total_positions,
         confidence_position_sizing=confidence_position_sizing,
         min_confidence_position_scale=min_confidence_position_scale,
+        expected_edge_policy_enabled=expected_edge_policy_enabled,
+        expected_edge_policy=expected_edge_policy,
         enable_universe_quality_gate=enable_universe_quality_gate,
         universe_quality_policy=universe_quality_policy,
     )
@@ -475,6 +515,7 @@ class PromotionSignalAdapter:
         self.logger = logger_ or logger
         self._model: Any | None = None
         self._meta_model: Any | None = None
+        self._expected_edge_model: Any | None = None
         self.feature_pipeline: Any | None = None
 
     def _load_model(self) -> Any:
@@ -492,6 +533,14 @@ class PromotionSignalAdapter:
         if self._meta_model is None:
             self._meta_model = _load_pickle(meta_model_path)
         return self._meta_model
+
+    def _load_expected_edge_model(self) -> Any | None:
+        expected_edge_model_path = getattr(self.contract, "expected_edge_model_path", None)
+        if expected_edge_model_path is None:
+            return None
+        if self._expected_edge_model is None:
+            self._expected_edge_model = _load_pickle(expected_edge_model_path)
+        return self._expected_edge_model
 
     def _choose_pipeline(self) -> Any:
         groups = resolve_feature_groups(self.contract)
@@ -885,6 +934,11 @@ class PromotionSignalAdapter:
         """Generate promotion-package signal frames aligned to raw market bars."""
         model = self._load_model()
         meta_model = self._load_meta_model()
+        expected_edge_model = (
+            self._load_expected_edge_model()
+            if bool(getattr(self.contract, "expected_edge_policy_enabled", False))
+            else None
+        )
         required_features = list(self.contract.feature_names or getattr(model, "feature_names", []))
         if not required_features:
             raise ValueError(
@@ -932,6 +986,12 @@ class PromotionSignalAdapter:
                         ),
                         "long_side_policy_scale": float(long_policy["signal_scale"]),
                         "short_side_policy_scale": float(short_policy["signal_scale"]),
+                        "expected_edge": np.zeros(len(timestamps), dtype=float),
+                        "edge_pass_probability": np.zeros(len(timestamps), dtype=float),
+                        "edge_loss_probability": np.zeros(len(timestamps), dtype=float),
+                        "edge_policy_pass": np.zeros(len(timestamps), dtype=bool),
+                        "edge_policy_scale": np.zeros(len(timestamps), dtype=float),
+                        "edge_policy_enabled": bool(expected_edge_model is not None),
                     }
                 )
                 continue
@@ -1010,6 +1070,8 @@ class PromotionSignalAdapter:
                     0.0,
                     1.0,
                 )
+            edge_signal_values = signal_values.copy()
+            edge_confidence = confidence.copy()
 
             meta_confidence = np.full(len(X_df), np.nan, dtype=float)
             if (
@@ -1048,6 +1110,59 @@ class PromotionSignalAdapter:
                     1.0,
                 )
 
+            expected_edge = np.zeros(len(X_df), dtype=float)
+            edge_pass_probability = np.zeros(len(X_df), dtype=float)
+            edge_loss_probability = np.zeros(len(X_df), dtype=float)
+            edge_policy_pass = (np.abs(edge_signal_values) > 0.0).astype(bool)
+            edge_policy_scale = np.where(
+                np.abs(edge_signal_values) > 0.0,
+                1.0,
+                0.0,
+            ).astype(float)
+            if expected_edge_model is not None and hasattr(expected_edge_model, "predict_policy"):
+                edge_policy = expected_edge_model.predict_policy(
+                    symbol_frame,
+                    probabilities=probability,
+                    long_threshold=float(effective_long_threshold),
+                    short_threshold=float(effective_short_threshold),
+                    raw_predictions=raw_prediction,
+                    signal_values=edge_signal_values,
+                    confidence=edge_confidence,
+                )
+                expected_edge = pd.to_numeric(
+                    pd.Series(_align_vector(edge_policy.get("expected_edge"), len(X_df), 0.0)),
+                    errors="coerce",
+                ).fillna(0.0).to_numpy(dtype=float)
+                edge_pass_probability = pd.to_numeric(
+                    pd.Series(
+                        _align_vector(edge_policy.get("edge_pass_probability"), len(X_df), 0.0)
+                    ),
+                    errors="coerce",
+                ).fillna(0.0).to_numpy(dtype=float)
+                edge_loss_probability = pd.to_numeric(
+                    pd.Series(
+                        _align_vector(edge_policy.get("edge_loss_probability"), len(X_df), 0.0)
+                    ),
+                    errors="coerce",
+                ).fillna(0.0).to_numpy(dtype=float)
+                edge_policy_pass = pd.Series(
+                    _align_vector(edge_policy.get("edge_policy_pass"), len(X_df), 0.0)
+                ).fillna(False).astype(bool).to_numpy(dtype=bool)
+                edge_policy_scale = pd.to_numeric(
+                    pd.Series(_align_vector(edge_policy.get("edge_policy_scale"), len(X_df), 0.0)),
+                    errors="coerce",
+                ).fillna(0.0).to_numpy(dtype=float)
+                signal_values = np.where(edge_policy_pass, signal_values * edge_policy_scale, 0.0)
+                confidence = np.clip(
+                    np.where(
+                        edge_policy_pass,
+                        (0.5 * confidence) + (0.5 * edge_pass_probability),
+                        0.0,
+                    ),
+                    0.0,
+                    1.0,
+                )
+
             timestamps = pd.to_datetime(symbol_frame.get("timestamp"), utc=True, errors="coerce")
             signal_frames[symbol] = pd.DataFrame(
                 {
@@ -1073,6 +1188,12 @@ class PromotionSignalAdapter:
                     ),
                     "long_side_policy_scale": float(long_policy["signal_scale"]),
                     "short_side_policy_scale": float(short_policy["signal_scale"]),
+                    "expected_edge": expected_edge,
+                    "edge_pass_probability": edge_pass_probability,
+                    "edge_loss_probability": edge_loss_probability,
+                    "edge_policy_pass": edge_policy_pass,
+                    "edge_policy_scale": edge_policy_scale,
+                    "edge_policy_enabled": bool(expected_edge_model is not None),
                 }
             )
         return signal_frames

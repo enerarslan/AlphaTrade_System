@@ -2570,6 +2570,7 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
         )
     )
     trainer.feature_names = ["feat_a", "feat_b"]
+    trainer.expected_edge_model = object()
     trainer.training_metrics = {
         "holdout_long_threshold": 0.61,
         "holdout_short_threshold": 0.39,
@@ -2577,6 +2578,9 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
             "long": {"enabled": True, "signal_scale": 1.10},
             "short": {"enabled": False, "signal_scale": 0.0},
         },
+        "expected_edge_training_selected_context_features": ["flow_imbalance"],
+        "expected_edge_training_summary": {"selected_rate": 0.42},
+        "expected_edge_holdout_summary": {"selected_edge_lift": 0.003},
         "symbol_quality_universe": ["AAPL", "MSFT"],
         "symbol_quality_dropped_list": ["TSLA"],
         "symbol_quality_report": {"AAPL": {"passes": True, "quality_score": 0.92}},
@@ -2597,8 +2601,61 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     assert payload["position_sizing_policy"]["max_total_positions"] == 20
     assert payload["signal_policy"]["long_side_policy"]["signal_scale"] == pytest.approx(1.10)
     assert payload["signal_policy"]["short_side_policy"]["enabled"] is False
+    assert payload["expected_edge_policy"]["enabled"] is True
+    assert payload["expected_edge_policy"]["selected_context_features"] == ["flow_imbalance"]
     assert payload["universe_quality_policy"]["selected_symbols"] == ["AAPL", "MSFT"]
     assert payload["universe_quality_policy"]["dropped_symbols"] == ["TSLA"]
+
+
+def test_train_expected_edge_policy_records_training_and_holdout_metrics():
+    class DummyProbabilityModel:
+        def predict_proba(self, X):
+            X = np.asarray(X, dtype=float)
+            probability = np.clip(X[:, 0], 0.0, 1.0)
+            return np.column_stack([1.0 - probability, probability])
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            expected_edge_min_samples=40,
+            expected_edge_min_coverage=0.15,
+            save_artifacts=False,
+        )
+    )
+    rows = 160
+    feat_a = np.where(np.arange(rows) % 2 == 0, 0.72, 0.28).astype(float)
+    flow_feature = np.linspace(-1.0, 1.0, rows, dtype=float)
+    trainer.features = pd.DataFrame(
+        {
+            "feat_a": feat_a,
+            "flow_imbalance_signal": flow_feature,
+            "macro_regime_score": np.sin(np.linspace(0.0, 3.14, rows)),
+        }
+    )
+    trainer.oof_primary_proba = feat_a.copy()
+    trainer.primary_forward_returns = np.where(feat_a >= 0.5, 0.015, -0.012).astype(float)
+    trainer.sample_weights = np.ones(rows, dtype=float)
+    trainer.model = DummyProbabilityModel()
+    trainer.holdout_features = pd.DataFrame(
+        {
+            "feat_a": [0.70, 0.68, 0.31, 0.29],
+            "flow_imbalance_signal": [0.6, 0.3, -0.4, -0.7],
+            "macro_regime_score": [0.2, 0.1, -0.1, -0.2],
+        }
+    )
+    trainer.holdout_primary_forward_returns = np.array([0.014, 0.010, -0.011, -0.013], dtype=float)
+    trainer.training_metrics["holdout_long_threshold"] = 0.60
+    trainer.training_metrics["holdout_short_threshold"] = 0.40
+
+    trainer._train_expected_edge_policy()
+
+    assert trainer.expected_edge_model is not None
+    assert trainer.training_metrics["expected_edge_policy_enabled"] == pytest.approx(1.0)
+    assert trainer.training_metrics["expected_edge_training_candidate_count"] >= 40
+    assert trainer.training_metrics["expected_edge_holdout_selected_count"] >= 1
+    assert "flow_imbalance_signal" in trainer.training_metrics[
+        "expected_edge_training_selected_context_features"
+    ]
 
 
 def test_build_parser_supports_institutional_failfast_flags_and_name():

@@ -118,6 +118,9 @@ def test_promotion_package_signal_source_dedupes_bars_and_sets_hold_contract_met
                         "universe_eligible": [True],
                         "universe_quality_score": [0.91],
                         "long_side_policy_scale": [1.05],
+                        "expected_edge": [0.012],
+                        "edge_pass_probability": [0.9],
+                        "edge_policy_scale": [0.5],
                     }
                 )
             }
@@ -158,5 +161,8 @@ def test_promotion_package_signal_source_dedupes_bars_and_sets_hold_contract_met
     assert signal.metadata["universe_eligible"] is True
     assert signal.metadata["universe_quality_score"] == 0.91
     assert signal.metadata["long_side_policy_scale"] == 1.05
+    assert signal.metadata["expected_edge"] == 0.012
+    assert signal.metadata["edge_pass_probability"] == 0.9
+    assert signal.metadata["edge_policy_scale"] == 0.5
 
     assert source.generate({"AAPL": bar}) == []

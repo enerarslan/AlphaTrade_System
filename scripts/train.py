@@ -77,6 +77,11 @@ from quant_trading_system.models.symbol_quality import (
     assess_symbol_quality,
 )
 from quant_trading_system.models.signal_policy import derive_asymmetric_signal_policy
+from quant_trading_system.models.expected_edge_policy import (
+    ExpectedEdgePolicyConfig,
+    ExpectedEdgePolicyModel,
+    derive_base_signal,
+)
 from quant_trading_system.models.statistical_validation import (
     calculate_deflated_sharpe_ratio,
     calculate_probability_of_backtest_overfitting,
@@ -961,6 +966,14 @@ class TrainingConfig:
     meta_label_dynamic_threshold: bool = True
     enable_probability_calibration: bool = True
     probability_calibration_method: str = "isotonic"
+    enable_expected_edge_policy: bool = True
+    expected_edge_min_samples: int = 120
+    expected_edge_min_coverage: float = 0.55
+    expected_edge_max_context_features: int = 24
+    expected_edge_min_pass_probability: float = 0.53
+    expected_edge_min_expected_edge: float = 0.0
+    expected_edge_min_signal_scale: float = 0.25
+    expected_edge_max_signal_scale: float = 1.10
 
     # Multiple testing correction (P1-3.1)
     apply_multiple_testing: bool = True
@@ -1104,6 +1117,33 @@ class TrainingConfig:
         if calibration_method not in {"isotonic", "sigmoid"}:
             raise ValueError("probability_calibration_method must be 'isotonic' or 'sigmoid'")
         self.probability_calibration_method = calibration_method
+        self.enable_expected_edge_policy = bool(self.enable_expected_edge_policy)
+        self.expected_edge_min_samples = max(32, int(self.expected_edge_min_samples))
+        self.expected_edge_min_coverage = float(
+            np.clip(float(self.expected_edge_min_coverage), 0.10, 1.0)
+        )
+        self.expected_edge_max_context_features = max(
+            4, int(self.expected_edge_max_context_features)
+        )
+        self.expected_edge_min_pass_probability = float(
+            np.clip(float(self.expected_edge_min_pass_probability), 0.45, 0.90)
+        )
+        self.expected_edge_min_expected_edge = float(self.expected_edge_min_expected_edge)
+        self.expected_edge_min_signal_scale = float(
+            np.clip(float(self.expected_edge_min_signal_scale), 0.0, 1.0)
+        )
+        self.expected_edge_max_signal_scale = float(
+            np.clip(
+                float(
+                    max(
+                        self.expected_edge_min_signal_scale,
+                        float(self.expected_edge_max_signal_scale),
+                    )
+                ),
+                self.expected_edge_min_signal_scale,
+                1.25,
+            )
+        )
         self.holdout_pct = min(max(float(self.holdout_pct), 0.05), 0.35)
         self.execution_vol_target_daily = max(float(self.execution_vol_target_daily), 1e-4)
         self.execution_turnover_cap = min(max(float(self.execution_turnover_cap), 0.05), 1.0)
@@ -1257,6 +1297,7 @@ class ModelTrainer:
         self.validation_results: dict = {}
         self.shap_values: np.ndarray | None = None
         self.meta_model: Any = None
+        self.expected_edge_model: Any = None
         self.probability_calibrator: Any = None
         self.probability_calibration_method_resolved: str | None = None
         self.oof_primary_proba: np.ndarray | None = None
@@ -1339,6 +1380,10 @@ class ModelTrainer:
             # Phase 8: Meta-Labeling (if enabled)
             if self.config.use_meta_labeling:
                 self._train_meta_labeler()
+
+            # Phase 8.5: OOF expected-edge policy (if enabled)
+            if self.config.enable_expected_edge_policy:
+                self._train_expected_edge_policy()
 
             # Phase 9: SHAP Explainability
             if self.config.compute_shap:
@@ -7381,6 +7426,266 @@ class ModelTrainer:
             brier_after,
         )
 
+    @staticmethod
+    def _resolve_signed_realized_returns(
+        *,
+        forward_returns: np.ndarray | pd.Series | None,
+        event_net_returns: np.ndarray | pd.Series | None,
+        event_directions: np.ndarray | pd.Series | None,
+    ) -> np.ndarray | None:
+        """Resolve realized returns signed relative to the long direction."""
+        if event_net_returns is not None:
+            signed = np.asarray(event_net_returns, dtype=float).reshape(-1)
+            if event_directions is not None:
+                directions = np.asarray(event_directions, dtype=float).reshape(-1)
+                target_len = min(len(signed), len(directions))
+                if target_len > 0:
+                    signed = signed[-target_len:]
+                    directions = directions[-target_len:]
+                    signed = signed * np.sign(directions)
+                    return np.nan_to_num(signed, nan=0.0, posinf=0.0, neginf=0.0)
+            return np.nan_to_num(signed, nan=0.0, posinf=0.0, neginf=0.0)
+        if forward_returns is None:
+            return None
+        return np.nan_to_num(
+            np.asarray(forward_returns, dtype=float).reshape(-1),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    @staticmethod
+    def _resolve_trade_realized_returns(
+        signed_realized_returns: np.ndarray | None,
+        signal_values: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Project signed realized returns into the model's chosen trade direction."""
+        if signed_realized_returns is None or signal_values is None:
+            return None
+        signed = np.asarray(signed_realized_returns, dtype=float).reshape(-1)
+        signal = np.asarray(signal_values, dtype=float).reshape(-1)
+        target_len = min(len(signed), len(signal))
+        if target_len <= 0:
+            return None
+        trade_returns = signed[-target_len:] * np.sign(signal[-target_len:])
+        return np.nan_to_num(trade_returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _resolve_expected_edge_thresholds(self) -> tuple[float, float]:
+        """Resolve the admission thresholds used by the edge policy layer."""
+        long_threshold = float(self.training_metrics.get("holdout_long_threshold", np.nan))
+        short_threshold = float(self.training_metrics.get("holdout_short_threshold", np.nan))
+        if np.isfinite(long_threshold) and np.isfinite(short_threshold) and long_threshold > short_threshold:
+            return long_threshold, short_threshold
+        if self.oof_primary_proba is not None and self.labels is not None:
+            derived_long, derived_short = self._derive_signal_thresholds(
+                np.asarray(self.oof_primary_proba, dtype=float),
+                train_labels=np.asarray(self.labels, dtype=float),
+                train_returns=self.primary_forward_returns,
+                train_regimes=self.regimes,
+            )
+            if derived_long > derived_short:
+                return float(derived_long), float(derived_short)
+        return 0.55, 0.45
+
+    def _record_expected_edge_metrics(self, prefix: str, summary: dict[str, Any]) -> None:
+        """Flatten expected-edge summaries into training metrics for artifacts."""
+        self.training_metrics[f"{prefix}_summary"] = dict(summary)
+        for key, value in summary.items():
+            metric_key = f"{prefix}_{key}"
+            if isinstance(value, (int, float, np.floating, np.integer)):
+                self.training_metrics[metric_key] = float(value)
+            elif isinstance(value, list):
+                self.training_metrics[metric_key] = list(value)
+
+    def _evaluate_expected_edge_policy_holdout(
+        self,
+        policy_model: ExpectedEdgePolicyModel,
+        *,
+        long_threshold: float,
+        short_threshold: float,
+    ) -> dict[str, Any]:
+        """Evaluate the expected-edge policy on aligned holdout predictions."""
+        if self.holdout_features is None or self.holdout_features.empty or self.model is None:
+            return {"source": "unavailable"}
+
+        X_holdout = self.holdout_features.values
+        holdout_probabilities = self._align_probabilities(
+            np.asarray(self._get_predictions_proba(self.model, X_holdout), dtype=float),
+            len(self.holdout_features),
+        )
+        holdout_signal = derive_base_signal(
+            holdout_probabilities,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+        )
+        holdout_signed_returns = self._resolve_signed_realized_returns(
+            forward_returns=self.holdout_primary_forward_returns,
+            event_net_returns=self.holdout_cost_aware_event_returns,
+            event_directions=self.holdout_primary_event_directions,
+        )
+        holdout_trade_returns = self._resolve_trade_realized_returns(
+            holdout_signed_returns,
+            holdout_signal,
+        )
+        if holdout_trade_returns is None:
+            return {"source": "missing_returns"}
+
+        aligned_len = min(len(self.holdout_features), len(holdout_probabilities), len(holdout_trade_returns))
+        if aligned_len <= 1:
+            return {"source": "insufficient_rows"}
+        holdout_frame = self.holdout_features.iloc[-aligned_len:].reset_index(drop=True)
+        holdout_probabilities = holdout_probabilities[-aligned_len:]
+        holdout_signal = holdout_signal[-aligned_len:]
+        holdout_trade_returns = holdout_trade_returns[-aligned_len:]
+
+        policy_frame = policy_model.predict_policy(
+            holdout_frame,
+            probabilities=holdout_probabilities,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+            signal_values=holdout_signal,
+        )
+        candidate_mask = np.abs(holdout_signal) > 1e-8
+        selected_mask = (
+            candidate_mask
+            & policy_frame["edge_policy_pass"].to_numpy(dtype=bool)
+            & np.isfinite(holdout_trade_returns)
+        )
+        candidate_returns = holdout_trade_returns[candidate_mask & np.isfinite(holdout_trade_returns)]
+        selected_returns = holdout_trade_returns[selected_mask]
+        expected_edge = policy_frame["expected_edge"].to_numpy(dtype=float)
+        corr_mask = candidate_mask & np.isfinite(holdout_trade_returns) & np.isfinite(expected_edge)
+        correlation = 0.0
+        if int(np.count_nonzero(corr_mask)) >= 20:
+            correlation = float(
+                np.corrcoef(expected_edge[corr_mask], holdout_trade_returns[corr_mask])[0, 1]
+            )
+            if not np.isfinite(correlation):
+                correlation = 0.0
+
+        return {
+            "source": "holdout",
+            "candidate_count": int(np.count_nonzero(candidate_mask)),
+            "selected_count": int(np.count_nonzero(selected_mask)),
+            "selected_rate": float(np.mean(selected_mask)) if aligned_len else 0.0,
+            "candidate_mean_trade_return": (
+                float(np.mean(candidate_returns)) if candidate_returns.size else 0.0
+            ),
+            "selected_mean_trade_return": (
+                float(np.mean(selected_returns)) if selected_returns.size else 0.0
+            ),
+            "selected_win_rate": (
+                float(np.mean(selected_returns > 0.0)) if selected_returns.size else 0.0
+            ),
+            "selected_edge_lift": (
+                float(np.mean(selected_returns) - np.mean(candidate_returns))
+                if selected_returns.size and candidate_returns.size
+                else 0.0
+            ),
+            "expected_edge_correlation": correlation,
+        }
+
+    def _train_expected_edge_policy(self) -> None:
+        """Train the second-stage expected-edge policy from OOF-safe predictions."""
+        self.logger.info("Phase 8.5: Training expected-edge policy...")
+        self.training_metrics["expected_edge_policy_enabled"] = 0.0
+
+        if self.features is None or self.features.empty:
+            self.training_metrics["expected_edge_policy_reason"] = "missing_features"
+            return
+        if self.oof_primary_proba is None:
+            self.training_metrics["expected_edge_policy_reason"] = "missing_oof_predictions"
+            return
+
+        signed_returns = self._resolve_signed_realized_returns(
+            forward_returns=self.primary_forward_returns,
+            event_net_returns=self.cost_aware_event_returns,
+            event_directions=self.primary_event_directions,
+        )
+        if signed_returns is None:
+            self.training_metrics["expected_edge_policy_reason"] = "missing_returns"
+            return
+
+        long_threshold, short_threshold = self._resolve_expected_edge_thresholds()
+        probabilities = np.asarray(self.oof_primary_proba, dtype=float).reshape(-1)
+        target_len = min(len(self.features), len(probabilities), len(signed_returns))
+        if target_len <= 1:
+            self.training_metrics["expected_edge_policy_reason"] = "insufficient_rows"
+            return
+
+        feature_frame = self.features.iloc[-target_len:].reset_index(drop=True)
+        probabilities = probabilities[-target_len:]
+        signed_returns = signed_returns[-target_len:]
+        signal_values = derive_base_signal(
+            probabilities,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+        )
+        trade_returns = self._resolve_trade_realized_returns(signed_returns, signal_values)
+        if trade_returns is None:
+            self.training_metrics["expected_edge_policy_reason"] = "missing_trade_returns"
+            return
+
+        sample_weights = None
+        if self.sample_weights is not None and len(self.sample_weights) >= target_len:
+            sample_weights = np.asarray(self.sample_weights, dtype=float)[-target_len:]
+
+        policy_model = ExpectedEdgePolicyModel(
+            config=ExpectedEdgePolicyConfig(
+                min_samples=int(self.config.expected_edge_min_samples),
+                min_coverage=float(self.config.expected_edge_min_coverage),
+                max_context_features=int(self.config.expected_edge_max_context_features),
+                min_pass_probability=float(self.config.expected_edge_min_pass_probability),
+                min_expected_edge=float(self.config.expected_edge_min_expected_edge),
+                min_signal_scale=float(self.config.expected_edge_min_signal_scale),
+                max_signal_scale=float(self.config.expected_edge_max_signal_scale),
+                random_state=int(self.config.seed),
+            )
+        )
+
+        try:
+            training_summary = policy_model.fit(
+                feature_frame,
+                probabilities=probabilities,
+                trade_returns=trade_returns,
+                long_threshold=float(long_threshold),
+                short_threshold=float(short_threshold),
+                signal_values=signal_values,
+                sample_weights=sample_weights,
+            )
+        except ValueError as exc:
+            self.training_metrics["expected_edge_policy_reason"] = str(exc)
+            self.logger.warning("Expected-edge policy skipped: %s", exc)
+            return
+
+        self.expected_edge_model = policy_model
+        self.training_metrics["expected_edge_policy_enabled"] = 1.0
+        self.training_metrics["expected_edge_policy_reason"] = "trained"
+        self.training_metrics["expected_edge_min_pass_probability"] = float(
+            self.config.expected_edge_min_pass_probability
+        )
+        self.training_metrics["expected_edge_min_expected_edge"] = float(
+            self.config.expected_edge_min_expected_edge
+        )
+        self.training_metrics["expected_edge_min_signal_scale"] = float(
+            self.config.expected_edge_min_signal_scale
+        )
+        self.training_metrics["expected_edge_max_signal_scale"] = float(
+            self.config.expected_edge_max_signal_scale
+        )
+        self._record_expected_edge_metrics("expected_edge_training", training_summary)
+        holdout_summary = self._evaluate_expected_edge_policy_holdout(
+            policy_model,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+        )
+        self._record_expected_edge_metrics("expected_edge_holdout", holdout_summary)
+        self.logger.info(
+            "Expected-edge policy trained: selected_rate=%.2f%% holdout_lift=%.6f",
+            float(training_summary.get("selected_rate", 0.0)) * 100.0,
+            float(holdout_summary.get("selected_edge_lift", 0.0)),
+        )
+
     def _get_raw_predictions_proba(self, model, X) -> np.ndarray:
         """Get raw prediction probabilities from model before post-hoc calibration."""
         if self._is_ranker_model():
@@ -8944,16 +9249,10 @@ class ModelTrainer:
         self.training_metrics["holdout_rows"] = float(len(y_holdout))
         self.training_metrics["holdout_long_threshold"] = float(long_threshold)
         self.training_metrics["holdout_short_threshold"] = float(short_threshold)
-        side_policy_returns = (
-            np.asarray(holdout_cost_aware_event_returns, dtype=float)
-            if holdout_cost_aware_event_returns is not None
-            and len(holdout_cost_aware_event_returns) == len(y_holdout_proba)
-            else (
-                np.asarray(holdout_primary_forward_returns, dtype=float)
-                if holdout_primary_forward_returns is not None
-                and len(holdout_primary_forward_returns) == len(y_holdout_proba)
-                else None
-            )
+        side_policy_returns = self._resolve_signed_realized_returns(
+            forward_returns=holdout_primary_forward_returns,
+            event_net_returns=holdout_cost_aware_event_returns,
+            event_directions=holdout_primary_event_directions,
         )
         holdout_side_policy = derive_asymmetric_signal_policy(
             y_holdout_proba,
@@ -10185,6 +10484,11 @@ class ModelTrainer:
         meta_model_path = (
             output_dir / f"{self.config.model_name}_meta.pkl" if self.meta_model is not None else None
         )
+        expected_edge_model_path = (
+            output_dir / f"{self.config.model_name}_expected_edge.pkl"
+            if self.expected_edge_model is not None
+            else None
+        )
         selected_features = list(
             self.training_metrics.get("feature_selection_selected_features", self.feature_names or [])
         )
@@ -10197,6 +10501,9 @@ class ModelTrainer:
             "model_type": self.config.model_type,
             "model_path": str(model_path),
             "meta_model_path": str(meta_model_path) if meta_model_path is not None else None,
+            "expected_edge_model_path": (
+                str(expected_edge_model_path) if expected_edge_model_path is not None else None
+            ),
             "artifacts_path": str(artifacts_path),
             "training_config": self.config.__dict__,
             "feature_schema_version": (
@@ -10263,6 +10570,22 @@ class ModelTrainer:
                 "max_total_positions": 20,
                 "confidence_position_sizing": True,
                 "min_confidence_position_scale": float(self.config.min_confidence_position_scale),
+            },
+            "expected_edge_policy": {
+                "enabled": bool(self.expected_edge_model is not None),
+                "min_pass_probability": float(self.config.expected_edge_min_pass_probability),
+                "min_expected_edge": float(self.config.expected_edge_min_expected_edge),
+                "min_signal_scale": float(self.config.expected_edge_min_signal_scale),
+                "max_signal_scale": float(self.config.expected_edge_max_signal_scale),
+                "selected_context_features": list(
+                    self.training_metrics.get("expected_edge_training_selected_context_features", [])
+                ),
+                "training_summary": self.training_metrics.get("expected_edge_training_summary", {}),
+                "holdout_summary": self.training_metrics.get("expected_edge_holdout_summary", {}),
+                "edge_reference": self.training_metrics.get(
+                    "expected_edge_training_edge_reference",
+                    self.training_metrics.get("expected_edge_holdout_edge_reference"),
+                ),
             },
             "promotion_passed": bool(self.validation_results.get("all_passed", False)),
             "snapshot_id": (
@@ -10505,6 +10828,12 @@ class ModelTrainer:
                 with open(meta_path, "wb") as f:
                     pickle.dump(self.meta_model, f)
                 self.logger.info(f"Meta-model saved to: {meta_path}")
+
+            if self.expected_edge_model is not None:
+                expected_edge_path = output_dir / f"{self.config.model_name}_expected_edge.pkl"
+                with open(expected_edge_path, "wb") as f:
+                    pickle.dump(self.expected_edge_model, f)
+                self.logger.info(f"Expected-edge model saved to: {expected_edge_path}")
 
         return str(model_path)
 
