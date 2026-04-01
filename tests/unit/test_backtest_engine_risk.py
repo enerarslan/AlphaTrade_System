@@ -282,6 +282,40 @@ def test_backtest_engine_target_sizing_does_not_stack_same_direction_when_at_tar
     assert plans == []
 
 
+def test_backtest_engine_target_sizing_can_disable_confidence_scaling():
+    handler = _sample_handler()
+    engine = BacktestEngine(
+        data_handler=handler,
+        strategy=NoSignalStrategy(),
+        config=BacktestConfig(
+            initial_capital=Decimal("100000"),
+            max_position_pct=0.10,
+            use_market_simulator=False,
+            allow_fractional=False,
+            use_portfolio_target_sizing=True,
+            confidence_position_sizing=False,
+        ),
+    )
+    engine._initialize()
+    assert handler.update_bars() is True
+
+    plans = engine._build_target_position_plans(
+        [
+            TradeSignal(
+                symbol="AAPL",
+                direction=Direction.LONG,
+                strength=1.0,
+                confidence=0.25,
+                horizon=1,
+                model_source="unit_test",
+            )
+        ]
+    )
+
+    assert len(plans) == 1
+    assert plans[0][2] == Decimal("100")
+
+
 def test_backtest_engine_target_sizing_normalizes_multi_signal_gross_exposure():
     dates = pd.date_range("2024-01-01", periods=1, freq="D")
     symbols = ["AAPL", "MSFT", "NVDA", "AMD", "META"]

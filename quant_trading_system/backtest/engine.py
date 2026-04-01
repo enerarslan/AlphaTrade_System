@@ -62,6 +62,7 @@ from quant_trading_system.trading.signal_generator import (
     SignalMetadata,
     SignalPriority,
 )
+from quant_trading_system.trading.target_sizing import build_sized_signal_targets
 
 logger = logging.getLogger(__name__)
 
@@ -597,6 +598,8 @@ class BacktestEngine:
                 percent_of_equity=float(self.config.max_position_pct),
                 max_position_pct=float(self.config.max_position_pct),
                 max_total_positions=max(1, int(self.config.max_total_positions)),
+                confidence_position_sizing=bool(self.config.confidence_position_sizing),
+                min_confidence_position_scale=float(self.config.min_confidence_position_scale),
             )
         )
 
@@ -1494,22 +1497,24 @@ class BacktestEngine:
             metadata=SignalMetadata(priority=self._resolve_signal_priority(signal)),
         )
 
-    def _select_batch_signals(self, signals: list[TradeSignal]) -> list[TradeSignal]:
-        """Select best-per-symbol signals using live-like priority ordering."""
-        current_timestamp = self.data_handler.get_current_timestamp()
-        selected_by_symbol: dict[str, TradeSignal] = {}
+    def _build_target_position_plans(
+        self,
+        signals: list[TradeSignal],
+    ) -> list[tuple[TradeSignal, OrderSide, Decimal, OHLCVBar]]:
+        """Build target-position order plans using live portfolio sizing semantics."""
+        if not signals or not self._execution_quality_gate_open():
+            return []
 
-        def signal_key(candidate: TradeSignal) -> tuple[int, float, float, datetime]:
-            return (
-                -self._resolve_signal_priority(candidate).value,
-                float(candidate.confidence),
-                abs(float(candidate.strength)),
-                candidate.timestamp,
-            )
+        current_timestamp = self.data_handler.get_current_timestamp()
+        portfolio = self._get_portfolio()
+        enriched_signals: list[EnrichedSignal] = []
+        prices: dict[str, Decimal] = {}
+        volatilities: dict[str, float] = {}
+        bars: dict[str, OHLCVBar] = {}
 
         for signal in signals:
             bar = self.data_handler.get_current_bar(signal.symbol)
-            if bar is None:
+            if bar is None or bar.close <= 0:
                 continue
             if current_timestamp is not None and bar.timestamp != current_timestamp:
                 continue
@@ -1522,81 +1527,40 @@ class BacktestEngine:
                 if existing is None or existing.quantity <= 0:
                     continue
 
-            existing_signal = selected_by_symbol.get(signal.symbol)
-            if existing_signal is None or signal_key(signal) > signal_key(existing_signal):
-                selected_by_symbol[signal.symbol] = signal
-
-        ranked = sorted(
-            selected_by_symbol.values(),
-            key=lambda signal: (
-                -self._resolve_signal_priority(signal).value,
-                float(signal.confidence),
-                abs(float(signal.strength)),
-                signal.timestamp,
-            ),
-            reverse=True,
-        )
-        return ranked[: max(1, int(self.config.max_total_positions))]
-
-    def _build_target_position_plans(
-        self,
-        signals: list[TradeSignal],
-    ) -> list[tuple[TradeSignal, OrderSide, Decimal, OHLCVBar]]:
-        """Build target-position order plans using live portfolio sizing semantics."""
-        if not signals or not self._execution_quality_gate_open():
-            return []
-
-        selected_signals = self._select_batch_signals(signals)
-        if not selected_signals:
-            return []
-
-        portfolio = self._get_portfolio()
-        enriched_signals = [self._build_enriched_signal(signal) for signal in selected_signals]
-        prices: dict[str, Decimal] = {}
-        volatilities: dict[str, float] = {}
-        bars: dict[str, OHLCVBar] = {}
-
-        for signal in selected_signals:
-            bar = self.data_handler.get_current_bar(signal.symbol)
-            if bar is None or bar.close <= 0:
-                continue
+            enriched_signals.append(self._build_enriched_signal(signal))
             bars[signal.symbol] = bar
             prices[signal.symbol] = bar.close
             market_conditions = self._market_conditions.get(signal.symbol)
             if market_conditions is not None and market_conditions.volatility > 0:
                 volatilities[signal.symbol] = float(market_conditions.volatility)
 
-        weights = self._portfolio_position_sizer.calculate_weights(
-            [item for item in enriched_signals if item.signal.symbol in prices],
+        if not enriched_signals:
+            return []
+
+        share_rounder = None
+        if not self.config.allow_fractional:
+            share_rounder = lambda shares: Decimal(int(shares))
+
+        sized_targets = build_sized_signal_targets(
+            enriched_signals,
             portfolio,
             prices,
-            volatilities,
+            self._portfolio_position_sizer.calculate_weights,
+            volatilities=volatilities,
+            allow_fractional=self.config.allow_fractional,
+            max_total_positions=self.config.max_total_positions,
+            share_rounder=share_rounder,
         )
 
         plans: list[tuple[TradeSignal, OrderSide, Decimal, OHLCVBar]] = []
-        for signal in selected_signals:
+        for sized_target in sized_targets:
+            signal = sized_target.signal.signal
             bar = bars.get(signal.symbol)
-            weight = float(weights.get(signal.symbol, 0.0))
-            if bar is None or abs(weight) <= 0.0:
+            if bar is None or sized_target.delta_shares == 0:
                 continue
 
-            price = bar.close
-            target_value = portfolio.equity * Decimal(str(abs(weight)))
-            target_shares = target_value / price
-            if not self.config.allow_fractional:
-                target_shares = Decimal(int(target_shares))
-            if target_shares <= 0:
-                continue
-
-            desired_qty = target_shares if weight > 0 else -target_shares
-            current_position = portfolio.positions.get(signal.symbol)
-            current_qty = current_position.quantity if current_position is not None else Decimal("0")
-            delta_qty = desired_qty - current_qty
-            if delta_qty == 0:
-                continue
-
-            side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
-            plans.append((signal, side, abs(delta_qty), bar))
+            side = OrderSide.BUY if sized_target.delta_shares > 0 else OrderSide.SELL
+            plans.append((signal, side, abs(sized_target.delta_shares), bar))
 
         return plans
 

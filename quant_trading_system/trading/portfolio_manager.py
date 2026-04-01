@@ -31,6 +31,7 @@ from quant_trading_system.core.data_types import (
 from quant_trading_system.core.events import EventBus
 from quant_trading_system.execution.order_manager import OrderPriority, OrderRequest
 from quant_trading_system.trading.signal_generator import EnrichedSignal, SignalPriority
+from quant_trading_system.trading.target_sizing import build_sized_signal_targets
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,8 @@ class PositionSizerConfig:
     percent_of_equity: float = 0.05  # 5% per position
     max_position_pct: float = 0.10  # Max 10% in single position
     max_total_positions: int = 20
+    confidence_position_sizing: bool = True
+    min_confidence_position_scale: float = 0.0
     volatility_target: float = 0.15  # Annual volatility target for vol scaling
     kelly_fraction: float = 0.25  # Fraction of full Kelly
 
@@ -197,6 +200,17 @@ class PositionSizer:
             return Decimal("1")
         return scale
 
+    def _resolve_confidence_scale(self, signal: EnrichedSignal) -> Decimal:
+        """Resolve optional confidence-based sizing scale."""
+        if not self.config.confidence_position_sizing:
+            return Decimal("1")
+
+        scale = max(
+            float(self.config.min_confidence_position_scale),
+            min(1.0, float(signal.signal.confidence)),
+        )
+        return Decimal(str(scale))
+
     def calculate_position_size(
         self,
         signal: EnrichedSignal,
@@ -226,8 +240,7 @@ class PositionSizer:
 
         elif self.config.method == PositionSizingMethod.PERCENT_EQUITY:
             target_value = portfolio.equity * Decimal(str(self.config.percent_of_equity))
-            # Scale by signal confidence
-            target_value *= Decimal(str(signal.signal.confidence))
+            target_value *= self._resolve_confidence_scale(signal)
             shares = target_value / current_price
 
         elif self.config.method == PositionSizingMethod.VOLATILITY_SCALED:
@@ -240,7 +253,7 @@ class PositionSizer:
             adjusted_pct = min(base_pct * vol_scalar, self.config.max_position_pct)
 
             target_value = portfolio.equity * Decimal(str(adjusted_pct))
-            target_value *= Decimal(str(signal.signal.confidence))
+            target_value *= self._resolve_confidence_scale(signal)
             shares = target_value / current_price
 
         elif self.config.method == PositionSizingMethod.KELLY:
@@ -392,42 +405,22 @@ class PortfolioManager:
             rebalance_reason="signal_update",
         )
 
-        # Filter to actionable signals
-        active_signals = [s for s in signals if s.is_actionable]
-
-        # Process both LONG and SHORT signals (full short selling support)
-        directional_signals = [
-            s for s in active_signals
-            if s.signal.direction in (Direction.LONG, Direction.SHORT)
-        ]
-
-        # Sort by priority and confidence
-        directional_signals.sort(
-            key=lambda s: (-s.metadata.priority.value, s.signal.confidence),
-            reverse=True,
-        )
-
-        # Limit number of positions
-        max_positions = self.position_sizer.config.max_total_positions
-        directional_signals = directional_signals[:max_positions]
-
-        # Calculate weights (positive for longs, negative for shorts)
-        weights = self.position_sizer.calculate_weights(
-            directional_signals, portfolio, prices, volatilities
+        sized_targets = build_sized_signal_targets(
+            signals,
+            portfolio,
+            prices,
+            self.position_sizer.calculate_weights,
+            volatilities=volatilities,
+            allow_fractional=False,
+            max_total_positions=self.position_sizer.config.max_total_positions,
         )
 
         # Build target positions
-        for signal in directional_signals:
+        for sized_target in sized_targets:
+            signal = sized_target.signal
             symbol = signal.signal.symbol
-            weight = weights.get(symbol, 0.0)
-
-            # Skip zero weights
-            if weight == 0.0:
-                continue
-
-            price = prices.get(symbol, Decimal("0"))
-            if price <= 0:
-                continue
+            weight = sized_target.weight
+            price = sized_target.price
 
             if self.rebalance_config.consider_transaction_costs:
                 cost_drag = self.rebalance_config.transaction_cost_bps / 10000
@@ -435,16 +428,19 @@ class PortfolioManager:
                 weight = sign * max(0.0, abs(weight) - cost_drag)
                 if weight == 0.0:
                     continue
+                target_value = portfolio.equity * Decimal(str(abs(weight)))
+                target_shares = (target_value / price).quantize(Decimal("1"))
+                if weight < 0:
+                    target_shares = -target_shares
+            else:
+                target_value = sized_target.target_value
+                target_shares = sized_target.target_shares
+
+            if target_shares == 0:
+                continue
 
             # For shorts, weight is negative - use absolute value for target_value
             is_short = weight < 0
-            abs_weight = abs(weight)
-            target_value = portfolio.equity * Decimal(str(abs_weight))
-            target_shares = (target_value / price).quantize(Decimal("1"))
-
-            # For short positions, shares are negative
-            if is_short:
-                target_shares = -target_shares
 
             # Determine priority
             if signal.metadata.priority == SignalPriority.CRITICAL:

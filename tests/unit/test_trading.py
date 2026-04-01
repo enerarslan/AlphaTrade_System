@@ -668,6 +668,34 @@ class TestPositionSizer:
         shares = sizer.calculate_position_size(signal, portfolio, Decimal("100"))
         assert shares == Decimal("25")
 
+    def test_confidence_scaling_can_be_disabled(self):
+        """Shared target sizing should support explicit confidence scaling policy."""
+        config = PositionSizerConfig(
+            method=PositionSizingMethod.PERCENT_EQUITY,
+            percent_of_equity=0.10,
+            confidence_position_sizing=False,
+        )
+        sizer = PositionSizer(config)
+
+        signal = EnrichedSignal(
+            signal=TradeSignal(
+                symbol="AAPL",
+                direction=Direction.LONG,
+                strength=0.8,
+                confidence=0.25,
+                horizon=10,
+                model_source="ml",
+            ),
+        )
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            buying_power=Decimal("100000"),
+        )
+
+        shares = sizer.calculate_position_size(signal, portfolio, Decimal("100"))
+        assert shares == Decimal("100")
+
     def test_max_position_constraint(self):
         """Test maximum position constraint."""
         config = PositionSizerConfig(
@@ -770,6 +798,62 @@ class TestPortfolioManager:
 
         assert target is not None
         assert "AAPL" in target.target_positions
+
+    def test_build_target_portfolio_deduplicates_symbols_before_position_cap(self):
+        """Position cap should apply after choosing the best signal per symbol."""
+        manager = PortfolioManager(
+            position_sizer=PositionSizer(
+                PositionSizerConfig(
+                    method=PositionSizingMethod.PERCENT_EQUITY,
+                    percent_of_equity=0.10,
+                    max_total_positions=2,
+                )
+            )
+        )
+
+        signals = [
+            EnrichedSignal(
+                signal=TradeSignal(
+                    symbol="AAPL",
+                    direction=Direction.LONG,
+                    strength=1.0,
+                    confidence=0.95,
+                    horizon=10,
+                    model_source="test",
+                )
+            ),
+            EnrichedSignal(
+                signal=TradeSignal(
+                    symbol="AAPL",
+                    direction=Direction.LONG,
+                    strength=0.9,
+                    confidence=0.94,
+                    horizon=10,
+                    model_source="test",
+                )
+            ),
+            EnrichedSignal(
+                signal=TradeSignal(
+                    symbol="MSFT",
+                    direction=Direction.LONG,
+                    strength=0.8,
+                    confidence=0.93,
+                    horizon=10,
+                    model_source="test",
+                )
+            ),
+        ]
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            buying_power=Decimal("100000"),
+        )
+        prices = {"AAPL": Decimal("100"), "MSFT": Decimal("100")}
+
+        target = manager.build_target_portfolio(signals, portfolio, prices)
+
+        assert set(target.target_positions) == {"AAPL", "MSFT"}
+        assert target.target_positions["AAPL"].confidence == pytest.approx(0.95)
 
     def test_generate_rebalance_trades(self):
         """Test generating rebalance trades."""
