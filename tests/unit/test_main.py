@@ -129,8 +129,16 @@ class TestParseArgs:
             "elastic_v1",
             "--timeframe",
             "1D",
+            "--timeframes",
+            "15Min",
+            "1Hour",
+            "1Day",
             "--feature-set-id",
             "universe_a",
+            "--target-universe-size",
+            "48",
+            "--universe-selection-buffer-size",
+            "18",
             "--no-redis-cache",
             "--min-accuracy",
             "0.55",
@@ -145,7 +153,10 @@ class TestParseArgs:
             assert args.training_profile == "research"
             assert args.name == "elastic_v1"
             assert args.timeframe == "1D"
+            assert args.timeframes == ["15Min", "1Hour", "1Day"]
             assert args.feature_set_id == "universe_a"
+            assert args.target_universe_size == 48
+            assert args.universe_selection_buffer_size == 18
             assert args.no_redis_cache is True
             assert args.min_accuracy == pytest.approx(0.55)
             assert args.min_white_reality_stat == pytest.approx(0.02)

@@ -7,6 +7,7 @@ import logging
 import sys
 from argparse import Namespace
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -97,6 +98,8 @@ def _base_args(**overrides):
         "intrinsic_bar_threshold": 0.0,
         "intrinsic_target_bars_per_day": 100,
         "disable_symbol_quality_filter": False,
+        "target_universe_size": 0,
+        "universe_selection_buffer_size": 24,
         "symbol_quality_min_rows": 1200,
         "symbol_quality_min_symbols": 8,
         "symbol_quality_max_missing_ratio": 0.12,
@@ -197,6 +200,185 @@ def test_training_config_normalizes_timeframes_and_modes():
 
     assert config.timeframes == ["15Min", "1Hour", "1Day"]
     assert config.training_bar_mode == "intrinsic"
+
+
+def test_training_config_normalizes_universe_reference_symbols():
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        universe_reference_symbols=[" spy ", "qqq", "SPY", ""],
+    )
+
+    assert config.universe_reference_symbols == ["QQQ", "SPY"]
+
+
+def test_select_candidate_symbols_from_postgres_prioritizes_timeframe_coverage():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            timeframe="15Min",
+            timeframes=["1Hour", "1Day"],
+            target_universe_size=2,
+            universe_selection_buffer_size=1,
+            enable_cross_sectional=False,
+            enable_reference_features=False,
+        )
+    )
+
+    class _FakeResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return list(self._rows)
+
+    class _FakeSession:
+        def __init__(self):
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        def execute(self, statement, params):
+            sql = str(statement)
+            self.calls.append((sql, dict(params)))
+            assert "timeframe_coverage" in sql
+            return _FakeResult(
+                [
+                    ("AAPL", 3200, 250, 5_000_000.0, 3),
+                    ("MSFT", 3300, 255, 4_800_000.0, 2),
+                    ("TSLA", 3100, 245, 4_600_000.0, 1),
+                ]
+            )
+
+    class _FakeRedis:
+        def __init__(self):
+            self.saved_key = ""
+            self.saved_payload = ""
+
+        def get(self, key):
+            return None
+
+        def set(self, key, value, expire_seconds=None):
+            self.saved_key = key
+            self.saved_payload = value
+
+    session = _FakeSession()
+    redis_mgr = _FakeRedis()
+
+    symbols = trainer._select_candidate_symbols_from_postgres(
+        session,
+        redis_mgr,
+        timeframe="15Min",
+        requested_timeframes=["15Min", "1Hour", "1Day"],
+        start_date=pd.Timestamp("2024-01-01T00:00:00Z"),
+        end_date=pd.Timestamp("2024-12-31T23:59:59Z"),
+    )
+
+    assert symbols == ["AAPL", "MSFT", "TSLA"]
+    assert trainer.training_metrics["database_universe_requested_timeframes"] == [
+        "15Min",
+        "1Hour",
+        "1Day",
+    ]
+    assert trainer.training_metrics["database_universe_full_timeframe_coverage_count"] == 1.0
+    assert trainer.training_metrics["database_universe_selection_source"] == "liquidity_ranked"
+    assert session.calls[0][1]["requested_timeframes"] == ["15Min", "1Hour", "1Day"]
+    assert "15Min,1Hour,1Day" in redis_mgr.saved_key
+    assert json.loads(redis_mgr.saved_payload) == ["AAPL", "MSFT", "TSLA"]
+
+
+def test_store_features_to_postgres_uses_development_frame_identifiers(monkeypatch, tmp_path):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            start_date="2024-01-01",
+            end_date="2024-01-31",
+        )
+    )
+    trainer.features = pd.DataFrame({"alpha": [0.1, 0.2], "beta": [1.0, 2.0]})
+    trainer.development_frame = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "MSFT"],
+            "timestamp": pd.to_datetime(
+                ["2024-01-02T14:30:00Z", "2024-01-02T14:45:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 200.0],
+            "high": [101.0, 201.0],
+            "low": [99.5, 199.5],
+            "close": [100.5, 200.5],
+            "volume": [1000, 2000],
+            "alpha": [0.1, 0.2],
+            "beta": [1.0, 2.0],
+        }
+    )
+    trainer.data = trainer.development_frame[
+        ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+    ].copy()
+
+    class _FakeCursor:
+        def __init__(self):
+            self.executed: list[tuple[str, object]] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, params=None):
+            self.executed.append((str(sql), params))
+
+    class _FakeRawConnection:
+        def __init__(self):
+            self.cursor_obj = _FakeCursor()
+            self.commits = 0
+            self.closed = False
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+        def close(self):
+            self.closed = True
+
+    fake_raw_connection = _FakeRawConnection()
+    fake_db_manager = SimpleNamespace(
+        engine=SimpleNamespace(raw_connection=lambda: fake_raw_connection)
+    )
+    fake_redis = SimpleNamespace(
+        delete=MagicMock(),
+        set=MagicMock(),
+    )
+
+    import quant_trading_system.database.connection as db_connection
+
+    monkeypatch.setattr(db_connection, "get_db_manager", lambda: fake_db_manager)
+    monkeypatch.setattr(db_connection, "get_redis_manager", lambda: fake_redis)
+    monkeypatch.setattr(
+        trainer,
+        "_feature_materialization_checkpoint_path",
+        lambda: tmp_path / "feature_checkpoint.json",
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_resolve_feature_materialization_source_batch_rows",
+        lambda feature_count: 100,
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_copy_feature_rows_to_stage",
+        lambda cursor, stage_table, long_batch, timeframe, feature_set_id: len(long_batch),
+    )
+
+    trainer._store_features_to_postgres()
+
+    delete_calls = [
+        params for sql, params in fake_raw_connection.cursor_obj.executed if "DELETE FROM features" in sql
+    ]
+    assert delete_calls
+    assert delete_calls[0][0] == ["AAPL", "MSFT"]
+    fake_redis.set.assert_called()
+    assert trainer.features_persisted_to_postgres is True
 
 
 def test_symbol_missing_ratio_ignores_daily_weekends():
@@ -946,6 +1128,54 @@ def test_run_training_research_profile_preserves_explicit_budget_overrides(monke
     assert captured["config"].feature_selection_stability_iterations == 5
 
 
+def test_run_training_research_profile_preserves_explicit_cli_overrides_equal_to_defaults(
+    monkeypatch,
+):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    parser = train_script.build_parser()
+    argv = [
+        "--training-profile",
+        "research",
+        "--model",
+        "lightgbm",
+        "--n-trials",
+        "100",
+        "--n-splits",
+        "5",
+        "--nested-outer-splits",
+        "4",
+        "--nested-inner-splits",
+        "3",
+        "--feature-selection-stability-iterations",
+        "16",
+    ]
+    args = parser.parse_args(argv)
+    train_script._attach_explicit_profile_overrides(parser, args, argv)
+
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].n_trials == 100
+    assert captured["config"].n_splits == 5
+    assert captured["config"].nested_outer_splits == 4
+    assert captured["config"].nested_inner_splits == 3
+    assert captured["config"].feature_selection_stability_iterations == 16
+    assert captured["config"].use_meta_labeling is False
+    assert captured["config"].compute_shap is False
+
+
 def test_run_training_primary_challenger_alias_dispatches_lightgbm_and_tcn(monkeypatch):
     trained: list[str] = []
 
@@ -1334,6 +1564,43 @@ def test_apply_model_priors_infers_lightgbm_monotonic_constraints():
     assert trainer.training_metrics["lightgbm_monotone_constraint_count"] == pytest.approx(3.0)
 
 
+def test_feature_selection_reapplies_lightgbm_monotonic_constraints(monkeypatch):
+    import quant_trading_system.models.feature_selection as feature_selection_module
+
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm"))
+    trainer.features = pd.DataFrame(
+        {
+            "momentum_10": [0.1, 0.2, 0.3, 0.4],
+            "volatility_20": [1.0, 0.9, 1.1, 1.0],
+            "rsi_14": [40.0, 42.0, 39.0, 43.0],
+        }
+    )
+    trainer.labels = np.array([0, 1, 0, 1], dtype=int)
+    trainer.feature_names = trainer.features.columns.tolist()
+    trainer.config.model_params = {}
+    trainer._apply_model_priors()
+
+    monkeypatch.setattr(
+        feature_selection_module,
+        "select_training_features",
+        lambda features, labels, config: SimpleNamespace(
+            selected_features=["momentum_10", "rsi_14"],
+            diagnostics={
+                "initial_feature_count": 3,
+                "selected_feature_count": 2,
+                "correlation_pruned_count": 1,
+            },
+            information_coefficients={"momentum_10": 0.12, "rsi_14": 0.01},
+            stability_scores={"momentum_10": 1.0, "rsi_14": 0.6},
+        ),
+    )
+
+    trainer._apply_feature_selection()
+
+    assert trainer.feature_names == ["momentum_10", "rsi_14"]
+    assert trainer.config.model_params["monotone_constraints"] == [1, 0]
+
+
 def test_aggregate_fold_objective_penalizes_instability_and_downside():
     stable_score = train_script.ModelTrainer._aggregate_fold_objective(
         [0.9, 1.0, 0.8],
@@ -1480,6 +1747,71 @@ def test_compute_shap_values_sequence_model_handles_single_row_kernel_calls(monk
     assert "shap_importance" in trainer.training_metrics
     assert trainer.model.call_sizes
     assert min(trainer.model.call_sizes) >= trainer.model.lookback_window
+
+
+def test_evaluate_holdout_performance_aligns_sequence_model_outputs(monkeypatch):
+    class DummySequenceModel:
+        lookback_window = 3
+
+        def predict(self, X):
+            if len(X) == 6:
+                return np.array([1.0, 0.0, 1.0, 0.0], dtype=float)
+            return np.zeros(len(X), dtype=float)
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="tcn", model_params={"lookback_window": 3})
+    )
+    trainer.model = DummySequenceModel()
+    trainer.features = pd.DataFrame(np.random.rand(8, 2), columns=["f1", "f2"])
+    trainer.labels = pd.Series(np.array([0, 1, 0, 1, 0, 1, 0, 1], dtype=float))
+    trainer.primary_forward_returns = np.zeros(8, dtype=float)
+    trainer.regimes = np.array(["trend"] * 8, dtype=object)
+    trainer.training_metrics = {}
+
+    trainer.holdout_features = pd.DataFrame(np.random.rand(6, 2), columns=["f1", "f2"])
+    trainer.holdout_labels = pd.Series(np.array([0, 1, 0, 1, 0, 1], dtype=float))
+    trainer.holdout_symbols = np.array(["AAPL"] * 6, dtype=object)
+    trainer.holdout_regimes = np.array(["trend"] * 6, dtype=object)
+    trainer.holdout_primary_forward_returns = np.linspace(0.01, 0.06, 6, dtype=float)
+    trainer.holdout_cost_aware_event_returns = np.linspace(0.01, 0.06, 6, dtype=float)
+    trainer.holdout_primary_event_directions = np.array([1, -1, 1, -1, 1, -1], dtype=float)
+    trainer.holdout_timestamps = np.array(
+        pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+        dtype="datetime64[ns]",
+    )
+
+    def _fake_get_predictions_proba(model, X):
+        if len(X) == 6:
+            return np.array([0.8, 0.2, 0.7, 0.3], dtype=float)
+        return np.linspace(0.4, 0.6, len(X), dtype=float)
+
+    captured_lengths: list[int] = []
+
+    def _fake_calculate_fold_metrics(y_true, y_pred, y_proba, **kwargs):
+        captured_lengths.append(len(np.asarray(y_true)))
+        if kwargs.get("symbols") is not None:
+            assert len(np.asarray(kwargs["symbols"])) == len(np.asarray(y_true))
+        if kwargs.get("timestamps") is not None:
+            assert len(np.asarray(kwargs["timestamps"])) == len(np.asarray(y_true))
+        return {
+            "accuracy": 0.5,
+            "sharpe": 0.1,
+            "max_drawdown": 0.05,
+            "trade_count": 2.0,
+            "risk_adjusted_score": 0.02,
+        }
+
+    monkeypatch.setattr(trainer, "_get_predictions_proba", _fake_get_predictions_proba)
+    monkeypatch.setattr(trainer, "_derive_signal_thresholds", lambda *args, **kwargs: (0.55, 0.45))
+    monkeypatch.setattr(trainer, "_calculate_fold_metrics", _fake_calculate_fold_metrics)
+
+    trainer._evaluate_holdout_performance()
+
+    assert captured_lengths
+    assert all(length == 4 for length in captured_lengths)
+    assert trainer.training_metrics["holdout_rows_raw"] == pytest.approx(6.0)
+    assert trainer.training_metrics["holdout_rows_aligned"] == pytest.approx(4.0)
+    assert trainer.training_metrics["holdout_rows"] == pytest.approx(4.0)
 
 
 def test_calculate_fold_metrics_uses_active_trade_returns():
@@ -2234,6 +2566,10 @@ def test_build_parser_supports_feature_pipeline_flags():
             "technical",
             "statistical",
             "--disable-cross-sectional",
+            "--target-universe-size",
+            "48",
+            "--universe-selection-buffer-size",
+            "18",
             "--strict-feature-groups",
             "--max-cross-sectional-symbols",
             "14",
@@ -2248,12 +2584,85 @@ def test_build_parser_supports_feature_pipeline_flags():
     )
     assert args.feature_groups == ["technical", "statistical"]
     assert args.disable_cross_sectional is True
+    assert args.target_universe_size == 48
+    assert args.universe_selection_buffer_size == 18
     assert args.strict_feature_groups is True
     assert args.max_cross_sectional_symbols == 14
     assert args.max_cross_sectional_rows == 150000
     assert args.feature_materialization_batch_rows == 4000
     assert args.feature_reuse_min_coverage == 0.3
     assert args.windows_fallback_features is True
+
+
+def test_compute_symbol_multitimeframe_feature_frame_prefers_db_native_timeframes(monkeypatch):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            timeframe="15Min",
+            timeframes=["1Hour"],
+        )
+    )
+    base_frame = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(
+                ["2024-01-01T14:30:00Z", "2024-01-01T14:45:00Z"], utc=True
+            ),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000, 1100],
+        }
+    )
+    hourly_frame = pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "timestamp": pd.to_datetime(["2024-01-01T15:00:00Z"], utc=True),
+            "open": [100.0],
+            "high": [102.0],
+            "low": [99.0],
+            "close": [101.5],
+            "volume": [2100],
+        }
+    )
+    trainer.ohlcv_panels_by_timeframe = {
+        "15Min": base_frame.copy(),
+        "1Hour": hourly_frame.copy(),
+    }
+
+    captured_rows: dict[str, int] = {}
+
+    def _fake_compute_symbol_feature_frame(
+        *,
+        df,
+        symbol,
+        groups_to_compute,
+        universe_data,
+        disable_optimized_technical,
+    ):
+        timeframe_value = pd.to_datetime(df["timestamp"], utc=True).diff().dropna()
+        timeframe_key = "1Hour" if len(df) == 1 else "15Min"
+        captured_rows[timeframe_key] = len(df)
+        return df.copy()
+
+    monkeypatch.setattr(
+        trainer,
+        "_compute_symbol_feature_frame",
+        _fake_compute_symbol_feature_frame,
+    )
+
+    result = trainer._compute_symbol_multitimeframe_feature_frame(
+        df=base_frame,
+        symbol="AAPL",
+        groups_to_compute=[object()],
+        universe_data=None,
+        disable_optimized_technical=False,
+    )
+
+    assert captured_rows["15Min"] == 2
+    assert captured_rows["1Hour"] == 1
+    assert not result.empty
 
 
 def test_build_parser_supports_symbols_file():

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import sys
 import time
 from dataclasses import dataclass, field
@@ -82,7 +83,11 @@ from quant_trading_system.core.system_integrator import (
     SystemIntegratorConfig,
     create_system_integrator,
 )
-from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
+from quant_trading_system.data.timeframe import (
+    DEFAULT_TIMEFRAME,
+    estimate_periods_per_year,
+    normalize_timeframe,
+)
 
 # Data
 from quant_trading_system.data.loader import DataLoader
@@ -155,6 +160,10 @@ from quant_trading_system.backtest.analyzer import (
     DrawdownMetrics,
     TradeMetrics,
 )
+from quant_trading_system.backtest.promotion import (
+    PromotionPackageContract,
+    load_promotion_package,
+)
 from quant_trading_system.backtest.performance_attribution import (
     PerformanceAttributionService as PerformanceAttributor,
     BrinsonAttribution,
@@ -215,6 +224,9 @@ class SignalBasedStrategy(Strategy):
         signals: dict[str, pd.DataFrame],
         signal_threshold: float = 0.1,
         signal_column: str = "signal",
+        confidence_column: str = "confidence",
+        horizon_column: str = "horizon",
+        source_column: str = "model_source",
     ):
         """Initialize signal-based strategy.
 
@@ -226,6 +238,9 @@ class SignalBasedStrategy(Strategy):
         self.signals: dict[str, pd.DataFrame] = {}
         self.signal_threshold = signal_threshold
         self.signal_column = signal_column
+        self.confidence_column = confidence_column
+        self.horizon_column = horizon_column
+        self.source_column = source_column
         for raw_symbol, frame in signals.items():
             symbol = str(raw_symbol).strip().upper()
             signal_df = frame.copy()
@@ -286,6 +301,12 @@ class SignalBasedStrategy(Strategy):
             if isinstance(signal_row, pd.DataFrame):
                 signal_row = signal_row.iloc[-1]
             signal_value = float(signal_row[self.signal_column])
+            confidence_value = float(
+                signal_row.get(self.confidence_column, min(abs(signal_value), 1.0))
+            )
+            confidence_value = float(np.clip(confidence_value, 0.0, 1.0))
+            horizon = int(max(1, float(signal_row.get(self.horizon_column, 1))))
+            model_source = str(signal_row.get(self.source_column, "alpha_combiner")).strip()
 
             # Skip if signal is too weak
             if abs(signal_value) < self.signal_threshold:
@@ -305,10 +326,25 @@ class SignalBasedStrategy(Strategy):
                 symbol=symbol,
                 direction=direction,
                 strength=strength,
-                confidence=abs(signal_value),
+                confidence=confidence_value,
                 timestamp=bar.timestamp,
-                horizon=1,  # Default 1-bar horizon for signal-based strategy
-                model_source="alpha_combiner",  # Source identifier
+                horizon=horizon,
+                model_source=model_source,
+                metadata={
+                    column: (
+                        signal_row[column].item()
+                        if hasattr(signal_row[column], "item")
+                        else signal_row[column]
+                    )
+                    for column in signal_df.columns
+                    if column
+                    not in {
+                        self.signal_column,
+                        self.confidence_column,
+                        self.horizon_column,
+                        self.source_column,
+                    }
+                },
             )
             trade_signals.append(trade_signal)
 
@@ -351,6 +387,7 @@ class BacktestSession:
     timeframe: str = DEFAULT_TIMEFRAME
     use_database: bool = True  # Load data from PostgreSQL + TimescaleDB
     benchmark_symbol: str | None = None
+    promotion_package_path: Path | None = None
 
     # Advanced options
     slippage_bps: float = 5.0
@@ -381,6 +418,9 @@ class BacktestSession:
                 "end_date": self.end_date.isoformat(),
                 "symbols": self.symbols,
                 "capital": float(self.initial_capital),
+                "promotion_package_path": (
+                    str(self.promotion_package_path) if self.promotion_package_path else None
+                ),
             },
         )
 
@@ -407,6 +447,261 @@ class BacktestRunner:
         self.features: dict[str, pd.DataFrame] = {}
         self.signals: dict[str, pd.DataFrame] = {}
         self.benchmark_data: Any | None = None
+        self.promotion_package: PromotionPackageContract | None = None
+        self._model_artifact: Any | None = None
+        self._meta_model_artifact: Any | None = None
+
+        if self.session.promotion_package_path is not None:
+            self.promotion_package = load_promotion_package(self.session.promotion_package_path)
+            self._apply_promotion_package_defaults()
+
+    def _apply_promotion_package_defaults(self) -> None:
+        """Apply safe session defaults from the promotion package."""
+        if self.promotion_package is None:
+            return
+
+        default_symbols = ["AAPL", "MSFT", "GOOGL"]
+        if self.session.symbols == default_symbols and self.promotion_package.symbols:
+            self.session.symbols = list(self.promotion_package.symbols)
+
+        if self.session.timeframe == DEFAULT_TIMEFRAME and self.promotion_package.timeframe:
+            self.session.timeframe = self.promotion_package.timeframe
+
+        if self.session.strategy_name == "momentum":
+            self.session.strategy_name = f"promotion_package:{self.promotion_package.model_name}"
+
+        package_slippage = float(self.promotion_package.cost_model.get("slippage_bps", 0.0))
+        if self.session.slippage_bps == 5.0 and package_slippage > 0.0:
+            self.session.slippage_bps = package_slippage
+
+    @staticmethod
+    def _resolve_feature_groups(names: list[str] | tuple[str, ...]) -> list[FeatureGroup]:
+        """Resolve string feature-group names into pipeline enums."""
+        group_map = {
+            "technical": FeatureGroup.TECHNICAL,
+            "statistical": FeatureGroup.STATISTICAL,
+            "microstructure": FeatureGroup.MICROSTRUCTURE,
+            "cross_sectional": FeatureGroup.CROSS_SECTIONAL,
+            "cross-sectional": FeatureGroup.CROSS_SECTIONAL,
+            "cross": FeatureGroup.CROSS_SECTIONAL,
+            "all": FeatureGroup.ALL,
+        }
+        resolved: list[FeatureGroup] = []
+        for raw_name in names:
+            group = group_map.get(str(raw_name).strip().lower())
+            if group is None:
+                continue
+            if group == FeatureGroup.ALL:
+                return [
+                    FeatureGroup.TECHNICAL,
+                    FeatureGroup.STATISTICAL,
+                    FeatureGroup.MICROSTRUCTURE,
+                    FeatureGroup.CROSS_SECTIONAL,
+                ]
+            if group not in resolved:
+                resolved.append(group)
+        return resolved or [FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL]
+
+    @staticmethod
+    def _extract_timestamps(frame: Any) -> pd.DatetimeIndex:
+        """Extract UTC timestamps from a pandas or polars frame."""
+        if hasattr(frame, "columns") and "timestamp" in frame.columns:
+            timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            return pd.DatetimeIndex(timestamps)
+        if hasattr(frame, "index"):
+            timestamps = pd.to_datetime(frame.index, utc=True, errors="coerce")
+            return pd.DatetimeIndex(timestamps)
+        return pd.DatetimeIndex([])
+
+    @staticmethod
+    def _extract_close_series(frame: Any, length: int) -> pd.Series:
+        """Extract close prices aligned to the requested length."""
+        close_series: pd.Series
+        if hasattr(frame, "columns") and "close" in frame.columns:
+            close_series = pd.Series(frame["close"])
+        elif hasattr(frame, "columns") and "Close" in frame.columns:
+            close_series = pd.Series(frame["Close"])
+        else:
+            close_series = pd.Series(np.full(length, np.nan, dtype=float))
+        close_series = pd.to_numeric(close_series, errors="coerce")
+        return close_series.reset_index(drop=True).reindex(range(length))
+
+    def _load_model_artifact(self) -> Any:
+        """Load the promoted primary model artifact."""
+        if self.promotion_package is None:
+            raise RuntimeError("Promotion package not configured")
+        if self._model_artifact is None:
+            with self.promotion_package.model_path.open("rb") as handle:
+                self._model_artifact = pickle.load(handle)
+        return self._model_artifact
+
+    def _load_meta_model_artifact(self) -> Any | None:
+        """Load the promoted meta-model artifact when available."""
+        if self.promotion_package is None or self.promotion_package.meta_model_path is None:
+            return None
+        if self._meta_model_artifact is None:
+            with self.promotion_package.meta_model_path.open("rb") as handle:
+                self._meta_model_artifact = pickle.load(handle)
+        return self._meta_model_artifact
+
+    @staticmethod
+    def _predict_model_probabilities(
+        model: Any,
+        X_valid: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return probability-like scores and raw predictions for arbitrary model wrappers."""
+        if hasattr(model, "predict_proba"):
+            probabilities = np.asarray(model.predict_proba(X_valid), dtype=float)
+            if probabilities.ndim == 2:
+                if probabilities.shape[1] >= 2:
+                    score = probabilities[:, -1]
+                else:
+                    score = probabilities[:, 0]
+            else:
+                score = probabilities.reshape(-1)
+            return score.astype(float), score.astype(float)
+
+        raw_prediction = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
+        prediction_scale = float(np.nanstd(raw_prediction))
+        if not np.isfinite(prediction_scale) or prediction_scale <= 1e-12:
+            prediction_scale = 1.0
+        score = 1.0 / (1.0 + np.exp(-(raw_prediction / prediction_scale)))
+        return score.astype(float), raw_prediction.astype(float)
+
+    def _generate_model_signals(self) -> None:
+        """Generate signals from a promoted model package."""
+        if self.promotion_package is None:
+            raise RuntimeError("Promotion package not configured")
+
+        model = self._load_model_artifact()
+        meta_model = self._load_meta_model_artifact()
+        required_features = list(
+            self.promotion_package.feature_names or getattr(model, "feature_names", [])
+        )
+        if not required_features:
+            raise ValueError(
+                "Promotion package does not define feature_names and loaded model exposes none."
+            )
+
+        for symbol, feature_frame in self.features.items():
+            try:
+                feature_df = feature_frame.copy()
+                missing_features = [
+                    feature_name
+                    for feature_name in required_features
+                    if feature_name not in feature_df.columns
+                ]
+                if missing_features:
+                    preview = ", ".join(missing_features[:10])
+                    raise ValueError(
+                        f"Missing {len(missing_features)} required features for {symbol}: {preview}"
+                    )
+
+                X_df = (
+                    feature_df.loc[:, required_features]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                )
+                valid_mask = X_df.notna().all(axis=1)
+                probability = np.full(len(X_df), np.nan, dtype=float)
+                raw_prediction = np.full(len(X_df), np.nan, dtype=float)
+
+                if bool(valid_mask.any()):
+                    score, raw = self._predict_model_probabilities(
+                        model,
+                        X_df.loc[valid_mask].to_numpy(dtype=float),
+                    )
+                    probability[valid_mask.to_numpy()] = np.clip(score, 0.0, 1.0)
+                    raw_prediction[valid_mask.to_numpy()] = raw
+
+                long_mask = probability >= self.promotion_package.long_threshold
+                short_mask = probability <= self.promotion_package.short_threshold
+                signal_values = np.zeros(len(X_df), dtype=float)
+
+                long_scale = max(1e-6, 1.0 - self.promotion_package.long_threshold)
+                short_scale = max(1e-6, self.promotion_package.short_threshold)
+                signal_values[long_mask] = np.clip(
+                    (probability[long_mask] - self.promotion_package.long_threshold) / long_scale,
+                    0.0,
+                    1.0,
+                )
+                signal_values[short_mask] = -np.clip(
+                    (self.promotion_package.short_threshold - probability[short_mask]) / short_scale,
+                    0.0,
+                    1.0,
+                )
+
+                confidence = np.clip(np.abs(probability - 0.5) * 2.0, 0.0, 1.0)
+                meta_confidence = np.full(len(X_df), np.nan, dtype=float)
+                if (
+                    meta_model is not None
+                    and self.promotion_package.meta_label_enabled
+                    and hasattr(meta_model, "filter_signals")
+                ):
+                    close_series = self._extract_close_series(self.data[symbol], len(X_df))
+                    primary_direction = pd.Series(np.sign(signal_values), dtype=float)
+                    filtered = meta_model.filter_signals(
+                        X_df.fillna(0.0),
+                        primary_direction,
+                        prices=close_series,
+                        threshold=self.promotion_package.meta_label_threshold,
+                    )
+                    filtered_signal = pd.to_numeric(
+                        filtered.get("filtered_signal", primary_direction),
+                        errors="coerce",
+                    ).fillna(0.0)
+                    meta_confidence = pd.to_numeric(
+                        filtered.get("confidence", np.nan),
+                        errors="coerce",
+                    ).to_numpy(dtype=float)
+                    signal_values = np.where(
+                        filtered_signal.to_numpy(dtype=float) > 0.0,
+                        np.maximum(signal_values, 0.0),
+                        np.where(
+                            filtered_signal.to_numpy(dtype=float) < 0.0,
+                            np.minimum(signal_values, 0.0),
+                            0.0,
+                        ),
+                    )
+                    confidence = np.clip(
+                        np.where(np.isfinite(meta_confidence), meta_confidence, confidence),
+                        0.0,
+                        1.0,
+                    )
+
+                timestamps = self._extract_timestamps(feature_df)
+                if len(timestamps) != len(feature_df):
+                    timestamps = self._extract_timestamps(self.data[symbol])
+                if len(timestamps) != len(feature_df):
+                    timestamps = pd.date_range(
+                        start=self.session.start_date,
+                        periods=len(feature_df),
+                        freq="15min",
+                        tz="UTC",
+                    )
+
+                signal_frame = pd.DataFrame(
+                    {
+                        "timestamp": timestamps[: len(feature_df)],
+                        "signal": signal_values,
+                        "confidence": confidence,
+                        "horizon": int(self.promotion_package.horizon_bars),
+                        "model_source": self.promotion_package.model_source,
+                        "probability": probability,
+                        "raw_prediction": raw_prediction,
+                        "long_threshold": float(self.promotion_package.long_threshold),
+                        "short_threshold": float(self.promotion_package.short_threshold),
+                        "meta_confidence": meta_confidence,
+                    }
+                )
+                self.signals[symbol] = signal_frame
+                logger.info(
+                    "Generated model signals for %s from promotion package %s",
+                    symbol,
+                    self.promotion_package.model_name,
+                )
+            except Exception as exc:
+                logger.error("Failed to generate model signals for %s: %s", symbol, exc)
 
     def run(self) -> BacktestResult:
         """Execute the complete backtest workflow.
@@ -530,8 +825,14 @@ class BacktestRunner:
 
     def _compute_features(self) -> None:
         """Compute features for all symbols."""
+        package_feature_groups = (
+            self._resolve_feature_groups(self.promotion_package.feature_groups)
+            if self.promotion_package is not None and self.promotion_package.feature_groups
+            else [FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL]
+        )
+
         # Choose pipeline based on GPU availability
-        if self.session.use_gpu and CUDF_AVAILABLE:
+        if self.session.use_gpu and CUDF_AVAILABLE and self.promotion_package is None:
             logger.info("Using GPU-accelerated feature pipeline")
             pipeline = OptimizedFeaturePipeline(
                 config=OptimizedPipelineConfig(
@@ -539,33 +840,85 @@ class BacktestRunner:
                 ),
             )
         else:
-            logger.info("Using CPU feature pipeline")
+            logger.info(
+                "Using CPU feature pipeline with groups: %s",
+                [group.value for group in package_feature_groups],
+            )
             pipeline = FeaturePipeline(
                 config=FeatureConfig(
-                    groups=[FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL],
+                    groups=package_feature_groups,
                 ),
             )
 
         self.session.feature_pipeline = pipeline
 
+        import polars as pl
+
+        universe_data: dict[str, pl.DataFrame] | None = None
+        if FeatureGroup.CROSS_SECTIONAL in package_feature_groups:
+            universe_data = {}
+            for symbol, df in self.data.items():
+                if isinstance(df, pl.DataFrame):
+                    universe_data[symbol] = df
+                elif hasattr(df, "to_pandas"):
+                    universe_data[symbol] = pl.from_pandas(df.to_pandas())
+                else:
+                    universe_data[symbol] = pl.from_pandas(
+                        df.reset_index() if hasattr(df, "reset_index") else pd.DataFrame(df)
+                    )
+
         for symbol, df in self.data.items():
             try:
                 # Convert polars DataFrame to polars for FeaturePipeline
-                import polars as pl
                 if not isinstance(df, pl.DataFrame):
-                    df_pl = pl.from_pandas(df) if hasattr(df, 'to_pandas') else pl.DataFrame(df)
+                    if hasattr(df, "to_pandas"):
+                        df_pl = pl.from_pandas(df.to_pandas())
+                    elif hasattr(df, "reset_index"):
+                        df_pl = pl.from_pandas(df.reset_index())
+                    else:
+                        df_pl = pl.DataFrame(df)
                 else:
                     df_pl = df
-                feature_set = pipeline.compute(df_pl, symbol=symbol)
-                # Convert to pandas for backtest engine
-                self.features[symbol] = feature_set.to_polars().to_pandas() if feature_set.num_features > 0 else df_pl.to_pandas()
-                logger.info(f"Computed {feature_set.num_features} features for {symbol}")
+                if hasattr(pipeline, "compute"):
+                    feature_set = pipeline.compute(df_pl, symbol=symbol, universe_data=universe_data)
+                    feature_count = int(getattr(feature_set, "num_features", 0))
+                    self.features[symbol] = (
+                        feature_set.to_polars().to_pandas()
+                        if feature_count > 0
+                        else df_pl.to_pandas()
+                    )
+                else:
+                    feature_frame = pipeline.compute_features(
+                        df_pl.to_pandas(),
+                        symbol=symbol,
+                    )
+                    feature_count = max(
+                        0,
+                        len(
+                            [
+                                column
+                                for column in feature_frame.columns
+                                if column
+                                not in {"timestamp", "open", "high", "low", "close", "volume"}
+                            ]
+                        ),
+                    )
+                    self.features[symbol] = feature_frame
+                logger.info(f"Computed {feature_count} features for {symbol}")
 
             except Exception as e:
                 logger.error(f"Failed to compute features for {symbol}: {e}")
 
     def _generate_signals(self) -> None:
-        """Generate trading signals using alpha factors."""
+        """Generate trading signals using a promotion package or alpha factors."""
+        if self.promotion_package is not None:
+            logger.info(
+                "Generating signals from promotion package: %s",
+                self.promotion_package.package_path,
+            )
+            self._generate_model_signals()
+            return
+
         # Create alpha factors based on strategy
         if self.session.strategy_name == "momentum":
             alphas = create_momentum_alphas()
@@ -681,7 +1034,7 @@ class BacktestRunner:
         # Create signal-based strategy
         strategy = SignalBasedStrategy(
             signals=self.signals,
-            signal_threshold=0.1,
+            signal_threshold=0.0 if self.promotion_package is not None else 0.1,
         )
 
         # Create backtest engine with proper parameters
@@ -701,7 +1054,8 @@ class BacktestRunner:
 
     def _analyze_results(self, result: BacktestResult) -> dict[str, Any]:
         """Analyze backtest results comprehensively."""
-        self.session.analyzer = PerformanceAnalyzer()
+        annualization_periods = estimate_periods_per_year(self.session.timeframe)
+        self.session.analyzer = PerformanceAnalyzer(periods_per_year=annualization_periods)
         benchmark_returns = None
         benchmark = (self.session.benchmark_symbol or "").strip().upper()
         if benchmark:
@@ -1017,6 +1371,13 @@ def run_backtest(args: argparse.Namespace) -> int:
         logger.error("Institutional backtests require PostgreSQL + Redis. CSV mode is disabled.")
         return 1
 
+    promotion_package_path = getattr(args, "promotion_package", None)
+    if promotion_package_path:
+        promotion_package_path = Path(promotion_package_path)
+        if not promotion_package_path.exists():
+            logger.error(f"Promotion package not found: {promotion_package_path}")
+            return 1
+
     try:
         _verify_backtest_infra()
     except Exception as exc:
@@ -1040,6 +1401,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         slippage_bps=args.slippage_bps,
         commission_bps=args.commission_bps,
         monte_carlo_sims=args.monte_carlo,
+        promotion_package_path=promotion_package_path,
     )
 
     # Run backtest
@@ -1072,6 +1434,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--commission-bps", type=float, default=1.0)
     parser.add_argument("--monte-carlo", type=int, default=0)
     parser.add_argument("--benchmark", type=str, default=None, help="Optional benchmark symbol (e.g., SPY)")
+    parser.add_argument(
+        "--promotion-package",
+        type=Path,
+        default=None,
+        help="Optional promotion package to run artifact-driven model backtests.",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)

@@ -347,6 +347,18 @@ class LightGBMModel(TradingModel):
             if key in self._params:
                 params[key] = self._params[key]
 
+        monotone_constraints = params.get("monotone_constraints")
+        if monotone_constraints is not None:
+            constraints = list(monotone_constraints)
+            if len(constraints) != int(X.shape[1]):
+                logger.warning(
+                    "Dropping LightGBM monotone_constraints due to feature mismatch: "
+                    "constraints=%d features=%d",
+                    len(constraints),
+                    int(X.shape[1]),
+                )
+                params.pop("monotone_constraints", None)
+
         if self._params.get("use_gpu"):
             params["device_type"] = "gpu"
         params.setdefault(

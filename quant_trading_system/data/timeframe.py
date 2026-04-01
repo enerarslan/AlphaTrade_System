@@ -4,9 +4,12 @@ Timeframe normalization utilities shared by database and script layers.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 DEFAULT_TIMEFRAME = "15Min"
+TRADING_DAYS_PER_YEAR = 252
+US_EQUITY_REGULAR_SESSION_MINUTES = 390
 
 _TIMEFRAME_ALIASES = {
     "1min": "1Min",
@@ -48,6 +51,16 @@ _FILENAME_SUFFIXES = {
     "_DAILY": "1Day",
 }
 
+_TIMEFRAME_MINUTES = {
+    "1Min": 1,
+    "5Min": 5,
+    "15Min": 15,
+    "30Min": 30,
+    "1Hour": 60,
+    "4Hour": 240,
+    "1Day": US_EQUITY_REGULAR_SESSION_MINUTES,
+}
+
 
 def normalize_timeframe(timeframe: str | None, default: str = DEFAULT_TIMEFRAME) -> str:
     """Normalize user/file/database timeframe labels to a canonical representation."""
@@ -64,6 +77,27 @@ def timeframe_slug(timeframe: str | None, default: str = DEFAULT_TIMEFRAME) -> s
     """Build a stable lowercase slug for cache keys and file names."""
     canonical = normalize_timeframe(timeframe, default=default)
     return canonical.lower()
+
+
+def timeframe_to_minutes(timeframe: str | None, default: str = DEFAULT_TIMEFRAME) -> int:
+    """Return the canonical timeframe length in minutes."""
+    canonical = normalize_timeframe(timeframe, default=default)
+    return int(_TIMEFRAME_MINUTES.get(canonical, _TIMEFRAME_MINUTES[DEFAULT_TIMEFRAME]))
+
+
+def estimate_periods_per_year(
+    timeframe: str | None,
+    trading_days_per_year: int = TRADING_DAYS_PER_YEAR,
+    session_minutes: int = US_EQUITY_REGULAR_SESSION_MINUTES,
+) -> int:
+    """Estimate annualization periods for US-equity regular-session bars."""
+    canonical = normalize_timeframe(timeframe, default=DEFAULT_TIMEFRAME)
+    if canonical == "1Day":
+        return int(trading_days_per_year)
+
+    minutes = timeframe_to_minutes(canonical, default=DEFAULT_TIMEFRAME)
+    bars_per_session = max(1, int(math.ceil(float(session_minutes) / float(minutes))))
+    return int(trading_days_per_year) * bars_per_session
 
 
 def infer_symbol_and_timeframe(

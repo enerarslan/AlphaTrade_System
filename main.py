@@ -859,6 +859,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Bar timeframe stored in PostgreSQL (default: 15Min)",
     )
     train_parser.add_argument(
+        "--timeframes",
+        nargs="+",
+        default=[],
+        help="Optional multi-timeframe fusion scope (for example: 15Min 1Hour 1Day)",
+    )
+    train_parser.add_argument(
         "--cv-method",
         choices=["purged_kfold", "combinatorial", "walk_forward"],
         default="purged_kfold",
@@ -1280,6 +1286,18 @@ For more information, visit: https://github.com/alphatrade/docs
         "--disable-symbol-quality-filter",
         action="store_true",
         help="Disable symbol-level quality universe filtering before feature generation",
+    )
+    train_parser.add_argument(
+        "--target-universe-size",
+        type=int,
+        default=0,
+        help="Optional database-first universe cap when symbols are not provided",
+    )
+    train_parser.add_argument(
+        "--universe-selection-buffer-size",
+        type=int,
+        default=24,
+        help="Extra candidate symbols kept before post-load quality filtering (default: 24)",
     )
     train_parser.add_argument(
         "--symbol-quality-min-rows",

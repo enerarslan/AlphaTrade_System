@@ -2,16 +2,46 @@
 
 from __future__ import annotations
 
+import json
+import pickle
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 
 from quant_trading_system.backtest.engine import BacktestState, PandasDataHandler, Trade
+from quant_trading_system.backtest.promotion import load_promotion_package
 from quant_trading_system.backtest.performance_attribution import PerformanceAttributionService
 from quant_trading_system.core.data_types import Direction, OrderSide, Portfolio
 from scripts.backtest import BacktestRunner, BacktestSession, SignalBasedStrategy, run_backtest
+
+
+class DummyProbabilityModel:
+    feature_names = ["feat_a", "feat_b"]
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        prob = np.clip(X[:, 0], 0.0, 1.0)
+        return np.column_stack([1.0 - prob, prob])
+
+
+class DummyMetaModel:
+    def filter_signals(self, X, signals, prices=None, threshold=None):
+        threshold = 0.60 if threshold is None else float(threshold)
+        signals = pd.Series(signals, dtype=float)
+        confidence = pd.Series(np.where(signals != 0.0, 0.90, 0.10), dtype=float)
+        filtered = signals.where(confidence >= threshold, 0.0)
+        return pd.DataFrame(
+            {
+                "original_signal": signals,
+                "confidence": confidence,
+                "filtered_signal": filtered,
+                "passed_filter": confidence >= threshold,
+            }
+        )
 
 
 def test_performance_attribution_compute_attribution_accepts_backtest_state():
@@ -101,7 +131,11 @@ def test_backtest_runner_passes_benchmark_returns_to_analyzer(monkeypatch):
             captured["benchmark_returns"] = benchmark_returns
             return _Report()
 
-    monkeypatch.setattr(backtest_script, "PerformanceAnalyzer", lambda: _Analyzer())
+    monkeypatch.setattr(
+        backtest_script,
+        "PerformanceAnalyzer",
+        lambda *args, **kwargs: _Analyzer(),
+    )
 
     t0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
     t1 = t0 + timedelta(minutes=15)
@@ -175,6 +209,54 @@ def test_signal_based_strategy_uses_bar_timestamp_lookup():
     assert signals[0].timestamp == t1
 
 
+def test_signal_based_strategy_prefers_confidence_and_horizon_columns():
+    t0 = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+    handler = PandasDataHandler(
+        {
+            "AAPL": pd.DataFrame(
+                {
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.0],
+                    "volume": [1_000_000],
+                },
+                index=pd.DatetimeIndex([t0]),
+            )
+        }
+    )
+    strategy = SignalBasedStrategy(
+        {
+            "AAPL": pd.DataFrame(
+                {
+                    "signal": [0.75],
+                    "confidence": [0.88],
+                    "horizon": [5],
+                    "model_source": ["promotion_package:test_model"],
+                    "probability": [0.87],
+                },
+                index=pd.DatetimeIndex([t0]),
+            )
+        },
+        signal_threshold=0.1,
+    )
+    portfolio = Portfolio(
+        equity=Decimal("100000"),
+        cash=Decimal("100000"),
+        buying_power=Decimal("100000"),
+        positions={},
+    )
+
+    assert handler.update_bars() is True
+    signals = strategy.generate_signals(handler, portfolio)
+
+    assert len(signals) == 1
+    assert signals[0].confidence == 0.88
+    assert signals[0].horizon == 5
+    assert signals[0].model_source == "promotion_package:test_model"
+    assert signals[0].metadata["probability"] == 0.87
+
+
 def test_run_backtest_rejects_csv_mode():
     args = SimpleNamespace(
         start="2025-01-01",
@@ -196,3 +278,178 @@ def test_run_backtest_rejects_csv_mode():
     )
 
     assert run_backtest(args) == 1
+
+
+def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
+    model_path = tmp_path / "test_model.pkl"
+    artifacts_path = tmp_path / "test_model_artifacts.json"
+    package_path = tmp_path / "test_model.promotion_package.json"
+
+    with model_path.open("wb") as handle:
+        pickle.dump(DummyProbabilityModel(), handle)
+
+    artifacts_payload = {
+        "feature_names": ["feat_a", "feat_b"],
+        "training_metrics": {
+            "holdout_long_threshold": 0.65,
+            "holdout_short_threshold": 0.35,
+            "meta_label_min_confidence": 0.70,
+        },
+        "snapshot_manifest": {"feature_schema_version": "schema-123"},
+    }
+    artifacts_path.write_text(json.dumps(artifacts_payload), encoding="utf-8")
+
+    package_payload = {
+        "schema_version": "1.0.0",
+        "model_name": "test_model",
+        "model_type": "lightgbm",
+        "model_path": str(model_path),
+        "training_config": {
+            "symbols": ["AAPL"],
+            "timeframe": "15Min",
+            "timeframes": ["15Min", "1Hour"],
+            "feature_groups": ["technical", "statistical"],
+            "meta_label_min_confidence": 0.66,
+        },
+    }
+    package_path.write_text(json.dumps(package_payload), encoding="utf-8")
+
+    package = load_promotion_package(package_path)
+
+    assert package.feature_names == ("feat_a", "feat_b")
+    assert package.long_threshold == 0.65
+    assert package.short_threshold == 0.35
+    assert package.meta_label_threshold == 0.70
+    assert package.feature_schema_version == "schema-123"
+    assert package.timeframes == ("15Min", "1Hour")
+
+
+def test_backtest_runner_generates_signals_from_promotion_package(tmp_path: Path):
+    model_path = tmp_path / "pkg_model.pkl"
+    meta_model_path = tmp_path / "pkg_model_meta.pkl"
+    package_path = tmp_path / "pkg_model.promotion_package.json"
+
+    with model_path.open("wb") as handle:
+        pickle.dump(DummyProbabilityModel(), handle)
+    with meta_model_path.open("wb") as handle:
+        pickle.dump(DummyMetaModel(), handle)
+
+    package_payload = {
+        "schema_version": "1.1.0",
+        "model_name": "pkg_model",
+        "model_type": "lightgbm",
+        "model_path": str(model_path),
+        "meta_model_path": str(meta_model_path),
+        "feature_contract": {
+            "selected_features": ["feat_a", "feat_b"],
+            "feature_groups": ["technical", "statistical"],
+        },
+        "signal_policy": {
+            "long_threshold": 0.60,
+            "short_threshold": 0.40,
+            "horizon_bars": 5,
+            "meta_label_enabled": True,
+            "meta_label_threshold": 0.60,
+            "model_source": "promotion_package:pkg_model",
+        },
+        "training_config": {
+            "symbols": ["AAPL"],
+            "timeframe": "15Min",
+            "timeframes": ["15Min"],
+        },
+    }
+    package_path.write_text(json.dumps(package_payload), encoding="utf-8")
+
+    t0 = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(minutes=15)
+    session = BacktestSession(
+        start_date=t0,
+        end_date=t1,
+        symbols=["AAPL"],
+        initial_capital=Decimal("100000"),
+        timeframe="15Min",
+        promotion_package_path=package_path,
+    )
+    runner = BacktestRunner(session)
+    runner.data["AAPL"] = pd.DataFrame(
+        {
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.0, 101.0],
+            "volume": [1000, 1000],
+        },
+        index=pd.DatetimeIndex([t0, t1]),
+    )
+    runner.features["AAPL"] = pd.DataFrame(
+        {
+            "timestamp": [t0, t1],
+            "feat_a": [0.80, 0.20],
+            "feat_b": [0.10, 0.20],
+        }
+    )
+
+    runner._generate_signals()
+
+    signal_frame = runner.signals["AAPL"]
+    assert list(signal_frame["horizon"]) == [5, 5]
+    assert list(signal_frame["model_source"]) == ["promotion_package:pkg_model"] * 2
+    assert signal_frame["signal"].iloc[0] > 0.0
+    assert signal_frame["signal"].iloc[1] < 0.0
+    assert signal_frame["confidence"].iloc[0] == 0.90
+    assert signal_frame["confidence"].iloc[1] == 0.90
+
+
+def test_backtest_runner_uses_timeframe_aware_annualization(monkeypatch):
+    import scripts.backtest as backtest_script
+
+    captured: dict[str, object] = {}
+
+    class _Metric:
+        def to_dict(self):
+            return {}
+
+    class _Report:
+        return_metrics = _Metric()
+        risk_adjusted_metrics = _Metric()
+        drawdown_metrics = _Metric()
+        trade_metrics = _Metric()
+        benchmark_metrics = None
+        statistical_tests = _Metric()
+
+    class _Analyzer:
+        def __init__(self, periods_per_year):
+            captured["periods_per_year"] = periods_per_year
+
+        def analyze(self, _result, benchmark_returns=None):
+            return _Report()
+
+    monkeypatch.setattr(
+        backtest_script,
+        "PerformanceAnalyzer",
+        lambda periods_per_year=252, risk_free_rate=0.02: _Analyzer(periods_per_year),
+    )
+
+    t0 = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(minutes=15)
+    session = BacktestSession(
+        start_date=t0,
+        end_date=t1,
+        symbols=["AAPL"],
+        initial_capital=Decimal("100000"),
+        timeframe="15Min",
+    )
+    runner = BacktestRunner(session)
+    result = BacktestState(
+        timestamp=t1,
+        equity=Decimal("100000"),
+        cash=Decimal("100000"),
+        positions={},
+        pending_orders=[],
+        equity_curve=[(t0, 100000.0), (t1, 100100.0)],
+        trades=[],
+    )
+
+    runner._analyze_results(result)
+
+    assert captured["periods_per_year"] == 26 * 252

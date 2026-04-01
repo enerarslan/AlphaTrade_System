@@ -1,7 +1,7 @@
 # AlphaTrade Training Execution Plan
 
 **Date:** 2026-04-01
-**Status:** In progress
+**Status:** Completed for initial optimization scope
 **Scope:** Training pipeline optimization without degrading final model quality
 
 ## 0. Execution Tracker
@@ -18,12 +18,23 @@ Completed on 2026-04-01:
 - [x] Added automatic local snapshot-bundle reuse for matching training scopes, with an explicit CLI escape hatch.
 - [x] Added `primary_challenger` orchestration so one command can run `lightgbm` primary plus `tcn` challenger.
 - [x] Stored snapshot training scope metadata in dataset bundle manifests so automatic reuse is deterministic and auditable.
+- [x] Exposed multi-timeframe fusion and database-first universe controls through `main.py train` (`--timeframes`, `--target-universe-size`, `--universe-selection-buffer-size`).
+- [x] Reworked PostgreSQL training loads to bulk-load one OHLCV panel per timeframe instead of looping symbol by symbol.
+- [x] Added liquidity-ranked universe selection that prioritizes symbols with full requested-timeframe coverage before loading data.
+- [x] Updated multi-timeframe feature materialization to prefer database-native higher-timeframe OHLCV panels before resampling fallback.
+- [x] Fixed PostgreSQL feature persistence for post-label training matrices by sourcing identifiers from the development frame after multi-timeframe materialization.
+- [x] Validated the database-first multi-timeframe path in WSL on a real `15Min + 1Hour + 1Day` LightGBM smoke run through artifact save.
+- [x] Fixed Docker Desktop WSL integration for `Ubuntu-24.04` and verified Docker CLI access from inside the distro.
+- [x] Restored non-interactive `wsl.exe -d Ubuntu-24.04 -- ...` command execution.
+- [x] Cloned the active repo into the WSL ext4 filesystem at `~/AlphaTrade` and created a Linux-side virtual environment.
+- [x] Installed the training Python stack in WSL and validated PostgreSQL, Redis, Docker, and GPU reachability there.
+- [x] Ran a WSL end-to-end LightGBM research smoke training pass through model save and artifact generation.
+- [x] Fixed a LightGBM monotone-constraint mismatch after feature selection by reapplying model priors and adding a defensive fallback in the model wrapper.
+- [x] Added regression coverage for the monotone-constraint mismatch in both trainer-level and model-level unit tests.
 
-Still open:
+No blocking gaps remain in the initial optimization plan:
 
-- [ ] Finish Ubuntu first-run initialization so non-interactive `wsl.exe -d Ubuntu-24.04 -- ...` commands return normally.
-- [ ] Move the active training workspace into WSL under `~/AlphaTrade` and validate PostgreSQL, Redis, and GPU reachability there.
-- [ ] Run the first benchmark matrix on one fixed snapshot and compare runtime and quality.
+- [x] Run the first benchmark matrix on one fixed snapshot and compare runtime and quality.
 
 ## 1. Objective
 
@@ -159,7 +170,23 @@ Required behavior:
 
 This prevents the feature pipeline from dominating every repeat run.
 
-### 4.4 Feature Strategy
+### 4.4 Database-First Universe and Multi-Timeframe Loading
+
+Use PostgreSQL as the source of truth for both:
+
+- symbol-universe selection
+- native higher-timeframe OHLCV loading
+
+Required behavior:
+
+- if the operator does not pin `--symbols`, the training pipeline should rank the candidate universe in PostgreSQL before loading full panels
+- ranking should favor symbols with strong liquidity and full requested-timeframe coverage
+- requested higher timeframes should be loaded directly from PostgreSQL when available
+- resampling from the base timeframe should remain only as a deterministic fallback
+
+This is the right default for the current dataset because the platform already stores multi-layer, multi-timeframe market data in PostgreSQL.
+
+### 4.5 Feature Strategy
 
 Do **not** solve the performance problem by throwing away the multi-layer dataset.
 
@@ -193,8 +220,9 @@ Acceptance criteria:
 
 Status:
 
-- Partial. Ubuntu 24.04 is installed in WSL and visible in `wsl -l -v`.
-- Blocked. Non-interactive command execution in `Ubuntu-24.04` is still timing out, so repo migration and infrastructure validation inside Linux are not complete yet.
+- Implemented. Docker Desktop integration and non-interactive `wsl.exe -d Ubuntu-24.04 -- ...` execution both work normally.
+- Implemented. The active repo has been cloned into `~/AlphaTrade`, a WSL virtual environment is in place, and PostgreSQL, Redis, Docker, and GPU access have all been validated from inside Ubuntu.
+- Implemented. A WSL LightGBM smoke training run now completes the full training path through model save and artifact generation.
 
 ### Phase 2: Training Profiles
 
@@ -232,6 +260,7 @@ Status:
 
 - Implemented. Matching local dataset snapshot bundles are now auto-reused by default for repeated runs.
 - Implemented. Operators can force a live rebuild with `--disable-auto-snapshot-reuse`.
+- Implemented. Snapshot training scopes now include universe-size controls and requested multi-timeframe scope so reuse remains deterministic when the data footprint changes.
 
 ### Phase 4: LightGBM Primary Path
 
@@ -248,7 +277,9 @@ Acceptance criteria:
 Status:
 
 - Partial. `lightgbm` is the default training model and now participates in the explicit `primary_challenger` orchestration flow.
-- Open. Actual runtime/quality benchmarking on a fixed snapshot still needs to be run.
+- Implemented. A WSL smoke training run exposed and confirmed a real LightGBM training blocker around monotone constraints after feature selection.
+- Implemented. The blocker is fixed by reapplying model priors after feature selection and dropping stale monotone constraints defensively in the wrapper when dimensions do not match.
+- Implemented. Runtime/quality benchmarking on a fixed snapshot is complete, and `lightgbm` remains the strongest primary path on that benchmark.
 
 ### Phase 5: TCN Challenger Path
 
@@ -264,7 +295,7 @@ Acceptance criteria:
 Status:
 
 - Implemented in orchestration. `tcn` now runs as the explicit challenger when `--model primary_challenger` is used.
-- Open. Runtime and quality comparison versus `lightgbm` still needs to be measured on a fixed snapshot.
+- Implemented. Runtime and quality comparison versus `lightgbm` has now been measured on the fixed snapshot, and `tcn` remains a slower challenger rather than the default primary path.
 
 ### Phase 6: Benchmark and Gating
 
@@ -296,7 +327,17 @@ Acceptance rule:
 Status:
 
 - Partial. The code path is ready: `primary_challenger` plus snapshot reuse now drives the existing benchmark matrix and champion/challenger report generation.
-- Open. The first real benchmark run on one fixed snapshot still needs to be executed.
+- Implemented. WSL runtime validation is complete and the training path is now proven end to end on the Linux filesystem.
+- Implemented. The PostgreSQL data path is now multi-timeframe aware: `main.py train` accepts explicit timeframe scopes, symbol-universe selection ranks candidates by timeframe coverage plus liquidity, and higher-timeframe OHLCV is bulk-loaded natively from PostgreSQL before any resampling fallback.
+- Implemented. A WSL research smoke run on `2024-01-01` to `2024-02-29` with `15Min + 1Hour + 1Day` and a ranked universe target of `4` completed end to end: `3` symbols loaded from PostgreSQL, `766,299` selected feature rows persisted back to PostgreSQL, model/replay/promotion artifacts were saved, and the run failed only on research validation gates rather than pipeline execution.
+- Implemented. The first fixed-snapshot benchmark run is complete on snapshot `snap_d7306f388a86906d` (`AAPL`, `2024-01-01` to `2024-12-31`, 3057 development rows, 539 holdout rows, 59 selected technical/statistical features).
+- Implemented. Research benchmark artifacts were written to `/root/AlphaTrade/models/benchmark_fixed_snapshot/research_v2/benchmarks/training_matrix_20260401T104818Z.json` and `/root/AlphaTrade/models/benchmark_fixed_snapshot/research_v2/champion_challenger_snapshot.json`.
+- Implemented. Promotion benchmark artifacts were written to `/root/AlphaTrade/models/benchmark_fixed_snapshot/promotion_v1/benchmarks/training_matrix_20260401T105020Z.json`.
+- Implemented. Benchmark outcome on the fixed snapshot:
+  - `research/lightgbm`: `67.3s`, mean Sharpe `0.3414`, holdout Sharpe `-0.1571`, deflated Sharpe `2.3132`, PBO `0.5108`.
+  - `research/tcn`: `214.2s`, mean Sharpe `0.1550`, holdout Sharpe `-0.6958`, deflated Sharpe `1.1424`, PBO `0.5936`.
+  - `promotion/lightgbm`: `99.6s`, mean Sharpe `0.3439`, holdout Sharpe `-0.2390`, deflated Sharpe `2.0799`, PBO `0.6249`.
+- Implemented. Benchmark conclusion: on this first fixed snapshot, `lightgbm` remains the primary path; `tcn` is materially slower and lower quality, while `promotion` adds governance/runtime cost and should remain reserved for shortlisted final candidates rather than normal iteration.
 
 ## 6. Expected Performance Impact
 
@@ -349,6 +390,9 @@ Research:
 python main.py train \
   --training-profile research \
   --model primary_challenger \
+  --timeframes 15Min 1Hour 1Day \
+  --target-universe-size 48 \
+  --universe-selection-buffer-size 24 \
   --feature-set-id lgbm_tcn_research
 ```
 
@@ -358,6 +402,9 @@ Promotion:
 python main.py train \
   --training-profile promotion \
   --model lightgbm \
+  --timeframes 15Min 1Hour 1Day \
+  --target-universe-size 64 \
+  --universe-selection-buffer-size 24 \
   --n-trials 50 \
   --n-splits 5 \
   --nested-outer-splits 4 \
@@ -365,13 +412,23 @@ python main.py train \
   --feature-set-id lgbm_promotion
 ```
 
+WSL operator wrapper:
+
+```bash
+wsl.exe -d Ubuntu-24.04 -u root -e sh -lc '
+  cd /root/AlphaTrade &&
+  . .venv/bin/activate &&
+  python main.py train --training-profile research --model primary_challenger
+'
+```
+
 ## 9. Immediate Next Steps
 
-1. Move the active training workflow to WSL Ubuntu.
-2. Resolve the current Ubuntu first-run/command-execution timeout so WSL commands can run non-interactively.
-3. Copy the active repo to `~/AlphaTrade` and point training artifacts to the Linux filesystem.
-4. Run the first benchmark matrix on one fixed snapshot and compare quality and runtime.
-5. Decide the final promotion budget after the first `research` versus `promotion` quality comparison.
+1. Reuse the fixed-snapshot benchmark pattern for a broader multi-symbol, full-layer benchmark when moving from smoke-scale validation to final paper-candidate selection.
+2. Keep `research` as the default search lane and reserve `promotion` for shortlisted `lightgbm` candidates.
+3. Keep `tcn` as an explicit challenger, not a default equal-budget peer to `lightgbm`.
+4. Run the next benchmark on a multi-symbol database-native timeframe stack such as `15Min + 1Hour + 1Day` with a ranked `48-64` symbol universe.
+5. Tune any remaining Redis health-check timeout issue seen during `python main.py health check --full` in WSL if it persists under steady-state load.
 
 ## 10. Success Definition
 

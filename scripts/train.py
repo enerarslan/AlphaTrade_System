@@ -123,6 +123,7 @@ SUPPORTED_MODELS = [
 DEFAULT_PRIMARY_MODEL = "lightgbm"
 PRIMARY_CHALLENGER_MODEL_ALIAS = "primary_challenger"
 SUPPORTED_TRAINING_PROFILES = ("promotion", "research")
+EXPLICIT_PROFILE_OVERRIDE_ATTR = "_explicit_profile_override_dests"
 PROFILE_TUNABLE_ARG_DEFAULTS: dict[str, Any] = {
     "n_splits": 5,
     "n_trials": 100,
@@ -173,8 +174,11 @@ def _resolve_profiled_value(
     """Resolve config values with replay-config precedence, CLI overrides, then profile presets."""
     if config_key in replay_config:
         return replay_config[config_key]
+    explicit_profile_overrides = getattr(args, EXPLICIT_PROFILE_OVERRIDE_ATTR, set())
     if arg_dest and hasattr(args, arg_dest):
         arg_value = getattr(args, arg_dest)
+        if arg_dest in explicit_profile_overrides:
+            return arg_transform(arg_value) if arg_transform else arg_value
         if arg_value != PROFILE_TUNABLE_ARG_DEFAULTS.get(arg_dest, object()):
             return arg_transform(arg_value) if arg_transform else arg_value
     if config_key in profile_defaults:
@@ -183,6 +187,25 @@ def _resolve_profiled_value(
         arg_value = getattr(args, arg_dest)
         return arg_transform(arg_value) if arg_transform else arg_value
     return fallback
+
+
+def _attach_explicit_profile_overrides(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    argv: list[str] | None,
+) -> argparse.Namespace:
+    """Track CLI options that were explicitly provided, even when equal to parser defaults."""
+    explicit_dests: set[str] = set()
+    for raw_arg in argv or []:
+        if not raw_arg.startswith("-"):
+            continue
+        option = raw_arg.split("=", 1)[0]
+        action = parser._option_string_actions.get(option)
+        if action is None:
+            continue
+        explicit_dests.add(action.dest)
+    setattr(args, EXPLICIT_PROFILE_OVERRIDE_ATTR, explicit_dests)
+    return args
 
 
 def _running_in_wsl() -> bool:
@@ -274,6 +297,9 @@ def _build_snapshot_training_scope(config: "TrainingConfig") -> dict[str, Any]:
         "enable_tick_microstructure_features": bool(config.enable_tick_microstructure_features),
         "enable_cross_sectional": bool(config.enable_cross_sectional),
         "enable_symbol_quality_filter": bool(config.enable_symbol_quality_filter),
+        "target_universe_size": int(config.target_universe_size),
+        "universe_selection_buffer_size": int(config.universe_selection_buffer_size),
+        "universe_reference_symbols": sorted(config.universe_reference_symbols),
         "symbol_quality_min_rows": int(config.symbol_quality_min_rows),
         "symbol_quality_min_symbols": int(config.symbol_quality_min_symbols),
         "symbol_quality_max_missing_ratio": float(config.symbol_quality_max_missing_ratio),
@@ -937,6 +963,11 @@ class TrainingConfig:
     quality_extreme_move_threshold: float = 0.01
     quality_corporate_action_jump_threshold: float = 0.001
     enable_symbol_quality_filter: bool = True
+    target_universe_size: int = 0
+    universe_selection_buffer_size: int = 24
+    universe_reference_symbols: list[str] = field(
+        default_factory=lambda: ["SPY", "QQQ", "IWM", "VIX"]
+    )
     symbol_quality_min_rows: int = 1200
     symbol_quality_min_symbols: int = 8
     symbol_quality_max_missing_ratio: float = 0.12
@@ -1071,6 +1102,15 @@ class TrainingConfig:
         )
         self.auto_live_profile_min_years = max(0.5, float(self.auto_live_profile_min_years))
         self.enable_symbol_quality_filter = bool(self.enable_symbol_quality_filter)
+        self.target_universe_size = max(0, int(self.target_universe_size))
+        self.universe_selection_buffer_size = max(0, int(self.universe_selection_buffer_size))
+        self.universe_reference_symbols = sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in self.universe_reference_symbols
+                if str(symbol).strip()
+            }
+        )
         self.symbol_quality_min_rows = max(200, int(self.symbol_quality_min_rows))
         self.symbol_quality_min_symbols = max(1, int(self.symbol_quality_min_symbols))
         self.symbol_quality_max_missing_ratio = float(
@@ -1155,6 +1195,7 @@ class ModelTrainer:
 
         # Training state
         self.data: pd.DataFrame | None = None
+        self.ohlcv_panels_by_timeframe: dict[str, pd.DataFrame] = {}
         self.features: pd.DataFrame | None = None
         self.labels: pd.Series | None = None
         self.feature_names: list[str] = []
@@ -1888,6 +1929,246 @@ class ModelTrainer:
             len(self.data),
         )
 
+    def _select_candidate_symbols_from_postgres(
+        self,
+        session: Any,
+        redis_mgr: Any,
+        *,
+        timeframe: str,
+        requested_timeframes: list[str] | None,
+        start_date: pd.Timestamp | None,
+        end_date: pd.Timestamp | None,
+    ) -> list[str]:
+        """Select a database-first training universe before loading full OHLCV panels."""
+        from sqlalchemy import bindparam
+
+        requested_timeframe_scope = [
+            normalize_timeframe(value, default=timeframe)
+            for value in (requested_timeframes or [timeframe])
+            if str(value).strip()
+        ]
+        if not requested_timeframe_scope:
+            requested_timeframe_scope = [normalize_timeframe(timeframe)]
+        requested_timeframe_scope = list(dict.fromkeys(requested_timeframe_scope))
+
+        cache_key = (
+            f"train:universe:{timeframe}:"
+            f"{','.join(requested_timeframe_scope)}:"
+            f"{self.config.target_universe_size}:{self.config.universe_selection_buffer_size}:"
+            f"{start_date.isoformat() if start_date is not None else 'none'}:"
+            f"{end_date.isoformat() if end_date is not None else 'none'}"
+        )
+        if redis_mgr is not None:
+            cached_raw = redis_mgr.get(cache_key)
+            if cached_raw:
+                try:
+                    cached_symbols = [
+                        str(symbol).strip().upper()
+                        for symbol in json.loads(cached_raw)
+                        if str(symbol).strip()
+                    ]
+                    if cached_symbols:
+                        self.training_metrics["database_universe_requested_timeframes"] = list(
+                            requested_timeframe_scope
+                        )
+                        self.training_metrics["database_universe_selection_source"] = "redis_cache"
+                        return cached_symbols
+                except json.JSONDecodeError:
+                    pass
+
+        target_size = int(self.config.target_universe_size)
+        if target_size <= 0:
+            result = session.execute(
+                text(
+                    """
+                    SELECT DISTINCT symbol
+                    FROM ohlcv_bars
+                    WHERE timeframe = :timeframe
+                      AND (:start_date IS NULL OR timestamp >= :start_date)
+                      AND (:end_date IS NULL OR timestamp <= :end_date)
+                    ORDER BY symbol
+                    """
+                ),
+                {
+                    "timeframe": timeframe,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            )
+            symbols = [str(row[0]).strip().upper() for row in result.fetchall() if str(row[0]).strip()]
+            self.training_metrics["database_universe_requested_timeframes"] = list(
+                requested_timeframe_scope
+            )
+            self.training_metrics["database_universe_selection_source"] = "full_timeframe_scan"
+            return symbols
+
+        candidate_limit = max(
+            target_size,
+            target_size + int(self.config.universe_selection_buffer_size),
+        )
+        result = session.execute(
+            text(
+                """
+                WITH base_metrics AS (
+                    SELECT
+                        symbol,
+                        COUNT(*) AS row_count,
+                        COUNT(DISTINCT DATE(timestamp)) AS active_days,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (
+                            ORDER BY (CAST(close AS DOUBLE PRECISION) * CAST(volume AS DOUBLE PRECISION))
+                        ) AS median_dollar_volume
+                    FROM ohlcv_bars
+                    WHERE timeframe = :timeframe
+                      AND (:start_date IS NULL OR timestamp >= :start_date)
+                      AND (:end_date IS NULL OR timestamp <= :end_date)
+                    GROUP BY symbol
+                    HAVING COUNT(*) >= :min_rows
+                ),
+                timeframe_coverage AS (
+                    SELECT
+                        symbol,
+                        COUNT(DISTINCT timeframe) AS timeframe_coverage_count
+                    FROM ohlcv_bars
+                    WHERE timeframe IN :requested_timeframes
+                      AND (:start_date IS NULL OR timestamp >= :start_date)
+                      AND (:end_date IS NULL OR timestamp <= :end_date)
+                    GROUP BY symbol
+                )
+                SELECT
+                    base_metrics.symbol,
+                    base_metrics.row_count,
+                    base_metrics.active_days,
+                    base_metrics.median_dollar_volume,
+                    COALESCE(timeframe_coverage.timeframe_coverage_count, 0) AS timeframe_coverage_count
+                FROM base_metrics
+                LEFT JOIN timeframe_coverage
+                    ON timeframe_coverage.symbol = base_metrics.symbol
+                ORDER BY
+                    timeframe_coverage_count DESC,
+                    median_dollar_volume DESC NULLS LAST,
+                    row_count DESC,
+                    active_days DESC,
+                    symbol ASC
+                LIMIT :candidate_limit
+                """
+            ).bindparams(bindparam("requested_timeframes", expanding=True)),
+            {
+                "timeframe": timeframe,
+                "requested_timeframes": requested_timeframe_scope,
+                "start_date": start_date,
+                "end_date": end_date,
+                "min_rows": int(self.config.symbol_quality_min_rows),
+                "candidate_limit": candidate_limit,
+            },
+        )
+        candidate_rows = result.fetchall()
+        symbols = [
+            str(row[0]).strip().upper()
+            for row in candidate_rows
+            if row and str(row[0]).strip()
+        ]
+        full_timeframe_coverage_count = sum(
+            1
+            for row in candidate_rows
+            if row and int(row[4] or 0) >= len(requested_timeframe_scope)
+        )
+
+        preferred_reference_symbols = (
+            list(self.config.universe_reference_symbols)
+            if (self.config.enable_cross_sectional or self.config.enable_reference_features)
+            else []
+        )
+        if preferred_reference_symbols:
+            reference_result = session.execute(
+                text(
+                    """
+                    SELECT DISTINCT symbol
+                    FROM ohlcv_bars
+                    WHERE timeframe = :timeframe
+                      AND symbol IN :symbols
+                      AND (:start_date IS NULL OR timestamp >= :start_date)
+                      AND (:end_date IS NULL OR timestamp <= :end_date)
+                    ORDER BY symbol
+                    """
+                ).bindparams(bindparam("symbols", expanding=True)),
+                {
+                    "timeframe": timeframe,
+                    "symbols": preferred_reference_symbols,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            )
+            for row in reference_result.fetchall():
+                symbol = str(row[0]).strip().upper()
+                if symbol and symbol not in symbols:
+                    symbols.append(symbol)
+
+        if redis_mgr is not None and symbols:
+            redis_mgr.set(cache_key, json.dumps(symbols), expire_seconds=300)
+
+        self.training_metrics["database_universe_requested_timeframes"] = list(
+            requested_timeframe_scope
+        )
+        self.training_metrics["database_universe_target_size"] = float(target_size)
+        self.training_metrics["database_universe_candidate_count"] = float(len(candidate_rows))
+        self.training_metrics["database_universe_full_timeframe_coverage_count"] = float(
+            full_timeframe_coverage_count
+        )
+        self.training_metrics["database_universe_selected_symbols"] = list(symbols)
+        self.training_metrics["database_universe_selection_source"] = "liquidity_ranked"
+        return symbols
+
+    def _load_ohlcv_panel_from_postgres(
+        self,
+        session: Any,
+        *,
+        symbols: list[str],
+        timeframe: str,
+        start_date: pd.Timestamp | None,
+        end_date: pd.Timestamp | None,
+    ) -> pd.DataFrame:
+        """Bulk-load one timeframe panel from PostgreSQL for the selected universe."""
+        from sqlalchemy import bindparam
+
+        if not symbols:
+            return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+
+        query = text(
+            """
+            SELECT
+                symbol,
+                timestamp,
+                CAST(open AS DOUBLE PRECISION) AS open,
+                CAST(high AS DOUBLE PRECISION) AS high,
+                CAST(low AS DOUBLE PRECISION) AS low,
+                CAST(close AS DOUBLE PRECISION) AS close,
+                CAST(volume AS BIGINT) AS volume
+            FROM ohlcv_bars
+            WHERE symbol IN :symbols
+              AND timeframe = :timeframe
+              AND (:start_date IS NULL OR timestamp >= :start_date)
+              AND (:end_date IS NULL OR timestamp <= :end_date)
+            ORDER BY symbol, timestamp
+            """
+        ).bindparams(bindparam("symbols", expanding=True))
+
+        result = session.execute(
+            query,
+            {
+                "symbols": [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()],
+                "timeframe": normalize_timeframe(timeframe),
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        )
+        rows = result.fetchall()
+        if not rows:
+            return pd.DataFrame(columns=result.keys())
+
+        frame = pd.DataFrame(rows, columns=result.keys())
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        return frame.dropna(subset=["timestamp"]).reset_index(drop=True)
+
     def _load_data_from_postgres(self) -> None:
         """Load OHLCV data from PostgreSQL/TimescaleDB."""
         from sqlalchemy import text
@@ -1908,94 +2189,72 @@ class ModelTrainer:
         with db_manager.session() as session:
             session.execute(text("SET LOCAL max_parallel_workers_per_gather = 0"))
             session.execute(text("SET LOCAL statement_timeout = '120000ms'"))
-            if not symbols:
-                cache_key = f"train:ohlcv_symbols:{timeframe}"
-                cached_symbols: list[str] = []
-                if redis_mgr is not None:
-                    cached_raw = redis_mgr.get(cache_key)
-                    if cached_raw:
-                        try:
-                            cached_symbols = json.loads(cached_raw)
-                        except json.JSONDecodeError:
-                            cached_symbols = []
-
-                if cached_symbols:
-                    symbols = cached_symbols
-                else:
-                    result = session.execute(
-                        text("""
-                            SELECT DISTINCT symbol
-                            FROM ohlcv_bars
-                            WHERE timeframe = :timeframe
-                            ORDER BY symbol
-                            """),
-                        {"timeframe": timeframe},
-                    )
-                    symbols = [row[0] for row in result.fetchall()]
-                    if redis_mgr is not None and symbols:
-                        redis_mgr.set(cache_key, json.dumps(symbols), expire_seconds=300)
-
-            if not symbols:
-                raise ValueError("No symbols found in ohlcv_bars")
-
-            self.logger.info(f"Loading {len(symbols)} symbols from PostgreSQL ({timeframe})")
-
-            query = text("""
-                SELECT
-                    symbol,
-                    timestamp,
-                    CAST(open AS DOUBLE PRECISION) AS open,
-                    CAST(high AS DOUBLE PRECISION) AS high,
-                    CAST(low AS DOUBLE PRECISION) AS low,
-                    CAST(close AS DOUBLE PRECISION) AS close,
-                    CAST(volume AS BIGINT) AS volume
-                FROM ohlcv_bars
-                WHERE symbol = :symbol
-                  AND timeframe = :timeframe
-                  AND (:start_date IS NULL OR timestamp >= :start_date)
-                  AND (:end_date IS NULL OR timestamp <= :end_date)
-                ORDER BY timestamp
-                """)
-
-            dfs: list[pd.DataFrame] = []
             start_date = (
                 pd.to_datetime(self.config.start_date, utc=True) if self.config.start_date else None
             )
             end_date = (
                 pd.to_datetime(self.config.end_date, utc=True) if self.config.end_date else None
             )
+            requested_timeframes = list(self.config.timeframes) or [timeframe]
+            if not symbols:
+                symbols = self._select_candidate_symbols_from_postgres(
+                    session,
+                    redis_mgr,
+                    timeframe=timeframe,
+                    requested_timeframes=requested_timeframes,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
 
-            for symbol in symbols:
+            if not symbols:
+                raise ValueError("No symbols found in ohlcv_bars")
+
+            self.logger.info(
+                "Loading %d symbols from PostgreSQL (%s)",
+                len(symbols),
+                ", ".join(requested_timeframes),
+            )
+
+            timeframe_panels: dict[str, pd.DataFrame] = {}
+            for requested_timeframe in requested_timeframes:
                 try:
-                    result = session.execute(
-                        query,
-                        {
-                            "symbol": symbol,
-                            "timeframe": timeframe,
-                            "start_date": start_date,
-                            "end_date": end_date,
-                        },
+                    panel = self._load_ohlcv_panel_from_postgres(
+                        session,
+                        symbols=symbols,
+                        timeframe=requested_timeframe,
+                        start_date=start_date,
+                        end_date=end_date,
                     )
-                    rows = result.fetchall()
-                    if not rows:
-                        self.logger.warning(f"No PostgreSQL rows for {symbol}")
-                        continue
-
-                    df = pd.DataFrame(rows, columns=result.keys())
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-                    df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
-                    dfs.append(df)
                 except Exception as e:
-                    self.logger.warning(f"Failed to load {symbol} from PostgreSQL: {e}")
+                    self.logger.warning(
+                        "Failed to load timeframe %s from PostgreSQL: %s",
+                        requested_timeframe,
+                        e,
+                    )
+                    continue
+                if panel.empty:
+                    self.logger.warning(
+                        "No PostgreSQL rows for requested timeframe %s", requested_timeframe
+                    )
+                    continue
+                timeframe_panels[normalize_timeframe(requested_timeframe)] = panel
 
-            if not dfs:
-                raise ValueError("No training data loaded from PostgreSQL")
+            if timeframe not in timeframe_panels:
+                raise ValueError("No training data loaded from PostgreSQL for base timeframe")
 
-            self.data = pd.concat(dfs, ignore_index=True)
+            self.ohlcv_panels_by_timeframe = timeframe_panels
+            self.data = timeframe_panels[timeframe].copy()
             self.logger.info(
                 f"Loaded {len(self.data)} rows from PostgreSQL for "
                 f"{self.data['symbol'].nunique()} symbols ({timeframe})"
             )
+            if len(timeframe_panels) > 1:
+                self.training_metrics["database_timeframes_loaded"] = sorted(
+                    list(timeframe_panels.keys())
+                )
+                self.training_metrics["database_timeframe_row_counts"] = {
+                    tf_name: float(len(panel)) for tf_name, panel in timeframe_panels.items()
+                }
 
     def _load_data_fallback(self) -> None:
         """CSV fallback is forbidden in institutional mode."""
@@ -2967,7 +3226,27 @@ class ModelTrainer:
             base_timeframe=self.config.timeframe,
             timeframes=self.config.timeframes,
         )
-        ohlcv_frames = engine.build_ohlcv_frames(df)
+        ohlcv_frames: dict[str, pd.DataFrame] = {}
+        db_native_panels = getattr(self, "ohlcv_panels_by_timeframe", {}) or {}
+        for timeframe_name in engine.normalized_timeframes():
+            panel = db_native_panels.get(timeframe_name)
+            if panel is None or panel.empty:
+                continue
+            symbol_frame = (
+                panel[panel["symbol"] == symbol]
+                .copy()
+                .sort_values("timestamp")
+                .reset_index(drop=True)
+            )
+            if not symbol_frame.empty:
+                ohlcv_frames[timeframe_name] = symbol_frame
+
+        if len(ohlcv_frames) < len(engine.normalized_timeframes()):
+            fallback_frames = engine.build_ohlcv_frames(df)
+            for timeframe_name, timeframe_frame in fallback_frames.items():
+                if timeframe_name not in ohlcv_frames and timeframe_frame is not None:
+                    ohlcv_frames[timeframe_name] = timeframe_frame
+
         feature_frames: dict[str, pd.DataFrame] = {}
         base_timeframe = normalize_timeframe(self.config.timeframe)
 
@@ -3050,6 +3329,7 @@ class ModelTrainer:
         if self.holdout_features is not None and not self.holdout_features.empty:
             self.holdout_features = self.holdout_features[selected_features].copy()
         self.feature_names = selected_features
+        self._apply_model_priors()
 
         keep_selected = set(selected_features)
         for attr in ("development_frame", "holdout_frame"):
@@ -3417,7 +3697,17 @@ class ModelTrainer:
         if not feature_cols:
             return
 
-        export_df = self.features[["symbol", "timestamp", *feature_cols]].copy()
+        export_source = self.features
+        if self.development_frame is not None and not self.development_frame.empty:
+            export_source = self.development_frame
+        required_export_cols = ["symbol", "timestamp", *feature_cols]
+        missing_export_cols = [col for col in required_export_cols if col not in export_source.columns]
+        if missing_export_cols:
+            raise KeyError(
+                f"Persisted feature source is missing required columns: {missing_export_cols}"
+            )
+
+        export_df = export_source[required_export_cols].copy()
         export_df["timestamp"] = pd.to_datetime(export_df["timestamp"], utc=True, errors="coerce")
         export_df = export_df.dropna(subset=["timestamp"])
         if export_df.empty:
@@ -8281,39 +8571,70 @@ class ModelTrainer:
             train_returns=self.primary_forward_returns,
             train_regimes=self.regimes,
         )
+        holdout_raw_rows = int(len(y_holdout))
+        holdout_eval_len = min(len(y_holdout), len(y_holdout_pred), len(y_holdout_proba))
+        if holdout_eval_len <= 1:
+            self.logger.warning("Insufficient aligned holdout predictions, skipping holdout metrics")
+            return
+
+        def _align_holdout_array(
+            values: np.ndarray | pd.Series | None,
+            *,
+            dtype: Any | None = None,
+        ) -> np.ndarray | None:
+            if values is None:
+                return None
+            arr = np.asarray(values, dtype=dtype).reshape(-1)
+            if arr.size < holdout_eval_len:
+                return None
+            return arr[-holdout_eval_len:]
+
+        if holdout_eval_len != holdout_raw_rows:
+            y_holdout = y_holdout[-holdout_eval_len:]
+            y_holdout_pred = y_holdout_pred[-holdout_eval_len:]
+            y_holdout_proba = y_holdout_proba[-holdout_eval_len:]
+            self.logger.info("Aligned holdout sequence outputs to %d samples", holdout_eval_len)
+
+        holdout_timestamps = _align_holdout_array(self.holdout_timestamps, dtype="datetime64[ns]")
+        holdout_symbols_arr = _align_holdout_array(self.holdout_symbols, dtype=object)
+        holdout_regimes = _align_holdout_array(self.holdout_regimes, dtype=str)
+        holdout_primary_forward_returns = _align_holdout_array(
+            self.holdout_primary_forward_returns,
+            dtype=float,
+        )
+        holdout_cost_aware_event_returns = _align_holdout_array(
+            self.holdout_cost_aware_event_returns,
+            dtype=float,
+        )
+        holdout_primary_event_directions = _align_holdout_array(
+            self.holdout_primary_event_directions,
+            dtype=float,
+        )
+
         holdout_metrics = self._calculate_fold_metrics(
             y_true=y_holdout,
             y_pred=y_holdout_pred,
             y_proba=y_holdout_proba,
             long_threshold=long_threshold,
             short_threshold=short_threshold,
-            realized_forward_returns=self.holdout_primary_forward_returns,
-            event_net_returns=self.holdout_cost_aware_event_returns,
-            event_directions=self.holdout_primary_event_directions,
-            timestamps=self.holdout_timestamps,
-            symbols=(
-                np.asarray(self.holdout_symbols, dtype=object)
-                if self.holdout_symbols is not None and len(self.holdout_symbols) == len(y_holdout)
-                else None
-            ),
-        )
-        holdout_symbols_arr = (
-            np.asarray(self.holdout_symbols, dtype=object).reshape(-1)
-            if self.holdout_symbols is not None and len(self.holdout_symbols) == len(y_holdout)
-            else None
+            realized_forward_returns=holdout_primary_forward_returns,
+            event_net_returns=holdout_cost_aware_event_returns,
+            event_directions=holdout_primary_event_directions,
+            timestamps=holdout_timestamps,
+            symbols=holdout_symbols_arr,
         )
 
         holdout_regime_shift = self._regime_shift_score(
             self._regime_distribution(self.regimes),
-            self._regime_distribution(self.holdout_regimes),
+            self._regime_distribution(holdout_regimes),
         )
         holdout_metrics["regime_shift"] = float(holdout_regime_shift)
 
         holdout_regime_metrics: dict[str, dict[str, float]] = {}
         holdout_worst_regime_sharpe = float(holdout_metrics.get("sharpe", 0.0))
         holdout_regime_sample_floor = max(30, int(round(0.05 * len(y_holdout))))
-        if self.holdout_regimes is not None and len(self.holdout_regimes) == len(y_holdout):
-            regime_arr = np.asarray(self.holdout_regimes, dtype=str).reshape(-1)
+        if holdout_regimes is not None and len(holdout_regimes) == len(y_holdout):
+            regime_arr = np.asarray(holdout_regimes, dtype=str).reshape(-1)
             unique_regimes = sorted({str(r).strip() for r in regime_arr if str(r).strip()})
             for regime_name in unique_regimes:
                 regime_mask = regime_arr == regime_name
@@ -8327,27 +8648,26 @@ class ModelTrainer:
                     long_threshold=long_threshold,
                     short_threshold=short_threshold,
                     realized_forward_returns=(
-                        np.asarray(self.holdout_primary_forward_returns, dtype=float)[regime_mask]
-                        if self.holdout_primary_forward_returns is not None
-                        and len(self.holdout_primary_forward_returns) == len(y_holdout)
+                        np.asarray(holdout_primary_forward_returns, dtype=float)[regime_mask]
+                        if holdout_primary_forward_returns is not None
+                        and len(holdout_primary_forward_returns) == len(y_holdout)
                         else None
                     ),
                     event_net_returns=(
-                        np.asarray(self.holdout_cost_aware_event_returns, dtype=float)[regime_mask]
-                        if self.holdout_cost_aware_event_returns is not None
-                        and len(self.holdout_cost_aware_event_returns) == len(y_holdout)
+                        np.asarray(holdout_cost_aware_event_returns, dtype=float)[regime_mask]
+                        if holdout_cost_aware_event_returns is not None
+                        and len(holdout_cost_aware_event_returns) == len(y_holdout)
                         else None
                     ),
                     event_directions=(
-                        np.asarray(self.holdout_primary_event_directions, dtype=float)[regime_mask]
-                        if self.holdout_primary_event_directions is not None
-                        and len(self.holdout_primary_event_directions) == len(y_holdout)
+                        np.asarray(holdout_primary_event_directions, dtype=float)[regime_mask]
+                        if holdout_primary_event_directions is not None
+                        and len(holdout_primary_event_directions) == len(y_holdout)
                         else None
                     ),
                     timestamps=(
-                        np.asarray(self.holdout_timestamps, dtype="datetime64[ns]")[regime_mask]
-                        if self.holdout_timestamps is not None
-                        and len(self.holdout_timestamps) == len(y_holdout)
+                        np.asarray(holdout_timestamps, dtype="datetime64[ns]")[regime_mask]
+                        if holdout_timestamps is not None and len(holdout_timestamps) == len(y_holdout)
                         else None
                     ),
                     symbols=(
@@ -8396,27 +8716,26 @@ class ModelTrainer:
                     long_threshold=long_threshold,
                     short_threshold=short_threshold,
                     realized_forward_returns=(
-                        np.asarray(self.holdout_primary_forward_returns, dtype=float)[symbol_mask]
-                        if self.holdout_primary_forward_returns is not None
-                        and len(self.holdout_primary_forward_returns) == len(y_holdout)
+                        np.asarray(holdout_primary_forward_returns, dtype=float)[symbol_mask]
+                        if holdout_primary_forward_returns is not None
+                        and len(holdout_primary_forward_returns) == len(y_holdout)
                         else None
                     ),
                     event_net_returns=(
-                        np.asarray(self.holdout_cost_aware_event_returns, dtype=float)[symbol_mask]
-                        if self.holdout_cost_aware_event_returns is not None
-                        and len(self.holdout_cost_aware_event_returns) == len(y_holdout)
+                        np.asarray(holdout_cost_aware_event_returns, dtype=float)[symbol_mask]
+                        if holdout_cost_aware_event_returns is not None
+                        and len(holdout_cost_aware_event_returns) == len(y_holdout)
                         else None
                     ),
                     event_directions=(
-                        np.asarray(self.holdout_primary_event_directions, dtype=float)[symbol_mask]
-                        if self.holdout_primary_event_directions is not None
-                        and len(self.holdout_primary_event_directions) == len(y_holdout)
+                        np.asarray(holdout_primary_event_directions, dtype=float)[symbol_mask]
+                        if holdout_primary_event_directions is not None
+                        and len(holdout_primary_event_directions) == len(y_holdout)
                         else None
                     ),
                     timestamps=(
-                        np.asarray(self.holdout_timestamps, dtype="datetime64[ns]")[symbol_mask]
-                        if self.holdout_timestamps is not None
-                        and len(self.holdout_timestamps) == len(y_holdout)
+                        np.asarray(holdout_timestamps, dtype="datetime64[ns]")[symbol_mask]
+                        if holdout_timestamps is not None and len(holdout_timestamps) == len(y_holdout)
                         else None
                     ),
                     symbols=holdout_symbols_arr[symbol_mask],
@@ -8470,7 +8789,9 @@ class ModelTrainer:
             if isinstance(value, (int, float, np.floating, np.integer)):
                 self.training_metrics[f"holdout_{key}"] = float(value)
 
-        self.training_metrics["holdout_rows"] = float(len(self.holdout_labels))
+        self.training_metrics["holdout_rows_raw"] = float(holdout_raw_rows)
+        self.training_metrics["holdout_rows_aligned"] = float(len(y_holdout))
+        self.training_metrics["holdout_rows"] = float(len(y_holdout))
         self.training_metrics["holdout_long_threshold"] = float(long_threshold)
         self.training_metrics["holdout_short_threshold"] = float(short_threshold)
 
@@ -9671,6 +9992,14 @@ class ModelTrainer:
         """Persist promotion gate package with nested CV and objective breakdown evidence."""
         package_dir = output_dir / "promotion_packages"
         package_dir.mkdir(parents=True, exist_ok=True)
+        artifacts_path = output_dir / f"{self.config.model_name}_artifacts.json"
+        meta_model_path = (
+            output_dir / f"{self.config.model_name}_meta.pkl" if self.meta_model is not None else None
+        )
+        selected_features = list(
+            self.training_metrics.get("feature_selection_selected_features", self.feature_names or [])
+        )
+        cost_model = self.config.to_trading_cost_model()
 
         payload = {
             "schema_version": PROMOTION_PACKAGE_SCHEMA_VERSION,
@@ -9678,7 +10007,47 @@ class ModelTrainer:
             "model_name": self.config.model_name,
             "model_type": self.config.model_type,
             "model_path": str(model_path),
+            "meta_model_path": str(meta_model_path) if meta_model_path is not None else None,
+            "artifacts_path": str(artifacts_path),
             "training_config": self.config.__dict__,
+            "feature_schema_version": (
+                str(self.snapshot_manifest.get("feature_schema_version"))
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "feature_contract": {
+                "feature_schema_version": (
+                    str(self.snapshot_manifest.get("feature_schema_version"))
+                    if isinstance(self.snapshot_manifest, dict)
+                    else None
+                ),
+                "feature_names": list(self.feature_names or []),
+                "selected_features": selected_features,
+                "feature_groups": sorted(str(group) for group in self.config.feature_groups),
+                "enable_cross_sectional": bool(self.config.enable_cross_sectional),
+                "enable_reference_features": bool(self.config.enable_reference_features),
+                "enable_tick_microstructure_features": bool(
+                    self.config.enable_tick_microstructure_features
+                ),
+                "timeframe": str(self.config.timeframe),
+                "timeframes": list(self.config.timeframes),
+            },
+            "signal_policy": {
+                "long_threshold": self.training_metrics.get("holdout_long_threshold"),
+                "short_threshold": self.training_metrics.get("holdout_short_threshold"),
+                "horizon_bars": int(self.config.primary_label_horizon),
+                "meta_label_enabled": bool(self.meta_model is not None),
+                "meta_label_threshold": self.training_metrics.get("meta_label_min_confidence"),
+                "meta_label_dynamic_threshold": bool(
+                    self.training_metrics.get("meta_label_dynamic_threshold", 0.0)
+                ),
+                "model_source": f"promotion_package:{self.config.model_name}",
+            },
+            "execution_cost_model": {
+                "spread_bps": float(cost_model.spread_bps),
+                "slippage_bps": float(cost_model.slippage_bps),
+                "impact_bps": float(cost_model.impact_bps),
+            },
             "promotion_passed": bool(self.validation_results.get("all_passed", False)),
             "snapshot_id": (
                 self.snapshot_manifest.get("snapshot_id")
@@ -10988,6 +11357,18 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_symbol_quality_filter", False)),
                     )
                 ),
+                target_universe_size=int(
+                    _cfg_value(
+                        "target_universe_size",
+                        getattr(args, "target_universe_size", 0),
+                    )
+                ),
+                universe_selection_buffer_size=int(
+                    _cfg_value(
+                        "universe_selection_buffer_size",
+                        getattr(args, "universe_selection_buffer_size", 24),
+                    )
+                ),
                 symbol_quality_min_rows=int(
                     _cfg_value(
                         "symbol_quality_min_rows",
@@ -11769,6 +12150,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable symbol-level quality universe filtering before feature generation.",
     )
+    parser.add_argument(
+        "--target-universe-size",
+        type=int,
+        default=0,
+        help=(
+            "Optional database-first universe cap when symbols are not provided. "
+            "Selects the most liquid/high-coverage symbols before loading full panels."
+        ),
+    )
+    parser.add_argument(
+        "--universe-selection-buffer-size",
+        type=int,
+        default=24,
+        help="Extra candidate symbols to keep before post-load quality filtering (default: 24).",
+    )
     parser.add_argument("--symbol-quality-min-rows", type=int, default=1200)
     parser.add_argument("--symbol-quality-min-symbols", type=int, default=8)
     parser.add_argument("--symbol-quality-max-missing-ratio", type=float, default=0.12)
@@ -11883,7 +12279,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Console entrypoint for quant-train."""
     parser = build_parser()
-    args = parser.parse_args(argv)
+    normalized_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(normalized_argv)
+    _attach_explicit_profile_overrides(parser, args, normalized_argv)
     return run_training(args)
 
 
