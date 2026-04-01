@@ -122,7 +122,7 @@ class TestParseArgs:
             "main.py",
             "train",
             "--model",
-            "lightgbm_ranker",
+            "primary_challenger",
             "--training-profile",
             "research",
             "--name",
@@ -141,7 +141,7 @@ class TestParseArgs:
         ]):
             args = parse_args()
             assert args.command == "train"
-            assert args.model == "lightgbm_ranker"
+            assert args.model == "primary_challenger"
             assert args.training_profile == "research"
             assert args.name == "elastic_v1"
             assert args.timeframe == "1D"
@@ -163,6 +163,7 @@ class TestParseArgs:
                 "--dataset-snapshot-bundle",
                 "models/snapshots/snap_123/dataset_bundle.manifest.json",
                 "--strict-snapshot-replay",
+                "--disable-auto-snapshot-reuse",
                 "--nested-outer-splits",
                 "5",
                 "--nested-inner-splits",
@@ -176,6 +177,7 @@ class TestParseArgs:
             assert str(args.replay_manifest).endswith("example.replay_manifest.json")
             assert str(args.dataset_snapshot_bundle).endswith("dataset_bundle.manifest.json")
             assert args.strict_snapshot_replay is True
+            assert args.disable_auto_snapshot_reuse is True
             assert args.nested_outer_splits == 5
             assert args.nested_inner_splits == 3
             assert args.seed == 7

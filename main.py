@@ -812,6 +812,7 @@ For more information, visit: https://github.com/alphatrade/docs
             "transformer",
             "tcn",
             "ensemble",
+            "primary_challenger",
             "all",
         ],
         default="lightgbm",
@@ -992,6 +993,11 @@ For more information, visit: https://github.com/alphatrade/docs
         "--strict-snapshot-replay",
         action="store_true",
         help="Fail instead of falling back when a requested dataset snapshot bundle is missing",
+    )
+    train_parser.add_argument(
+        "--disable-auto-snapshot-reuse",
+        action="store_true",
+        help="Force live dataset rebuild even when a matching local dataset snapshot bundle exists",
     )
     train_parser.add_argument(
         "--gpu",

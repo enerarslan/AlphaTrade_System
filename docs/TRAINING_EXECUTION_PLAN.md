@@ -15,12 +15,14 @@ Completed on 2026-04-01:
 - [x] Added runtime guidance for Windows and WSL-mounted filesystem training so the operator sees when WSL/Linux storage is the preferred path.
 - [x] Added `training_profile` to training lineage summaries for auditability.
 - [x] Switched the default train model selection to `lightgbm`.
+- [x] Added automatic local snapshot-bundle reuse for matching training scopes, with an explicit CLI escape hatch.
+- [x] Added `primary_challenger` orchestration so one command can run `lightgbm` primary plus `tcn` challenger.
+- [x] Stored snapshot training scope metadata in dataset bundle manifests so automatic reuse is deterministic and auditable.
 
 Still open:
 
+- [ ] Finish Ubuntu first-run initialization so non-interactive `wsl.exe -d Ubuntu-24.04 -- ...` commands return normally.
 - [ ] Move the active training workspace into WSL under `~/AlphaTrade` and validate PostgreSQL, Redis, and GPU reachability there.
-- [ ] Make snapshot-first training the default repeated-experiment path rather than an opt-in operator path.
-- [ ] Add a more opinionated `lightgbm` primary / `tcn` challenger orchestration flow on top of the new profiles.
 - [ ] Run the first benchmark matrix on one fixed snapshot and compare runtime and quality.
 
 ## 1. Objective
@@ -191,7 +193,8 @@ Acceptance criteria:
 
 Status:
 
-- Partial. Runtime warnings now point operators away from Windows and `/mnt/...` paths, but the actual WSL migration and infrastructure validation still need to be executed.
+- Partial. Ubuntu 24.04 is installed in WSL and visible in `wsl -l -v`.
+- Blocked. Non-interactive command execution in `Ubuntu-24.04` is still timing out, so repo migration and infrastructure validation inside Linux are not complete yet.
 
 ### Phase 2: Training Profiles
 
@@ -227,7 +230,8 @@ Acceptance criteria:
 
 Status:
 
-- Partial. Snapshot bundle flags are now exposed from `main.py train`, but snapshot-first still is not the default repeated-run behavior.
+- Implemented. Matching local dataset snapshot bundles are now auto-reused by default for repeated runs.
+- Implemented. Operators can force a live rebuild with `--disable-auto-snapshot-reuse`.
 
 ### Phase 4: LightGBM Primary Path
 
@@ -243,7 +247,8 @@ Acceptance criteria:
 
 Status:
 
-- Partial. `lightgbm` is now the default training model, but the dedicated optimized `lightgbm` promotion workflow is still to be implemented and benchmarked.
+- Partial. `lightgbm` is the default training model and now participates in the explicit `primary_challenger` orchestration flow.
+- Open. Actual runtime/quality benchmarking on a fixed snapshot still needs to be run.
 
 ### Phase 5: TCN Challenger Path
 
@@ -258,7 +263,8 @@ Acceptance criteria:
 
 Status:
 
-- Not started in orchestration. The plan still stands, but no `tcn`-specific workflow change has been coded yet.
+- Implemented in orchestration. `tcn` now runs as the explicit challenger when `--model primary_challenger` is used.
+- Open. Runtime and quality comparison versus `lightgbm` still needs to be measured on a fixed snapshot.
 
 ### Phase 6: Benchmark and Gating
 
@@ -289,7 +295,8 @@ Acceptance rule:
 
 Status:
 
-- Not started. Benchmark matrix and A/B measurement work still needs to be run on a fixed snapshot.
+- Partial. The code path is ready: `primary_challenger` plus snapshot reuse now drives the existing benchmark matrix and champion/challenger report generation.
+- Open. The first real benchmark run on one fixed snapshot still needs to be executed.
 
 ## 6. Expected Performance Impact
 
@@ -341,8 +348,8 @@ Research:
 ```bash
 python main.py train \
   --training-profile research \
-  --model lightgbm \
-  --feature-set-id lgbm_research
+  --model primary_challenger \
+  --feature-set-id lgbm_tcn_research
 ```
 
 Promotion:
@@ -361,8 +368,8 @@ python main.py train \
 ## 9. Immediate Next Steps
 
 1. Move the active training workflow to WSL Ubuntu.
-2. Make snapshot-first training the default for repeated runs.
-3. Standardize on `lightgbm` primary and `tcn` challenger in orchestration, not only in defaults.
+2. Resolve the current Ubuntu first-run/command-execution timeout so WSL commands can run non-interactively.
+3. Copy the active repo to `~/AlphaTrade` and point training artifacts to the Linux filesystem.
 4. Run the first benchmark matrix on one fixed snapshot and compare quality and runtime.
 5. Decide the final promotion budget after the first `research` versus `promotion` quality comparison.
 

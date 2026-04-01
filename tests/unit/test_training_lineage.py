@@ -279,6 +279,7 @@ def test_persist_and_load_dataset_snapshot_bundle_round_trip(tmp_path) -> None:
         development_frame=development_frame,
         holdout_frame=holdout_frame,
         feature_names=["f_beta", "f_alpha"],
+        training_scope={"timeframe": "15Min", "feature_set_id": "default"},
         data_quality_report=quality_report,
         development_sample_weights=np.array([1.0, 0.8]),
         holdout_sample_weights=np.array([0.9]),
@@ -295,6 +296,10 @@ def test_persist_and_load_dataset_snapshot_bundle_round_trip(tmp_path) -> None:
     pd.testing.assert_frame_equal(loaded["development_frame"], development_frame)
     pd.testing.assert_frame_equal(loaded["holdout_frame"], holdout_frame)
     assert loaded["feature_names"] == ["f_alpha", "f_beta"]
+    assert loaded["bundle_manifest"]["training_scope"] == {
+        "timeframe": "15Min",
+        "feature_set_id": "default",
+    }
     assert loaded["development_sample_weights"].tolist() == [1.0, 0.8]
     assert loaded["holdout_sample_weights"].tolist() == [0.9]
     assert loaded["cv_splits"][0][0].tolist() == [0]

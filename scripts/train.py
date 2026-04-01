@@ -121,6 +121,7 @@ SUPPORTED_MODELS = [
 ]
 
 DEFAULT_PRIMARY_MODEL = "lightgbm"
+PRIMARY_CHALLENGER_MODEL_ALIAS = "primary_challenger"
 SUPPORTED_TRAINING_PROFILES = ("promotion", "research")
 PROFILE_TUNABLE_ARG_DEFAULTS: dict[str, Any] = {
     "n_splits": 5,
@@ -147,6 +148,7 @@ TRAINING_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "require_objective_breakdown_for_promotion": False,
     },
 }
+SNAPSHOT_TRAINING_SCOPE_SCHEMA_VERSION = "1.0.0"
 
 
 def _normalize_training_profile(value: Any) -> str:
@@ -217,6 +219,129 @@ def _log_training_environment_guidance(profile: str) -> None:
             "Linux-native path to avoid Windows mount filesystem overhead.",
             cwd,
         )
+
+
+def _build_snapshot_feature_selection_signature(config: "TrainingConfig") -> dict[str, Any]:
+    """Serialize feature-selection settings that affect snapshot contents."""
+    label_horizons = sorted(
+        {
+            int(h)
+            for h in config.label_horizons
+            if isinstance(h, (int, np.integer, float, np.floating)) and int(h) > 0
+        }
+    )
+    return {
+        "enabled": bool(config.enable_feature_selection),
+        "min_information_coefficient": float(config.feature_selection_min_ic),
+        "max_correlation": float(config.feature_selection_max_corr),
+        "max_features": int(config.feature_selection_max_features),
+        "stability_iterations": int(config.feature_selection_stability_iterations),
+        "min_stability_support": float(config.feature_selection_min_stability_support),
+        "primary_label_horizon": int(config.primary_label_horizon),
+        "label_horizons": label_horizons,
+    }
+
+
+def _build_snapshot_training_scope(config: "TrainingConfig") -> dict[str, Any]:
+    """Return deterministic data/feature/label scope for snapshot auto-reuse."""
+    symbols = sorted({str(symbol).strip().upper() for symbol in config.symbols if str(symbol).strip()})
+    feature_groups = sorted(
+        {str(group).strip().lower() for group in config.feature_groups if str(group).strip()}
+    )
+    timeframes = sorted(
+        {str(timeframe).strip() for timeframe in config.timeframes if str(timeframe).strip()}
+    )
+    label_horizons = sorted(
+        {
+            int(h)
+            for h in config.label_horizons
+            if isinstance(h, (int, np.integer, float, np.floating)) and int(h) > 0
+        }
+    )
+    return {
+        "schema_version": SNAPSHOT_TRAINING_SCOPE_SCHEMA_VERSION,
+        "symbols": symbols,
+        "start_date": str(config.start_date or ""),
+        "end_date": str(config.end_date or ""),
+        "timeframe": str(config.timeframe),
+        "timeframes": timeframes,
+        "feature_groups": feature_groups,
+        "training_bar_mode": str(config.training_bar_mode),
+        "intrinsic_bar_type": str(config.intrinsic_bar_type),
+        "intrinsic_bar_threshold": float(config.intrinsic_bar_threshold),
+        "intrinsic_target_bars_per_day": int(config.intrinsic_target_bars_per_day),
+        "enable_reference_features": bool(config.enable_reference_features),
+        "enable_tick_microstructure_features": bool(config.enable_tick_microstructure_features),
+        "enable_cross_sectional": bool(config.enable_cross_sectional),
+        "enable_symbol_quality_filter": bool(config.enable_symbol_quality_filter),
+        "symbol_quality_min_rows": int(config.symbol_quality_min_rows),
+        "symbol_quality_min_symbols": int(config.symbol_quality_min_symbols),
+        "symbol_quality_max_missing_ratio": float(config.symbol_quality_max_missing_ratio),
+        "symbol_quality_max_extreme_move_ratio": float(config.symbol_quality_max_extreme_move_ratio),
+        "symbol_quality_max_corporate_action_ratio": float(
+            config.symbol_quality_max_corporate_action_ratio
+        ),
+        "symbol_quality_min_median_dollar_volume": float(
+            config.symbol_quality_min_median_dollar_volume
+        ),
+        "max_cross_sectional_symbols": int(config.max_cross_sectional_symbols),
+        "max_cross_sectional_rows": int(config.max_cross_sectional_rows),
+        "allow_feature_group_fallback": bool(config.allow_feature_group_fallback),
+        "windows_force_fallback_features": bool(config.windows_force_fallback_features),
+        "feature_set_id": str(config.feature_set_id),
+        "adjust_prices_for_corporate_actions": bool(config.adjust_prices_for_corporate_actions),
+        "data_max_abs_return": float(config.data_max_abs_return),
+        "label_horizons": label_horizons,
+        "primary_label_horizon": int(config.primary_label_horizon),
+        "label_profit_taking_threshold": float(config.label_profit_taking_threshold),
+        "label_stop_loss_threshold": float(config.label_stop_loss_threshold),
+        "label_max_holding_period": int(config.label_max_holding_period),
+        "label_spread_bps": float(config.label_spread_bps),
+        "label_slippage_bps": float(config.label_slippage_bps),
+        "label_impact_bps": float(config.label_impact_bps),
+        "label_min_signal_abs_return_bps": float(config.label_min_signal_abs_return_bps),
+        "label_neutral_buffer_bps": float(config.label_neutral_buffer_bps),
+        "label_max_abs_forward_return": float(config.label_max_abs_forward_return),
+        "label_signal_volatility_floor_mult": float(config.label_signal_volatility_floor_mult),
+        "label_volatility_lookback": int(config.label_volatility_lookback),
+        "label_regime_lookback": int(config.label_regime_lookback),
+        "label_temporal_weight_decay": float(config.label_temporal_weight_decay),
+        "label_edge_cost_buffer_bps": float(config.label_edge_cost_buffer_bps),
+        "label_apply_uniqueness_weighting": bool(config.label_apply_uniqueness_weighting),
+        "label_uniqueness_weight_floor": float(config.label_uniqueness_weight_floor),
+        "label_apply_volatility_inverse_weighting": bool(
+            config.label_apply_volatility_inverse_weighting
+        ),
+        "label_volatility_weight_cap": float(config.label_volatility_weight_cap),
+        "feature_selection_signature": _build_snapshot_feature_selection_signature(config),
+    }
+
+
+def _find_reusable_snapshot_bundle(config: "TrainingConfig") -> Path | None:
+    """Discover the newest dataset snapshot bundle that matches the current training scope."""
+    snapshots_root = Path(config.output_dir) / "snapshots"
+    if not snapshots_root.exists():
+        return None
+
+    expected_scope = _build_snapshot_training_scope(config)
+    candidates: list[tuple[str, Path]] = []
+    for manifest_path in snapshots_root.rglob("dataset_bundle.manifest.json"):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("training_scope") != expected_scope:
+            continue
+        created_at = str(payload.get("created_at") or "")
+        candidates.append((created_at, manifest_path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 LIGHTGBM_FAMILY_MODELS = {"lightgbm", "lightgbm_ranker", "lightgbm_regressor"}
 RANKING_MODELS = {"lightgbm_ranker"}
 REGRESSION_MODELS = {"xgboost_regressor", "lightgbm_regressor"}
@@ -806,6 +931,7 @@ class TrainingConfig:
     save_artifacts: bool = True
     dataset_snapshot_bundle_path: str = ""
     strict_snapshot_replay: bool = False
+    auto_snapshot_reuse_enabled: bool = True
     quality_missing_bars_threshold: float = 0.01
     quality_duplicate_bars_threshold: float = 0.001
     quality_extreme_move_threshold: float = 0.01
@@ -881,6 +1007,7 @@ class TrainingConfig:
         self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
         self.dataset_snapshot_bundle_path = str(self.dataset_snapshot_bundle_path or "").strip()
         self.strict_snapshot_replay = bool(self.strict_snapshot_replay)
+        self.auto_snapshot_reuse_enabled = bool(self.auto_snapshot_reuse_enabled)
         self.data_max_abs_return = max(float(self.data_max_abs_return), 0.05)
         self.min_trades = max(1, int(self.min_trades))
         self.objective_weight_trade_activity = max(
@@ -2602,23 +2729,7 @@ class ModelTrainer:
 
     def _feature_selection_schema_signature(self) -> dict[str, Any]:
         """Serialize feature-selection knobs that change the persisted cache contract."""
-        label_horizons = sorted(
-            {
-                int(h)
-                for h in self.config.label_horizons
-                if isinstance(h, (int, np.integer, float, np.floating)) and int(h) > 0
-            }
-        )
-        return {
-            "enabled": bool(self.config.enable_feature_selection),
-            "min_information_coefficient": float(self.config.feature_selection_min_ic),
-            "max_correlation": float(self.config.feature_selection_max_corr),
-            "max_features": int(self.config.feature_selection_max_features),
-            "stability_iterations": int(self.config.feature_selection_stability_iterations),
-            "min_stability_support": float(self.config.feature_selection_min_stability_support),
-            "primary_label_horizon": int(self.config.primary_label_horizon),
-            "label_horizons": label_horizons,
-        }
+        return _build_snapshot_feature_selection_signature(self.config)
 
     def _current_ohlcv_fingerprint(self) -> str:
         """Fingerprint current OHLCV panel for safe feature-cache reuse."""
@@ -9710,6 +9821,7 @@ class ModelTrainer:
                     ),
                     holdout_frame=self.holdout_frame,
                     feature_names=self.feature_names,
+                    training_scope=_build_snapshot_training_scope(self.config),
                     data_quality_report=self.data_quality_report,
                     development_sample_weights=self.sample_weights,
                     holdout_sample_weights=self.holdout_sample_weights,
@@ -10287,7 +10399,11 @@ def run_training(args: argparse.Namespace) -> int:
                 "ensemble",
             ]
             if requested_model == "all"
-            else [requested_model]
+            else (
+                ["lightgbm", "tcn"]
+                if requested_model == PRIMARY_CHALLENGER_MODEL_ALIAS
+                else [requested_model]
+            )
         )
         if training_profile == "research" and requested_model == "all":
             logger.warning(
@@ -11093,8 +11209,26 @@ def run_training(args: argparse.Namespace) -> int:
                         or bool(replay_snapshot_bundle_path),
                     )
                 ),
+                auto_snapshot_reuse_enabled=bool(
+                    _cfg_value(
+                        "auto_snapshot_reuse_enabled",
+                        not bool(getattr(args, "disable_auto_snapshot_reuse", False)),
+                    )
+                ),
                 model_params=model_params,
             )
+            if (
+                not config.dataset_snapshot_bundle_path
+                and config.auto_snapshot_reuse_enabled
+                and not replay_config
+            ):
+                reusable_snapshot_bundle = _find_reusable_snapshot_bundle(config)
+                if reusable_snapshot_bundle is not None:
+                    config.dataset_snapshot_bundle_path = str(reusable_snapshot_bundle)
+                    logger.info(
+                        "Auto-reusing dataset snapshot bundle for matching training scope: %s",
+                        reusable_snapshot_bundle,
+                    )
             _verify_institutional_infra(config)
             _log_training_environment_guidance(config.training_profile)
 
@@ -11424,7 +11558,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default=DEFAULT_PRIMARY_MODEL,
-        choices=SUPPORTED_MODELS + ["all"],
+        choices=SUPPORTED_MODELS + ["all", PRIMARY_CHALLENGER_MODEL_ALIAS],
     )
     parser.add_argument("--name", type=str, default="")
     parser.add_argument(
@@ -11497,6 +11631,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-snapshot-replay",
         action="store_true",
         help="Fail instead of falling back when dataset snapshot replay bundle is missing.",
+    )
+    parser.add_argument(
+        "--disable-auto-snapshot-reuse",
+        action="store_true",
+        help="Force live dataset rebuild even when a matching local dataset snapshot bundle exists.",
     )
     parser.add_argument(
         "--min-accuracy",

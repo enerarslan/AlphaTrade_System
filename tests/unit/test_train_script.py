@@ -62,6 +62,7 @@ def _base_args(**overrides):
         "replay_manifest": None,
         "dataset_snapshot_bundle": None,
         "strict_snapshot_replay": False,
+        "disable_auto_snapshot_reuse": False,
         "gpu": False,
         "use_gpu": False,
         "no_database": False,
@@ -943,6 +944,123 @@ def test_run_training_research_profile_preserves_explicit_budget_overrides(monke
     assert exit_code == 0
     assert captured["config"].n_trials == 9
     assert captured["config"].feature_selection_stability_iterations == 5
+
+
+def test_run_training_primary_challenger_alias_dispatches_lightgbm_and_tcn(monkeypatch):
+    trained: list[str] = []
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            self.config = config
+            trained.append(config.model_type)
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    args = _base_args(model="primary_challenger", training_profile="research")
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert trained == ["lightgbm", "tcn"]
+
+
+def test_run_training_auto_reuses_matching_snapshot_bundle(monkeypatch, tmp_path):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(model_type="lightgbm", output_dir=str(tmp_path))
+    )
+    bundle_path = tmp_path / "snapshots" / "snap_123" / "dataset_bundle.manifest.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "created_at": "2026-04-01T10:00:00+00:00",
+                "snapshot_id": "snap_123",
+                "training_scope": scope,
+                "snapshot_manifest": {},
+                "artifacts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = _base_args(
+        model="lightgbm",
+        output_dir=str(tmp_path),
+        n_trials=100,
+        n_splits=5,
+        nested_outer_splits=4,
+        nested_inner_splits=3,
+        feature_selection_stability_iterations=16,
+    )
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].dataset_snapshot_bundle_path == str(bundle_path)
+
+
+def test_run_training_can_disable_auto_snapshot_reuse(monkeypatch, tmp_path):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(model_type="lightgbm", output_dir=str(tmp_path))
+    )
+    bundle_path = tmp_path / "snapshots" / "snap_456" / "dataset_bundle.manifest.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "created_at": "2026-04-01T10:00:00+00:00",
+                "snapshot_id": "snap_456",
+                "training_scope": scope,
+                "snapshot_manifest": {},
+                "artifacts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = _base_args(
+        model="lightgbm",
+        output_dir=str(tmp_path),
+        disable_auto_snapshot_reuse=True,
+        n_trials=100,
+        n_splits=5,
+        nested_outer_splits=4,
+        nested_inner_splits=3,
+        feature_selection_stability_iterations=16,
+    )
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].dataset_snapshot_bundle_path == ""
 
 
 def test_get_cv_splitter_walk_forward_applies_purge_gap():
@@ -2081,11 +2199,14 @@ def test_build_parser_supports_training_profiles_and_snapshot_flags():
     parser = train_script.build_parser()
     args = parser.parse_args(
         [
+            "--model",
+            "primary_challenger",
             "--training-profile",
             "research",
             "--dataset-snapshot-bundle",
             "models/snapshots/snap_123/dataset_bundle.manifest.json",
             "--strict-snapshot-replay",
+            "--disable-auto-snapshot-reuse",
             "--disable-meta-labeling",
             "--disable-feature-selection",
             "--feature-selection-stability-iterations",
@@ -2094,9 +2215,11 @@ def test_build_parser_supports_training_profiles_and_snapshot_flags():
             "models/lightgbm_prev.pkl",
         ]
     )
+    assert args.model == "primary_challenger"
     assert args.training_profile == "research"
     assert str(args.dataset_snapshot_bundle).endswith("dataset_bundle.manifest.json")
     assert args.strict_snapshot_replay is True
+    assert args.disable_auto_snapshot_reuse is True
     assert args.disable_meta_labeling is True
     assert args.disable_feature_selection is True
     assert args.feature_selection_stability_iterations == 6
