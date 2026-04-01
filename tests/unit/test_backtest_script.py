@@ -62,11 +62,32 @@ class DummyExpectedEdgeModel:
         raw_predictions=None,
         signal_values=None,
         confidence=None,
+        regimes=None,
+        regime_policy=None,
     ):
         del feature_frame, long_threshold, short_threshold, raw_predictions, confidence
         probabilities = np.asarray(probabilities, dtype=float).reshape(-1)
         signal_values = np.asarray(signal_values, dtype=float).reshape(-1)
+        runtime_regimes = (
+            np.asarray(regimes, dtype=object).reshape(-1)
+            if regimes is not None
+            else np.full(len(probabilities), "normal_range", dtype=object)
+        )
         passed = (probabilities >= 0.64) & (np.abs(signal_values) > 0.0)
+        signal_scale = np.where(runtime_regimes == "high_vol", 0.30, 1.00)
+        confidence_scale = np.where(runtime_regimes == "high_vol", 0.60, 1.00)
+        if isinstance(regime_policy, dict) and regime_policy.get("enabled"):
+            high_vol_block = regime_policy.get("regimes", {}).get("high_vol", {})
+            signal_scale = np.where(
+                runtime_regimes == "high_vol",
+                float(high_vol_block.get("signal_scale", 0.30)),
+                signal_scale,
+            )
+            confidence_scale = np.where(
+                runtime_regimes == "high_vol",
+                float(high_vol_block.get("confidence_scale", 0.60)),
+                confidence_scale,
+            )
         scale = np.where(passed, 0.5, 0.0)
         pass_probability = np.where(passed, 0.90, 0.20)
         return pd.DataFrame(
@@ -75,7 +96,11 @@ class DummyExpectedEdgeModel:
                 "edge_pass_probability": pass_probability,
                 "edge_loss_probability": 1.0 - pass_probability,
                 "edge_policy_pass": passed,
-                "edge_policy_scale": scale,
+                "edge_policy_scale": scale * signal_scale,
+                "edge_policy_confidence_scale": np.where(passed, confidence_scale, 0.0),
+                "runtime_regime": runtime_regimes,
+                "regime_policy_enabled": np.ones(len(probabilities), dtype=bool),
+                "regime_policy_signal_scale": signal_scale,
             }
         )
 
@@ -278,7 +303,18 @@ def test_promotion_signal_adapter_applies_expected_edge_policy_gate_and_scale():
             long_side_policy={},
             short_side_policy={},
             expected_edge_policy_enabled=True,
-            expected_edge_policy={},
+            expected_edge_policy={
+                "regime_conditioned_policy": {
+                    "enabled": True,
+                    "regimes": {
+                        "high_vol": {
+                            "signal_scale": 0.30,
+                            "confidence_scale": 0.60,
+                            "long_threshold_adjustment": 0.05,
+                        }
+                    },
+                }
+            },
             enable_universe_quality_gate=False,
             universe_quality_policy={},
         )
@@ -289,7 +325,15 @@ def test_promotion_signal_adapter_applies_expected_edge_policy_gate_and_scale():
         ["2025-01-02T14:30:00Z", "2025-01-02T14:45:00Z"],
         utc=True,
     )
-    features = {"AAPL": pd.DataFrame({"timestamp": timestamps, "feat_a": [0.65, 0.61]})}
+    features = {
+        "AAPL": pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "feat_a": [0.65, 0.61],
+                "regime": ["normal_range", "high_vol"],
+            }
+        )
+    }
     raw_frame = pd.DataFrame(
         {
             "open": [100.0, 100.5],
@@ -312,9 +356,13 @@ def test_promotion_signal_adapter_applies_expected_edge_policy_gate_and_scale():
     assert bool(signal_frame.loc[0, "edge_policy_pass"]) is True
     assert signal_frame.loc[0, "edge_policy_scale"] == pytest.approx(0.5)
     assert signal_frame.loc[0, "expected_edge"] == pytest.approx(0.012)
+    assert signal_frame.loc[0, "runtime_regime"] == "normal_range"
+    assert signal_frame.loc[1, "runtime_regime"] == "high_vol"
+    assert signal_frame.loc[1, "long_threshold"] == pytest.approx(0.65)
     assert signal_frame.loc[1, "signal"] == pytest.approx(0.0)
     assert signal_frame.loc[1, "confidence"] == pytest.approx(0.0)
     assert bool(signal_frame.loc[1, "edge_policy_pass"]) is False
+    assert signal_frame.loc[1, "regime_policy_signal_scale"] == pytest.approx(0.30)
 
 
 def test_performance_attribution_compute_attribution_accepts_backtest_state():
@@ -588,6 +636,10 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
         "expected_edge_policy": {
             "enabled": True,
             "min_pass_probability": 0.56,
+            "regime_conditioned_policy": {
+                "enabled": True,
+                "regimes": {"high_vol": {"signal_scale": 0.75}},
+            },
         },
         "universe_quality_policy": {
             "enabled": True,
@@ -626,6 +678,9 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
     assert package.short_side_policy["enabled"] is False
     assert package.expected_edge_policy_enabled is True
     assert package.expected_edge_policy["min_pass_probability"] == pytest.approx(0.56)
+    assert package.expected_edge_policy["regime_conditioned_policy"]["regimes"]["high_vol"][
+        "signal_scale"
+    ] == pytest.approx(0.75)
     assert package.enable_universe_quality_gate is True
     assert package.universe_quality_policy["min_rows"] == 900
 

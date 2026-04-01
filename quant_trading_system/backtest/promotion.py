@@ -28,10 +28,12 @@ from quant_trading_system.features.optimized_pipeline import (
     OptimizedFeaturePipeline,
     OptimizedPipelineConfig,
 )
+from quant_trading_system.models.expected_edge_policy import resolve_regime_policy_frame
 from quant_trading_system.models.symbol_quality import (
     SymbolQualityThresholds,
     assess_symbol_quality,
 )
+from quant_trading_system.models.target_engineering import infer_regime_series
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +85,14 @@ def _align_vector(values: Any, length: int, fill_value: float = 0.0) -> np.ndarr
     if length <= 0:
         return np.array([], dtype=float)
     if values is None:
-        return np.full(length, fill_value, dtype=float)
+        dtype = object if isinstance(fill_value, str) else float
+        return np.full(length, fill_value, dtype=dtype)
     arr = np.asarray(values).reshape(-1)
     if arr.size == length:
         return arr
     if arr.size == 0:
-        return np.full(length, fill_value, dtype=float)
+        dtype = object if isinstance(fill_value, str) else float
+        return np.full(length, fill_value, dtype=dtype)
     if arr.size < length:
         aligned = np.full(length, fill_value, dtype=arr.dtype if arr.dtype != object else object)
         aligned[-arr.size :] = arr
@@ -599,6 +603,40 @@ class PromotionSignalAdapter:
             return float(self.contract.long_threshold), float(self.contract.short_threshold)
         return long_threshold, short_threshold
 
+    def _resolve_runtime_regimes(
+        self,
+        symbol_frame: pd.DataFrame,
+        raw_frame: pd.DataFrame,
+        *,
+        length: int,
+    ) -> np.ndarray:
+        """Resolve canonical runtime regime labels for promotion inference."""
+        if length <= 0:
+            return np.array([], dtype=object)
+        if "regime" in symbol_frame.columns:
+            candidate = (
+                pd.Series(symbol_frame["regime"], dtype="object")
+                .fillna("normal_range")
+                .astype(str)
+                .str.strip()
+            )
+            if (candidate != "").any():
+                values = candidate.where(candidate != "", "normal_range").to_numpy(dtype=object)
+                return _align_vector(values, length, "normal_range").astype(object)
+
+        training_config = (
+            getattr(self.contract, "raw_payload", {}).get("training_config", {})
+            if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+            else {}
+        )
+        regime_lookback = int(float(_coalesce(training_config.get("label_regime_lookback"), 30)))
+        inferred = infer_regime_series(
+            raw_frame.reset_index(drop=False) if "close" not in raw_frame.columns else raw_frame,
+            lookback=max(2, regime_lookback),
+            vol_lookback=max(2, min(20, regime_lookback)),
+        )
+        return _align_vector(inferred.to_numpy(dtype=object), length, "normal_range").astype(object)
+
     def _resolve_symbol_quality_thresholds(self) -> SymbolQualityThresholds | None:
         """Return runtime symbol quality thresholds when universe gating is enabled."""
         if not bool(getattr(self.contract, "enable_universe_quality_gate", False)):
@@ -954,6 +992,16 @@ class PromotionSignalAdapter:
         effective_long_threshold, effective_short_threshold = self._effective_thresholds()
         long_policy = self._resolve_side_policy("long")
         short_policy = self._resolve_side_policy("short")
+        expected_edge_policy_payload = (
+            getattr(self.contract, "expected_edge_policy", {})
+            if isinstance(getattr(self.contract, "expected_edge_policy", {}), dict)
+            else {}
+        )
+        regime_policy_payload = (
+            expected_edge_policy_payload.get("regime_conditioned_policy", {})
+            if isinstance(expected_edge_policy_payload.get("regime_conditioned_policy", {}), dict)
+            else {}
+        )
         signal_frames: dict[str, pd.DataFrame] = {}
         for symbol, raw_frame in normalized_data.items():
             quality = quality_assessments.get(
@@ -986,11 +1034,22 @@ class PromotionSignalAdapter:
                         ),
                         "long_side_policy_scale": float(long_policy["signal_scale"]),
                         "short_side_policy_scale": float(short_policy["signal_scale"]),
+                        "runtime_regime": np.full(len(timestamps), "normal_range", dtype=object),
+                        "regime_policy_enabled": np.zeros(len(timestamps), dtype=bool),
+                        "regime_policy_signal_scale": np.zeros(len(timestamps), dtype=float),
+                        "regime_policy_confidence_scale": np.zeros(len(timestamps), dtype=float),
+                        "regime_long_threshold": np.full(
+                            len(timestamps), float(effective_long_threshold), dtype=float
+                        ),
+                        "regime_short_threshold": np.full(
+                            len(timestamps), float(effective_short_threshold), dtype=float
+                        ),
                         "expected_edge": np.zeros(len(timestamps), dtype=float),
                         "edge_pass_probability": np.zeros(len(timestamps), dtype=float),
                         "edge_loss_probability": np.zeros(len(timestamps), dtype=float),
                         "edge_policy_pass": np.zeros(len(timestamps), dtype=bool),
                         "edge_policy_scale": np.zeros(len(timestamps), dtype=float),
+                        "edge_policy_confidence_scale": np.zeros(len(timestamps), dtype=float),
                         "edge_policy_enabled": bool(expected_edge_model is not None),
                     }
                 )
@@ -1025,18 +1084,59 @@ class PromotionSignalAdapter:
                 probability[valid_mask.to_numpy()] = np.clip(score, 0.0, 1.0)
                 raw_prediction[valid_mask.to_numpy()] = raw
 
-            long_mask = probability >= effective_long_threshold
-            short_mask = probability <= effective_short_threshold
+            runtime_regimes = self._resolve_runtime_regimes(symbol_frame, raw_frame, length=len(X_df))
+            regime_policy_frame = resolve_regime_policy_frame(
+                runtime_regimes,
+                regime_policy_payload,
+                length=len(X_df),
+            )
+            regime_enabled = (
+                regime_policy_frame["enabled"].to_numpy(dtype=bool)
+                if "enabled" in regime_policy_frame.columns
+                else np.ones(len(X_df), dtype=bool)
+            )
+            regime_long_threshold = np.clip(
+                float(effective_long_threshold)
+                + regime_policy_frame.get(
+                    "long_threshold_adjustment",
+                    pd.Series(np.zeros(len(X_df), dtype=float)),
+                ).to_numpy(dtype=float),
+                0.51,
+                0.99,
+            )
+            regime_short_threshold = np.clip(
+                float(effective_short_threshold)
+                + regime_policy_frame.get(
+                    "short_threshold_adjustment",
+                    pd.Series(np.zeros(len(X_df), dtype=float)),
+                ).to_numpy(dtype=float),
+                0.01,
+                0.49,
+            )
+            invalid_threshold_mask = regime_long_threshold <= regime_short_threshold
+            regime_long_threshold = np.where(
+                invalid_threshold_mask,
+                float(effective_long_threshold),
+                regime_long_threshold,
+            )
+            regime_short_threshold = np.where(
+                invalid_threshold_mask,
+                float(effective_short_threshold),
+                regime_short_threshold,
+            )
+
+            long_mask = regime_enabled & (probability >= regime_long_threshold)
+            short_mask = regime_enabled & (probability <= regime_short_threshold)
             signal_values = np.zeros(len(X_df), dtype=float)
-            long_scale = max(1e-6, 1.0 - effective_long_threshold)
-            short_scale = max(1e-6, effective_short_threshold)
+            long_scale = np.maximum(1e-6, 1.0 - regime_long_threshold)
+            short_scale = np.maximum(1e-6, regime_short_threshold)
             signal_values[long_mask] = np.clip(
-                (probability[long_mask] - effective_long_threshold) / long_scale,
+                (probability[long_mask] - regime_long_threshold[long_mask]) / long_scale[long_mask],
                 0.0,
                 1.0,
             )
             signal_values[short_mask] = -np.clip(
-                (effective_short_threshold - probability[short_mask]) / short_scale,
+                (regime_short_threshold[short_mask] - probability[short_mask]) / short_scale[short_mask],
                 0.0,
                 1.0,
             )
@@ -1119,6 +1219,11 @@ class PromotionSignalAdapter:
                 1.0,
                 0.0,
             ).astype(float)
+            edge_policy_confidence_scale = np.where(
+                np.abs(edge_signal_values) > 0.0,
+                1.0,
+                0.0,
+            ).astype(float)
             if expected_edge_model is not None and hasattr(expected_edge_model, "predict_policy"):
                 edge_policy = expected_edge_model.predict_policy(
                     symbol_frame,
@@ -1128,6 +1233,8 @@ class PromotionSignalAdapter:
                     raw_predictions=raw_prediction,
                     signal_values=edge_signal_values,
                     confidence=edge_confidence,
+                    regimes=runtime_regimes,
+                    regime_policy=regime_policy_payload,
                 )
                 expected_edge = pd.to_numeric(
                     pd.Series(_align_vector(edge_policy.get("expected_edge"), len(X_df), 0.0)),
@@ -1152,16 +1259,64 @@ class PromotionSignalAdapter:
                     pd.Series(_align_vector(edge_policy.get("edge_policy_scale"), len(X_df), 0.0)),
                     errors="coerce",
                 ).fillna(0.0).to_numpy(dtype=float)
+                edge_policy_confidence_scale = pd.to_numeric(
+                    pd.Series(
+                        _align_vector(
+                            edge_policy.get("edge_policy_confidence_scale"),
+                            len(X_df),
+                            0.0,
+                        )
+                    ),
+                    errors="coerce",
+                ).fillna(0.0).to_numpy(dtype=float)
+                runtime_regimes = _align_vector(
+                    edge_policy.get("runtime_regime"),
+                    len(X_df),
+                    "normal_range",
+                ).astype(object)
+                regime_enabled = pd.Series(
+                    _align_vector(edge_policy.get("regime_policy_enabled"), len(X_df), 0.0)
+                ).fillna(False).astype(bool).to_numpy(dtype=bool)
+                regime_signal_scale = pd.to_numeric(
+                    pd.Series(
+                        _align_vector(
+                            edge_policy.get("regime_policy_signal_scale"),
+                            len(X_df),
+                            1.0,
+                        )
+                    ),
+                    errors="coerce",
+                ).fillna(1.0).to_numpy(dtype=float)
+                regime_confidence_scale = pd.to_numeric(
+                    pd.Series(
+                        _align_vector(
+                            edge_policy.get("edge_policy_confidence_scale"),
+                            len(X_df),
+                            1.0,
+                        )
+                    ),
+                    errors="coerce",
+                ).fillna(1.0).to_numpy(dtype=float)
                 signal_values = np.where(edge_policy_pass, signal_values * edge_policy_scale, 0.0)
                 confidence = np.clip(
                     np.where(
                         edge_policy_pass,
-                        (0.5 * confidence) + (0.5 * edge_pass_probability),
+                        ((0.5 * confidence) + (0.5 * edge_pass_probability))
+                        * edge_policy_confidence_scale,
                         0.0,
                     ),
                     0.0,
                     1.0,
                 )
+            else:
+                regime_signal_scale = regime_policy_frame.get(
+                    "signal_scale",
+                    pd.Series(np.ones(len(X_df), dtype=float)),
+                ).to_numpy(dtype=float)
+                regime_confidence_scale = regime_policy_frame.get(
+                    "confidence_scale",
+                    pd.Series(np.ones(len(X_df), dtype=float)),
+                ).to_numpy(dtype=float)
 
             timestamps = pd.to_datetime(symbol_frame.get("timestamp"), utc=True, errors="coerce")
             signal_frames[symbol] = pd.DataFrame(
@@ -1173,8 +1328,8 @@ class PromotionSignalAdapter:
                     "model_source": self.contract.model_source,
                     "probability": probability,
                     "raw_prediction": raw_prediction,
-                    "long_threshold": float(effective_long_threshold),
-                    "short_threshold": float(effective_short_threshold),
+                    "long_threshold": regime_long_threshold,
+                    "short_threshold": regime_short_threshold,
                     "base_long_threshold": float(self.contract.long_threshold),
                     "base_short_threshold": float(self.contract.short_threshold),
                     "meta_confidence": meta_confidence,
@@ -1188,11 +1343,18 @@ class PromotionSignalAdapter:
                     ),
                     "long_side_policy_scale": float(long_policy["signal_scale"]),
                     "short_side_policy_scale": float(short_policy["signal_scale"]),
+                    "runtime_regime": runtime_regimes,
+                    "regime_policy_enabled": regime_enabled,
+                    "regime_policy_signal_scale": regime_signal_scale,
+                    "regime_policy_confidence_scale": regime_confidence_scale,
+                    "regime_long_threshold": regime_long_threshold,
+                    "regime_short_threshold": regime_short_threshold,
                     "expected_edge": expected_edge,
                     "edge_pass_probability": edge_pass_probability,
                     "edge_loss_probability": edge_loss_probability,
                     "edge_policy_pass": edge_policy_pass,
                     "edge_policy_scale": edge_policy_scale,
+                    "edge_policy_confidence_scale": edge_policy_confidence_scale,
                     "edge_policy_enabled": bool(expected_edge_model is not None),
                 }
             )

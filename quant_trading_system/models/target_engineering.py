@@ -108,6 +108,25 @@ def _classify_regime(close: pd.Series, lookback: int, vol_lookback: int) -> pd.S
     return pd.Series(regime, index=close.index, dtype="object")
 
 
+def infer_regime_series(
+    frame_or_close: pd.DataFrame | pd.Series,
+    *,
+    lookback: int = 30,
+    vol_lookback: int = 20,
+) -> pd.Series:
+    """Infer the canonical regime labels from close prices."""
+    if isinstance(frame_or_close, pd.DataFrame):
+        if "close" not in frame_or_close.columns:
+            raise ValueError("infer_regime_series requires a 'close' column when given a frame.")
+        close = pd.to_numeric(frame_or_close["close"], errors="coerce")
+    else:
+        close = pd.to_numeric(frame_or_close, errors="coerce")
+    close = pd.Series(close).replace([np.inf, -np.inf], np.nan).ffill().bfill()
+    if close.empty:
+        return pd.Series(dtype="object")
+    return _classify_regime(close.astype(float), int(lookback), int(vol_lookback)).astype("object")
+
+
 def _compute_temporal_weights(length: int, decay: float) -> np.ndarray:
     if length <= 0:
         return np.array([], dtype=float)

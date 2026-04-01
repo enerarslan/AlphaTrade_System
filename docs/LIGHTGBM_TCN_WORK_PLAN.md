@@ -1,8 +1,8 @@
 # AlphaTrade LightGBM + TCN Work Plan
 
 **Date:** 2026-04-01
-**Status:** Updated after pre-run performance hardening
-**Scope:** Produce one serious LightGBM primary candidate and one TCN challenger without contaminating comparisons
+**Status:** Updated after pre-run hardening and regime-conditioned policy integration
+**Scope:** Produce one serious LightGBM primary candidate first, then evaluate a deferred TCN challenger on the same frozen snapshot
 
 ## 1. Objective
 
@@ -17,8 +17,8 @@ Wave 1 working stack:
 
 - **Primary candidate:** `lightgbm_ranker`
 - **Fallback primary:** `lightgbm`
-- **Challenger:** `tcn`
-- **Filter layer:** existing meta-labeling flow in `scripts/train.py`
+- **Challenger:** `tcn` (deferred until the LightGBM baseline survives replay and early paper validation)
+- **Filter layer:** meta-labeling + expected-edge policy + regime-conditioned policy + asymmetric side policy + universe quality gate
 
 ## 2. What Changed In Code Before The Next Run
 
@@ -29,6 +29,7 @@ The repo now hardens the pre-run edge stack before any new LightGBM training:
 - tighter default label thresholds, feature-selection thresholds, and turnover discipline in `scripts/train.py`
 - out-of-fold probability calibration for probability-producing models
 - non-zero minimum confidence position sizing floor for execution-aware evaluation and promotion packages
+- regime-conditioned threshold, edge-gate, and sizing policy carried from training into backtest and paper trading
 
 Implication:
 
@@ -198,6 +199,9 @@ Review after Phase 1:
 
 - `holdout_sharpe`
 - `effective_holdout_sharpe_gate_metric`
+- `expected_edge_holdout_selected_edge_lift`
+- `expected_edge_holdout_expected_edge_correlation`
+- `expected_edge_holdout_regime_count`
 - `holdout_symbol_coverage_ratio`
 - `holdout_symbol_underwater_ratio`
 - `mean_trade_count`
@@ -254,18 +258,64 @@ Promotion pass conditions:
 - probability calibration does not worsen Brier score
 - turnover remains within cap without starving trade count
 - symbol breadth remains sufficient for ranking
+- expected-edge policy shows positive holdout edge lift
+- regime-conditioned policy does not suppress the strategy into near-zero activity
 
-### Phase 3: TCN Challenger On The Same Snapshot
+### Phase 3: Replay And Early Paper Validation
 
 Goal:
 
-- test whether sequence modeling adds incremental edge beyond the hardened LightGBM candidate
+- validate the hardened LightGBM baseline in deployment-like conditions before opening a new model-comparison branch
 
 Rules:
 
-- exact same dataset snapshot bundle as the LightGBM serious candidate
+- exact same promoted artifact used for replay and paper
+- no feature-policy changes between promotion, replay, and paper
+- no new model family while LightGBM deployment evidence is still incomplete
+- if replay shows regime-specific failure, tighten policy or labels first instead of jumping to TCN
+
+Replay is mandatory before paper promotion. Minimum replay requirements:
+
+- three windows
+- one trending window
+- one high-volatility window
+- one mixed/range window
+
+Suggested first replay windows:
+
+- `2024-01-01` to `2024-01-05`
+- `2024-08-01` to `2024-08-09`
+- `2025-03-03` to `2025-03-14`
+
+Paper-trading minimum:
+
+- `2` weeks minimum
+- `4` weeks preferred before declaring the model stable
+
+Track daily:
+
+- net PnL
+- turnover
+- slippage
+- fill / rejection rate
+- symbol concentration
+- risk warnings
+- no-trade band behavior
+- regime distribution of accepted trades
+- expected-edge pass rate vs realized hit rate
+
+### Phase 4: TCN Deferred Challenger On The Same Snapshot
+
+Goal:
+
+- test whether sequence modeling adds incremental edge beyond a LightGBM baseline that already survived replay and early paper validation
+
+Rules:
+
+- exact same dataset snapshot bundle as the accepted LightGBM serious candidate
+- exact same policy stack and operator settings
 - no silent universe or date-range changes
-- no new feature-policy change between LightGBM and TCN comparison
+- TCN is not allowed to skip replay just because it beats CV or holdout
 
 TCN research template:
 
@@ -298,36 +348,6 @@ python main.py train \
 ```
 
 TCN only replaces LightGBM if it improves holdout and replay quality without materially worsening turnover, drawdown, or symbol breadth.
-
-### Phase 4: Replay And Paper Trading
-
-Replay is mandatory before paper promotion. Minimum replay requirements:
-
-- three windows
-- one trending window
-- one high-volatility window
-- one mixed/range window
-
-Suggested first replay windows:
-
-- `2024-01-01` to `2024-01-05`
-- `2024-08-01` to `2024-08-09`
-- `2025-03-03` to `2025-03-14`
-
-Paper-trading minimum:
-
-- `2` weeks minimum
-- `4` weeks preferred before declaring the model stable
-
-Track daily:
-
-- net PnL
-- turnover
-- slippage
-- fill / rejection rate
-- symbol concentration
-- risk warnings
-- no-trade band behavior
 
 ## 7. Operating Rules
 
@@ -368,15 +388,20 @@ Run 3:
 
 Run 4:
 
+- replay the promoted LightGBM artifact across the three required windows
+- start early paper trading on the exact same promoted artifact
+
+Optional Run 5:
+
 - `tcn`
 - `promotion`
-- exact same snapshot as Run 3
+- exact same snapshot and policy stack as the accepted LightGBM baseline
 
 After Run 4:
 
-- keep the strongest base model
-- use replay and paper trading to validate the winner
+- keep the promoted LightGBM candidate if replay and early paper evidence remain coherent
+- only then open the TCN comparison branch if incremental edge is still worth the compute
 
 ## 9. Short Summary
 
-The next LightGBM run should not be another loose experiment. It should be the first serious post-hardening candidate on a frozen snapshot, with tighter label discipline, tighter turnover control, out-of-fold probability calibration, and a non-zero confidence sizing floor. Only after that baseline is credible should TCN be judged against it.
+The next LightGBM run should not be another loose experiment. It should be the first serious post-hardening candidate on a frozen snapshot, with tighter label discipline, tighter turnover control, out-of-fold probability calibration, asymmetric side control, expected-edge filtering, universe quality gating, and regime-conditioned policy. Only after that baseline survives replay and early paper trading should TCN be judged against it.

@@ -2581,6 +2581,12 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
         "expected_edge_training_selected_context_features": ["flow_imbalance"],
         "expected_edge_training_summary": {"selected_rate": 0.42},
         "expected_edge_holdout_summary": {"selected_edge_lift": 0.003},
+        "expected_edge_regime_policy": {
+            "enabled": True,
+            "regimes": {
+                "high_vol": {"signal_scale": 0.75},
+            },
+        },
         "symbol_quality_universe": ["AAPL", "MSFT"],
         "symbol_quality_dropped_list": ["TSLA"],
         "symbol_quality_report": {"AAPL": {"passes": True, "quality_score": 0.92}},
@@ -2603,6 +2609,9 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     assert payload["signal_policy"]["short_side_policy"]["enabled"] is False
     assert payload["expected_edge_policy"]["enabled"] is True
     assert payload["expected_edge_policy"]["selected_context_features"] == ["flow_imbalance"]
+    assert payload["expected_edge_policy"]["regime_conditioned_policy"]["regimes"]["high_vol"][
+        "signal_scale"
+    ] == pytest.approx(0.75)
     assert payload["universe_quality_policy"]["selected_symbols"] == ["AAPL", "MSFT"]
     assert payload["universe_quality_policy"]["dropped_symbols"] == ["TSLA"]
 
@@ -2632,6 +2641,7 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
             "macro_regime_score": np.sin(np.linspace(0.0, 3.14, rows)),
         }
     )
+    trainer.regimes = np.where(np.arange(rows) % 3 == 0, "high_vol", "trend_up").astype(object)
     trainer.oof_primary_proba = feat_a.copy()
     trainer.primary_forward_returns = np.where(feat_a >= 0.5, 0.015, -0.012).astype(float)
     trainer.sample_weights = np.ones(rows, dtype=float)
@@ -2643,6 +2653,7 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
             "macro_regime_score": [0.2, 0.1, -0.1, -0.2],
         }
     )
+    trainer.holdout_regimes = np.array(["trend_up", "trend_up", "high_vol", "high_vol"], dtype=object)
     trainer.holdout_primary_forward_returns = np.array([0.014, 0.010, -0.011, -0.013], dtype=float)
     trainer.training_metrics["holdout_long_threshold"] = 0.60
     trainer.training_metrics["holdout_short_threshold"] = 0.40
@@ -2656,6 +2667,10 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
     assert "flow_imbalance_signal" in trainer.training_metrics[
         "expected_edge_training_selected_context_features"
     ]
+    regime_policy = trainer.training_metrics["expected_edge_regime_policy"]
+    assert regime_policy["enabled"] is True
+    assert sorted(regime_policy["regimes"].keys()) == ["high_vol", "trend_up"]
+    assert trainer.training_metrics["expected_edge_holdout_regime_policy_enabled"] == pytest.approx(1.0)
 
 
 def test_build_parser_supports_institutional_failfast_flags_and_name():

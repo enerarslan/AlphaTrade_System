@@ -45,6 +45,253 @@ _DERIVED_POLICY_COLUMNS = (
 )
 
 
+def _normalize_regime_values(
+    regimes: np.ndarray | list[str] | pd.Series | None,
+    *,
+    length: int,
+) -> np.ndarray:
+    """Normalize arbitrary regime labels into stable lowercase keys."""
+    if length <= 0:
+        return np.array([], dtype=object)
+    if regimes is None:
+        return np.full(length, "normal_range", dtype=object)
+    arr = np.asarray(regimes, dtype=object).reshape(-1)
+    if arr.size < length:
+        aligned = np.full(length, "normal_range", dtype=object)
+        aligned[-arr.size :] = arr.astype(object)
+        arr = aligned
+    elif arr.size > length:
+        arr = arr[-length:]
+    normalized = pd.Series(arr, dtype="object").fillna("normal_range").astype(str).str.strip().str.lower()
+    normalized = normalized.where(normalized != "", "normal_range")
+    return normalized.to_numpy(dtype=object)
+
+
+def _neutral_regime_policy() -> dict[str, Any]:
+    """Return a no-op regime policy block."""
+    return {
+        "enabled": True,
+        "long_threshold_adjustment": 0.0,
+        "short_threshold_adjustment": 0.0,
+        "min_pass_probability_adjustment": 0.0,
+        "min_expected_edge_adjustment": 0.0,
+        "signal_scale": 1.0,
+        "confidence_scale": 1.0,
+        "trade_count": 0,
+        "active_rate": 0.0,
+        "mean_trade_return": 0.0,
+        "win_rate": 0.5,
+        "score": 0.0,
+        "sample_confidence": 0.0,
+    }
+
+
+def _coerce_regime_policy_block(raw_policy: Any) -> dict[str, Any]:
+    """Normalize arbitrary regime policy payloads into a stable block."""
+    base = _neutral_regime_policy()
+    if not isinstance(raw_policy, dict):
+        return base
+    normalized = dict(base)
+    normalized["enabled"] = bool(raw_policy.get("enabled", base["enabled"]))
+    for key, low, high in (
+        ("long_threshold_adjustment", -0.08, 0.08),
+        ("short_threshold_adjustment", -0.08, 0.08),
+        ("min_pass_probability_adjustment", -0.10, 0.12),
+        ("min_expected_edge_adjustment", -0.01, 0.01),
+        ("signal_scale", 0.0, 1.25),
+        ("confidence_scale", 0.0, 1.20),
+        ("active_rate", 0.0, 1.0),
+        ("win_rate", 0.0, 1.0),
+        ("score", -10.0, 10.0),
+        ("sample_confidence", 0.0, 1.0),
+    ):
+        normalized[key] = float(np.clip(float(raw_policy.get(key, base[key]) or base[key]), low, high))
+    for key in ("mean_trade_return",):
+        normalized[key] = float(raw_policy.get(key, base[key]) or base[key])
+    normalized["trade_count"] = int(max(0, int(float(raw_policy.get("trade_count", base["trade_count"]) or 0))))
+    return normalized
+
+
+def resolve_regime_policy_frame(
+    regimes: np.ndarray | list[str] | pd.Series | None,
+    regime_policy: dict[str, Any] | None,
+    *,
+    length: int,
+) -> pd.DataFrame:
+    """Resolve per-row regime-conditioned policy parameters."""
+    normalized_regimes = _normalize_regime_values(regimes, length=length)
+    raw_policy = regime_policy if isinstance(regime_policy, dict) else {}
+    raw_default = raw_policy.get("default_policy", {})
+    default_block = _coerce_regime_policy_block(raw_default)
+    policy_by_regime = raw_policy.get("regimes", {})
+    if not isinstance(policy_by_regime, dict):
+        policy_by_regime = {}
+
+    rows: list[dict[str, Any]] = []
+    for regime_name in normalized_regimes.tolist():
+        raw_block = policy_by_regime.get(str(regime_name), default_block)
+        merged = dict(default_block)
+        merged.update(_coerce_regime_policy_block(raw_block))
+        merged["regime"] = str(regime_name)
+        rows.append(merged)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "regime",
+                "enabled",
+                "long_threshold_adjustment",
+                "short_threshold_adjustment",
+                "min_pass_probability_adjustment",
+                "min_expected_edge_adjustment",
+                "signal_scale",
+                "confidence_scale",
+                "trade_count",
+                "active_rate",
+                "mean_trade_return",
+                "win_rate",
+                "score",
+                "sample_confidence",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def derive_regime_conditioned_policy(
+    *,
+    regimes: np.ndarray | list[str] | pd.Series | None,
+    trade_returns: np.ndarray | list[float],
+    signal_values: np.ndarray | list[float],
+    selected_mask: np.ndarray | list[bool] | pd.Series | None = None,
+    min_samples: int = 120,
+    edge_reference: float = 0.001,
+) -> dict[str, Any]:
+    """Derive a compact regime-conditioned policy from realized candidate-trade outcomes."""
+    trade_return_values = np.asarray(trade_returns, dtype=float).reshape(-1)
+    signal = np.asarray(signal_values, dtype=float).reshape(-1)
+    if trade_return_values.size == 0 or signal.size == 0:
+        return {
+            "enabled": False,
+            "reason": "insufficient_rows",
+            "default_policy": _neutral_regime_policy(),
+            "regimes": {},
+        }
+    length = int(min(trade_return_values.size, signal.size))
+    trade_return_values = trade_return_values[-length:]
+    signal = signal[-length:]
+    normalized_regimes = _normalize_regime_values(regimes, length=length)
+    finite_mask = np.isfinite(trade_return_values)
+    candidate_mask = finite_mask & (np.abs(signal) > 1e-8)
+    candidate_count = int(np.count_nonzero(candidate_mask))
+    if candidate_count < max(30, int(min_samples * 0.5)):
+        return {
+            "enabled": False,
+            "reason": "insufficient_candidates",
+            "default_policy": _neutral_regime_policy(),
+            "regimes": {},
+        }
+
+    selected = None
+    if selected_mask is not None:
+        selected = np.asarray(selected_mask, dtype=bool).reshape(-1)
+        if selected.size < length:
+            aligned = np.zeros(length, dtype=bool)
+            aligned[-selected.size :] = selected
+            selected = aligned
+        elif selected.size > length:
+            selected = selected[-length:]
+
+    candidate_returns = trade_return_values[candidate_mask]
+    global_mean = float(np.mean(candidate_returns)) if candidate_returns.size else 0.0
+    global_win_rate = float(np.mean(candidate_returns > 0.0)) if candidate_returns.size else 0.5
+    reference = float(max(abs(edge_reference), 1e-4))
+    min_regime_observations = max(15, int(round(candidate_count * 0.08)))
+    resolved: dict[str, dict[str, Any]] = {}
+
+    for regime_name in sorted(set(normalized_regimes.tolist())):
+        regime_mask = candidate_mask & (normalized_regimes == regime_name)
+        regime_count = int(np.count_nonzero(regime_mask))
+        if regime_count < min_regime_observations:
+            continue
+        regime_returns = trade_return_values[regime_mask]
+        regime_signal = signal[regime_mask]
+        mean_trade_return = float(np.mean(regime_returns)) if regime_returns.size else 0.0
+        win_rate = float(np.mean(regime_returns > 0.0)) if regime_returns.size else 0.5
+        active_rate = float(regime_count / max(candidate_count, 1))
+
+        long_returns = regime_returns[regime_signal > 0.0]
+        short_returns = regime_returns[regime_signal < 0.0]
+        long_mean = float(np.mean(long_returns)) if long_returns.size else mean_trade_return
+        short_mean = float(np.mean(short_returns)) if short_returns.size else mean_trade_return
+        directional_bias = float(np.clip((long_mean - short_mean) / reference, -1.25, 1.25))
+        edge_bias = float(np.clip((mean_trade_return - global_mean) / reference, -1.25, 1.25))
+
+        selected_rate = 0.0
+        selected_lift = 0.0
+        if selected is not None:
+            regime_selected = regime_mask & selected
+            selected_rate = float(np.mean(regime_selected[regime_mask])) if regime_count else 0.0
+            selected_returns = trade_return_values[regime_selected & np.isfinite(trade_return_values)]
+            if selected_returns.size:
+                selected_lift = float(np.mean(selected_returns) - mean_trade_return)
+        selected_bias = float(np.clip(selected_lift / reference, -1.0, 1.0))
+
+        downside = max(0.0, -edge_bias)
+        upside = max(0.0, edge_bias)
+        long_adjustment = float(
+            np.clip((0.018 * downside) - (0.018 * upside) - (0.022 * directional_bias), -0.05, 0.05)
+        )
+        short_adjustment = float(
+            np.clip((0.018 * downside) - (0.018 * upside) + (0.022 * directional_bias), -0.05, 0.05)
+        )
+        pass_adjustment = float(
+            np.clip((0.035 * downside) - (0.030 * upside) - (0.020 * selected_bias), -0.05, 0.08)
+        )
+        edge_adjustment = float(
+            np.clip((0.00035 * downside) - (0.00025 * upside) - (0.00015 * selected_bias), -0.0006, 0.0012)
+        )
+        signal_scale = float(np.clip(1.0 + (0.16 * edge_bias) + (0.08 * selected_bias), 0.70, 1.15))
+        confidence_scale = float(np.clip(1.0 + (0.08 * edge_bias) + (0.05 * selected_bias), 0.80, 1.10))
+        sample_confidence = float(np.clip(regime_count / max(min_regime_observations * 2.0, 1.0), 0.0, 1.0))
+        score = float(
+            (0.60 * edge_bias)
+            + (0.20 * ((win_rate - global_win_rate) * 4.0))
+            + (0.20 * selected_bias)
+        )
+        enabled = not (
+            mean_trade_return < min(global_mean - (0.50 * reference), -0.25 * reference)
+            and win_rate < 0.42
+            and regime_count >= max(min_regime_observations, 24)
+        )
+        resolved[str(regime_name)] = {
+            "enabled": bool(enabled),
+            "long_threshold_adjustment": long_adjustment,
+            "short_threshold_adjustment": short_adjustment,
+            "min_pass_probability_adjustment": pass_adjustment,
+            "min_expected_edge_adjustment": edge_adjustment,
+            "signal_scale": signal_scale if enabled else 0.0,
+            "confidence_scale": confidence_scale if enabled else 0.0,
+            "trade_count": regime_count,
+            "active_rate": active_rate,
+            "mean_trade_return": mean_trade_return,
+            "win_rate": win_rate,
+            "score": score,
+            "sample_confidence": sample_confidence,
+            "selected_rate": selected_rate,
+            "selected_edge_lift": selected_lift,
+            "long_mean_trade_return": long_mean,
+            "short_mean_trade_return": short_mean,
+        }
+
+    enabled = bool(resolved)
+    return {
+        "enabled": enabled,
+        "reason": "trained" if enabled else "insufficient_regimes",
+        "default_policy": _neutral_regime_policy(),
+        "regimes": resolved,
+    }
+
+
 def _safe_numeric_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """Normalize arbitrary feature frames into finite numeric columns."""
     numeric = (
@@ -372,6 +619,8 @@ class ExpectedEdgePolicyModel:
         raw_predictions: np.ndarray | list[float] | None = None,
         signal_values: np.ndarray | list[float] | None = None,
         confidence: np.ndarray | list[float] | None = None,
+        regimes: np.ndarray | list[str] | pd.Series | None = None,
+        regime_policy: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         """Predict expected edge, trade pass probability, and signal scale."""
         if self._edge_model is None or self._pass_model is None:
@@ -405,12 +654,36 @@ class ExpectedEdgePolicyModel:
             ).reshape(-1)
             pass_probability[candidate_mask] = self._predict_pass_probability(candidate_features)
 
-        min_edge = float(self.config.min_expected_edge)
-        min_pass_probability = float(self.config.min_pass_probability)
-        edge_range = max(float(self.edge_reference_) - min_edge, 1e-6)
+        regime_frame = resolve_regime_policy_frame(regimes, regime_policy, length=len(X))
+        regime_enabled = (
+            regime_frame["enabled"].to_numpy(dtype=bool)
+            if "enabled" in regime_frame.columns
+            else np.ones(len(X), dtype=bool)
+        )
+        min_edge = np.full(len(X), float(self.config.min_expected_edge), dtype=float)
+        min_pass_probability = np.full(len(X), float(self.config.min_pass_probability), dtype=float)
+        regime_signal_scale = np.ones(len(X), dtype=float)
+        regime_confidence_scale = np.ones(len(X), dtype=float)
+        if not regime_frame.empty:
+            min_edge = np.clip(
+                min_edge
+                + regime_frame["min_expected_edge_adjustment"].to_numpy(dtype=float),
+                -0.02,
+                0.02,
+            )
+            min_pass_probability = np.clip(
+                min_pass_probability
+                + regime_frame["min_pass_probability_adjustment"].to_numpy(dtype=float),
+                0.0,
+                0.995,
+            )
+            regime_signal_scale = regime_frame["signal_scale"].to_numpy(dtype=float)
+            regime_confidence_scale = regime_frame["confidence_scale"].to_numpy(dtype=float)
+
+        edge_range = np.maximum(float(self.edge_reference_) - min_edge, 1e-6)
         edge_component = np.clip((expected_edge - min_edge) / edge_range, 0.0, 1.5)
         pass_component = np.clip(
-            (pass_probability - min_pass_probability) / max(1.0 - min_pass_probability, 1e-6),
+            (pass_probability - min_pass_probability) / np.maximum(1.0 - min_pass_probability, 1e-6),
             0.0,
             1.0,
         )
@@ -420,18 +693,30 @@ class ExpectedEdgePolicyModel:
         scale = np.clip(scale, float(self.config.min_signal_scale), float(self.config.max_signal_scale))
         policy_pass = (
             candidate_mask
+            & regime_enabled
             & (expected_edge >= min_edge)
             & (pass_probability >= min_pass_probability)
         )
-        scale = np.where(policy_pass, scale, 0.0)
+        scale = np.where(policy_pass, scale * regime_signal_scale, 0.0)
 
-        return pd.DataFrame(
+        result = pd.DataFrame(
             {
                 "expected_edge": expected_edge,
                 "edge_pass_probability": np.clip(pass_probability, 0.0, 1.0),
                 "edge_loss_probability": np.clip(1.0 - pass_probability, 0.0, 1.0),
                 "edge_policy_pass": policy_pass.astype(bool),
                 "edge_policy_scale": scale,
+                "edge_policy_confidence_scale": np.where(
+                    policy_pass,
+                    np.clip(regime_confidence_scale, 0.0, 1.20),
+                    0.0,
+                ),
+                "runtime_regime": regime_frame.get("regime", pd.Series(["normal_range"] * len(X))).to_numpy(),
+                "regime_policy_enabled": regime_enabled.astype(bool),
+                "regime_policy_signal_scale": regime_signal_scale,
+                "regime_policy_min_pass_probability": min_pass_probability,
+                "regime_policy_min_expected_edge": min_edge,
             },
             index=policy_frame.index,
         )
+        return result

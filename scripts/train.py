@@ -81,6 +81,7 @@ from quant_trading_system.models.expected_edge_policy import (
     ExpectedEdgePolicyConfig,
     ExpectedEdgePolicyModel,
     derive_base_signal,
+    derive_regime_conditioned_policy,
 )
 from quant_trading_system.models.statistical_validation import (
     calculate_deflated_sharpe_ratio,
@@ -7503,6 +7504,7 @@ class ModelTrainer:
         *,
         long_threshold: float,
         short_threshold: float,
+        regime_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Evaluate the expected-edge policy on aligned holdout predictions."""
         if self.holdout_features is None or self.holdout_features.empty or self.model is None:
@@ -7537,6 +7539,9 @@ class ModelTrainer:
         holdout_probabilities = holdout_probabilities[-aligned_len:]
         holdout_signal = holdout_signal[-aligned_len:]
         holdout_trade_returns = holdout_trade_returns[-aligned_len:]
+        holdout_regimes = None
+        if self.holdout_regimes is not None and len(self.holdout_regimes) >= aligned_len:
+            holdout_regimes = np.asarray(self.holdout_regimes, dtype=object)[-aligned_len:]
 
         policy_frame = policy_model.predict_policy(
             holdout_frame,
@@ -7544,6 +7549,8 @@ class ModelTrainer:
             long_threshold=float(long_threshold),
             short_threshold=float(short_threshold),
             signal_values=holdout_signal,
+            regimes=holdout_regimes,
+            regime_policy=regime_policy,
         )
         candidate_mask = np.abs(holdout_signal) > 1e-8
         selected_mask = (
@@ -7583,6 +7590,12 @@ class ModelTrainer:
                 else 0.0
             ),
             "expected_edge_correlation": correlation,
+            "regime_policy_enabled": float(bool(regime_policy and regime_policy.get("enabled"))),
+            "regime_count": float(
+                len(regime_policy.get("regimes", {}))
+                if isinstance(regime_policy, dict)
+                else 0
+            ),
         }
 
     def _train_expected_edge_policy(self) -> None:
@@ -7674,16 +7687,52 @@ class ModelTrainer:
             self.config.expected_edge_max_signal_scale
         )
         self._record_expected_edge_metrics("expected_edge_training", training_summary)
+        aligned_regimes = None
+        if self.regimes is not None and len(self.regimes) >= target_len:
+            aligned_regimes = np.asarray(self.regimes, dtype=object)[-target_len:]
+        training_policy_frame = policy_model.predict_policy(
+            feature_frame,
+            probabilities=probabilities,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+            signal_values=signal_values,
+        )
+        regime_policy = derive_regime_conditioned_policy(
+            regimes=aligned_regimes,
+            trade_returns=trade_returns,
+            signal_values=signal_values,
+            selected_mask=training_policy_frame["edge_policy_pass"].to_numpy(dtype=bool),
+            min_samples=int(self.config.expected_edge_min_samples),
+            edge_reference=float(getattr(policy_model, "edge_reference_", 0.001)),
+        )
+        self.training_metrics["expected_edge_regime_policy"] = regime_policy
+        if isinstance(regime_policy, dict):
+            self.training_metrics["expected_edge_regime_policy_enabled"] = float(
+                bool(regime_policy.get("enabled"))
+            )
+            self.training_metrics["expected_edge_regime_policy_reason"] = str(
+                regime_policy.get("reason", "unavailable")
+            )
+            self.training_metrics["expected_edge_regime_policy_regimes"] = sorted(
+                str(name)
+                for name in (
+                    regime_policy.get("regimes", {}).keys()
+                    if isinstance(regime_policy.get("regimes", {}), dict)
+                    else []
+                )
+            )
         holdout_summary = self._evaluate_expected_edge_policy_holdout(
             policy_model,
             long_threshold=float(long_threshold),
             short_threshold=float(short_threshold),
+            regime_policy=regime_policy,
         )
         self._record_expected_edge_metrics("expected_edge_holdout", holdout_summary)
         self.logger.info(
-            "Expected-edge policy trained: selected_rate=%.2f%% holdout_lift=%.6f",
+            "Expected-edge policy trained: selected_rate=%.2f%% holdout_lift=%.6f regimes=%d",
             float(training_summary.get("selected_rate", 0.0)) * 100.0,
             float(holdout_summary.get("selected_edge_lift", 0.0)),
+            len(regime_policy.get("regimes", {})) if isinstance(regime_policy, dict) else 0,
         )
 
     def _get_raw_predictions_proba(self, model, X) -> np.ndarray:
@@ -10585,6 +10634,9 @@ class ModelTrainer:
                 "edge_reference": self.training_metrics.get(
                     "expected_edge_training_edge_reference",
                     self.training_metrics.get("expected_edge_holdout_edge_reference"),
+                ),
+                "regime_conditioned_policy": self.training_metrics.get(
+                    "expected_edge_regime_policy", {}
                 ),
             },
             "promotion_passed": bool(self.validation_results.get("all_passed", False)),
