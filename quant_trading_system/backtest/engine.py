@@ -53,6 +53,15 @@ from quant_trading_system.risk.limits import (
     RiskLimitsConfig,
     RiskLimitsManager,
 )
+from quant_trading_system.trading.portfolio_manager import (
+    PositionSizer,
+    PositionSizerConfig,
+)
+from quant_trading_system.trading.signal_generator import (
+    EnrichedSignal,
+    SignalMetadata,
+    SignalPriority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +130,10 @@ class BacktestConfig:
     max_fill_rejection_rate: float = 0.20
     capacity_safety_buffer: float = 1.0
     min_capacity_multiplier: float = 0.25
+    confidence_position_sizing: bool = True
+    min_confidence_position_scale: float = 0.0
+    use_portfolio_target_sizing: bool = True
+    max_total_positions: int = 20
 
 
 @dataclass
@@ -571,12 +584,21 @@ class BacktestEngine:
 
         # Position tracking for trade calculation
         self._open_positions: dict[str, dict[str, Any]] = {}
+        self._pending_signal_context: dict[str, TradeSignal] = {}
+        self._pending_exit_reasons: dict[str, str] = {}
 
         # JPMORGAN FIX: Track market conditions per symbol
         self._market_conditions: dict[str, MarketConditions] = {}
         self._volatility_window: int = 20  # Bars for volatility calculation
         self._price_history: dict[str, deque] = {}
         self._is_intraday_data: bool | None = None
+        self._portfolio_position_sizer = PositionSizer(
+            PositionSizerConfig(
+                percent_of_equity=float(self.config.max_position_pct),
+                max_position_pct=float(self.config.max_position_pct),
+                max_total_positions=max(1, int(self.config.max_total_positions)),
+            )
+        )
 
         # Execution quality telemetry for capacity and hard gating.
         self._orders_submitted_total: int = 0
@@ -642,6 +664,8 @@ class BacktestEngine:
         cancelled = len(self._state.pending_orders)
         self._state.pending_orders.clear()
         self._deferred_fill_results.clear()
+        self._pending_signal_context.clear()
+        self._pending_exit_reasons.clear()
         return cancelled
 
     def _infer_intraday_data(self) -> bool:
@@ -729,6 +753,8 @@ class BacktestEngine:
             trades=[],
         )
         self._open_positions = {}
+        self._pending_signal_context = {}
+        self._pending_exit_reasons = {}
 
         # JPMORGAN FIX: Initialize price history for volatility calculation
         self._price_history = {
@@ -767,6 +793,10 @@ class BacktestEngine:
             # Process pending orders
             self._process_pending_orders(symbol, bar)
 
+            # Enforce hold/exit semantics after current price is known and
+            # after previously pending orders have settled for this bar.
+            self._evaluate_position_exits(symbol, bar)
+
             # Notify strategy
             self.strategy.on_bar(symbol, bar)
 
@@ -795,11 +825,16 @@ class BacktestEngine:
         )
 
         # Process signals
-        for signal in signals:
-            self._state.signals_generated += 1
-            self._process_signal(signal)
-            for callback in self._on_signal_callbacks:
-                callback(signal)
+        if signals:
+            self._state.signals_generated += len(signals)
+            if self.config.use_portfolio_target_sizing:
+                self._process_signal_batch(signals)
+            else:
+                for signal in signals:
+                    self._process_signal(signal)
+            for signal in signals:
+                for callback in self._on_signal_callbacks:
+                    callback(signal)
 
         # Update equity curve
         self._update_equity()
@@ -868,6 +903,9 @@ class BacktestEngine:
             if self.market_simulator is not None and symbol in self._market_conditions:
                 fill_result = self._simulate_order_execution(order, symbol, bar)
                 if fill_result is not None:
+                    if fill_result.fill_type == FillType.REJECTED:
+                        orders_to_remove.append(i)
+                        continue
                     if self.config.simulate_latency and fill_result.timestamp > bar.timestamp:
                         # Execution happened between bars; settle on the first bar
                         # whose timestamp catches up with execution time.
@@ -895,6 +933,8 @@ class BacktestEngine:
 
         # Remove filled orders
         for i in sorted(orders_to_remove, reverse=True):
+            if i >= len(self._state.pending_orders):
+                continue
             removed = self._state.pending_orders.pop(i)
             self._deferred_fill_results.pop(str(removed.order_id), None)
 
@@ -939,7 +979,7 @@ class BacktestEngine:
             self._orders_rejected_total += 1
             self._enforce_execution_quality_gate()
             logger.debug(f"Order rejected: {order.symbol} - {fill_result.rejection_reason}")
-            return None
+            return fill_result
 
         # Check if we can afford the fill
         if not self._can_fill_order_amount(
@@ -950,7 +990,17 @@ class BacktestEngine:
         ):
             self._orders_rejected_total += 1
             self._enforce_execution_quality_gate()
-            return None
+            return FillResult(
+                fill_type=FillType.REJECTED,
+                fill_price=fill_result.fill_price,
+                fill_quantity=Decimal("0"),
+                slippage=fill_result.slippage,
+                market_impact=fill_result.market_impact,
+                commission=fill_result.commission,
+                latency_ms=fill_result.latency_ms,
+                timestamp=fill_result.timestamp,
+                rejection_reason="insufficient_capacity_or_cash",
+            )
 
         if not self.config.simulate_latency:
             fill_result.latency_ms = 0.0
@@ -1026,6 +1076,9 @@ class BacktestEngine:
         position = self._state.positions.get(order.symbol)
         current_qty = position.quantity if position else Decimal("0")
         open_pos = self._open_positions.get(order.symbol)
+        order_key = str(order.order_id)
+        signal_context = self._pending_signal_context.get(order_key)
+        exit_reason = self._pending_exit_reasons.get(order_key, "signal")
 
         if order.side == OrderSide.BUY:
             self._state.cash -= trade_value + commission
@@ -1085,6 +1138,7 @@ class BacktestEngine:
                 commission=total_commission,
                 slippage=total_slippage,
                 holding_period_bars=open_pos.get("bars_held", 0),
+                exit_reason=str(exit_reason),
                 metadata={
                     "fill_type": fill_result.fill_type.value,
                     "latency_ms": fill_result.latency_ms,
@@ -1132,6 +1186,29 @@ class BacktestEngine:
                 tracked["total_slippage"] = (
                     Decimal(str(tracked.get("total_slippage", Decimal("0")))) + open_slippage
                 )
+                if signal_context is not None:
+                    tracked["horizon_bars"] = int(
+                        max(
+                            1,
+                            signal_context.metadata.get(
+                                "max_holding_bars",
+                                signal_context.metadata.get("horizon_bars", signal_context.horizon),
+                            ),
+                        )
+                    )
+                    tracked["prediction_horizon_bars"] = int(max(1, signal_context.horizon))
+                    tracked["stop_loss_pct"] = float(
+                        signal_context.metadata.get(
+                            "stop_loss_pct",
+                            tracked.get("stop_loss_pct", 0.0),
+                        )
+                    )
+                    tracked["take_profit_pct"] = float(
+                        signal_context.metadata.get(
+                            "take_profit_pct",
+                            tracked.get("take_profit_pct", 0.0),
+                        )
+                    )
                 self._open_positions[order.symbol] = tracked
             else:
                 self._open_positions[order.symbol] = {
@@ -1142,6 +1219,35 @@ class BacktestEngine:
                     "entry_side": entry_side,
                     "total_slippage": open_slippage,
                     "total_commission": open_commission,
+                    "horizon_bars": int(
+                        max(
+                            1,
+                            (
+                                signal_context.metadata.get(
+                                    "max_holding_bars",
+                                    signal_context.metadata.get(
+                                        "horizon_bars",
+                                        signal_context.horizon,
+                                    ),
+                                )
+                                if signal_context is not None
+                                else 1
+                            ),
+                        )
+                    ),
+                    "prediction_horizon_bars": int(
+                        max(1, signal_context.horizon) if signal_context is not None else 1
+                    ),
+                    "stop_loss_pct": float(
+                        signal_context.metadata.get("stop_loss_pct", 0.0)
+                        if signal_context is not None
+                        else 0.0
+                    ),
+                    "take_profit_pct": float(
+                        signal_context.metadata.get("take_profit_pct", 0.0)
+                        if signal_context is not None
+                        else 0.0
+                    ),
                 }
 
         if new_qty == 0:
@@ -1174,6 +1280,12 @@ class BacktestEngine:
             )
             self._risk_limits_manager.on_order_submitted(remaining_order, fill_price)
             self._state.pending_orders.append(remaining_order)
+            if signal_context is not None:
+                self._pending_signal_context[str(remaining_order.order_id)] = signal_context
+            if order_key in self._pending_exit_reasons:
+                self._pending_exit_reasons[str(remaining_order.order_id)] = self._pending_exit_reasons[
+                    order_key
+                ]
             logger.debug(
                 f"Partial fill for {order.symbol}: {fill_quantity} filled, "
                 f"{fill_result.partial_remaining} remaining"
@@ -1196,6 +1308,77 @@ class BacktestEngine:
 
         for callback in self._on_fill_callbacks:
             callback(order, fill_price)
+
+        self._pending_signal_context.pop(order_key, None)
+        self._pending_exit_reasons.pop(order_key, None)
+
+    def _has_pending_order_for_symbol(self, symbol: str) -> bool:
+        """Return True when there is already a pending order for the symbol."""
+        return any(order.symbol == symbol for order in self._state.pending_orders)
+
+    def _schedule_exit_order(self, symbol: str, bar: OHLCVBar, reason: str) -> None:
+        """Schedule a market exit order for the current position."""
+        position = self._state.positions.get(symbol)
+        if position is None or position.quantity == 0:
+            return
+        if self._has_pending_order_for_symbol(symbol):
+            return
+
+        order = Order(
+            symbol=symbol,
+            side=OrderSide.SELL if position.quantity > 0 else OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=abs(position.quantity),
+            created_at=bar.timestamp,
+            updated_at=bar.timestamp,
+        )
+        self._pending_exit_reasons[str(order.order_id)] = str(reason)
+        self._orders_submitted_total += 1
+        self._state.pending_orders.append(order)
+        logger.debug("Scheduled %s exit for %s", reason, symbol)
+
+    def _position_return_pct(self, open_pos: dict[str, Any], bar: OHLCVBar) -> float:
+        """Compute signed open-position return as a fraction."""
+        entry_price = Decimal(str(open_pos.get("entry_price", bar.close)))
+        if entry_price <= 0:
+            return 0.0
+        entry_side = open_pos.get("entry_side", OrderSide.BUY)
+        if entry_side == OrderSide.BUY:
+            return float((bar.close - entry_price) / entry_price)
+        return float((entry_price - bar.close) / entry_price)
+
+    def _evaluate_position_exits(self, symbol: str, bar: OHLCVBar) -> None:
+        """Evaluate stop/take-profit/max-holding exits for an open position."""
+        position = self._state.positions.get(symbol)
+        open_pos = self._open_positions.get(symbol)
+        if position is None or position.quantity == 0 or open_pos is None:
+            return
+        if self._has_pending_order_for_symbol(symbol):
+            return
+
+        ret_pct = self._position_return_pct(open_pos, bar)
+        take_profit_pct = float(open_pos.get("take_profit_pct", 0.0) or 0.0)
+        stop_loss_pct = float(open_pos.get("stop_loss_pct", 0.0) or 0.0)
+        if take_profit_pct > 0.0 and ret_pct >= take_profit_pct:
+            self._schedule_exit_order(symbol, bar, "take_profit")
+            return
+        if stop_loss_pct > 0.0 and ret_pct <= -abs(stop_loss_pct):
+            self._schedule_exit_order(symbol, bar, "stop_loss")
+            return
+
+        prediction_horizon_bars = int(max(1, open_pos.get("prediction_horizon_bars", 1)))
+        max_holding_bars = int(max(1, open_pos.get("horizon_bars", prediction_horizon_bars)))
+        bars_held = int(open_pos.get("bars_held", 0))
+
+        if max_holding_bars < prediction_horizon_bars and bars_held >= max_holding_bars:
+            self._schedule_exit_order(symbol, bar, "max_holding")
+            return
+        if bars_held >= prediction_horizon_bars:
+            self._schedule_exit_order(symbol, bar, "horizon")
+            return
+        if bars_held >= max_holding_bars:
+            self._schedule_exit_order(symbol, bar, "max_holding")
+            return
 
     def _get_fill_price(self, bar: OHLCVBar) -> Decimal | None:
         """Get fill price based on execution config.
@@ -1286,34 +1469,147 @@ class BacktestEngine:
         )
         self._fill_order_with_result(order, fill_result, fill_time)
 
-    def _process_signal(self, signal: TradeSignal) -> None:
-        """Process a trading signal and create order."""
-        bar = self.data_handler.get_current_bar(signal.symbol)
-        if bar is None:
-            return
+    def _resolve_signal_priority(self, signal: TradeSignal) -> SignalPriority:
+        """Resolve optional signal priority from metadata."""
+        raw_priority = signal.metadata.get("priority", SignalPriority.NORMAL)
+        if isinstance(raw_priority, SignalPriority):
+            return raw_priority
+        if isinstance(raw_priority, str):
+            normalized = raw_priority.strip().upper()
+            if normalized in SignalPriority.__members__:
+                return SignalPriority[normalized]
+        try:
+            numeric = int(raw_priority)
+        except Exception:
+            return SignalPriority.NORMAL
+        for candidate in SignalPriority:
+            if candidate.value == numeric:
+                return candidate
+        return SignalPriority.NORMAL
+
+    def _build_enriched_signal(self, signal: TradeSignal) -> EnrichedSignal:
+        """Convert a raw trade signal into the live portfolio sizing envelope."""
+        return EnrichedSignal(
+            signal=signal,
+            metadata=SignalMetadata(priority=self._resolve_signal_priority(signal)),
+        )
+
+    def _select_batch_signals(self, signals: list[TradeSignal]) -> list[TradeSignal]:
+        """Select best-per-symbol signals using live-like priority ordering."""
         current_timestamp = self.data_handler.get_current_timestamp()
-        if current_timestamp is not None and bar.timestamp != current_timestamp:
-            return
-        if not self._execution_quality_gate_open():
-            return
+        selected_by_symbol: dict[str, TradeSignal] = {}
 
-        # Determine order side based on signal direction
-        if signal.direction == Direction.LONG:
-            side = OrderSide.BUY
-        elif signal.direction == Direction.SHORT:
-            existing = self._state.positions.get(signal.symbol)
-            if not self.config.allow_short and (existing is None or existing.quantity <= 0):
-                return
-            side = OrderSide.SELL
-        else:
+        def signal_key(candidate: TradeSignal) -> tuple[int, float, float, datetime]:
+            return (
+                -self._resolve_signal_priority(candidate).value,
+                float(candidate.confidence),
+                abs(float(candidate.strength)),
+                candidate.timestamp,
+            )
+
+        for signal in signals:
+            bar = self.data_handler.get_current_bar(signal.symbol)
+            if bar is None:
+                continue
+            if current_timestamp is not None and bar.timestamp != current_timestamp:
+                continue
+            if self._has_pending_order_for_symbol(signal.symbol):
+                continue
+            if signal.direction == Direction.FLAT:
+                continue
+            if signal.direction == Direction.SHORT and not self.config.allow_short:
+                existing = self._state.positions.get(signal.symbol)
+                if existing is None or existing.quantity <= 0:
+                    continue
+
+            existing_signal = selected_by_symbol.get(signal.symbol)
+            if existing_signal is None or signal_key(signal) > signal_key(existing_signal):
+                selected_by_symbol[signal.symbol] = signal
+
+        ranked = sorted(
+            selected_by_symbol.values(),
+            key=lambda signal: (
+                -self._resolve_signal_priority(signal).value,
+                float(signal.confidence),
+                abs(float(signal.strength)),
+                signal.timestamp,
+            ),
+            reverse=True,
+        )
+        return ranked[: max(1, int(self.config.max_total_positions))]
+
+    def _build_target_position_plans(
+        self,
+        signals: list[TradeSignal],
+    ) -> list[tuple[TradeSignal, OrderSide, Decimal, OHLCVBar]]:
+        """Build target-position order plans using live portfolio sizing semantics."""
+        if not signals or not self._execution_quality_gate_open():
+            return []
+
+        selected_signals = self._select_batch_signals(signals)
+        if not selected_signals:
+            return []
+
+        portfolio = self._get_portfolio()
+        enriched_signals = [self._build_enriched_signal(signal) for signal in selected_signals]
+        prices: dict[str, Decimal] = {}
+        volatilities: dict[str, float] = {}
+        bars: dict[str, OHLCVBar] = {}
+
+        for signal in selected_signals:
+            bar = self.data_handler.get_current_bar(signal.symbol)
+            if bar is None or bar.close <= 0:
+                continue
+            bars[signal.symbol] = bar
+            prices[signal.symbol] = bar.close
+            market_conditions = self._market_conditions.get(signal.symbol)
+            if market_conditions is not None and market_conditions.volatility > 0:
+                volatilities[signal.symbol] = float(market_conditions.volatility)
+
+        weights = self._portfolio_position_sizer.calculate_weights(
+            [item for item in enriched_signals if item.signal.symbol in prices],
+            portfolio,
+            prices,
+            volatilities,
+        )
+
+        plans: list[tuple[TradeSignal, OrderSide, Decimal, OHLCVBar]] = []
+        for signal in selected_signals:
+            bar = bars.get(signal.symbol)
+            weight = float(weights.get(signal.symbol, 0.0))
+            if bar is None or abs(weight) <= 0.0:
+                continue
+
+            price = bar.close
+            target_value = portfolio.equity * Decimal(str(abs(weight)))
+            target_shares = target_value / price
+            if not self.config.allow_fractional:
+                target_shares = Decimal(int(target_shares))
+            if target_shares <= 0:
+                continue
+
+            desired_qty = target_shares if weight > 0 else -target_shares
+            current_position = portfolio.positions.get(signal.symbol)
+            current_qty = current_position.quantity if current_position is not None else Decimal("0")
+            delta_qty = desired_qty - current_qty
+            if delta_qty == 0:
+                continue
+
+            side = OrderSide.BUY if delta_qty > 0 else OrderSide.SELL
+            plans.append((signal, side, abs(delta_qty), bar))
+
+        return plans
+
+    def _submit_signal_order(
+        self,
+        signal: TradeSignal,
+        bar: OHLCVBar,
+        side: OrderSide,
+        quantity: Decimal,
+    ) -> None:
+        """Submit a signal-derived order after sizing is finalized."""
+        if quantity <= 0:
             return
-
-        # Calculate position size
-        position_value = self._state.equity * Decimal(str(self.config.max_position_pct))
-        quantity = position_value / bar.close
-
-        if not self.config.allow_fractional:
-            quantity = Decimal(int(quantity))
 
         # Enforce participation/ADV caps for realistic capacity control.
         quantity = self._cap_quantity_to_liquidity(quantity, bar)
@@ -1372,6 +1668,57 @@ class BacktestEngine:
         self._risk_limits_manager.on_order_submitted(order, bar.close)
         self._orders_submitted_total += 1
         self._state.pending_orders.append(order)
+        self._pending_signal_context[str(order.order_id)] = signal
+
+    def _process_signal_batch(self, signals: list[TradeSignal]) -> None:
+        """Process a bar-sized batch of signals against one shared portfolio snapshot."""
+        for signal, side, quantity, bar in self._build_target_position_plans(signals):
+            self._submit_signal_order(signal, bar, side, quantity)
+
+    def _process_signal(self, signal: TradeSignal) -> None:
+        """Process a trading signal and create order."""
+        bar = self.data_handler.get_current_bar(signal.symbol)
+        if bar is None:
+            return
+        current_timestamp = self.data_handler.get_current_timestamp()
+        if current_timestamp is not None and bar.timestamp != current_timestamp:
+            return
+        if not self._execution_quality_gate_open():
+            return
+        if self._has_pending_order_for_symbol(signal.symbol):
+            return
+
+        # Determine order side based on signal direction
+        if signal.direction == Direction.LONG:
+            side = OrderSide.BUY
+        elif signal.direction == Direction.SHORT:
+            existing = self._state.positions.get(signal.symbol)
+            if not self.config.allow_short and (existing is None or existing.quantity <= 0):
+                return
+            side = OrderSide.SELL
+        else:
+            return
+
+        # Calculate position size
+        position_value = self._state.equity * Decimal(str(self.config.max_position_pct))
+        if self.config.confidence_position_sizing:
+            scale = max(
+                float(self.config.min_confidence_position_scale),
+                min(1.0, float(signal.confidence)),
+            )
+            position_value *= Decimal(str(scale))
+        runtime_scale = signal.metadata.get("runtime_position_scale", 1.0)
+        try:
+            runtime_scale_value = float(runtime_scale)
+        except Exception:
+            runtime_scale_value = 1.0
+        runtime_scale_value = float(np.clip(runtime_scale_value, 0.0, 1.0))
+        position_value *= Decimal(str(runtime_scale_value))
+        quantity = position_value / bar.close
+
+        if not self.config.allow_fractional:
+            quantity = Decimal(int(quantity))
+        self._submit_signal_order(signal, bar, side, quantity)
 
     def _evaluate_pre_trade_risk(
         self,

@@ -1971,6 +1971,56 @@ def test_calculate_fold_metrics_uses_portfolio_aggregated_series(monkeypatch):
     assert metrics["sharpe"] > 1.0
 
 
+def test_calculate_fold_metrics_uses_timeframe_aware_annualization(monkeypatch):
+    def _fake_compute_net_returns(
+        y_true,
+        y_proba,
+        long_threshold=0.55,
+        short_threshold=0.45,
+        realized_forward_returns=None,
+        event_net_returns=None,
+        event_directions=None,
+        timestamps=None,
+        symbols=None,
+        return_details=False,
+    ):
+        row_returns = np.array([0.02, 0.01, 0.03, 0.01], dtype=float)
+        details = {
+            "positions": np.ones(4, dtype=float),
+            "turnover_series": np.zeros(4, dtype=float),
+            "trade_mask": np.ones(4, dtype=bool),
+            "entry_mask": np.ones(4, dtype=bool),
+            "portfolio_returns": np.array([0.02, 0.01, 0.03, 0.01], dtype=float),
+            "portfolio_turnover_series": np.zeros(4, dtype=float),
+            "portfolio_trade_mask": np.ones(4, dtype=bool),
+            "portfolio_entry_mask": np.ones(4, dtype=bool),
+        }
+        return (row_returns, details) if return_details else row_returns
+
+    daily_trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="xgboost", timeframe="1Day")
+    )
+    intraday_trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="xgboost", timeframe="1Hour")
+    )
+    monkeypatch.setattr(daily_trainer, "_compute_net_returns", _fake_compute_net_returns)
+    monkeypatch.setattr(intraday_trainer, "_compute_net_returns", _fake_compute_net_returns)
+
+    daily_metrics = daily_trainer._calculate_fold_metrics(
+        y_true=np.array([1.0, 1.0, 1.0, 1.0], dtype=float),
+        y_pred=np.array([1.0, 1.0, 1.0, 1.0], dtype=float),
+        y_proba=np.array([0.9, 0.9, 0.9, 0.9], dtype=float),
+    )
+    intraday_metrics = intraday_trainer._calculate_fold_metrics(
+        y_true=np.array([1.0, 1.0, 1.0, 1.0], dtype=float),
+        y_pred=np.array([1.0, 1.0, 1.0, 1.0], dtype=float),
+        y_proba=np.array([0.9, 0.9, 0.9, 0.9], dtype=float),
+    )
+
+    assert intraday_metrics["sharpe"] > daily_metrics["sharpe"]
+    assert intraday_metrics["calmar"] > daily_metrics["calmar"]
+
+
 def test_build_execution_profile_applies_symbol_entry_share_cap():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -2505,6 +2555,36 @@ def test_save_model_uses_model_native_save_when_available(tmp_path):
     assert model_path == str(tmp_path / "native_save_model.pkl")
     assert (tmp_path / "native_save_model.pkl").exists()
     assert trainer.model.saved_path == (tmp_path / "native_save_model")
+
+
+def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            model_name="pkg_model",
+            output_dir=str(tmp_path),
+            save_artifacts=False,
+        )
+    )
+    trainer.feature_names = ["feat_a", "feat_b"]
+    trainer.training_metrics = {
+        "holdout_long_threshold": 0.61,
+        "holdout_short_threshold": 0.39,
+    }
+    trainer.validation_results = {"all_passed": True}
+    trainer.snapshot_manifest = {"feature_schema_version": "schema-1", "snapshot_id": "snap-1"}
+
+    package_path = trainer._write_promotion_package(
+        output_dir=tmp_path,
+        model_path=tmp_path / "pkg_model.pkl",
+        replay_manifest_path=None,
+    )
+
+    payload = json.loads(package_path.read_text(encoding="utf-8"))
+
+    assert payload["position_sizing_policy"]["use_portfolio_target_sizing"] is True
+    assert payload["position_sizing_policy"]["max_position_pct"] == pytest.approx(0.10)
+    assert payload["position_sizing_policy"]["max_total_positions"] == 20
 
 
 def test_build_parser_supports_institutional_failfast_flags_and_name():
@@ -3086,6 +3166,43 @@ def test_multiple_testing_correction_sets_effective_pbo_gate_and_source():
     assert trainer.training_metrics["multiple_testing_return_source"] == "all_returns"
     assert trainer.training_metrics["multiple_testing_return_observations"] == pytest.approx(4.0)
     assert float(trainer.training_metrics["effective_max_pbo_gate"]) >= 0.45
+
+
+def test_multiple_testing_correction_uses_timeframe_annualization(monkeypatch):
+    captured: dict[str, float] = {}
+
+    def _fake_white_reality_check(
+        returns,
+        n_bootstrap,
+        block_size,
+        random_seed,
+        annualization_factor,
+    ):
+        captured["annualization_factor"] = float(annualization_factor)
+        return 0.1, 0.05, "ok"
+
+    monkeypatch.setattr(
+        train_script,
+        "calculate_white_reality_check",
+        _fake_white_reality_check,
+    )
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            correction_method="deflated_sharpe",
+            timeframe="1Hour",
+            n_trials=10,
+        )
+    )
+    trainer.training_metrics = {"mean_sharpe": 0.8}
+    trainer.cv_results = [{"fold": 1}, {"fold": 2}]
+    trainer.cv_return_series = [np.array([0.001, -0.001, 0.002, 0.0005] * 20, dtype=float)]
+
+    trainer._apply_multiple_testing_correction()
+
+    assert captured["annualization_factor"] == pytest.approx(7 * 252)
+    assert trainer.training_metrics["white_reality_annualization_factor"] == pytest.approx(7 * 252)
 
 
 def test_multiple_testing_correction_records_pbo_diagnostics_and_gate_metric():

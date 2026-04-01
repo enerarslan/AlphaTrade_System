@@ -5,11 +5,29 @@ Promotion package contract helpers for artifact-driven backtests and replay.
 from __future__ import annotations
 
 import json
+import logging
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pandas as pd
+
 from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
+from quant_trading_system.features.feature_pipeline import (
+    FeatureConfig,
+    FeatureGroup,
+    FeaturePipeline,
+)
+from quant_trading_system.features.optimized_pipeline import (
+    CUDF_AVAILABLE,
+    ComputeMode,
+    OptimizedFeaturePipeline,
+    OptimizedPipelineConfig,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _coalesce(*values: Any) -> Any:
@@ -73,13 +91,24 @@ class PromotionPackageContract:
     timeframe: str
     timeframes: tuple[str, ...]
     feature_schema_version: str | None
+    enable_cross_sectional: bool
+    enable_reference_features: bool
+    enable_tick_microstructure_features: bool
     long_threshold: float
     short_threshold: float
     horizon_bars: int
+    max_holding_bars: int
+    take_profit_pct: float
+    stop_loss_pct: float
     meta_label_enabled: bool
     meta_label_threshold: float | None
     model_source: str
     cost_model: dict[str, float]
+    use_portfolio_target_sizing: bool
+    max_position_pct: float
+    max_total_positions: int
+    confidence_position_sizing: bool
+    min_confidence_position_scale: float
 
 
 def load_promotion_package(package_path: str | Path) -> PromotionPackageContract:
@@ -124,6 +153,10 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     if not isinstance(signal_policy, dict):
         signal_policy = {}
 
+    position_sizing_policy = raw_payload.get("position_sizing_policy", {})
+    if not isinstance(position_sizing_policy, dict):
+        position_sizing_policy = {}
+
     raw_feature_names = _coalesce(
         feature_contract.get("selected_features"),
         feature_contract.get("feature_names"),
@@ -137,6 +170,23 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         training_config.get("feature_groups"),
     )
     feature_groups = tuple(_normalize_string_list(raw_feature_groups))
+    enable_cross_sectional = bool(
+        _coalesce(feature_contract.get("enable_cross_sectional"), training_config.get("enable_cross_sectional"), False)
+    )
+    enable_reference_features = bool(
+        _coalesce(
+            feature_contract.get("enable_reference_features"),
+            training_config.get("enable_reference_features"),
+            False,
+        )
+    )
+    enable_tick_microstructure_features = bool(
+        _coalesce(
+            feature_contract.get("enable_tick_microstructure_features"),
+            training_config.get("enable_tick_microstructure_features"),
+            False,
+        )
+    )
 
     symbols = tuple(_normalize_string_list(training_config.get("symbols")))
     timeframe = normalize_timeframe(training_config.get("timeframe"), default=DEFAULT_TIMEFRAME)
@@ -174,6 +224,36 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
                 )
             )
         ),
+    )
+    max_holding_bars = max(
+        1,
+        int(
+            float(
+                _coalesce(
+                    signal_policy.get("max_holding_bars"),
+                    training_config.get("label_max_holding_period"),
+                    horizon_bars,
+                )
+            )
+        ),
+    )
+    take_profit_pct = float(
+        _coalesce(
+            signal_policy.get("take_profit_pct"),
+            training_config.get("label_profit_taking_threshold"),
+            0.0,
+        )
+    )
+    stop_loss_pct = float(
+        abs(
+            float(
+                _coalesce(
+                    signal_policy.get("stop_loss_pct"),
+                    training_config.get("label_stop_loss_threshold"),
+                    0.0,
+                )
+            )
+        )
     )
 
     explicit_meta_path = _resolve_optional_path(package_dir, raw_payload.get("meta_model_path"))
@@ -213,6 +293,23 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         ),
     }
 
+    max_position_pct = float(_coalesce(position_sizing_policy.get("max_position_pct"), 0.10))
+    max_position_pct = min(1.0, max(0.0, max_position_pct))
+    max_total_positions = max(
+        1,
+        int(float(_coalesce(position_sizing_policy.get("max_total_positions"), 20))),
+    )
+    use_portfolio_target_sizing = bool(
+        _coalesce(position_sizing_policy.get("use_portfolio_target_sizing"), True)
+    )
+    confidence_position_sizing = bool(
+        _coalesce(position_sizing_policy.get("confidence_position_sizing"), True)
+    )
+    min_confidence_position_scale = float(
+        _coalesce(position_sizing_policy.get("min_confidence_position_scale"), 0.0)
+    )
+    min_confidence_position_scale = min(1.0, max(0.0, min_confidence_position_scale))
+
     model_name = str(_coalesce(raw_payload.get("model_name"), model_path.stem)).strip()
     model_type = str(_coalesce(raw_payload.get("model_type"), training_config.get("model_type"), "")).strip()
     model_source = str(
@@ -248,11 +345,346 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         timeframe=timeframe,
         timeframes=timeframes,
         feature_schema_version=feature_schema_version,
+        enable_cross_sectional=enable_cross_sectional,
+        enable_reference_features=enable_reference_features,
+        enable_tick_microstructure_features=enable_tick_microstructure_features,
         long_threshold=long_threshold,
         short_threshold=short_threshold,
         horizon_bars=horizon_bars,
+        max_holding_bars=max_holding_bars,
+        take_profit_pct=take_profit_pct,
+        stop_loss_pct=stop_loss_pct,
         meta_label_enabled=meta_label_enabled,
         meta_label_threshold=meta_label_threshold,
         model_source=model_source,
         cost_model=cost_model,
+        use_portfolio_target_sizing=use_portfolio_target_sizing,
+        max_position_pct=max_position_pct,
+        max_total_positions=max_total_positions,
+        confidence_position_sizing=confidence_position_sizing,
+        min_confidence_position_scale=min_confidence_position_scale,
     )
+
+
+def resolve_feature_groups(contract: PromotionPackageContract) -> list[FeatureGroup]:
+    """Resolve promotion-package feature groups into pipeline enums."""
+    group_map = {
+        "technical": FeatureGroup.TECHNICAL,
+        "statistical": FeatureGroup.STATISTICAL,
+        "microstructure": FeatureGroup.MICROSTRUCTURE,
+        "cross_sectional": FeatureGroup.CROSS_SECTIONAL,
+        "cross-sectional": FeatureGroup.CROSS_SECTIONAL,
+        "cross": FeatureGroup.CROSS_SECTIONAL,
+        "all": FeatureGroup.ALL,
+    }
+    resolved: list[FeatureGroup] = []
+    for raw_name in contract.feature_groups:
+        group = group_map.get(str(raw_name).strip().lower())
+        if group is None:
+            continue
+        if group == FeatureGroup.ALL:
+            return [
+                FeatureGroup.TECHNICAL,
+                FeatureGroup.STATISTICAL,
+                FeatureGroup.MICROSTRUCTURE,
+                FeatureGroup.CROSS_SECTIONAL,
+            ]
+        if group == FeatureGroup.CROSS_SECTIONAL and not contract.enable_cross_sectional:
+            continue
+        if group not in resolved:
+            resolved.append(group)
+    return resolved or [FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL]
+
+
+def _extract_timestamps(frame: Any) -> pd.Series:
+    """Extract UTC timestamps from pandas/polars-like inputs."""
+    if hasattr(frame, "columns") and "timestamp" in frame.columns:
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        return pd.Series(timestamps).reset_index(drop=True)
+    if hasattr(frame, "index"):
+        timestamps = pd.to_datetime(frame.index, utc=True, errors="coerce")
+        return pd.Series(timestamps).reset_index(drop=True)
+    return pd.Series(dtype="datetime64[ns, UTC]")
+
+
+def _to_pandas_frame(frame: Any) -> pd.DataFrame:
+    """Normalize market data to a pandas DataFrame."""
+    if isinstance(frame, pd.DataFrame):
+        pdf = frame.copy()
+    elif hasattr(frame, "to_pandas"):
+        pdf = frame.to_pandas()
+    else:
+        pdf = pd.DataFrame(frame)
+    if "timestamp" not in pdf.columns:
+        pdf = pdf.reset_index()
+        first_column = pdf.columns[0]
+        if str(first_column) != "timestamp":
+            pdf = pdf.rename(columns={first_column: "timestamp"})
+    pdf["timestamp"] = pd.to_datetime(pdf["timestamp"], utc=True, errors="coerce")
+    return pdf
+
+
+def _load_pickle(path: Path) -> Any:
+    """Load a trusted pickle artifact."""
+    with path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+class PromotionSignalAdapter:
+    """Artifact-driven promotion package adapter shared by backtest and replay."""
+
+    def __init__(
+        self,
+        contract: PromotionPackageContract,
+        use_gpu: bool = False,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        self.contract = contract
+        self.use_gpu = use_gpu
+        self.logger = logger_ or logger
+        self._model: Any | None = None
+        self._meta_model: Any | None = None
+        self.feature_pipeline: Any | None = None
+
+    def _load_model(self) -> Any:
+        if self._model is None:
+            self._model = _load_pickle(self.contract.model_path)
+        return self._model
+
+    def _load_meta_model(self) -> Any | None:
+        if self.contract.meta_model_path is None:
+            return None
+        if self._meta_model is None:
+            self._meta_model = _load_pickle(self.contract.meta_model_path)
+        return self._meta_model
+
+    def _choose_pipeline(self) -> Any:
+        groups = resolve_feature_groups(self.contract)
+        if self.use_gpu and CUDF_AVAILABLE:
+            pipeline = OptimizedFeaturePipeline(
+                config=OptimizedPipelineConfig(compute_mode=ComputeMode.GPU)
+            )
+        else:
+            pipeline = FeaturePipeline(config=FeatureConfig(groups=groups))
+        self.feature_pipeline = pipeline
+        return pipeline
+
+    def compute_features(self, data: dict[str, Any]) -> dict[str, pd.DataFrame]:
+        """Compute package-compatible feature frames from raw market data."""
+        import polars as pl
+
+        pipeline = self._choose_pipeline()
+        groups = resolve_feature_groups(self.contract)
+        universe_data: dict[str, pl.DataFrame] | None = None
+        if FeatureGroup.CROSS_SECTIONAL in groups:
+            universe_data = {
+                str(symbol).strip().upper(): pl.from_pandas(_to_pandas_frame(frame))
+                for symbol, frame in data.items()
+            }
+
+        feature_frames: dict[str, pd.DataFrame] = {}
+        for raw_symbol, frame in data.items():
+            symbol = str(raw_symbol).strip().upper()
+            pdf = _to_pandas_frame(frame)
+            df_pl = pl.from_pandas(pdf)
+            if hasattr(pipeline, "compute"):
+                feature_set = pipeline.compute(df_pl, symbol=symbol, universe_data=universe_data)
+                feature_count = int(getattr(feature_set, "num_features", 0))
+                features = (
+                    feature_set.to_polars().to_pandas()
+                    if feature_count > 0
+                    else df_pl.to_pandas()
+                )
+            else:
+                features = pipeline.compute_features(pdf, symbol=symbol)
+
+            features = features.copy().reset_index(drop=True)
+            timestamps = _extract_timestamps(pdf).reindex(range(len(features)))
+            if "timestamp" not in features.columns:
+                features.insert(0, "timestamp", timestamps)
+            else:
+                features["timestamp"] = pd.to_datetime(features["timestamp"], utc=True, errors="coerce")
+            features["symbol"] = symbol
+            feature_frames[symbol] = features
+
+        if not feature_frames:
+            return feature_frames
+
+        merged = pd.concat(feature_frames.values(), ignore_index=True)
+        if self.contract.enable_reference_features:
+            try:
+                from quant_trading_system.features.reference import ReferenceFeatureBuilder
+
+                merged = ReferenceFeatureBuilder(logger_=self.logger).augment(merged)
+            except Exception as exc:
+                self.logger.warning("Promotion reference feature augmentation skipped: %s", exc)
+        if self.contract.enable_tick_microstructure_features:
+            try:
+                from quant_trading_system.features.tick_microstructure import (
+                    TickMicrostructureFeatureBuilder,
+                    TickMicrostructureFeatureConfig,
+                )
+
+                merged = TickMicrostructureFeatureBuilder(
+                    TickMicrostructureFeatureConfig(timeframe=self.contract.timeframe),
+                    logger_=self.logger,
+                ).augment(merged)
+            except Exception as exc:
+                self.logger.warning("Promotion tick microstructure augmentation skipped: %s", exc)
+
+        merged["symbol"] = merged["symbol"].astype(str).str.upper().str.strip()
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
+        merged = merged.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+        split: dict[str, pd.DataFrame] = {}
+        for symbol in merged["symbol"].dropna().unique().tolist():
+            split[str(symbol)] = (
+                merged[merged["symbol"] == symbol].copy().reset_index(drop=True)
+            )
+        return split
+
+    @staticmethod
+    def _predict_model_probabilities(model: Any, X_valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return probability-like scores and raw predictions for arbitrary model wrappers."""
+        if hasattr(model, "predict_proba"):
+            probabilities = np.asarray(model.predict_proba(X_valid), dtype=float)
+            if probabilities.ndim == 2:
+                score = probabilities[:, -1] if probabilities.shape[1] >= 2 else probabilities[:, 0]
+            else:
+                score = probabilities.reshape(-1)
+            return score.astype(float), score.astype(float)
+
+        raw_prediction = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
+        prediction_scale = float(np.nanstd(raw_prediction))
+        if not np.isfinite(prediction_scale) or prediction_scale <= 1e-12:
+            prediction_scale = 1.0
+        score = 1.0 / (1.0 + np.exp(-(raw_prediction / prediction_scale)))
+        return score.astype(float), raw_prediction.astype(float)
+
+    @staticmethod
+    def _extract_close_series(frame: Any, length: int) -> pd.Series:
+        """Extract close prices aligned to the requested length."""
+        pdf = _to_pandas_frame(frame)
+        if "close" in pdf.columns:
+            close_series = pd.Series(pdf["close"])
+        elif "Close" in pdf.columns:
+            close_series = pd.Series(pdf["Close"])
+        else:
+            close_series = pd.Series(np.full(length, np.nan, dtype=float))
+        return pd.to_numeric(close_series, errors="coerce").reset_index(drop=True).reindex(range(length))
+
+    def generate_signal_frames(
+        self,
+        data: dict[str, Any],
+        features: dict[str, pd.DataFrame] | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """Generate promotion-package signal frames aligned to raw market bars."""
+        model = self._load_model()
+        meta_model = self._load_meta_model()
+        required_features = list(self.contract.feature_names or getattr(model, "feature_names", []))
+        if not required_features:
+            raise ValueError(
+                "Promotion package does not define feature_names and loaded model exposes none."
+            )
+
+        feature_frames = features or self.compute_features(data)
+        signal_frames: dict[str, pd.DataFrame] = {}
+        for symbol, feature_df in feature_frames.items():
+            symbol_frame = feature_df.copy().reset_index(drop=True)
+            missing_features = [
+                feature_name for feature_name in required_features if feature_name not in symbol_frame.columns
+            ]
+            if missing_features:
+                preview = ", ".join(missing_features[:10])
+                raise ValueError(
+                    f"Missing {len(missing_features)} required features for {symbol}: {preview}"
+                )
+
+            X_df = (
+                symbol_frame.loc[:, required_features]
+                .apply(pd.to_numeric, errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+            )
+            valid_mask = X_df.notna().all(axis=1)
+            probability = np.full(len(X_df), np.nan, dtype=float)
+            raw_prediction = np.full(len(X_df), np.nan, dtype=float)
+            if bool(valid_mask.any()):
+                score, raw = self._predict_model_probabilities(
+                    model,
+                    X_df.loc[valid_mask].to_numpy(dtype=float),
+                )
+                probability[valid_mask.to_numpy()] = np.clip(score, 0.0, 1.0)
+                raw_prediction[valid_mask.to_numpy()] = raw
+
+            long_mask = probability >= self.contract.long_threshold
+            short_mask = probability <= self.contract.short_threshold
+            signal_values = np.zeros(len(X_df), dtype=float)
+            long_scale = max(1e-6, 1.0 - self.contract.long_threshold)
+            short_scale = max(1e-6, self.contract.short_threshold)
+            signal_values[long_mask] = np.clip(
+                (probability[long_mask] - self.contract.long_threshold) / long_scale,
+                0.0,
+                1.0,
+            )
+            signal_values[short_mask] = -np.clip(
+                (self.contract.short_threshold - probability[short_mask]) / short_scale,
+                0.0,
+                1.0,
+            )
+
+            confidence = np.clip(np.abs(probability - 0.5) * 2.0, 0.0, 1.0)
+            meta_confidence = np.full(len(X_df), np.nan, dtype=float)
+            if (
+                meta_model is not None
+                and self.contract.meta_label_enabled
+                and hasattr(meta_model, "filter_signals")
+            ):
+                close_series = self._extract_close_series(data[symbol], len(X_df))
+                primary_direction = pd.Series(np.sign(signal_values), dtype=float)
+                filtered = meta_model.filter_signals(
+                    X_df.fillna(0.0),
+                    primary_direction,
+                    prices=close_series,
+                    threshold=self.contract.meta_label_threshold,
+                )
+                filtered_signal = pd.to_numeric(
+                    filtered.get("filtered_signal", primary_direction),
+                    errors="coerce",
+                ).fillna(0.0)
+                meta_confidence = pd.to_numeric(
+                    filtered.get("confidence", np.nan),
+                    errors="coerce",
+                ).to_numpy(dtype=float)
+                signal_values = np.where(
+                    filtered_signal.to_numpy(dtype=float) > 0.0,
+                    np.maximum(signal_values, 0.0),
+                    np.where(
+                        filtered_signal.to_numpy(dtype=float) < 0.0,
+                        np.minimum(signal_values, 0.0),
+                        0.0,
+                    ),
+                )
+                confidence = np.clip(
+                    np.where(np.isfinite(meta_confidence), meta_confidence, confidence),
+                    0.0,
+                    1.0,
+                )
+
+            timestamps = pd.to_datetime(symbol_frame.get("timestamp"), utc=True, errors="coerce")
+            signal_frames[symbol] = pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "signal": signal_values,
+                    "confidence": confidence,
+                    "horizon": int(self.contract.horizon_bars),
+                    "model_source": self.contract.model_source,
+                    "probability": probability,
+                    "raw_prediction": raw_prediction,
+                    "long_threshold": float(self.contract.long_threshold),
+                    "short_threshold": float(self.contract.short_threshold),
+                    "meta_confidence": meta_confidence,
+                    "take_profit_pct": float(self.contract.take_profit_pct),
+                    "stop_loss_pct": float(self.contract.stop_loss_pct),
+                    "max_holding_bars": int(self.contract.max_holding_bars),
+                }
+            )
+        return signal_frames

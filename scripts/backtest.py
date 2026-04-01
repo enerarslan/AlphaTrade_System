@@ -162,6 +162,7 @@ from quant_trading_system.backtest.analyzer import (
 )
 from quant_trading_system.backtest.promotion import (
     PromotionPackageContract,
+    PromotionSignalAdapter,
     load_promotion_package,
 )
 from quant_trading_system.backtest.performance_attribution import (
@@ -393,6 +394,11 @@ class BacktestSession:
     slippage_bps: float = 5.0
     commission_bps: float = 1.0
     monte_carlo_sims: int = 0
+    max_position_pct: float = 0.10
+    max_total_positions: int = 20
+    confidence_position_sizing: bool = True
+    min_confidence_position_scale: float = 0.0
+    use_portfolio_target_sizing: bool = True
 
     # Session state
     session_id: str = field(default_factory=lambda: f"bt_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}")
@@ -448,11 +454,17 @@ class BacktestRunner:
         self.signals: dict[str, pd.DataFrame] = {}
         self.benchmark_data: Any | None = None
         self.promotion_package: PromotionPackageContract | None = None
+        self.promotion_adapter: PromotionSignalAdapter | None = None
         self._model_artifact: Any | None = None
         self._meta_model_artifact: Any | None = None
 
         if self.session.promotion_package_path is not None:
             self.promotion_package = load_promotion_package(self.session.promotion_package_path)
+            self.promotion_adapter = PromotionSignalAdapter(
+                self.promotion_package,
+                use_gpu=self.session.use_gpu,
+                logger_=logger,
+            )
             self._apply_promotion_package_defaults()
 
     def _apply_promotion_package_defaults(self) -> None:
@@ -473,6 +485,18 @@ class BacktestRunner:
         package_slippage = float(self.promotion_package.cost_model.get("slippage_bps", 0.0))
         if self.session.slippage_bps == 5.0 and package_slippage > 0.0:
             self.session.slippage_bps = package_slippage
+
+        self.session.max_position_pct = float(self.promotion_package.max_position_pct)
+        self.session.max_total_positions = int(self.promotion_package.max_total_positions)
+        self.session.confidence_position_sizing = bool(
+            self.promotion_package.confidence_position_sizing
+        )
+        self.session.min_confidence_position_scale = float(
+            self.promotion_package.min_confidence_position_scale
+        )
+        self.session.use_portfolio_target_sizing = bool(
+            self.promotion_package.use_portfolio_target_sizing
+        )
 
     @staticmethod
     def _resolve_feature_groups(names: list[str] | tuple[str, ...]) -> list[FeatureGroup]:
@@ -570,138 +594,9 @@ class BacktestRunner:
 
     def _generate_model_signals(self) -> None:
         """Generate signals from a promoted model package."""
-        if self.promotion_package is None:
+        if self.promotion_package is None or self.promotion_adapter is None:
             raise RuntimeError("Promotion package not configured")
-
-        model = self._load_model_artifact()
-        meta_model = self._load_meta_model_artifact()
-        required_features = list(
-            self.promotion_package.feature_names or getattr(model, "feature_names", [])
-        )
-        if not required_features:
-            raise ValueError(
-                "Promotion package does not define feature_names and loaded model exposes none."
-            )
-
-        for symbol, feature_frame in self.features.items():
-            try:
-                feature_df = feature_frame.copy()
-                missing_features = [
-                    feature_name
-                    for feature_name in required_features
-                    if feature_name not in feature_df.columns
-                ]
-                if missing_features:
-                    preview = ", ".join(missing_features[:10])
-                    raise ValueError(
-                        f"Missing {len(missing_features)} required features for {symbol}: {preview}"
-                    )
-
-                X_df = (
-                    feature_df.loc[:, required_features]
-                    .apply(pd.to_numeric, errors="coerce")
-                    .replace([np.inf, -np.inf], np.nan)
-                )
-                valid_mask = X_df.notna().all(axis=1)
-                probability = np.full(len(X_df), np.nan, dtype=float)
-                raw_prediction = np.full(len(X_df), np.nan, dtype=float)
-
-                if bool(valid_mask.any()):
-                    score, raw = self._predict_model_probabilities(
-                        model,
-                        X_df.loc[valid_mask].to_numpy(dtype=float),
-                    )
-                    probability[valid_mask.to_numpy()] = np.clip(score, 0.0, 1.0)
-                    raw_prediction[valid_mask.to_numpy()] = raw
-
-                long_mask = probability >= self.promotion_package.long_threshold
-                short_mask = probability <= self.promotion_package.short_threshold
-                signal_values = np.zeros(len(X_df), dtype=float)
-
-                long_scale = max(1e-6, 1.0 - self.promotion_package.long_threshold)
-                short_scale = max(1e-6, self.promotion_package.short_threshold)
-                signal_values[long_mask] = np.clip(
-                    (probability[long_mask] - self.promotion_package.long_threshold) / long_scale,
-                    0.0,
-                    1.0,
-                )
-                signal_values[short_mask] = -np.clip(
-                    (self.promotion_package.short_threshold - probability[short_mask]) / short_scale,
-                    0.0,
-                    1.0,
-                )
-
-                confidence = np.clip(np.abs(probability - 0.5) * 2.0, 0.0, 1.0)
-                meta_confidence = np.full(len(X_df), np.nan, dtype=float)
-                if (
-                    meta_model is not None
-                    and self.promotion_package.meta_label_enabled
-                    and hasattr(meta_model, "filter_signals")
-                ):
-                    close_series = self._extract_close_series(self.data[symbol], len(X_df))
-                    primary_direction = pd.Series(np.sign(signal_values), dtype=float)
-                    filtered = meta_model.filter_signals(
-                        X_df.fillna(0.0),
-                        primary_direction,
-                        prices=close_series,
-                        threshold=self.promotion_package.meta_label_threshold,
-                    )
-                    filtered_signal = pd.to_numeric(
-                        filtered.get("filtered_signal", primary_direction),
-                        errors="coerce",
-                    ).fillna(0.0)
-                    meta_confidence = pd.to_numeric(
-                        filtered.get("confidence", np.nan),
-                        errors="coerce",
-                    ).to_numpy(dtype=float)
-                    signal_values = np.where(
-                        filtered_signal.to_numpy(dtype=float) > 0.0,
-                        np.maximum(signal_values, 0.0),
-                        np.where(
-                            filtered_signal.to_numpy(dtype=float) < 0.0,
-                            np.minimum(signal_values, 0.0),
-                            0.0,
-                        ),
-                    )
-                    confidence = np.clip(
-                        np.where(np.isfinite(meta_confidence), meta_confidence, confidence),
-                        0.0,
-                        1.0,
-                    )
-
-                timestamps = self._extract_timestamps(feature_df)
-                if len(timestamps) != len(feature_df):
-                    timestamps = self._extract_timestamps(self.data[symbol])
-                if len(timestamps) != len(feature_df):
-                    timestamps = pd.date_range(
-                        start=self.session.start_date,
-                        periods=len(feature_df),
-                        freq="15min",
-                        tz="UTC",
-                    )
-
-                signal_frame = pd.DataFrame(
-                    {
-                        "timestamp": timestamps[: len(feature_df)],
-                        "signal": signal_values,
-                        "confidence": confidence,
-                        "horizon": int(self.promotion_package.horizon_bars),
-                        "model_source": self.promotion_package.model_source,
-                        "probability": probability,
-                        "raw_prediction": raw_prediction,
-                        "long_threshold": float(self.promotion_package.long_threshold),
-                        "short_threshold": float(self.promotion_package.short_threshold),
-                        "meta_confidence": meta_confidence,
-                    }
-                )
-                self.signals[symbol] = signal_frame
-                logger.info(
-                    "Generated model signals for %s from promotion package %s",
-                    symbol,
-                    self.promotion_package.model_name,
-                )
-            except Exception as exc:
-                logger.error("Failed to generate model signals for %s: %s", symbol, exc)
+        self.signals = self.promotion_adapter.generate_signal_frames(self.data, self.features)
 
     def run(self) -> BacktestResult:
         """Execute the complete backtest workflow.
@@ -825,6 +720,11 @@ class BacktestRunner:
 
     def _compute_features(self) -> None:
         """Compute features for all symbols."""
+        if self.promotion_adapter is not None:
+            self.features = self.promotion_adapter.compute_features(self.data)
+            self.session.feature_pipeline = self.promotion_adapter.feature_pipeline
+            return
+
         package_feature_groups = (
             self._resolve_feature_groups(self.promotion_package.feature_groups)
             if self.promotion_package is not None and self.promotion_package.feature_groups
@@ -1005,6 +905,11 @@ class BacktestRunner:
             execution_mode=exec_mode,
             commission_bps=self.session.commission_bps,
             slippage_bps=self.session.slippage_bps,
+            max_position_pct=self.session.max_position_pct,
+            max_total_positions=self.session.max_total_positions,
+            confidence_position_sizing=self.session.confidence_position_sizing,
+            min_confidence_position_scale=self.session.min_confidence_position_scale,
+            use_portfolio_target_sizing=self.session.use_portfolio_target_sizing,
             max_leverage=1.0,
             start_date=self.session.start_date,
             end_date=self.session.end_date,

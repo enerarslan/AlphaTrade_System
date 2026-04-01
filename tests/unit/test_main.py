@@ -95,6 +95,26 @@ class TestParseArgs:
             assert args.max_drawdown == pytest.approx(0.15)
             assert args.allow_short is False
 
+    def test_parse_replay_command_with_promotion_package(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "replay",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+                "--promotion-package",
+                "models/promotion_packages/lgb.json",
+            ],
+        ):
+            args = parse_args()
+            assert args.command == "replay"
+            normalized_path = str(args.promotion_package).replace("\\", "/")
+            assert normalized_path.endswith("models/promotion_packages/lgb.json")
+
     def test_parse_dashboard_command(self):
         """Test parsing dashboard command."""
         with patch.object(sys, 'argv', ['main.py', 'dashboard']):
@@ -309,6 +329,31 @@ class TestParseArgs:
             assert args.disable_feature_selection is True
             assert args.feature_selection_stability_iterations == 7
             assert str(args.warm_start_model).endswith("lightgbm_prev.pkl")
+
+    def test_parse_train_command_tracks_explicit_profile_overrides(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "train",
+                "--training-profile",
+                "research",
+                "--n-trials",
+                "100",
+                "--feature-selection-stability-iterations",
+                "16",
+            ],
+        ):
+            args = parse_args()
+            explicit = getattr(args, "_explicit_profile_override_dests")
+
+            assert args.command == "train"
+            assert args.training_profile == "research"
+            assert args.n_trials == 100
+            assert args.feature_selection_stability_iterations == 16
+            assert "n_trials" in explicit
+            assert "feature_selection_stability_iterations" in explicit
 
     def test_parse_data_download_alias_and_sync_flags(self):
         with patch.object(

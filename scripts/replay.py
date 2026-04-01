@@ -25,6 +25,7 @@ from quant_trading_system.backtest.replay import (
 )
 from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
 from quant_trading_system.data.loader import DataLoader
+from quant_trading_system.backtest.promotion import load_promotion_package
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenario-id", type=str, default="trading_day_replay")
     parser.add_argument("--start", type=str, required=True, help="Replay start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, required=True, help="Replay end date (YYYY-MM-DD)")
-    parser.add_argument("--symbols", nargs="+", required=True, help="Symbols for replay")
+    parser.add_argument("--symbols", nargs="+", required=False, help="Symbols for replay")
 
     parser.add_argument("--capital", type=float, default=100000.0)
     parser.add_argument(
@@ -46,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--slippage-bps", type=float, default=5.0)
     parser.add_argument("--commission-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--promotion-package",
+        type=Path,
+        default=None,
+        help="Optional promotion package for artifact-driven replay.",
+    )
 
     parser.add_argument("--return-threshold-bps", type=float, default=5.0)
     parser.add_argument("--signal-confidence", type=float, default=0.75)
@@ -158,7 +165,17 @@ def run_replay(args: argparse.Namespace) -> int:
     timeframe = normalize_timeframe(getattr(args, "timeframe", DEFAULT_TIMEFRAME))
 
     try:
-        symbols = [symbol.upper() for symbol in args.symbols]
+        contract = None
+        promotion_package = getattr(args, "promotion_package", None)
+        if promotion_package:
+            contract = load_promotion_package(promotion_package)
+
+        arg_symbols = list(getattr(args, "symbols", []) or [])
+        symbols = [symbol.upper() for symbol in (arg_symbols or (list(contract.symbols) if contract else []))]
+        if not symbols:
+            raise ValueError("Replay requires symbols or a promotion package with packaged symbols.")
+        if contract is not None and timeframe == DEFAULT_TIMEFRAME:
+            timeframe = contract.timeframe
         data = _load_replay_data(
             symbols=symbols,
             start_date=start_date,
@@ -180,6 +197,7 @@ def run_replay(args: argparse.Namespace) -> int:
                 confidence=float(args.signal_confidence),
                 horizon_bars=max(1, int(args.signal_horizon)),
             ),
+            promotion_package_path=Path(promotion_package) if promotion_package else None,
         )
         slo_gates = ReplaySLOGates(
             max_drawdown=float(args.max_drawdown),

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import pickle
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
+import quant_trading_system.backtest.replay as replay_module
 from quant_trading_system.backtest.engine import ExecutionMode
+from quant_trading_system.backtest.engine import BacktestState
 from quant_trading_system.backtest.replay import (
     ReplaySLOGates,
     ReplayScenario,
@@ -155,3 +160,130 @@ def test_evaluate_replay_slo_flags_cost_ratio_violation():
     )
 
     assert any("execution_cost_ratio=" in violation for violation in violations)
+
+
+def test_replay_scenario_uses_promotion_package_signal_frames(tmp_path: Path, monkeypatch):
+    model_path = tmp_path / "pkg_model.pkl"
+    package_path = tmp_path / "pkg_model.promotion_package.json"
+
+    with model_path.open("wb") as handle:
+        pickle.dump({"dummy": True}, handle)
+
+    package_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.1.0",
+                "model_name": "pkg_model",
+                "model_type": "lightgbm",
+                "model_path": str(model_path),
+                "feature_contract": {
+                    "selected_features": ["feat_a"],
+                    "feature_groups": ["technical", "statistical"],
+                },
+                "execution_cost_model": {
+                    "spread_bps": 1.0,
+                    "slippage_bps": 3.0,
+                    "impact_bps": 2.0,
+                },
+                "position_sizing_policy": {
+                    "use_portfolio_target_sizing": True,
+                    "max_position_pct": 0.15,
+                    "max_total_positions": 7,
+                    "confidence_position_sizing": True,
+                    "min_confidence_position_scale": 0.25,
+                },
+                "signal_policy": {
+                    "long_threshold": 0.60,
+                    "short_threshold": 0.40,
+                    "horizon_bars": 2,
+                    "max_holding_bars": 3,
+                    "model_source": "promotion_package:pkg_model",
+                },
+                "training_config": {
+                    "symbols": ["AAPL"],
+                    "timeframe": "15Min",
+                    "timeframes": ["15Min"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_generate(self, data, features=None):
+        frame = next(iter(data.values()))
+        timestamps = frame.index
+        return {
+            "AAPL": pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "signal": [0.8, 0.0, 0.0, 0.0, 0.0, 0.0][: len(timestamps)],
+                    "confidence": [0.9] * len(timestamps),
+                    "horizon": [2] * len(timestamps),
+                    "model_source": ["promotion_package:pkg_model"] * len(timestamps),
+                    "max_holding_bars": [3] * len(timestamps),
+                    "take_profit_pct": [0.0] * len(timestamps),
+                    "stop_loss_pct": [0.0] * len(timestamps),
+                }
+            )
+        }
+
+    monkeypatch.setattr(
+        replay_module.PromotionSignalAdapter,
+        "generate_signal_frames",
+        _fake_generate,
+    )
+    captured: dict[str, object] = {}
+
+    class _CapturedEngine:
+        def __init__(self, data_handler, strategy, config):
+            captured["config"] = config
+
+        def run(self):
+            return BacktestState(
+                timestamp=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                equity=Decimal("100000"),
+                cash=Decimal("100000"),
+                positions={},
+                pending_orders=[],
+                equity_curve=[
+                    (datetime(2024, 1, 2, tzinfo=timezone.utc), 100000.0),
+                    (datetime(2024, 1, 3, tzinfo=timezone.utc), 100100.0),
+                ],
+                trades=[],
+                bars_processed=6,
+            )
+
+        def get_execution_slo_snapshot(self):
+            return {
+                "orders_submitted": 1,
+                "rejection_rate": 0.0,
+                "avg_slippage_bps": 0.0,
+            }
+
+    monkeypatch.setattr(replay_module, "BacktestEngine", _CapturedEngine)
+
+    outcome = run_replay_scenario(
+        data={"AAPL": _ohlcv([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])},
+        scenario=ReplayScenario(
+            scenario_id="pkg_replay",
+            symbols=["AAPL"],
+            start_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            end_date=datetime(2024, 1, 5, tzinfo=timezone.utc),
+            promotion_package_path=package_path,
+        ),
+        slo_gates=ReplaySLOGates(
+            max_drawdown=0.50,
+            max_rejection_rate=1.0,
+            max_avg_slippage_bps=500.0,
+            max_risk_escalations=5,
+            max_escalation_latency_ms=10_000.0,
+            min_orders_for_gate=1,
+        ),
+    )
+
+    assert outcome.execution_slo["expected_execution_cost_bps"] == pytest.approx(6.0)
+    assert outcome.execution_slo["orders_submitted"] > 0
+    config = captured["config"]
+    assert config.max_position_pct == pytest.approx(0.15)
+    assert config.max_total_positions == 7
+    assert config.min_confidence_position_scale == pytest.approx(0.25)

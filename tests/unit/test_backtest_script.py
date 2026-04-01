@@ -311,6 +311,13 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
             "feature_groups": ["technical", "statistical"],
             "meta_label_min_confidence": 0.66,
         },
+        "position_sizing_policy": {
+            "use_portfolio_target_sizing": True,
+            "max_position_pct": 0.12,
+            "max_total_positions": 8,
+            "confidence_position_sizing": True,
+            "min_confidence_position_scale": 0.15,
+        },
     }
     package_path.write_text(json.dumps(package_payload), encoding="utf-8")
 
@@ -322,6 +329,9 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
     assert package.meta_label_threshold == 0.70
     assert package.feature_schema_version == "schema-123"
     assert package.timeframes == ("15Min", "1Hour")
+    assert package.max_position_pct == 0.12
+    assert package.max_total_positions == 8
+    assert package.min_confidence_position_scale == 0.15
 
 
 def test_backtest_runner_generates_signals_from_promotion_package(tmp_path: Path):
@@ -352,6 +362,13 @@ def test_backtest_runner_generates_signals_from_promotion_package(tmp_path: Path
             "meta_label_threshold": 0.60,
             "model_source": "promotion_package:pkg_model",
         },
+        "position_sizing_policy": {
+            "use_portfolio_target_sizing": True,
+            "max_position_pct": 0.12,
+            "max_total_positions": 6,
+            "confidence_position_sizing": True,
+            "min_confidence_position_scale": 0.20,
+        },
         "training_config": {
             "symbols": ["AAPL"],
             "timeframe": "15Min",
@@ -371,6 +388,9 @@ def test_backtest_runner_generates_signals_from_promotion_package(tmp_path: Path
         promotion_package_path=package_path,
     )
     runner = BacktestRunner(session)
+    assert runner.session.max_position_pct == 0.12
+    assert runner.session.max_total_positions == 6
+    assert runner.session.min_confidence_position_scale == 0.20
     runner.data["AAPL"] = pd.DataFrame(
         {
             "open": [100.0, 101.0],

@@ -83,7 +83,11 @@ from quant_trading_system.models.target_engineering import (
     generate_targets,
 )
 from quant_trading_system.models.trading_costs import TradingCostModel
-from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
+from quant_trading_system.data.timeframe import (
+    DEFAULT_TIMEFRAME,
+    estimate_periods_per_year,
+    normalize_timeframe,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -195,12 +199,28 @@ def _attach_explicit_profile_overrides(
     argv: list[str] | None,
 ) -> argparse.Namespace:
     """Track CLI options that were explicitly provided, even when equal to parser defaults."""
+    def _resolve_action(
+        candidate_parser: argparse.ArgumentParser,
+        option: str,
+    ) -> argparse.Action | None:
+        action = candidate_parser._option_string_actions.get(option)
+        if action is not None:
+            return action
+        for parser_action in candidate_parser._actions:
+            if not isinstance(parser_action, argparse._SubParsersAction):
+                continue
+            for subparser in parser_action.choices.values():
+                nested_action = _resolve_action(subparser, option)
+                if nested_action is not None:
+                    return nested_action
+        return None
+
     explicit_dests: set[str] = set()
     for raw_arg in argv or []:
         if not raw_arg.startswith("-"):
             continue
         option = raw_arg.split("=", 1)[0]
-        action = parser._option_string_actions.get(option)
+        action = _resolve_action(parser, option)
         if action is None:
             continue
         explicit_dests.add(action.dest)
@@ -2785,6 +2805,10 @@ class ModelTrainer:
         if not horizons:
             horizons = [int(self.config.primary_label_horizon)]
         return max(1, max(horizons))
+
+    def _annualization_periods(self) -> int:
+        """Return timeframe-aware annualization periods for intraday metrics."""
+        return int(estimate_periods_per_year(self.config.timeframe))
 
     def _is_ranker_model(self) -> bool:
         """Return True when current model type uses ranking objective/training."""
@@ -7443,8 +7467,11 @@ class ModelTrainer:
             trade_count = int(np.count_nonzero(entry_mask))
             active_signal_rate = float(np.mean(portfolio_trade_mask))
             std = float(np.std(performance_returns)) if performance_returns.size > 0 else 0.0
+            annualization_periods = float(self._annualization_periods())
             sharpe = (
-                float(np.mean(performance_returns) / std * np.sqrt(252)) if std > 1e-12 else 0.0
+                float(np.mean(performance_returns) / std * np.sqrt(annualization_periods))
+                if std > 1e-12
+                else 0.0
             )
             max_dd = self._max_drawdown(performance_returns)
             trade_obs_count = int(len(trade_returns))
@@ -7470,7 +7497,9 @@ class ModelTrainer:
             else:
                 win_rate = 0.0
             annual_return = (
-                float(np.mean(performance_returns) * 252) if performance_returns.size > 0 else 0.0
+                float(np.mean(performance_returns) * annualization_periods)
+                if performance_returns.size > 0
+                else 0.0
             )
             calmar = annual_return / max_dd if max_dd > 1e-9 else annual_return
             if performance_returns.size > 0:
@@ -9490,18 +9519,20 @@ class ModelTrainer:
         )
         bootstrap_reps = int(np.clip(max(400, n_trials * 30), 400, 3000))
         block_size = int(np.clip(np.sqrt(float(max(returns.size, 1))), 3.0, 32.0))
+        annualization_factor = float(self._annualization_periods())
         white_stat, white_p_value, white_interpretation = calculate_white_reality_check(
             returns=returns,
             n_bootstrap=bootstrap_reps,
             block_size=block_size,
             random_seed=int(self.config.seed),
-            annualization_factor=252.0,
+            annualization_factor=annualization_factor,
         )
         self.training_metrics["white_reality_stat"] = float(white_stat)
         self.training_metrics["white_reality_pvalue"] = float(white_p_value)
         self.training_metrics["white_reality_interpretation"] = str(white_interpretation)
         self.training_metrics["white_reality_bootstrap_reps"] = float(bootstrap_reps)
         self.training_metrics["white_reality_block_size"] = float(block_size)
+        self.training_metrics["white_reality_annualization_factor"] = float(annualization_factor)
         self.logger.info(
             "White Reality Check: stat=%.4f p=%.4f (%s)",
             float(white_stat),
@@ -10036,6 +10067,9 @@ class ModelTrainer:
                 "long_threshold": self.training_metrics.get("holdout_long_threshold"),
                 "short_threshold": self.training_metrics.get("holdout_short_threshold"),
                 "horizon_bars": int(self.config.primary_label_horizon),
+                "max_holding_bars": int(self.config.label_max_holding_period),
+                "take_profit_pct": float(self.config.label_profit_taking_threshold),
+                "stop_loss_pct": float(abs(self.config.label_stop_loss_threshold)),
                 "meta_label_enabled": bool(self.meta_model is not None),
                 "meta_label_threshold": self.training_metrics.get("meta_label_min_confidence"),
                 "meta_label_dynamic_threshold": bool(
@@ -10047,6 +10081,13 @@ class ModelTrainer:
                 "spread_bps": float(cost_model.spread_bps),
                 "slippage_bps": float(cost_model.slippage_bps),
                 "impact_bps": float(cost_model.impact_bps),
+            },
+            "position_sizing_policy": {
+                "use_portfolio_target_sizing": True,
+                "max_position_pct": 0.10,
+                "max_total_positions": 20,
+                "confidence_position_sizing": True,
+                "min_confidence_position_scale": 0.0,
             },
             "promotion_passed": bool(self.validation_results.get("all_passed", False)),
             "snapshot_id": (

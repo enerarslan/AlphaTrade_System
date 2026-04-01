@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
@@ -23,6 +24,10 @@ from quant_trading_system.backtest.engine import (
 )
 from quant_trading_system.core.data_types import Direction, TradeSignal
 from quant_trading_system.models.trading_costs import TradingCostModel
+from quant_trading_system.backtest.promotion import (
+    PromotionSignalAdapter,
+    load_promotion_package,
+)
 
 
 @dataclass(frozen=True)
@@ -63,10 +68,18 @@ class ReplayScenario:
     commission_bps: float = 1.0
     allow_short: bool = True
     signal: ReplaySignalConfig = field(default_factory=ReplaySignalConfig)
+    promotion_package_path: Path | None = None
     backtest_overrides: dict[str, Any] = field(default_factory=dict)
 
     def to_trading_cost_model(self) -> TradingCostModel:
         """Build canonical execution cost assumptions for replay validation."""
+        if self.promotion_package_path is not None:
+            contract = load_promotion_package(self.promotion_package_path)
+            return TradingCostModel(
+                spread_bps=float(contract.cost_model.get("spread_bps", 0.0)),
+                slippage_bps=float(contract.cost_model.get("slippage_bps", 0.0)),
+                impact_bps=float(contract.cost_model.get("impact_bps", 0.0)),
+            )
         return TradingCostModel(
             spread_bps=float(self.commission_bps),
             slippage_bps=float(self.slippage_bps),
@@ -196,6 +209,96 @@ class DeterministicReplayStrategy(Strategy):
         return signals
 
 
+class SignalFrameReplayStrategy(Strategy):
+    """Replay strategy backed by precomputed promotion-package signal frames."""
+
+    def __init__(
+        self,
+        signals: dict[str, pd.DataFrame],
+        signal_threshold: float = 0.0,
+    ) -> None:
+        self.signals: dict[str, pd.DataFrame] = {}
+        self.signal_threshold = signal_threshold
+        for raw_symbol, frame in signals.items():
+            symbol = str(raw_symbol).strip().upper()
+            signal_df = frame.copy()
+            if "timestamp" in signal_df.columns:
+                signal_df["timestamp"] = pd.to_datetime(signal_df["timestamp"], utc=True, errors="coerce")
+                signal_df = signal_df.dropna(subset=["timestamp"]).drop_duplicates(
+                    subset=["timestamp"],
+                    keep="last",
+                )
+                signal_df = signal_df.sort_values("timestamp").set_index("timestamp")
+            else:
+                signal_df.index = pd.to_datetime(signal_df.index, utc=True, errors="coerce")
+                signal_df = signal_df[~signal_df.index.isna()]
+                signal_df = signal_df[~signal_df.index.duplicated(keep="last")].sort_index()
+            self.signals[symbol] = signal_df
+
+    def generate_signals(self, data_handler, portfolio) -> list[TradeSignal]:
+        trade_signals: list[TradeSignal] = []
+        current_symbols = (
+            data_handler.get_updated_symbols()
+            if hasattr(data_handler, "get_updated_symbols")
+            else data_handler.get_symbols()
+        )
+
+        for symbol in current_symbols:
+            signal_df = self.signals.get(symbol)
+            if signal_df is None:
+                continue
+
+            bar = data_handler.get_current_bar(symbol)
+            if bar is None:
+                continue
+
+            bar_timestamp = pd.Timestamp(bar.timestamp)
+            if bar_timestamp.tzinfo is None:
+                bar_timestamp = bar_timestamp.tz_localize("UTC")
+            else:
+                bar_timestamp = bar_timestamp.tz_convert("UTC")
+            if bar_timestamp not in signal_df.index:
+                continue
+
+            signal_row = signal_df.loc[bar_timestamp]
+            if isinstance(signal_row, pd.DataFrame):
+                signal_row = signal_row.iloc[-1]
+            signal_value = float(signal_row["signal"])
+            if abs(signal_value) < self.signal_threshold:
+                continue
+
+            direction = Direction.LONG if signal_value > 0 else Direction.SHORT
+            position = portfolio.get_position(symbol)
+            if position is not None:
+                if direction == Direction.LONG and position.quantity > 0:
+                    continue
+                if direction == Direction.SHORT and position.quantity < 0:
+                    continue
+
+            trade_signals.append(
+                TradeSignal(
+                    symbol=symbol,
+                    direction=direction,
+                    strength=max(-1.0, min(1.0, signal_value)),
+                    confidence=float(max(0.0, min(1.0, signal_row.get("confidence", abs(signal_value))))),
+                    timestamp=bar.timestamp,
+                    horizon=int(max(1, float(signal_row.get("horizon", 1)))),
+                    model_source=str(signal_row.get("model_source", "promotion_package_replay")),
+                    metadata={
+                        column: (
+                            signal_row[column].item()
+                            if hasattr(signal_row[column], "item")
+                            else signal_row[column]
+                        )
+                        for column in signal_df.columns
+                        if column not in {"signal", "confidence", "horizon", "model_source"}
+                    },
+                )
+            )
+
+        return trade_signals
+
+
 def run_replay_suite(
     scenarios: list[ReplayScenario],
     data_provider: Callable[[ReplayScenario], dict[str, pd.DataFrame]],
@@ -218,11 +321,24 @@ def run_replay_scenario(
     """Run a deterministic replay scenario and evaluate SLO gates."""
     prepared_data = _prepare_replay_data(data, scenario)
     config = _build_backtest_config(scenario)
-    strategy = DeterministicReplayStrategy(
-        symbols=scenario.symbols,
-        signal_config=scenario.signal,
-        allow_short=scenario.allow_short,
-    )
+    if scenario.promotion_package_path is not None:
+        contract = load_promotion_package(scenario.promotion_package_path)
+        adapter = PromotionSignalAdapter(contract)
+        signal_frames = adapter.generate_signal_frames(prepared_data)
+        strategy = SignalFrameReplayStrategy(signal_frames, signal_threshold=0.0)
+        config.max_position_pct = float(contract.max_position_pct)
+        config.max_total_positions = int(contract.max_total_positions)
+        config.confidence_position_sizing = bool(contract.confidence_position_sizing)
+        config.min_confidence_position_scale = float(contract.min_confidence_position_scale)
+        config.use_portfolio_target_sizing = bool(contract.use_portfolio_target_sizing)
+        if float(config.slippage_bps) == 5.0 and float(contract.cost_model.get("slippage_bps", 0.0)) > 0.0:
+            config.slippage_bps = float(contract.cost_model["slippage_bps"])
+    else:
+        strategy = DeterministicReplayStrategy(
+            symbols=scenario.symbols,
+            signal_config=scenario.signal,
+            allow_short=scenario.allow_short,
+        )
     engine = BacktestEngine(
         data_handler=PandasDataHandler(prepared_data),
         strategy=strategy,
@@ -329,8 +445,12 @@ def _prepare_replay_data(
     prepared: dict[str, pd.DataFrame] = {}
     start = pd.Timestamp(scenario.start_date)
     end = pd.Timestamp(scenario.end_date)
+    symbols = list(scenario.symbols)
+    if not symbols and scenario.promotion_package_path is not None:
+        contract = load_promotion_package(scenario.promotion_package_path)
+        symbols = list(contract.symbols or [str(symbol).upper() for symbol in raw_data.keys()])
 
-    for symbol in scenario.symbols:
+    for symbol in symbols:
         upper_symbol = symbol.upper()
         frame = raw_data.get(upper_symbol)
         if frame is None:

@@ -14,7 +14,7 @@ from quant_trading_system.backtest.engine import (
     Strategy,
 )
 from quant_trading_system.backtest.simulator import FillResult, FillType
-from quant_trading_system.core.data_types import Direction, OrderSide, TradeSignal
+from quant_trading_system.core.data_types import Direction, OrderSide, Position, TradeSignal
 from quant_trading_system.risk.limits import KillSwitchReason
 
 
@@ -64,6 +64,55 @@ class AlwaysLongStrategy(Strategy):
                 model_source="unit_test",
             )
         ]
+
+
+class OneShotMetadataStrategy(Strategy):
+    """Emit one signal once with custom metadata and confidence."""
+
+    def __init__(
+        self,
+        *,
+        direction: Direction = Direction.LONG,
+        confidence: float = 1.0,
+        horizon: int = 1,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.direction = direction
+        self.confidence = confidence
+        self.horizon = horizon
+        self.metadata = metadata or {}
+        self._emitted = False
+
+    def generate_signals(self, data_handler, portfolio):
+        if self._emitted:
+            return []
+        self._emitted = True
+        symbol = data_handler.get_symbols()[0]
+        return [
+            TradeSignal(
+                symbol=symbol,
+                direction=self.direction,
+                strength=1.0 if self.direction == Direction.LONG else -1.0,
+                confidence=self.confidence,
+                horizon=self.horizon,
+                model_source="unit_test_metadata",
+                metadata=dict(self.metadata),
+            )
+        ]
+
+
+class BatchSignalStrategy(Strategy):
+    """Emit a predefined batch of signals once."""
+
+    def __init__(self, signals: list[TradeSignal]) -> None:
+        self.signals = signals
+        self._emitted = False
+
+    def generate_signals(self, data_handler, portfolio):
+        if self._emitted:
+            return []
+        self._emitted = True
+        return list(self.signals)
 
 
 def _sample_handler() -> PandasDataHandler:
@@ -160,6 +209,197 @@ def test_backtest_engine_risk_limit_uses_configured_max_position_pct():
     assert risk_config.max_position_value == Decimal("10000")
 
 
+def test_backtest_engine_scales_position_size_by_signal_confidence():
+    handler = _sample_handler()
+    engine = BacktestEngine(
+        data_handler=handler,
+        strategy=NoSignalStrategy(),
+        config=BacktestConfig(
+            initial_capital=Decimal("100000"),
+            max_position_pct=0.10,
+            use_market_simulator=False,
+            allow_fractional=False,
+        ),
+    )
+    engine._initialize()
+    assert handler.update_bars() is True
+
+    engine._process_signal(
+        TradeSignal(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            strength=1.0,
+            confidence=0.50,
+            horizon=1,
+            model_source="unit_test",
+        )
+    )
+
+    assert len(engine._state.pending_orders) == 1
+    assert engine._state.pending_orders[0].quantity == Decimal("50")
+
+
+def test_backtest_engine_target_sizing_does_not_stack_same_direction_when_at_target():
+    handler = _sample_handler()
+    engine = BacktestEngine(
+        data_handler=handler,
+        strategy=NoSignalStrategy(),
+        config=BacktestConfig(
+            initial_capital=Decimal("100000"),
+            max_position_pct=0.10,
+            use_market_simulator=False,
+            allow_fractional=False,
+            use_portfolio_target_sizing=True,
+        ),
+    )
+    engine._initialize()
+    assert handler.update_bars() is True
+
+    engine._state.positions["AAPL"] = Position(
+        symbol="AAPL",
+        quantity=Decimal("100"),
+        avg_entry_price=Decimal("100"),
+        current_price=Decimal("100"),
+        cost_basis=Decimal("10000"),
+        market_value=Decimal("10000"),
+        unrealized_pnl=Decimal("0"),
+        realized_pnl=Decimal("0"),
+    )
+
+    plans = engine._build_target_position_plans(
+        [
+            TradeSignal(
+                symbol="AAPL",
+                direction=Direction.LONG,
+                strength=1.0,
+                confidence=1.0,
+                horizon=1,
+                model_source="unit_test",
+            )
+        ]
+    )
+
+    assert plans == []
+
+
+def test_backtest_engine_target_sizing_normalizes_multi_signal_gross_exposure():
+    dates = pd.date_range("2024-01-01", periods=1, freq="D")
+    symbols = ["AAPL", "MSFT", "NVDA", "AMD", "META"]
+    handler = PandasDataHandler(
+        {
+            symbol: pd.DataFrame(
+                {
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.0],
+                    "volume": [1_000_000],
+                },
+                index=dates,
+            )
+            for symbol in symbols
+        }
+    )
+    signals = [
+        TradeSignal(
+            symbol=symbol,
+            direction=Direction.LONG,
+            strength=1.0,
+            confidence=1.0,
+            horizon=2,
+            model_source="unit_test",
+        )
+        for symbol in symbols
+    ]
+    engine = BacktestEngine(
+        data_handler=handler,
+        strategy=BatchSignalStrategy(signals),
+        config=BacktestConfig(
+            initial_capital=Decimal("100000"),
+            max_position_pct=0.50,
+            max_leverage=3.0,
+            use_market_simulator=False,
+            allow_fractional=False,
+            enforce_market_calendar=False,
+            use_portfolio_target_sizing=True,
+        ),
+    )
+    engine._initialize()
+    assert handler.update_bars() is True
+
+    plans = engine._build_target_position_plans(signals)
+
+    assert len(plans) == 5
+    assert {symbol for symbol, _, _, _ in [(p[0].symbol, p[1], p[2], p[3]) for p in plans]} == set(
+        symbols
+    )
+    assert all(quantity == Decimal("400") for _, _, quantity, _ in plans)
+
+
+def test_backtest_engine_target_sizing_limits_signal_batch_to_max_total_positions():
+    dates = pd.date_range("2024-01-01", periods=1, freq="D")
+    handler = PandasDataHandler(
+        {
+            "AAPL": pd.DataFrame(
+                {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [1_000_000]},
+                index=dates,
+            ),
+            "MSFT": pd.DataFrame(
+                {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [1_000_000]},
+                index=dates,
+            ),
+            "NVDA": pd.DataFrame(
+                {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [1_000_000]},
+                index=dates,
+            ),
+        }
+    )
+    signals = [
+        TradeSignal(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            strength=1.0,
+            confidence=0.90,
+            horizon=2,
+            model_source="unit_test",
+        ),
+        TradeSignal(
+            symbol="MSFT",
+            direction=Direction.LONG,
+            strength=1.0,
+            confidence=0.80,
+            horizon=2,
+            model_source="unit_test",
+        ),
+        TradeSignal(
+            symbol="NVDA",
+            direction=Direction.LONG,
+            strength=1.0,
+            confidence=0.70,
+            horizon=2,
+            model_source="unit_test",
+        ),
+    ]
+    engine = BacktestEngine(
+        data_handler=handler,
+        strategy=BatchSignalStrategy(signals),
+        config=BacktestConfig(
+            use_market_simulator=False,
+            allow_fractional=False,
+            enforce_market_calendar=False,
+            use_portfolio_target_sizing=True,
+            max_total_positions=2,
+        ),
+    )
+    engine._initialize()
+    assert handler.update_bars() is True
+
+    plans = engine._build_target_position_plans(signals)
+
+    assert len(plans) == 2
+    assert [signal.symbol for signal, _, _, _ in plans] == ["AAPL", "MSFT"]
+
+
 def test_backtest_engine_blocks_new_orders_when_kill_switch_active():
     handler = _sample_handler()
     engine = BacktestEngine(
@@ -202,6 +442,78 @@ def test_backtest_engine_halts_on_drawdown_via_risk_manager():
 
     assert state.bars_processed < 5
     assert engine._risk_limits_manager.kill_switch.is_active()
+
+
+def test_backtest_engine_exits_position_on_stop_loss_reason():
+    dates = pd.date_range("2024-01-01", periods=4, freq="D")
+    data = {
+        "AAPL": pd.DataFrame(
+            {
+                "open": [100.0, 100.0, 90.0, 90.0],
+                "high": [101.0, 101.0, 91.0, 91.0],
+                "low": [99.0, 99.0, 89.0, 89.0],
+                "close": [100.0, 100.0, 90.0, 90.0],
+                "volume": [1_000_000] * 4,
+            },
+            index=dates,
+        )
+    }
+    engine = BacktestEngine(
+        data_handler=PandasDataHandler(data),
+        strategy=OneShotMetadataStrategy(
+            direction=Direction.LONG,
+            confidence=1.0,
+            horizon=5,
+            metadata={"stop_loss_pct": 0.05, "max_holding_bars": 10},
+        ),
+        config=BacktestConfig(
+            use_market_simulator=False,
+            allow_fractional=False,
+            enforce_market_calendar=False,
+            max_position_pct=0.50,
+        ),
+    )
+
+    state = engine.run()
+
+    assert len(state.trades) == 1
+    assert state.trades[0].exit_reason == "stop_loss"
+
+
+def test_backtest_engine_exits_position_on_max_holding_reason():
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    data = {
+        "AAPL": pd.DataFrame(
+            {
+                "open": [100.0, 100.0, 100.0, 100.0, 100.0],
+                "high": [101.0] * 5,
+                "low": [99.0] * 5,
+                "close": [100.0] * 5,
+                "volume": [1_000_000] * 5,
+            },
+            index=dates,
+        )
+    }
+    engine = BacktestEngine(
+        data_handler=PandasDataHandler(data),
+        strategy=OneShotMetadataStrategy(
+            direction=Direction.LONG,
+            confidence=1.0,
+            horizon=5,
+            metadata={"max_holding_bars": 2},
+        ),
+        config=BacktestConfig(
+            use_market_simulator=False,
+            allow_fractional=False,
+            enforce_market_calendar=False,
+            max_position_pct=0.50,
+        ),
+    )
+
+    state = engine.run()
+
+    assert len(state.trades) == 1
+    assert state.trades[0].exit_reason == "max_holding"
 
 
 def test_backtest_engine_respects_early_close_session_filter():

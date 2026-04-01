@@ -21,6 +21,7 @@ def _args(tmp_path: Path, **overrides):
         "execution_mode": "realistic",
         "slippage_bps": 5.0,
         "commission_bps": 1.0,
+        "promotion_package": None,
         "return_threshold_bps": 5.0,
         "signal_confidence": 0.75,
         "signal_horizon": 1,
@@ -87,3 +88,30 @@ def test_run_replay_returns_one_on_bad_dates(tmp_path):
     args = _args(tmp_path, start="2024-99-99")
     code = replay_script.run_replay(args)
     assert code == 1
+
+
+def test_run_replay_uses_promotion_package_symbols_when_symbols_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(replay_script, "_verify_replay_infra", lambda: None)
+    monkeypatch.setattr(
+        replay_script,
+        "load_promotion_package",
+        lambda path: SimpleNamespace(symbols=("AAPL",), timeframe="15Min"),
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_load_replay_data(**kwargs):
+        captured["symbols"] = kwargs["symbols"]
+        return {"AAPL": object()}
+
+    monkeypatch.setattr(replay_script, "_load_replay_data", _fake_load_replay_data)
+    monkeypatch.setattr(replay_script, "run_replay_scenario", lambda **_: _outcome(True))
+
+    args = _args(
+        tmp_path,
+        symbols=[],
+        promotion_package=tmp_path / "pkg.json",
+    )
+    code = replay_script.run_replay(args)
+
+    assert code == 0
+    assert captured["symbols"] == ["AAPL"]

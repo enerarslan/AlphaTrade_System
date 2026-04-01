@@ -648,7 +648,7 @@ For more information, visit: https://github.com/alphatrade/docs
     replay_parser.add_argument(
         "--symbols",
         nargs="+",
-        required=True,
+        required=False,
         help="Symbols to replay",
     )
     replay_parser.add_argument(
@@ -675,6 +675,12 @@ For more information, visit: https://github.com/alphatrade/docs
         type=float,
         default=1.0,
         help="Commission in basis points (default: 1)",
+    )
+    replay_parser.add_argument(
+        "--promotion-package",
+        type=Path,
+        default=None,
+        help="Optional promotion package for artifact-driven replay",
     )
     replay_parser.add_argument(
         "--return-threshold-bps",
@@ -2217,7 +2223,13 @@ def setup_signal_handlers() -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments (compatibility wrapper used by tests)."""
     parser = create_parser()
-    return parser.parse_args(argv)
+    normalized_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(normalized_argv)
+    if getattr(args, "command", None) == "train":
+        from scripts.train import _attach_explicit_profile_overrides
+
+        _attach_explicit_profile_overrides(parser, args, normalized_argv)
+    return args
 
 
 class TradingSystemApp:
@@ -2268,7 +2280,12 @@ def main() -> int:
     """Main entry point for the AlphaTrade CLI."""
 
     parser = create_parser()
-    args = parser.parse_args()
+    raw_argv = sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+    if getattr(args, "command", None) == "train":
+        from scripts.train import _attach_explicit_profile_overrides
+
+        _attach_explicit_profile_overrides(parser, args, raw_argv)
 
     # Setup logging
     setup_logging(
