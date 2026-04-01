@@ -375,6 +375,59 @@ class TestBacktestConfig:
         assert engine._state.pending_orders[0].quantity == Decimal("5")
 
 
+class TestBacktestEngineHelpers:
+    """Focused tests for helper behavior added to the event-driven engine."""
+
+    def test_update_equity_advances_holding_period_only_for_updated_symbols(self):
+        timestamps = pd.date_range("2024-01-02 14:30:00", periods=2, freq="15min", tz="UTC")
+        data = {
+            "AAPL": pd.DataFrame(
+                {
+                    "open": [100.0, 101.0],
+                    "high": [101.0, 102.0],
+                    "low": [99.0, 100.0],
+                    "close": [100.5, 101.5],
+                    "volume": [1000, 1000],
+                },
+                index=timestamps,
+            ),
+            "MSFT": pd.DataFrame(
+                {
+                    "open": [200.0, 201.0],
+                    "high": [201.0, 202.0],
+                    "low": [199.0, 200.0],
+                    "close": [200.5, 201.5],
+                    "volume": [1000, 1000],
+                },
+                index=timestamps,
+            ),
+        }
+
+        engine = BacktestEngine(
+            data_handler=PandasDataHandler(data),
+            strategy=SimpleStrategy(),
+            config=BacktestConfig(use_market_simulator=False),
+        )
+        engine._state = BacktestState(
+            timestamp=timestamps[0].to_pydatetime(),
+            equity=Decimal("100000"),
+            cash=Decimal("100000"),
+            positions={},
+            pending_orders=[],
+            equity_curve=[],
+            trades=[],
+        )
+        engine._open_positions = {
+            "AAPL": {"bars_held": 2},
+            "MSFT": {"bars_held": 4},
+        }
+
+        engine._update_equity(["AAPL"])
+
+        assert engine._open_positions["AAPL"]["bars_held"] == 3
+        assert engine._open_positions["MSFT"]["bars_held"] == 4
+
+
 class TestPandasDataHandler:
     """Tests for PandasDataHandler."""
 

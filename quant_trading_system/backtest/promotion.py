@@ -542,22 +542,32 @@ class PromotionSignalAdapter:
             )
         return split
 
-    @staticmethod
-    def _predict_model_probabilities(model: Any, X_valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return probability-like scores and raw predictions for arbitrary model wrappers."""
-        if hasattr(model, "predict_proba"):
-            probabilities = np.asarray(model.predict_proba(X_valid), dtype=float)
-            if probabilities.ndim == 2:
-                score = probabilities[:, -1] if probabilities.shape[1] >= 2 else probabilities[:, 0]
-            else:
-                score = probabilities.reshape(-1)
-            return score.astype(float), score.astype(float)
+    def _predict_model_probabilities(self, model: Any, X_valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return probability-like scores using the same transforms as training."""
+        model_type = str(self.contract.model_type or "").strip().lower()
+        model_class_name = type(model).__name__.lower()
+        is_ranker_model = "rank" in model_type or "ranker" in model_class_name
+
+        if is_ranker_model:
+            raw_scores = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
+            clipped = np.clip(raw_scores, -20.0, 20.0)
+            score = 1.0 / (1.0 + np.exp(-clipped))
+            return score.astype(float), raw_scores.astype(float)
+
+        try:
+            if hasattr(model, "predict_proba"):
+                probabilities = np.asarray(model.predict_proba(X_valid), dtype=float)
+                if probabilities.ndim == 2:
+                    score = probabilities[:, -1] if probabilities.shape[1] >= 2 else probabilities[:, 0]
+                else:
+                    score = probabilities.reshape(-1)
+                return score.astype(float), score.astype(float)
+        except (AttributeError, NotImplementedError):
+            pass
 
         raw_prediction = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
-        prediction_scale = float(np.nanstd(raw_prediction))
-        if not np.isfinite(prediction_scale) or prediction_scale <= 1e-12:
-            prediction_scale = 1.0
-        score = 1.0 / (1.0 + np.exp(-(raw_prediction / prediction_scale)))
+        clipped = np.clip(raw_prediction, -1.0, 1.0)
+        score = (clipped + 1.0) / 2.0
         return score.astype(float), raw_prediction.astype(float)
 
     @staticmethod

@@ -22,6 +22,11 @@ from quant_trading_system.backtest.engine import (
     PandasDataHandler,
     Strategy,
 )
+from quant_trading_system.backtest.simulator import (
+    create_optimistic_simulator,
+    create_pessimistic_simulator,
+    create_realistic_simulator,
+)
 from quant_trading_system.core.data_types import Direction, TradeSignal
 from quant_trading_system.models.trading_costs import TradingCostModel
 from quant_trading_system.backtest.promotion import (
@@ -321,6 +326,8 @@ def run_replay_scenario(
     """Run a deterministic replay scenario and evaluate SLO gates."""
     prepared_data = _prepare_replay_data(data, scenario)
     config = _build_backtest_config(scenario)
+    resolved_spread_bps = 0.0
+    resolved_impact_bps = 0.0
     if scenario.promotion_package_path is not None:
         contract = load_promotion_package(scenario.promotion_package_path)
         adapter = PromotionSignalAdapter(contract)
@@ -331,19 +338,48 @@ def run_replay_scenario(
         config.confidence_position_sizing = bool(contract.confidence_position_sizing)
         config.min_confidence_position_scale = float(contract.min_confidence_position_scale)
         config.use_portfolio_target_sizing = bool(contract.use_portfolio_target_sizing)
-        if float(config.slippage_bps) == 5.0 and float(contract.cost_model.get("slippage_bps", 0.0)) > 0.0:
-            config.slippage_bps = float(contract.cost_model["slippage_bps"])
+        resolved_spread_bps = float(contract.cost_model.get("spread_bps", 0.0))
+        resolved_impact_bps = float(contract.cost_model.get("impact_bps", 0.0))
+        contract_slippage_bps = float(contract.cost_model.get("slippage_bps", 0.0))
+        if float(config.slippage_bps) == 5.0 and (
+            contract_slippage_bps > 0.0 or resolved_impact_bps > 0.0
+        ):
+            config.slippage_bps = contract_slippage_bps + resolved_impact_bps
     else:
         strategy = DeterministicReplayStrategy(
             symbols=scenario.symbols,
             signal_config=scenario.signal,
             allow_short=scenario.allow_short,
         )
-    engine = BacktestEngine(
-        data_handler=PandasDataHandler(prepared_data),
-        strategy=strategy,
-        config=config,
-    )
+    market_simulator = None
+    if config.execution_mode == ExecutionMode.REALISTIC:
+        market_simulator = create_realistic_simulator(
+            commission_bps=float(config.commission_bps),
+            base_slippage_bps=float(config.slippage_bps),
+            base_spread_bps=float(resolved_spread_bps),
+        )
+    elif config.execution_mode == ExecutionMode.OPTIMISTIC:
+        market_simulator = create_optimistic_simulator()
+    else:
+        market_simulator = create_pessimistic_simulator(
+            commission_bps=float(config.commission_bps) * 2.0,
+            base_slippage_bps=float(config.slippage_bps) * 2.0,
+            base_spread_bps=float(resolved_spread_bps) * 2.0,
+        )
+    engine_kwargs: dict[str, Any] = {
+        "data_handler": PandasDataHandler(prepared_data),
+        "strategy": strategy,
+        "config": config,
+    }
+    if market_simulator is not None:
+        engine_kwargs["market_simulator"] = market_simulator
+    try:
+        engine = BacktestEngine(**engine_kwargs)
+    except TypeError as exc:
+        if "market_simulator" not in str(exc):
+            raise
+        engine_kwargs.pop("market_simulator", None)
+        engine = BacktestEngine(**engine_kwargs)
 
     started_at = datetime.now(timezone.utc)
     state = engine.run()

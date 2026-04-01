@@ -33,6 +33,25 @@ class TestParseArgs:
             args = parse_args()
             assert args.mode == "live"
 
+    def test_parse_trade_command_with_promotion_package(self):
+        """Trade parser should accept artifact-backed promotion packages."""
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "trade",
+                "--mode",
+                "paper",
+                "--promotion-package",
+                "models/promotion_packages/pkg_model.json",
+            ],
+        ):
+            args = parse_args()
+            assert args.command == "trade"
+            normalized_path = str(args.promotion_package).replace("\\", "/")
+            assert normalized_path.endswith("models/promotion_packages/pkg_model.json")
+
     def test_parse_trade_dry_run(self):
         """Test parsing trade command with dry-run."""
         with patch.object(sys, 'argv', ['main.py', 'trade', '--dry-run']):
@@ -63,6 +82,27 @@ class TestParseArgs:
         ]):
             args = parse_args()
             assert args.initial_capital == 200000.0
+
+    def test_parse_backtest_command_with_promotion_package(self):
+        """Backtest parser should accept artifact-backed promotion packages."""
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "backtest",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-31",
+                "--promotion-package",
+                "models/promotion_packages/pkg_model.json",
+            ],
+        ):
+            args = parse_args()
+            assert args.command == "backtest"
+            normalized_path = str(args.promotion_package).replace("\\", "/")
+            assert normalized_path.endswith("models/promotion_packages/pkg_model.json")
 
     def test_parse_replay_command(self):
         """Test parsing deterministic replay command."""

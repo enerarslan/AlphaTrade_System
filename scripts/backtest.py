@@ -391,7 +391,9 @@ class BacktestSession:
     promotion_package_path: Path | None = None
 
     # Advanced options
+    spread_bps: float = 0.0
     slippage_bps: float = 5.0
+    impact_bps: float = 0.0
     commission_bps: float = 1.0
     monte_carlo_sims: int = 0
     max_position_pct: float = 0.10
@@ -482,9 +484,17 @@ class BacktestRunner:
         if self.session.strategy_name == "momentum":
             self.session.strategy_name = f"promotion_package:{self.promotion_package.model_name}"
 
+        package_spread = float(self.promotion_package.cost_model.get("spread_bps", 0.0))
+        if self.session.spread_bps == 0.0 and package_spread > 0.0:
+            self.session.spread_bps = package_spread
+
         package_slippage = float(self.promotion_package.cost_model.get("slippage_bps", 0.0))
         if self.session.slippage_bps == 5.0 and package_slippage > 0.0:
             self.session.slippage_bps = package_slippage
+
+        package_impact = float(self.promotion_package.cost_model.get("impact_bps", 0.0))
+        if self.session.impact_bps == 0.0 and package_impact > 0.0:
+            self.session.impact_bps = package_impact
 
         self.session.max_position_pct = float(self.promotion_package.max_position_pct)
         self.session.max_total_positions = int(self.promotion_package.max_total_positions)
@@ -899,12 +909,13 @@ class BacktestRunner:
         exec_mode = exec_mode_map.get(self.session.execution_mode, ExecutionMode.REALISTIC)
 
         # Create backtest config
+        effective_slippage_bps = float(self.session.slippage_bps) + float(self.session.impact_bps)
         config = BacktestConfig(
             initial_capital=self.session.initial_capital,
             mode=BacktestMode.EVENT_DRIVEN,
             execution_mode=exec_mode,
             commission_bps=self.session.commission_bps,
-            slippage_bps=self.session.slippage_bps,
+            slippage_bps=effective_slippage_bps,
             max_position_pct=self.session.max_position_pct,
             max_total_positions=self.session.max_total_positions,
             confidence_position_sizing=self.session.confidence_position_sizing,
@@ -919,14 +930,16 @@ class BacktestRunner:
         if exec_mode == ExecutionMode.REALISTIC:
             market_simulator = create_realistic_simulator(
                 commission_bps=self.session.commission_bps,
-                base_slippage_bps=self.session.slippage_bps,
+                base_slippage_bps=effective_slippage_bps,
+                base_spread_bps=self.session.spread_bps,
             )
         elif exec_mode == ExecutionMode.OPTIMISTIC:
             market_simulator = create_optimistic_simulator()
         else:
             market_simulator = create_pessimistic_simulator(
                 commission_bps=self.session.commission_bps * 2,
-                base_slippage_bps=self.session.slippage_bps * 2,
+                base_slippage_bps=effective_slippage_bps * 2,
+                base_spread_bps=self.session.spread_bps * 2,
             )
 
         # Use PolarsDataHandler for native Polars support (no conversion overhead)

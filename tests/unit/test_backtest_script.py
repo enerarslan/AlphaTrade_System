@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from quant_trading_system.backtest.engine import BacktestState, PandasDataHandler, Trade
-from quant_trading_system.backtest.promotion import load_promotion_package
+from quant_trading_system.backtest.promotion import PromotionSignalAdapter, load_promotion_package
 from quant_trading_system.backtest.performance_attribution import PerformanceAttributionService
 from quant_trading_system.core.data_types import Direction, OrderSide, Portfolio
 from scripts.backtest import BacktestRunner, BacktestSession, SignalBasedStrategy, run_backtest
@@ -42,6 +42,25 @@ class DummyMetaModel:
                 "passed_filter": confidence >= threshold,
             }
         )
+
+
+class DummyRankerModel:
+    def predict(self, X):
+        del X
+        return np.array([-2.0, 0.0, 2.0], dtype=float)
+
+
+def test_promotion_signal_adapter_uses_training_parity_for_ranker_scores():
+    adapter = PromotionSignalAdapter(SimpleNamespace(model_type="lightgbm_ranker"))
+
+    probabilities, raw_scores = adapter._predict_model_probabilities(
+        DummyRankerModel(),
+        np.zeros((3, 1), dtype=float),
+    )
+
+    expected = 1.0 / (1.0 + np.exp(-np.array([-2.0, 0.0, 2.0], dtype=float)))
+    np.testing.assert_allclose(raw_scores, np.array([-2.0, 0.0, 2.0], dtype=float))
+    np.testing.assert_allclose(probabilities, expected)
 
 
 def test_performance_attribution_compute_attribution_accepts_backtest_state():

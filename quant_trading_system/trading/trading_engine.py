@@ -26,9 +26,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from quant_trading_system.core.data_types import (
+    Direction,
     FeatureVector,
     ModelPrediction,
     OHLCVBar,
+    OrderSide,
+    OrderType,
     Portfolio,
 )
 from quant_trading_system.core.events import (
@@ -46,7 +49,12 @@ from quant_trading_system.risk.limits import (
     RiskLimitsManager,
 )
 from quant_trading_system.execution.alpaca_client import AlpacaClient
-from quant_trading_system.execution.order_manager import ManagedOrder, OrderManager
+from quant_trading_system.execution.order_manager import (
+    ManagedOrder,
+    OrderManager,
+    OrderPriority,
+    OrderRequest,
+)
 from quant_trading_system.execution.position_tracker import PositionTracker
 from quant_trading_system.models.runtime_governor import ModelRuntimeGovernor, RuntimeGovernorConfig
 from quant_trading_system.trading.portfolio_manager import PortfolioManager
@@ -215,6 +223,8 @@ class TradingEngine:
         self._latest_predictions: dict[str, ModelPrediction] = {}
         self._raw_predictions: dict[str, ModelPrediction] = {}
         self._prices: dict[str, Decimal] = {}
+        self._updated_symbols: list[str] | None = None
+        self._position_contracts: dict[str, dict[str, Any]] = {}
 
         # Callbacks
         self._bar_callbacks: list[Callable[[dict[str, OHLCVBar]], None]] = []
@@ -645,6 +655,16 @@ class TradingEngine:
         try:
             # 1. Get latest market data
             await self._update_market_data()
+            active_symbols = (
+                list(self._updated_symbols)
+                if self._updated_symbols is not None
+                else list(self._latest_bars.keys())
+            )
+            signal_bars = {
+                symbol: self._latest_bars[symbol]
+                for symbol in active_symbols
+                if symbol in self._latest_bars
+            }
 
             # 2. Check risk limits - MANDATORY (cannot be disabled)
             # CRITICAL FIX: Risk checks always run. Safety controls are non-negotiable.
@@ -654,47 +674,49 @@ class TradingEngine:
 
             # 3. Generate signals
             portfolio = self.position_tracker.get_portfolio()
-            predictions = self._get_governed_predictions()
-            signals = self.signal_generator.generate_signals(
-                bars=self._latest_bars,
-                features=self._latest_features,
-                predictions=predictions,
-                portfolio=portfolio,
-            )
-            if self.runtime_governor is not None:
-                signals = self.runtime_governor.govern_signals(signals)
+            if signal_bars:
+                await self._evaluate_position_exit_contracts(list(signal_bars))
+                predictions = self._get_governed_predictions()
+                signals = self.signal_generator.generate_signals(
+                    bars=signal_bars,
+                    features=self._latest_features,
+                    predictions=predictions,
+                    portfolio=portfolio,
+                )
+                if self.runtime_governor is not None:
+                    signals = self.runtime_governor.govern_signals(signals)
 
-            if self._session:
-                self._session.signals_generated += len(signals)
-            self._metrics.signals_generated += len(signals)
+                if self._session:
+                    self._session.signals_generated += len(signals)
+                self._metrics.signals_generated += len(signals)
 
-            # Invoke callbacks
-            for callback in self._signal_callbacks:
-                try:
-                    callback(signals)
-                except Exception as e:
-                    logger.error(f"Signal callback error: {e}")
+                # Invoke callbacks
+                for callback in self._signal_callbacks:
+                    try:
+                        callback(signals)
+                    except Exception as e:
+                        logger.error(f"Signal callback error: {e}")
 
-            # 4. Build target portfolio (including empty-signal case)
-            target = self.portfolio_manager.build_target_portfolio(
-                signals=signals,
-                portfolio=portfolio,
-                prices=self._prices,
-            )
+                # 4. Build target portfolio (including empty-signal case)
+                target = self.portfolio_manager.build_target_portfolio(
+                    signals=signals,
+                    portfolio=portfolio,
+                    prices=self._prices,
+                )
 
-            # 5. Check if rebalancing needed
-            needs_rebalance, reason = self.portfolio_manager.check_rebalance_needed(
-                target=target,
-                portfolio=portfolio,
-                prices=self._prices,
-            )
+                # 5. Check if rebalancing needed
+                needs_rebalance, reason = self.portfolio_manager.check_rebalance_needed(
+                    target=target,
+                    portfolio=portfolio,
+                    prices=self._prices,
+                )
 
-            # 6. Generate and execute trades
-            if needs_rebalance:
-                await self._execute_rebalance(target, portfolio)
+                # 6. Generate and execute trades
+                if needs_rebalance:
+                    await self._execute_rebalance(target, portfolio)
 
-            # Update metrics
-            self._metrics.bars_processed += len(self._latest_bars)
+                self._increment_position_contract_bars(list(signal_bars))
+                self._metrics.bars_processed += len(signal_bars)
 
             # Calculate latency
             latency_ms = (datetime.now(timezone.utc) - iteration_start).total_seconds() * 1000
@@ -780,80 +802,7 @@ class TradingEngine:
         # Submit orders with P0 FIX: PreTradeRiskChecker validation
         for request in order_requests:
             try:
-                current_price = self._prices.get(request.symbol)
-
-                # Create managed order first (required for risk check)
-                managed = self.order_manager.create_order(
-                    request=request,
-                    portfolio=portfolio,
-                    current_price=current_price,
-                )
-
-                # P0 FIX: Pre-trade risk check with portfolio lock for atomicity
-                # FIX: Use check_all() instead of non-existent check_order()
-                with self._risk_checker.portfolio_lock:
-                    market_data: dict[str, Any] = {}
-                    latest_bar = self._latest_bars.get(request.symbol)
-                    if latest_bar is not None:
-                        bars_per_day = max(1, int(390 / max(self.config.bar_interval_minutes, 1)))
-                        adv_proxy = max(int(latest_bar.volume), int(latest_bar.volume) * bars_per_day)
-                        market_data["avg_daily_volume"] = adv_proxy
-                        market_data["avg_daily_dollar_volume"] = float(
-                            Decimal(str(adv_proxy)) * latest_bar.close
-                        )
-
-                    # Forward optional upstream liquidity hints if strategy populated metadata.
-                    for key in (
-                        "avg_daily_volume",
-                        "average_daily_volume",
-                        "adv",
-                        "avg_daily_dollar_volume",
-                        "average_daily_dollar_volume",
-                        "addv",
-                        "spread_bps",
-                        "bid_ask_spread_bps",
-                    ):
-                        if key in managed.request.metadata:
-                            market_data[key] = managed.request.metadata[key]
-
-                    can_submit, risk_results = self._risk_limits_manager.pre_trade_check(
-                        managed.order,
-                        portfolio,
-                        current_price or Decimal("0"),
-                        market_data=market_data or None,
-                    )
-
-                    # Check if any risk check failed
-                    failed_checks = [r for r in risk_results if r.result == CheckResult.FAILED]
-                    warning_checks = [r for r in risk_results if r.result == CheckResult.WARNING]
-                    if not can_submit or failed_checks:
-                        # P0 FIX (January 2026 Audit): Use 'message' attribute instead of 'reason'
-                        # RiskCheckResult dataclass has 'message' field, not 'reason'
-                        reasons = "; ".join(r.message for r in failed_checks if r.message)
-                        logger.warning(
-                            f"Order rejected by PreTradeRiskChecker: {request.symbol} "
-                            f"- {reasons}"
-                        )
-                        continue
-                    if warning_checks:
-                        warning_text = "; ".join(w.message for w in warning_checks if w.message)
-                        logger.warning(
-                            f"Order risk warnings for {request.symbol}: {warning_text}"
-                        )
-
-                    await self.order_manager.submit_order(
-                        managed=managed,
-                        current_price=current_price,
-                    )
-                    if self.runtime_governor is not None:
-                        self.runtime_governor.record_order_submission(managed.request.metadata)
-
-                # P0-7 FIX: Acquire lock when modifying session state
-                with self._state_lock:
-                    if self._session:
-                        self._session.orders_submitted += 1
-                self._metrics.orders_submitted += 1
-
+                await self._submit_order_request(request, portfolio)
             except Exception as e:
                 logger.error(f"Failed to submit order for {request.symbol}: {e}")
 
@@ -902,6 +851,7 @@ class TradingEngine:
 
     async def _update_market_data(self) -> None:
         """Update market data for all symbols."""
+        updated_symbols: list[str] = []
         for symbol in self.config.symbols:
             try:
                 # Get latest bar from Alpaca
@@ -919,11 +869,16 @@ class TradingEngine:
                         volume=int(bar_data["v"]),
                         vwap=Decimal(str(bar_data.get("vw", bar_data["c"]))),
                     )
+                    previous_bar = self._latest_bars.get(symbol)
                     self._latest_bars[symbol] = bar
                     self._prices[symbol] = bar.close
+                    if previous_bar is None or bar.timestamp > previous_bar.timestamp:
+                        updated_symbols.append(symbol)
 
             except Exception as e:
                 logger.warning(f"Failed to get data for {symbol}: {e}")
+
+        self._updated_symbols = updated_symbols
 
         # Update position prices
         self.position_tracker.update_prices(self._prices)
@@ -934,6 +889,198 @@ class TradingEngine:
                 callback(self._latest_bars)
             except Exception as e:
                 logger.error(f"Bar callback error: {e}")
+
+    def _resolve_bar_interval_minutes(self) -> int:
+        """Resolve configured bar interval into minutes."""
+        interval_map = {
+            "1Min": 1,
+            "5Min": 5,
+            "15Min": 15,
+            "30Min": 30,
+            "1Hour": 60,
+        }
+        return max(1, int(interval_map.get(self.config.bar_interval, 1)))
+
+    def _has_active_order_for_symbol(self, symbol: str) -> bool:
+        """Check whether the OMS already has an active order for a symbol."""
+        getter = getattr(self.order_manager, "get_active_orders", None)
+        if getter is None or not callable(getter):
+            return False
+        try:
+            active_orders = getter(symbol=symbol)
+        except TypeError:
+            active_orders = getter(symbol)
+        return isinstance(active_orders, list) and len(active_orders) > 0
+
+    def _increment_position_contract_bars(self, symbols: list[str]) -> None:
+        """Advance hold-contract bars only for symbols with a fresh bar."""
+        for symbol in symbols:
+            contract = self._position_contracts.get(symbol)
+            if contract is None or not bool(contract.get("hold_contract_enabled", False)):
+                continue
+            contract["bars_held"] = int(contract.get("bars_held", 0)) + 1
+
+    def _position_contract_return_pct(
+        self,
+        contract: dict[str, Any],
+        bar: OHLCVBar,
+        position_side: str,
+    ) -> float:
+        """Compute signed return for a tracked live position contract."""
+        entry_price = Decimal(str(contract.get("entry_price", bar.close)))
+        if entry_price <= 0:
+            return 0.0
+        if position_side == "long":
+            return float((bar.close - entry_price) / entry_price)
+        return float((entry_price - bar.close) / entry_price)
+
+    async def _evaluate_position_exit_contracts(self, symbols: list[str]) -> None:
+        """Evaluate horizon/TP/SL exits for live paper positions."""
+        for symbol in symbols:
+            contract = self._position_contracts.get(symbol)
+            if contract is None or not bool(contract.get("hold_contract_enabled", False)):
+                continue
+
+            position = self.position_tracker.get_position(symbol)
+            if position is None or position.is_flat:
+                self._position_contracts.pop(symbol, None)
+                continue
+
+            if self._has_active_order_for_symbol(symbol):
+                continue
+
+            bar = self._latest_bars.get(symbol)
+            if bar is None:
+                continue
+
+            position_side = "long" if position.is_long else "short"
+            ret_pct = self._position_contract_return_pct(contract, bar, position_side)
+            take_profit_pct = float(contract.get("take_profit_pct", 0.0) or 0.0)
+            stop_loss_pct = float(contract.get("stop_loss_pct", 0.0) or 0.0)
+            bars_held = int(contract.get("bars_held", 0))
+            prediction_horizon_bars = int(max(1, contract.get("prediction_horizon_bars", 1)))
+            max_holding_bars = int(
+                max(1, contract.get("max_holding_bars", prediction_horizon_bars))
+            )
+
+            exit_reason: str | None = None
+            if take_profit_pct > 0.0 and ret_pct >= take_profit_pct:
+                exit_reason = "take_profit"
+            elif stop_loss_pct > 0.0 and ret_pct <= -abs(stop_loss_pct):
+                exit_reason = "stop_loss"
+            elif max_holding_bars < prediction_horizon_bars and bars_held >= max_holding_bars:
+                exit_reason = "max_holding"
+            elif bars_held >= prediction_horizon_bars:
+                exit_reason = "horizon"
+            elif bars_held >= max_holding_bars:
+                exit_reason = "max_holding"
+
+            if exit_reason is not None:
+                await self._submit_position_exit_order(symbol, position, exit_reason)
+
+    async def _submit_order_request(
+        self,
+        request: OrderRequest,
+        portfolio: Portfolio,
+    ) -> bool:
+        """Create, risk-check, and submit a single OMS request."""
+        current_price = self._prices.get(request.symbol) or self._extract_expected_price(request.metadata)
+        managed = self.order_manager.create_order(
+            request=request,
+            portfolio=portfolio,
+            current_price=current_price,
+        )
+
+        with self._risk_checker.portfolio_lock:
+            market_data: dict[str, Any] = {}
+            latest_bar = self._latest_bars.get(request.symbol)
+            if latest_bar is not None:
+                bars_per_day = max(
+                    1,
+                    int(390 / max(self._resolve_bar_interval_minutes(), 1)),
+                )
+                adv_proxy = max(int(latest_bar.volume), int(latest_bar.volume) * bars_per_day)
+                market_data["avg_daily_volume"] = adv_proxy
+                market_data["avg_daily_dollar_volume"] = float(
+                    Decimal(str(adv_proxy)) * latest_bar.close
+                )
+
+            for key in (
+                "avg_daily_volume",
+                "average_daily_volume",
+                "adv",
+                "avg_daily_dollar_volume",
+                "average_daily_dollar_volume",
+                "addv",
+                "spread_bps",
+                "bid_ask_spread_bps",
+            ):
+                if key in managed.request.metadata:
+                    market_data[key] = managed.request.metadata[key]
+
+            can_submit, risk_results = self._risk_limits_manager.pre_trade_check(
+                managed.order,
+                portfolio,
+                current_price or Decimal("0"),
+                market_data=market_data or None,
+            )
+
+            failed_checks = [r for r in risk_results if r.result == CheckResult.FAILED]
+            warning_checks = [r for r in risk_results if r.result == CheckResult.WARNING]
+            if not can_submit or failed_checks:
+                reasons = "; ".join(r.message for r in failed_checks if r.message)
+                logger.warning(
+                    f"Order rejected by PreTradeRiskChecker: {request.symbol} - {reasons}"
+                )
+                return False
+            if warning_checks:
+                warning_text = "; ".join(w.message for w in warning_checks if w.message)
+                logger.warning(f"Order risk warnings for {request.symbol}: {warning_text}")
+
+            await self.order_manager.submit_order(
+                managed=managed,
+                current_price=current_price,
+            )
+            if self.runtime_governor is not None:
+                self.runtime_governor.record_order_submission(managed.request.metadata)
+
+        with self._state_lock:
+            if self._session:
+                self._session.orders_submitted += 1
+        self._metrics.orders_submitted += 1
+        return True
+
+    async def _submit_position_exit_order(
+        self,
+        symbol: str,
+        position: Any,
+        exit_reason: str,
+    ) -> None:
+        """Submit a risk-reduction exit order for a tracked hold contract."""
+        if self._global_kill_switch.is_active():
+            return
+        if self.config.mode == TradingMode.DRY_RUN:
+            logger.info("DRY RUN: Would submit %s exit for %s", exit_reason, symbol)
+            return
+        if self._has_active_order_for_symbol(symbol):
+            return
+
+        request = OrderRequest(
+            symbol=symbol,
+            side=OrderSide.SELL if position.is_long else OrderSide.BUY,
+            quantity=abs(position.quantity),
+            order_type=OrderType.MARKET,
+            priority=OrderPriority.HIGH,
+            strategy_id="TradingEngineHoldContract",
+            notes=f"{exit_reason}_exit",
+            metadata={
+                "contract_exit_reason": exit_reason,
+                "expected_price": str(position.current_price),
+                "hold_contract_enabled": True,
+            },
+        )
+        portfolio = self.position_tracker.get_portfolio()
+        await self._submit_order_request(request, portfolio)
 
     def _check_risk_limits(self) -> bool:
         """Check risk limits.
@@ -1097,6 +1244,7 @@ class TradingEngine:
             fill_price=managed.order.filled_avg_price or Decimal("0"),
             strategy_id=managed.request.strategy_id,
         )
+        self._sync_position_contract_from_fill(managed)
 
         if self.runtime_governor is not None and managed.order.filled_avg_price is not None:
             expected_price = self._extract_expected_price(managed.request.metadata)
@@ -1123,6 +1271,80 @@ class TradingEngine:
                 managed.request.metadata,
                 reason=managed.error_message or "",
             )
+
+    def _sync_position_contract_from_fill(self, managed: ManagedOrder) -> None:
+        """Refresh live hold-contract state after a fill updates broker positions."""
+        symbol = managed.order.symbol
+        position = self.position_tracker.get_position(symbol)
+        if position is None or position.is_flat:
+            self._position_contracts.pop(symbol, None)
+            return
+
+        metadata = managed.request.metadata if isinstance(managed.request.metadata, dict) else {}
+        existing = self._position_contracts.get(symbol)
+        hold_contract_enabled = bool(
+            metadata.get(
+                "hold_contract_enabled",
+                existing.get("hold_contract_enabled", False) if existing is not None else False,
+            )
+        )
+        if not hold_contract_enabled and existing is None:
+            return
+
+        position_side = "long" if position.is_long else "short"
+        fill_price = managed.order.filled_avg_price or position.current_price
+        current_quantity = abs(position.quantity)
+
+        if existing is None or existing.get("position_side") != position_side:
+            contract: dict[str, Any] = {
+                "entry_time": datetime.now(timezone.utc),
+                "entry_price": fill_price,
+                "bars_held": 0,
+            }
+        else:
+            contract = dict(existing)
+            previous_quantity = Decimal(str(contract.get("quantity", current_quantity)))
+            if current_quantity > previous_quantity and previous_quantity > 0:
+                previous_entry = Decimal(str(contract.get("entry_price", fill_price)))
+                added_quantity = current_quantity - previous_quantity
+                contract["entry_price"] = (
+                    (previous_entry * previous_quantity) + (fill_price * added_quantity)
+                ) / current_quantity
+
+        contract["quantity"] = current_quantity
+        contract["position_side"] = position_side
+        contract["hold_contract_enabled"] = hold_contract_enabled
+        contract["prediction_horizon_bars"] = int(
+            max(
+                1,
+                metadata.get(
+                    "signal_horizon_bars",
+                    contract.get("prediction_horizon_bars", 1),
+                ),
+            )
+        )
+        contract["max_holding_bars"] = int(
+            max(
+                1,
+                metadata.get(
+                    "max_holding_bars",
+                    contract.get("max_holding_bars", contract["prediction_horizon_bars"]),
+                ),
+            )
+        )
+        contract["take_profit_pct"] = float(
+            metadata.get("take_profit_pct", contract.get("take_profit_pct", 0.0)) or 0.0
+        )
+        contract["stop_loss_pct"] = float(
+            metadata.get("stop_loss_pct", contract.get("stop_loss_pct", 0.0)) or 0.0
+        )
+        contract["model_source"] = str(
+            metadata.get(
+                "signal_model_source",
+                contract.get("model_source", managed.request.strategy_id or ""),
+            )
+        )
+        self._position_contracts[symbol] = contract
 
     def _is_pre_market(self, current_time: time) -> bool:
         """Check if in pre-market period.

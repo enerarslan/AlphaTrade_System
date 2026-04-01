@@ -593,6 +593,12 @@ class PortfolioManager:
                 return True, "new_signals"
             return False, ""
 
+        # Preserve live/backtest parity: absence of a fresh target does not
+        # imply liquidation. Positions are exited only by explicit rebalance
+        # targets or dedicated hold/stop contracts.
+        if target.num_positions == 0:
+            return False, ""
+
         # Calculate current weights
         current_weights = self._calculate_current_weights(portfolio, prices)
 
@@ -647,6 +653,9 @@ class PortfolioManager:
                         "signal_model_source": signal.signal.model_source,
                         "signal_confidence": signal.signal.confidence,
                         "signal_strength": signal.signal.strength,
+                        "signal_horizon_bars": int(signal.signal.horizon),
+                        "signal_direction": signal.signal.direction.value,
+                        "signal_timestamp": signal.signal.timestamp.isoformat(),
                     }
                 )
 

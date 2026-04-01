@@ -483,6 +483,12 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Trading strategy to use (default: momentum)",
     )
     trade_parser.add_argument(
+        "--promotion-package",
+        type=Path,
+        default=None,
+        help="Optional promotion package to drive artifact-backed paper/live trading",
+    )
+    trade_parser.add_argument(
         "--capital",
         type=float,
         default=100000.0,
@@ -557,6 +563,12 @@ For more information, visit: https://github.com/alphatrade/docs
         "--strategy",
         default="momentum",
         help="Strategy to backtest (default: momentum)",
+    )
+    backtest_parser.add_argument(
+        "--promotion-package",
+        type=Path,
+        default=None,
+        help="Optional promotion package to run artifact-driven model backtests",
     )
     backtest_parser.add_argument(
         "--execution-mode",

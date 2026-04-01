@@ -287,3 +287,128 @@ def test_replay_scenario_uses_promotion_package_signal_frames(tmp_path: Path, mo
     assert config.max_position_pct == pytest.approx(0.15)
     assert config.max_total_positions == 7
     assert config.min_confidence_position_scale == pytest.approx(0.25)
+
+
+def test_replay_scenario_propagates_contract_costs_into_market_simulator(
+    tmp_path: Path,
+    monkeypatch,
+):
+    model_path = tmp_path / "pkg_model.pkl"
+    package_path = tmp_path / "pkg_model.promotion_package.json"
+
+    with model_path.open("wb") as handle:
+        pickle.dump({"dummy": True}, handle)
+
+    package_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.1.0",
+                "model_name": "pkg_model",
+                "model_type": "lightgbm",
+                "model_path": str(model_path),
+                "feature_contract": {
+                    "selected_features": ["feat_a"],
+                    "feature_groups": ["technical"],
+                },
+                "execution_cost_model": {
+                    "spread_bps": 2.0,
+                    "slippage_bps": 4.0,
+                    "impact_bps": 3.0,
+                },
+                "signal_policy": {
+                    "horizon_bars": 2,
+                    "model_source": "promotion_package:pkg_model",
+                },
+                "training_config": {
+                    "symbols": ["AAPL"],
+                    "timeframe": "15Min",
+                    "timeframes": ["15Min"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_generate(self, data, features=None):
+        frame = next(iter(data.values()))
+        return {
+            "AAPL": pd.DataFrame(
+                {
+                    "timestamp": frame.index,
+                    "signal": [0.8] + [0.0] * (len(frame.index) - 1),
+                    "confidence": [0.9] * len(frame.index),
+                    "horizon": [2] * len(frame.index),
+                    "model_source": ["promotion_package:pkg_model"] * len(frame.index),
+                }
+            )
+        }
+
+    monkeypatch.setattr(
+        replay_module.PromotionSignalAdapter,
+        "generate_signal_frames",
+        _fake_generate,
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_realistic_simulator(*, commission_bps, base_slippage_bps, base_spread_bps):
+        captured["commission_bps"] = commission_bps
+        captured["base_slippage_bps"] = base_slippage_bps
+        captured["base_spread_bps"] = base_spread_bps
+        return "SIMULATOR"
+
+    class _CapturedEngine:
+        def __init__(self, data_handler, strategy, config, market_simulator=None):
+            captured["config"] = config
+            captured["market_simulator"] = market_simulator
+
+        def run(self):
+            return BacktestState(
+                timestamp=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                equity=Decimal("100000"),
+                cash=Decimal("100000"),
+                positions={},
+                pending_orders=[],
+                equity_curve=[
+                    (datetime(2024, 1, 2, tzinfo=timezone.utc), 100000.0),
+                    (datetime(2024, 1, 3, tzinfo=timezone.utc), 100050.0),
+                ],
+                trades=[],
+                bars_processed=6,
+            )
+
+        def get_execution_slo_snapshot(self):
+            return {
+                "orders_submitted": 1,
+                "rejection_rate": 0.0,
+                "avg_slippage_bps": 0.0,
+                "risk_playbook": {},
+            }
+
+    monkeypatch.setattr(replay_module, "create_realistic_simulator", _fake_realistic_simulator)
+    monkeypatch.setattr(replay_module, "BacktestEngine", _CapturedEngine)
+
+    run_replay_scenario(
+        data={"AAPL": _ohlcv([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])},
+        scenario=ReplayScenario(
+            scenario_id="pkg_replay_costs",
+            symbols=["AAPL"],
+            start_date=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            end_date=datetime(2024, 1, 5, tzinfo=timezone.utc),
+            promotion_package_path=package_path,
+        ),
+        slo_gates=ReplaySLOGates(
+            max_drawdown=0.50,
+            max_rejection_rate=1.0,
+            max_avg_slippage_bps=500.0,
+            max_risk_escalations=5,
+            max_escalation_latency_ms=10_000.0,
+            min_orders_for_gate=1,
+        ),
+    )
+
+    assert captured["market_simulator"] == "SIMULATOR"
+    assert captured["commission_bps"] == pytest.approx(1.0)
+    assert captured["base_spread_bps"] == pytest.approx(2.0)
+    assert captured["base_slippage_bps"] == pytest.approx(7.0)
+    assert captured["config"].slippage_bps == pytest.approx(7.0)

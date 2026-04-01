@@ -931,6 +931,44 @@ class TestPortfolioManager:
         # 20% target vs ~10% actual = 10% drift > 5% threshold
         assert needs_rebalance is True
 
+    def test_check_rebalance_needed_does_not_force_liquidation_without_new_target(self):
+        """Absence of a fresh target should not liquidate existing positions."""
+        manager = PortfolioManager(
+            rebalance_config=RebalanceConfig(
+                method=RebalanceMethod.THRESHOLD,
+                threshold_pct=0.05,
+            )
+        )
+
+        target = TargetPortfolio(
+            total_equity=Decimal("100000"),
+            target_positions={},
+        )
+        portfolio = Portfolio(
+            equity=Decimal("100000"),
+            cash=Decimal("90000"),
+            buying_power=Decimal("90000"),
+            positions={
+                "AAPL": Position(
+                    symbol="AAPL",
+                    quantity=Decimal("50"),
+                    avg_entry_price=Decimal("100"),
+                    current_price=Decimal("105"),
+                    cost_basis=Decimal("5000"),
+                    market_value=Decimal("5250"),
+                ),
+            },
+        )
+
+        needs_rebalance, reason = manager.check_rebalance_needed(
+            target,
+            portfolio,
+            {"AAPL": Decimal("105")},
+        )
+
+        assert needs_rebalance is False
+        assert reason == ""
+
     def test_create_order_requests_preserves_runtime_metadata(self):
         """Signal metadata should survive into order requests for audit/governance."""
         manager = PortfolioManager()
@@ -970,6 +1008,10 @@ class TestPortfolioManager:
         assert requests[0].metadata["runtime_selected_model"] == "lightgbm:v2"
         assert requests[0].metadata["runtime_model_role"] == "challenger"
         assert requests[0].metadata["expected_price"] == "150"
+        assert requests[0].metadata["signal_model_source"] == "MLStrategy:test"
+        assert requests[0].metadata["signal_horizon_bars"] == 5
+        assert requests[0].metadata["signal_direction"] == Direction.LONG.value
+        assert requests[0].metadata["signal_timestamp"] == signal.signal.timestamp.isoformat()
 
 
 class TestPortfolioOptimizer:
@@ -1249,6 +1291,42 @@ class TestTradingEngine:
         runtime_governor.route_predictions.assert_called_once_with(engine._raw_predictions)
         used_predictions = mock_signal_generator.generate_signals.call_args.kwargs["predictions"]
         assert used_predictions == routed_predictions
+
+    @pytest.mark.asyncio
+    async def test_evaluate_position_exit_contracts_submits_horizon_exit(self):
+        """Tracked paper/live positions should exit when the prediction horizon is reached."""
+        engine = self.create_mock_engine()
+        bar_time = datetime.now(timezone.utc)
+        position = Position(
+            symbol="AAPL",
+            quantity=Decimal("10"),
+            avg_entry_price=Decimal("100"),
+            current_price=Decimal("104"),
+            cost_basis=Decimal("1000"),
+            market_value=Decimal("1040"),
+        )
+        engine._latest_bars["AAPL"] = OHLCVBar(
+            symbol="AAPL",
+            timestamp=bar_time,
+            open=Decimal("103"),
+            high=Decimal("105"),
+            low=Decimal("102"),
+            close=Decimal("104"),
+            volume=1000,
+        )
+        engine._position_contracts["AAPL"] = {
+            "hold_contract_enabled": True,
+            "entry_price": Decimal("100"),
+            "bars_held": 5,
+            "prediction_horizon_bars": 5,
+            "max_holding_bars": 7,
+        }
+        engine.position_tracker.get_position = MagicMock(return_value=position)
+
+        with patch.object(engine, "_submit_position_exit_order", AsyncMock()) as submit_exit:
+            await engine._evaluate_position_exit_contracts(["AAPL"])
+
+        submit_exit.assert_awaited_once_with("AAPL", position, "horizon")
 
     def test_check_risk_limits_passes(self):
         """Test risk limit check when within limits."""

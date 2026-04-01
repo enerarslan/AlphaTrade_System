@@ -46,6 +46,7 @@ from quant_trading_system.backtest.simulator import (
 )
 from quant_trading_system.core.reproducibility import set_global_seed
 from quant_trading_system.core.utils import get_market_session_bounds, is_market_holiday, to_eastern
+from quant_trading_system.data.timeframe import US_EQUITY_REGULAR_SESSION_MINUTES
 from quant_trading_system.risk.limits import (
     CheckResult,
     KillSwitchReason,
@@ -593,6 +594,7 @@ class BacktestEngine:
         self._volatility_window: int = 20  # Bars for volatility calculation
         self._price_history: dict[str, deque] = {}
         self._is_intraday_data: bool | None = None
+        self._annualization_periods: int = 252
         self._portfolio_position_sizer = PositionSizer(
             PositionSizerConfig(
                 percent_of_equity=float(self.config.max_position_pct),
@@ -685,6 +687,43 @@ class BacktestEngine:
 
         return abs((second - first).total_seconds()) < 86_400
 
+    def _estimate_annualization_periods(self) -> int:
+        """Estimate annualization periods from the loaded bar frequency."""
+        dates = getattr(self.data_handler, "_dates", None)
+        if not isinstance(dates, list) or len(dates) < 2:
+            return 252
+
+        min_delta_seconds: float | None = None
+        previous_ts: datetime | None = None
+        for raw_timestamp in dates[: min(len(dates), 512)]:
+            try:
+                current_ts = pd.Timestamp(raw_timestamp).to_pydatetime()
+            except Exception:
+                continue
+            if previous_ts is not None:
+                delta_seconds = abs((current_ts - previous_ts).total_seconds())
+                if delta_seconds > 0:
+                    min_delta_seconds = (
+                        delta_seconds
+                        if min_delta_seconds is None
+                        else min(min_delta_seconds, delta_seconds)
+                    )
+            previous_ts = current_ts
+
+        if min_delta_seconds is None or min_delta_seconds >= 86_400:
+            return 252
+
+        bars_per_session = max(
+            1,
+            int(
+                np.ceil(
+                    (US_EQUITY_REGULAR_SESSION_MINUTES * 60.0)
+                    / max(min_delta_seconds, 1.0)
+                )
+            ),
+        )
+        return 252 * bars_per_session
+
     def _to_market_time(self, timestamp: datetime) -> datetime:
         """Normalize bar timestamp to Eastern market time.
 
@@ -765,6 +804,7 @@ class BacktestEngine:
         }
         self._market_conditions = {}
         self._is_intraday_data = self._infer_intraday_data()
+        self._annualization_periods = self._estimate_annualization_periods()
         self._orders_submitted_total = 0
         self._orders_rejected_total = 0
         self._recent_slippage_bps.clear()
@@ -777,6 +817,7 @@ class BacktestEngine:
     def _process_bar(self) -> None:
         """Process current bar for all symbols."""
         processed_any_bar = False
+        processed_symbols: list[str] = []
         updated_symbols = self.data_handler.get_updated_symbols()
         current_timestamp = self.data_handler.get_current_timestamp()
         for symbol in updated_symbols:
@@ -787,6 +828,7 @@ class BacktestEngine:
                 continue
 
             processed_any_bar = True
+            processed_symbols.append(symbol)
             self._state.timestamp = current_timestamp or bar.timestamp
             self._state.bars_processed += 1
 
@@ -840,7 +882,7 @@ class BacktestEngine:
                     callback(signal)
 
         # Update equity curve
-        self._update_equity()
+        self._update_equity(processed_symbols)
 
     def _update_position_prices(self, symbol: str, bar: OHLCVBar) -> None:
         """Update position with current price."""
@@ -864,7 +906,7 @@ class BacktestEngine:
             prices = list(self._price_history[symbol])
             returns = [(prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))]
             if returns:
-                volatility = float(np.std(returns) * np.sqrt(252))  # Annualized
+                volatility = float(np.std(returns) * np.sqrt(self._annualization_periods))
 
         # Estimate bid/ask from high/low
         spread = bar.high - bar.low
@@ -1930,16 +1972,18 @@ class BacktestEngine:
             return Decimal(int(low))
         return low
 
-    def _update_equity(self) -> None:
+    def _update_equity(self, updated_symbols: list[str] | None = None) -> None:
         """Update equity and equity curve."""
         position_value = sum(p.market_value for p in self._state.positions.values())
         self._state.equity = self._state.cash + position_value
 
         self._state.equity_curve.append((self._state.timestamp, float(self._state.equity)))
 
-        # Update holding periods
-        for symbol in self._open_positions:
-            self._open_positions[symbol]["bars_held"] += 1
+        # Update holding periods only for symbols that received a fresh bar.
+        symbols_to_advance = updated_symbols or list(self._open_positions.keys())
+        for symbol in symbols_to_advance:
+            if symbol in self._open_positions:
+                self._open_positions[symbol]["bars_held"] += 1
 
     def _check_halt_conditions(self) -> bool:
         """Check if backtest should halt."""
