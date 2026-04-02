@@ -29,6 +29,7 @@ from quant_trading_system.features.optimized_pipeline import (
     OptimizedPipelineConfig,
 )
 from quant_trading_system.models.expected_edge_policy import resolve_regime_policy_frame
+from quant_trading_system.models.feature_schema import prepare_model_inference_input
 from quant_trading_system.models.symbol_quality import (
     SymbolQualityThresholds,
     assess_symbol_quality,
@@ -1049,9 +1050,14 @@ class PromotionSignalAdapter:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return probability-like scores using the same transforms as training."""
         is_ranker_model = self._is_ranker_contract(model)
+        X_inference = prepare_model_inference_input(
+            model,
+            X_valid,
+            fallback_feature_names=getattr(self.contract, "feature_names", ()),
+        )
 
         if is_ranker_model:
-            raw_scores = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
+            raw_scores = np.asarray(model.predict(X_inference), dtype=float).reshape(-1)
             score = _normalize_ranker_scores(
                 raw_scores,
                 timestamps=timestamps,
@@ -1063,7 +1069,7 @@ class PromotionSignalAdapter:
 
         try:
             if hasattr(model, "predict_proba"):
-                probabilities = np.asarray(model.predict_proba(X_valid), dtype=float)
+                probabilities = np.asarray(model.predict_proba(X_inference), dtype=float)
                 if probabilities.ndim == 2:
                     score = (
                         probabilities[:, -1] if probabilities.shape[1] >= 2 else probabilities[:, 0]
@@ -1078,7 +1084,7 @@ class PromotionSignalAdapter:
         except (AttributeError, NotImplementedError):
             pass
 
-        raw_prediction = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
+        raw_prediction = np.asarray(model.predict(X_inference), dtype=float).reshape(-1)
         clipped = np.clip(raw_prediction, -1.0, 1.0)
         score = (clipped + 1.0) / 2.0
         payload = self._resolve_probability_calibration_payload(model)

@@ -84,6 +84,7 @@ from quant_trading_system.models.expected_edge_policy import (
     derive_base_signal,
     derive_regime_conditioned_policy,
 )
+from quant_trading_system.models.feature_schema import prepare_model_inference_input
 from quant_trading_system.data.data_access import filter_ohlcv_frame_to_market_session
 from quant_trading_system.models.statistical_validation import (
     calculate_deflated_sharpe_ratio,
@@ -652,7 +653,9 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
     }:
         section = all_cfg.get(model_type, {})
         if not section and model_type == "lightgbm_ranker":
-            section = all_cfg.get("lightgbm", {})
+            legacy_section = all_cfg.get("lightgbm", {})
+            legacy_ranker = legacy_section.get("ranker", {}) if isinstance(legacy_section, dict) else {}
+            section = {"ranker": legacy_ranker} if legacy_ranker else {}
         if not section and model_type == "xgboost_regressor":
             section = all_cfg.get("xgboost", {})
         if not section and model_type == "lightgbm_regressor":
@@ -662,7 +665,10 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
             subsection_name = "regressor"
         elif model_type == "lightgbm_ranker":
             subsection_name = "ranker"
-        params = dict(section.get(subsection_name, section.get("classifier", {})))
+        if model_type == "lightgbm_ranker":
+            params = dict(section.get("ranker", {}))
+        else:
+            params = dict(section.get(subsection_name, section.get("classifier", {})))
     elif model_type in {"lstm", "transformer", "tcn"}:
         params = dict(all_cfg.get(model_type, {}))
     else:
@@ -3275,6 +3281,46 @@ class ModelTrainer:
         self.feature_names = feature_cols
         self._apply_model_priors()
 
+    def _hydrate_snapshot_symbol_quality_metrics(self) -> None:
+        """Backfill symbol-quality audit fields when replaying an approved snapshot bundle."""
+        symbol_universe: list[str] = []
+        if isinstance(self.snapshot_manifest, dict):
+            symbol_universe = [
+                str(symbol).strip().upper()
+                for symbol in self.snapshot_manifest.get("symbol_universe", [])
+                if str(symbol).strip()
+            ]
+        if not symbol_universe and isinstance(self.dataset_snapshot_bundle_manifest, dict):
+            training_scope = self.dataset_snapshot_bundle_manifest.get("training_scope", {})
+            if isinstance(training_scope, dict):
+                symbol_universe = [
+                    str(symbol).strip().upper()
+                    for symbol in training_scope.get("symbols", [])
+                    if str(symbol).strip()
+                ]
+        if not symbol_universe:
+            return
+
+        normalized_universe = sorted(set(symbol_universe))
+        if float(self.training_metrics.get("symbol_quality_input_symbols", 0.0) or 0.0) <= 0.0:
+            self.training_metrics["symbol_quality_input_symbols"] = float(len(normalized_universe))
+        if (
+            float(self.training_metrics.get("symbol_quality_selected_symbols", 0.0) or 0.0)
+            <= 0.0
+        ):
+            self.training_metrics["symbol_quality_selected_symbols"] = float(
+                len(normalized_universe)
+            )
+        self.training_metrics.setdefault("symbol_quality_dropped_symbols", 0.0)
+        self.training_metrics.setdefault("symbol_quality_dropped_list", [])
+        if not self.training_metrics.get("symbol_quality_universe"):
+            self.training_metrics["symbol_quality_universe"] = normalized_universe
+        if not self.training_metrics.get("symbol_quality_report"):
+            self.training_metrics["symbol_quality_report"] = {
+                symbol: {"passes": True, "source": "snapshot_bundle_replay"}
+                for symbol in normalized_universe
+            }
+
     def _load_training_dataset_snapshot(self) -> bool:
         """Load immutable dataset snapshot bundle for deterministic replay."""
         bundle_path = Path(self.config.dataset_snapshot_bundle_path)
@@ -3370,6 +3416,7 @@ class ModelTrainer:
         self.training_metrics["snapshot_bundle_path"] = str(
             self.dataset_snapshot_bundle_manifest_path
         )
+        self._hydrate_snapshot_symbol_quality_metrics()
 
         self._restore_training_state_from_split_frames(
             dev_frame=development_frame,
@@ -3666,6 +3713,46 @@ class ModelTrainer:
                     candidate.feature_names = fit_feature_names
                 except Exception:
                     pass
+
+    def _prepare_model_input_for_prediction(self, model: Any, X: Any) -> Any:
+        """Align prediction inputs to the fitted feature schema when available."""
+        fallback_feature_names = (
+            [str(name) for name in self.feature_names] if self._is_lightgbm_family_model() else None
+        )
+        return prepare_model_inference_input(
+            model,
+            X,
+            fallback_feature_names=fallback_feature_names,
+        )
+
+    def _predict_with_model(self, model: Any, X: Any) -> Any:
+        """Call estimator.predict with schema-aligned inference inputs."""
+        return model.predict(self._prepare_model_input_for_prediction(model, X))
+
+    def _predict_proba_with_model(self, model: Any, X: Any) -> Any:
+        """Call estimator.predict_proba with schema-aligned inference inputs."""
+        return model.predict_proba(self._prepare_model_input_for_prediction(model, X))
+
+    @staticmethod
+    def _ranker_eval_at(model: Any) -> list[int]:
+        """Resolve eval_at from model params when explicitly configured."""
+        get_params = getattr(model, "get_params", None)
+        if not callable(get_params):
+            return []
+        try:
+            params = get_params(deep=False)
+        except TypeError:
+            params = get_params()
+        except Exception:
+            return []
+        raw_eval_at = params.get("eval_at")
+        if raw_eval_at is None:
+            return []
+        if isinstance(raw_eval_at, (list, tuple, set, np.ndarray)):
+            resolved = [int(value) for value in raw_eval_at]
+        else:
+            resolved = [int(raw_eval_at)]
+        return [value for value in resolved if value > 0]
 
     @staticmethod
     def _summarize_lightgbm_model_structure(model: Any) -> dict[str, Any]:
@@ -5608,7 +5695,7 @@ class ModelTrainer:
                         val_timestamps=test_ts,
                     )
 
-                    y_pred = np.asarray(model.predict(X_test))
+                    y_pred = np.asarray(self._predict_with_model(model, X_test))
                     y_proba = np.asarray(
                         self._get_predictions_proba(model, X_test, timestamps=test_ts)
                     )
@@ -6064,7 +6151,7 @@ class ModelTrainer:
                             ),
                         )
 
-                        y_pred = np.asarray(model.predict(X_val))
+                        y_pred = np.asarray(self._predict_with_model(model, X_val))
                         y_proba = np.asarray(
                             self._get_predictions_proba(
                                 model,
@@ -6329,7 +6416,7 @@ class ModelTrainer:
                 )
                 continue
 
-            y_pred = np.asarray(model.predict(X_outer_test))
+            y_pred = np.asarray(self._predict_with_model(model, X_outer_test))
             y_proba = np.asarray(
                 self._get_predictions_proba(model, X_outer_test, timestamps=ts_outer_test)
             )
@@ -6553,13 +6640,15 @@ class ModelTrainer:
 
     def _optimize_with_grid_search(self) -> None:
         """Grid search optimization."""
+        if self._is_ranker_model():
+            raise ValueError(
+                "Grid search is disabled for ranker models. Use Optuna with timestamp-query scoring."
+            )
         from sklearn.model_selection import GridSearchCV
 
         model = self._create_base_model()
         scoring: str | None
-        if self._is_ranker_model():
-            scoring = None
-        elif self._is_regression_model():
+        if self._is_regression_model():
             scoring = "neg_mean_squared_error"
         else:
             scoring = "roc_auc"
@@ -6589,14 +6678,16 @@ class ModelTrainer:
 
     def _optimize_with_random_search(self) -> None:
         """Random search optimization."""
+        if self._is_ranker_model():
+            raise ValueError(
+                "Random search is disabled for ranker models. Use Optuna with timestamp-query scoring."
+            )
         from sklearn.model_selection import RandomizedSearchCV
         from scipy.stats import randint, uniform
 
         model = self._create_base_model()
         scoring: str | None
-        if self._is_ranker_model():
-            scoring = None
-        elif self._is_regression_model():
+        if self._is_regression_model():
             scoring = "neg_mean_squared_error"
         else:
             scoring = "roc_auc"
@@ -7673,7 +7764,7 @@ class ModelTrainer:
                 val_timestamps=test_ts,
             )
 
-            y_pred = np.asarray(model.predict(X_test))
+            y_pred = np.asarray(self._predict_with_model(model, X_test))
             y_proba_raw = np.asarray(
                 self._get_raw_predictions_proba(model, X_test, timestamps=test_ts)
             )
@@ -7837,7 +7928,7 @@ class ModelTrainer:
             )
 
             # Evaluate
-            y_pred = np.asarray(model.predict(X_test))
+            y_pred = np.asarray(self._predict_with_model(model, X_test))
             y_proba_raw = np.asarray(
                 self._get_raw_predictions_proba(model, X_test, timestamps=test_ts)
             )
@@ -8429,28 +8520,32 @@ class ModelTrainer:
         if use_eval and eval_group.size == 0:
             use_eval = False
 
+        eval_at = self._ranker_eval_at(model)
+        fit_eval_at = eval_at if eval_at else [1, 3, 5, 10]
+        include_eval_at_kwarg = not bool(eval_at)
+
         candidate_calls: list[dict[str, Any]] = []
         if use_eval and sample_weights is not None:
-            candidate_calls.append(
-                {
-                    "group": train_group,
-                    "sample_weight": sample_weights,
-                    "eval_set": [(X_val_fit, y_val)],
-                    "eval_group": [eval_group],
-                    "eval_at": [1, 3, 5, 10],
-                }
-            )
+            call_kwargs = {
+                "group": train_group,
+                "sample_weight": sample_weights,
+                "eval_set": [(X_val_fit, y_val)],
+                "eval_group": [eval_group],
+            }
+            if include_eval_at_kwarg:
+                call_kwargs["eval_at"] = fit_eval_at
+            candidate_calls.append(call_kwargs)
         if sample_weights is not None:
             candidate_calls.append({"group": train_group, "sample_weight": sample_weights})
         if use_eval:
-            candidate_calls.append(
-                {
-                    "group": train_group,
-                    "eval_set": [(X_val_fit, y_val)],
-                    "eval_group": [eval_group],
-                    "eval_at": [1, 3, 5, 10],
-                }
-            )
+            call_kwargs = {
+                "group": train_group,
+                "eval_set": [(X_val_fit, y_val)],
+                "eval_group": [eval_group],
+            }
+            if include_eval_at_kwarg:
+                call_kwargs["eval_at"] = fit_eval_at
+            candidate_calls.append(call_kwargs)
         candidate_calls.append({"group": train_group})
 
         last_error: Exception | None = None
@@ -10151,12 +10246,12 @@ class ModelTrainer:
     def _get_raw_predictions_proba(self, model, X, timestamps=None) -> np.ndarray:
         """Get raw prediction probabilities from model before post-hoc calibration."""
         if self._is_ranker_model():
-            raw_scores = np.asarray(model.predict(X), dtype=float).reshape(-1)
+            raw_scores = np.asarray(self._predict_with_model(model, X), dtype=float).reshape(-1)
             return self._normalize_ranker_scores(raw_scores, timestamps=timestamps).astype(float)
 
         try:
             if hasattr(model, "predict_proba"):
-                proba = model.predict_proba(X)
+                proba = self._predict_proba_with_model(model, X)
                 if proba.ndim == 2:
                     return proba[:, 1]
                 return proba
@@ -10165,7 +10260,7 @@ class ModelTrainer:
 
         if hasattr(model, "predict"):
             # For regressors, normalize predictions to [0, 1] range
-            predictions = model.predict(X)
+            predictions = self._predict_with_model(model, X)
             if isinstance(predictions, np.ndarray):
                 # Clip and normalize to [0, 1]
                 predictions = np.clip(predictions, -1, 1)
@@ -11728,7 +11823,7 @@ class ModelTrainer:
 
         X_holdout = self.holdout_features.values
         y_holdout = self.holdout_labels.to_numpy(dtype=float)
-        y_holdout_pred = np.asarray(self.model.predict(X_holdout))
+        y_holdout_pred = np.asarray(self._predict_with_model(self.model, X_holdout))
         y_holdout_raw_proba = np.asarray(
             self._get_raw_predictions_proba(
                 self.model,

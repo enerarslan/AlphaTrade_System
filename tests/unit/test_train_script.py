@@ -1704,6 +1704,20 @@ def test_optuna_search_space_does_not_add_classifier_weights_to_ranker():
     assert "scale_pos_weight" not in params
 
 
+def test_grid_search_is_blocked_for_ranker_models():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+
+    with pytest.raises(ValueError, match="Grid search is disabled for ranker models"):
+        trainer._optimize_with_grid_search()
+
+
+def test_random_search_is_blocked_for_ranker_models():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+
+    with pytest.raises(ValueError, match="Random search is disabled for ranker models"):
+        trainer._optimize_with_random_search()
+
+
 def test_optuna_search_space_regularizes_xgboost_for_small_folds():
     trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
     search_space = trainer._get_optuna_search_space(min_train_size=200)
@@ -4515,6 +4529,73 @@ def test_get_predictions_proba_applies_attached_probability_calibration():
     assert np.allclose(calibrated, np.array([0.30, 0.65, 0.90]))
 
 
+def test_get_raw_predictions_proba_aligns_ranker_feature_schema_for_inference():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    trainer.feature_names = ["feat_a", "feat_b"]
+
+    class SchemaAwareRanker:
+        feature_names = ["feat_a", "feat_b"]
+
+        def predict(self, X):
+            assert isinstance(X, pd.DataFrame)
+            assert X.columns.tolist() == ["feat_a", "feat_b"]
+            return X["feat_a"].to_numpy(dtype=float)
+
+    normalized = trainer._get_raw_predictions_proba(
+        SchemaAwareRanker(),
+        np.array([[0.2, 1.0], [0.8, 0.0]], dtype=float),
+    )
+
+    np.testing.assert_allclose(normalized, np.array([0.25, 0.75], dtype=float))
+
+
+def test_fit_ranker_model_uses_model_eval_at_without_duplicate_fit_kwarg():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    trainer.feature_names = ["feat_a", "feat_b"]
+
+    captured: dict[str, object] = {}
+
+    class DummyRanker:
+        feature_names = ["feat_a", "feat_b"]
+
+        def get_params(self, deep=False):
+            del deep
+            return {"eval_at": [1, 5, 10]}
+
+        def fit(self, X, y, **kwargs):
+            del y
+            captured["X_type"] = type(X)
+            captured["columns"] = list(X.columns)
+            captured["kwargs"] = kwargs
+            return self
+
+    trainer._fit_ranker_model(
+        DummyRanker(),
+        X_train=np.array([[0.1, 0.0], [0.2, 0.0], [0.3, 0.0], [0.4, 0.0]], dtype=float),
+        y_train=np.array([0.0, 1.0, 0.0, 1.0], dtype=float),
+        X_val=np.array([[0.5, 0.0], [0.6, 0.0]], dtype=float),
+        y_val=np.array([1.0, 0.0], dtype=float),
+        train_timestamps=np.array(
+            [
+                "2024-01-01T10:00:00",
+                "2024-01-01T10:00:00",
+                "2024-01-01T10:01:00",
+                "2024-01-01T10:01:00",
+            ],
+            dtype="datetime64[ns]",
+        ),
+        val_timestamps=np.array(
+            ["2024-01-01T10:02:00", "2024-01-01T10:02:00"],
+            dtype="datetime64[ns]",
+        ),
+    )
+
+    assert captured["X_type"] is pd.DataFrame
+    assert captured["columns"] == ["feat_a", "feat_b"]
+    assert "eval_at" not in captured["kwargs"]
+    assert captured["kwargs"]["eval_group"] == [np.array([2])]
+
+
 def test_build_ranking_groups_segments_by_timestamp():
     trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
     timestamps = np.array(
@@ -5695,6 +5776,10 @@ def test_load_training_dataset_snapshot_restores_state(tmp_path):
     assert trainer.sample_weights.tolist() == [1.0, 0.8]
     assert trainer.holdout_sample_weights.tolist() == [0.9]
     assert len(trainer.cached_cv_splits) == 1
+    assert trainer.training_metrics["symbol_quality_input_symbols"] == pytest.approx(1.0)
+    assert trainer.training_metrics["symbol_quality_selected_symbols"] == pytest.approx(1.0)
+    assert trainer.training_metrics["symbol_quality_universe"] == ["AAPL"]
+    assert trainer.training_metrics["symbol_quality_report"]["AAPL"]["passes"] is True
 
 
 def test_load_features_from_postgres_recomputes_when_ohlcv_hash_changes(monkeypatch):

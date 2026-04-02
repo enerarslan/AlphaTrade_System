@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from quant_trading_system.models.base import ModelType, TradingModel
+from quant_trading_system.models.feature_schema import prepare_model_inference_input
 
 logger = logging.getLogger(__name__)
 
@@ -351,13 +352,10 @@ class LightGBMModel(TradingModel):
         if monotone_constraints is not None:
             constraints = list(monotone_constraints)
             if len(constraints) != int(X.shape[1]):
-                logger.warning(
-                    "Dropping LightGBM monotone_constraints due to feature mismatch: "
-                    "constraints=%d features=%d",
-                    len(constraints),
-                    int(X.shape[1]),
+                raise ValueError(
+                    "LightGBM monotone_constraints length does not match feature count: "
+                    f"constraints={len(constraints)} features={int(X.shape[1])}"
                 )
-                params.pop("monotone_constraints", None)
 
         if self._params.get("use_gpu"):
             params["device"] = "cuda"
@@ -406,17 +404,25 @@ class LightGBMModel(TradingModel):
 
         return self
 
+    def _prepare_inference_matrix(self, X: np.ndarray) -> Any:
+        """Align inference inputs to the fitted LightGBM feature schema."""
+        return prepare_model_inference_input(
+            self._model,
+            X,
+            fallback_feature_names=self._feature_names,
+        )
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Generate predictions."""
         X = self._validate_input(X)
-        return self._model.predict(X)
+        return self._model.predict(self._prepare_inference_matrix(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Generate probability estimates (classification only)."""
         if self._model_type != ModelType.CLASSIFIER:
             raise NotImplementedError("predict_proba only available for classifiers")
         X = self._validate_input(X)
-        return self._model.predict_proba(X)
+        return self._model.predict_proba(self._prepare_inference_matrix(X))
 
     def get_feature_importance(self) -> dict[str, float]:
         """Get feature importance scores."""
@@ -432,7 +438,7 @@ class LightGBMModel(TradingModel):
 
         DRY FIX: Delegates to base class _compute_metrics() for unified metrics calculation.
         """
-        predictions = self._model.predict(X)
+        predictions = self._model.predict(self._prepare_inference_matrix(X))
         return super()._compute_metrics(y, predictions)
 
 

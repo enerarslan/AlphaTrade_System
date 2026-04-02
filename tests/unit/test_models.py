@@ -359,12 +359,12 @@ class TestLightGBMModel:
         importance = model.get_feature_importance()
         assert len(importance) == X.shape[1]
 
-    def test_fit_drops_mismatched_monotone_constraints(
+    def test_fit_rejects_mismatched_monotone_constraints(
         self,
         monkeypatch,
         sample_regression_data,
     ):
-        """Wrapper should not forward stale constraint vectors after feature changes."""
+        """Wrapper should fail closed when stale constraint vectors no longer match features."""
         X, y = sample_regression_data
         captured: dict[str, dict[str, object]] = {}
 
@@ -388,9 +388,8 @@ class TestLightGBMModel:
         monkeypatch.setitem(sys.modules, "lightgbm", fake_lgb)
 
         model = LightGBMModel(n_estimators=10, monotone_constraints=[1, -1])
-        model.fit(X, y)
-
-        assert "monotone_constraints" not in captured["params"]
+        with pytest.raises(ValueError, match="monotone_constraints length does not match"):
+            model.fit(X, y)
 
     def test_fit_uses_cuda_device_when_gpu_enabled(
         self,

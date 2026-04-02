@@ -141,6 +141,41 @@ def test_promotion_signal_adapter_uses_training_parity_for_ranker_scores():
     )
 
 
+def test_promotion_signal_adapter_aligns_ranker_feature_schema_for_inference():
+    class SchemaAwareRanker:
+        feature_names = ["feat_a", "feat_b"]
+
+        def predict(self, X):
+            assert isinstance(X, pd.DataFrame)
+            assert X.columns.tolist() == ["feat_a", "feat_b"]
+            return X["feat_a"].to_numpy(dtype=float)
+
+    adapter = PromotionSignalAdapter(
+        SimpleNamespace(
+            model_type="lightgbm_ranker",
+            feature_names=("feat_a", "feat_b"),
+            ranker_score_normalization="query_percentile",
+            ranker_requires_cross_sectional_panel=True,
+        )
+    )
+    timestamps = np.array(
+        [
+            "2025-01-02T10:00:00Z",
+            "2025-01-02T10:00:00Z",
+        ],
+        dtype="datetime64[ns]",
+    )
+
+    probabilities, raw_scores = adapter._predict_model_probabilities(
+        SchemaAwareRanker(),
+        np.array([[0.2, 1.0], [0.8, 0.0]], dtype=float),
+        timestamps=timestamps,
+    )
+
+    np.testing.assert_allclose(raw_scores, np.array([0.2, 0.8], dtype=float))
+    np.testing.assert_allclose(probabilities, np.array([0.25, 0.75], dtype=float))
+
+
 def test_promotion_signal_adapter_scores_ranker_cross_sectionally_across_symbols():
     class FeatureDrivenRanker:
         feature_names = ["feat_a", "feat_b"]
