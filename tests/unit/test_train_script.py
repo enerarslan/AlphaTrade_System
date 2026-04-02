@@ -1614,6 +1614,61 @@ def test_feature_selection_reapplies_lightgbm_monotonic_constraints(monkeypatch)
     assert trainer.config.model_params["monotone_constraints"] == [1, 0]
 
 
+def test_apply_feature_selection_records_detailed_audit(monkeypatch):
+    import quant_trading_system.models.feature_selection as feature_selection_module
+
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    trainer.features = pd.DataFrame(
+        {
+            "momentum_10": [0.1, 0.2, 0.3, 0.4],
+            "volatility_20": [1.0, 0.9, 1.1, 1.0],
+            "atr_14": [0.5, 0.7, 0.6, 0.4],
+            "rsi_14": [40.0, 42.0, 39.0, 43.0],
+        }
+    )
+    trainer.labels = np.array([0, 1, 0, 1], dtype=int)
+    trainer.feature_names = trainer.features.columns.tolist()
+
+    monkeypatch.setattr(
+        feature_selection_module,
+        "select_training_features",
+        lambda features, labels, config: SimpleNamespace(
+            selected_features=["momentum_10", "rsi_14"],
+            diagnostics={
+                "initial_feature_count": 4,
+                "selected_feature_count": 2,
+                "correlation_pruned_count": 1,
+                "stability_selected_count": 2,
+            },
+            information_coefficients={
+                "momentum_10": 0.12,
+                "volatility_20": 0.11,
+                "atr_14": 0.05,
+                "rsi_14": 0.03,
+            },
+            correlation_pruned_features=["volatility_20"],
+            stability_scores={
+                "momentum_10": 1.0,
+                "volatility_20": 0.8,
+                "atr_14": 0.2,
+                "rsi_14": 0.9,
+            },
+        ),
+    )
+
+    trainer._apply_feature_selection()
+
+    audit = trainer.training_metrics["feature_selection_audit"]
+    rejected = {item["feature"]: item["reason"] for item in audit["rejected_features"]}
+
+    assert audit["selection_binding"] is True
+    assert audit["selected_feature_count"] == 2
+    assert rejected["volatility_20"] == "correlation_pruned"
+    assert rejected["atr_14"] == "stability_support"
+    assert audit["selected_family_counts"]["momentum"] == 1
+    assert trainer.training_metrics["feature_selection_binding"] == pytest.approx(1.0)
+
+
 def test_aggregate_fold_objective_penalizes_instability_and_downside():
     stable_score = train_script.ModelTrainer._aggregate_fold_objective(
         [0.9, 1.0, 0.8],
@@ -2707,6 +2762,7 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
             "macro_regime_score": np.sin(np.linspace(0.0, 3.14, rows)),
         }
     )
+    trainer.row_symbols = np.where(np.arange(rows) % 2 == 0, "AAPL", "MSFT").astype(object)
     trainer.regimes = np.where(np.arange(rows) % 3 == 0, "high_vol", "trend_up").astype(object)
     trainer.oof_primary_proba = feat_a.copy()
     trainer.primary_forward_returns = np.where(feat_a >= 0.5, 0.015, -0.012).astype(float)
@@ -2719,6 +2775,7 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
             "macro_regime_score": [0.2, 0.1, -0.1, -0.2],
         }
     )
+    trainer.holdout_symbols = np.array(["AAPL", "AAPL", "MSFT", "MSFT"], dtype=object)
     trainer.holdout_regimes = np.array(["trend_up", "trend_up", "high_vol", "high_vol"], dtype=object)
     trainer.holdout_primary_forward_returns = np.array([0.014, 0.010, -0.011, -0.013], dtype=float)
     trainer.training_metrics["holdout_long_threshold"] = 0.60
@@ -2733,10 +2790,123 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
     assert "flow_imbalance_signal" in trainer.training_metrics[
         "expected_edge_training_selected_context_features"
     ]
+    candidate_floor = trainer.training_metrics["expected_edge_candidate_floor"]
+    assert candidate_floor["meets_min_samples"] is True
+    assert candidate_floor["candidate_count"] >= 40
+    training_funnel = trainer.training_metrics["expected_edge_training_signal_funnel"]
+    assert training_funnel["candidate_count"] >= training_funnel["selected_count"]
+    assert trainer.training_metrics["expected_edge_training_signal_funnel_by_symbol"]["AAPL"][
+        "candidate_count"
+    ] >= 1
     regime_policy = trainer.training_metrics["expected_edge_regime_policy"]
     assert regime_policy["enabled"] is True
     assert sorted(regime_policy["regimes"].keys()) == ["high_vol", "trend_up"]
     assert trainer.training_metrics["expected_edge_holdout_regime_policy_enabled"] == pytest.approx(1.0)
+    assert trainer.training_metrics["expected_edge_holdout_signal_funnel_by_regime"]["high_vol"][
+        "candidate_count"
+    ] >= 1
+
+
+def test_train_expected_edge_policy_records_candidate_floor_when_skipped():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            expected_edge_min_samples=20,
+            expected_edge_min_coverage=0.30,
+            save_artifacts=False,
+        )
+    )
+    rows = 24
+    trainer.features = pd.DataFrame(
+        {
+            "feat_a": np.full(rows, 0.52, dtype=float),
+            "flow_imbalance_signal": np.linspace(-0.2, 0.2, rows, dtype=float),
+        }
+    )
+    trainer.row_symbols = np.where(np.arange(rows) % 2 == 0, "AAPL", "MSFT").astype(object)
+    trainer.regimes = np.where(np.arange(rows) % 2 == 0, "trend_up", "high_vol").astype(object)
+    trainer.oof_primary_proba = np.array(
+        [0.52] * 18 + [0.70, 0.72, 0.74, 0.26, 0.24, 0.22],
+        dtype=float,
+    )
+    trainer.primary_forward_returns = np.where(trainer.oof_primary_proba >= 0.5, 0.01, -0.01).astype(
+        float
+    )
+
+    trainer._train_expected_edge_policy()
+
+    assert trainer.expected_edge_model is None
+    assert "candidate trades" in trainer.training_metrics["expected_edge_policy_reason"]
+    assert "received 6" in trainer.training_metrics["expected_edge_policy_reason"]
+    candidate_floor = trainer.training_metrics["expected_edge_candidate_floor"]
+    assert candidate_floor["candidate_count"] == 6
+    assert candidate_floor["configured_min_samples"] >= 20
+    assert candidate_floor["meets_min_samples"] is False
+    precheck_funnel = trainer.training_metrics["expected_edge_training_precheck_signal_funnel"]
+    assert precheck_funnel["candidate_count"] == 6
+    assert trainer.training_metrics["expected_edge_training_precheck_signal_funnel_by_regime"][
+        "high_vol"
+    ]["candidate_count"] >= 1
+
+
+def test_run_records_training_run_events(monkeypatch, tmp_path):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            output_dir=str(tmp_path),
+            save_artifacts=False,
+            optimize=False,
+            compute_shap=False,
+            use_meta_labeling=False,
+            enable_expected_edge_policy=False,
+        )
+    )
+    events: list[dict[str, object]] = []
+
+    def _capture_event(index_root, event):
+        events.append({"index_root": index_root, "event": dict(event)})
+        return tmp_path / "run_index" / "training_runs.jsonl"
+
+    monkeypatch.setattr(train_script, "append_training_run_event", _capture_event)
+    monkeypatch.setattr(trainer, "_load_data", lambda: None)
+    monkeypatch.setattr(trainer, "_compute_features", lambda: None)
+    monkeypatch.setattr(trainer, "_create_labels", lambda: None)
+    monkeypatch.setattr(trainer, "_apply_feature_selection", lambda: None)
+    monkeypatch.setattr(trainer, "_persist_features_to_postgres_if_needed", lambda: None)
+    monkeypatch.setattr(trainer, "_validate_no_future_leakage", lambda: None)
+    monkeypatch.setattr(trainer, "_train_with_cv", lambda: None)
+    monkeypatch.setattr(trainer, "_build_model_card", lambda: {"summary": "ok"})
+    monkeypatch.setattr(
+        trainer,
+        "_build_deployment_plan",
+        lambda passed_validation: {"ready_for_production": bool(passed_validation)},
+    )
+    monkeypatch.setattr(trainer, "_validate_model", lambda: True)
+
+    def _fake_save_model():
+        trainer.artifacts_path = tmp_path / "model_artifacts.json"
+        return str(tmp_path / "model.pkl")
+
+    monkeypatch.setattr(trainer, "_save_model", _fake_save_model)
+    trainer.training_metrics.update(
+        {
+            "mean_sharpe": 1.1,
+            "mean_trade_count": 120.0,
+            "mean_risk_adjusted_score": 0.8,
+            "holdout_sharpe": 0.9,
+            "holdout_max_drawdown": 0.15,
+        }
+    )
+
+    result = trainer.run()
+
+    statuses = [entry["event"]["status"] for entry in events]
+    assert statuses == ["started", "completed"]
+    assert result["success"] is True
+    assert result["run_id"] == trainer.run_id
+    assert str(result["run_event_index_path"]).endswith("training_runs.jsonl")
+    assert events[-1]["event"]["metrics"]["mean_trade_count"] == 120.0
+    assert str(events[-1]["index_root"]).endswith("run_index")
 
 
 def test_build_parser_supports_institutional_failfast_flags_and_name():

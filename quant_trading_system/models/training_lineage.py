@@ -18,6 +18,7 @@ from pandas.tseries.offsets import CustomBusinessDay
 SNAPSHOT_MANIFEST_SCHEMA_VERSION = "1.0.0"
 MODEL_REGISTRY_SCHEMA_VERSION = "1.0.0"
 DATASET_SNAPSHOT_BUNDLE_SCHEMA_VERSION = "1.0.0"
+TRAINING_RUN_EVENT_SCHEMA_VERSION = "1.0.0"
 
 DEFAULT_DATA_QUALITY_THRESHOLDS: dict[str, float] = {
     "missing_bars_ratio_max": 0.01,
@@ -656,6 +657,29 @@ def _sanitize_metrics(metrics: dict[str, Any] | None) -> dict[str, float]:
         if isinstance(value, (int, float, np.integer, np.floating)):
             sanitized[str(key)] = _safe_float(value)
     return sanitized
+
+
+def append_training_run_event(
+    index_root: Path,
+    event: dict[str, Any],
+) -> Path:
+    """Append one durable training-run event to a JSONL index."""
+    if not isinstance(event, dict):
+        raise ValueError("Training run event must be a dict.")
+
+    index_dir = Path(index_root)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    index_path = index_dir / "training_runs.jsonl"
+
+    payload = dict(event)
+    payload.setdefault("schema_version", TRAINING_RUN_EVENT_SCHEMA_VERSION)
+    payload.setdefault("recorded_at", datetime.now(timezone.utc).isoformat())
+
+    with index_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str))
+        handle.write("\n")
+
+    return index_path
 
 
 def register_training_model_version(

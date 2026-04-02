@@ -492,6 +492,7 @@ If you are trying to understand the production-critical path, start with:
 ## Related Documentation
 
 - Work plan: [`docs/LIGHTGBM_TCN_WORK_PLAN.md`](docs/LIGHTGBM_TCN_WORK_PLAN.md)
+- Production task list: [`docs/LIGHTGBM_TCN_PRODUCTION_TASK_LIST.md`](docs/LIGHTGBM_TCN_PRODUCTION_TASK_LIST.md)
 - Agent instructions: [`AGENTS.md`](AGENTS.md)
 - Project configuration and toolchain: [`pyproject.toml`](pyproject.toml)
 
@@ -499,9 +500,9 @@ If you are trying to understand the production-critical path, start with:
 
 The current focus of the repository is:
 
-- build a serious LightGBM baseline on a frozen snapshot
-- validate it through replay and early paper trading
-- compare TCN only after the LightGBM baseline is stable
+- repair dataset quality and training diagnostics around the frozen snapshot workflow
+- produce a promotion-ready LightGBM baseline that clears institutional gates
+- validate it through replay and early paper trading before reopening any TCN branch
 
 If you want the fastest way to understand the project:
 

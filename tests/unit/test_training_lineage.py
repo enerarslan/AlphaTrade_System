@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from quant_trading_system.models.training_lineage import (
+    append_training_run_event,
     build_data_quality_report,
     build_snapshot_manifest,
     compute_data_quality_hash,
@@ -81,6 +82,25 @@ def test_estimate_missing_bars_count_detects_daily_business_day_gaps() -> None:
 
     assert missing_count == 2
     assert inferred_bar_seconds is not None
+
+
+def test_append_training_run_event_writes_jsonl_payload(tmp_path) -> None:
+    index_path = append_training_run_event(
+        tmp_path / "run_index",
+        {
+            "status": "completed",
+            "run_id": "lightgbm_ranker_20260402T000000Z",
+            "metrics": {"mean_sharpe": 1.25},
+        },
+    )
+
+    payload = json.loads(index_path.read_text(encoding="utf-8").strip())
+    assert index_path.name == "training_runs.jsonl"
+    assert payload["status"] == "completed"
+    assert payload["run_id"] == "lightgbm_ranker_20260402T000000Z"
+    assert payload["metrics"]["mean_sharpe"] == 1.25
+    assert payload["schema_version"] == "1.0.0"
+    assert "recorded_at" in payload
 
 
 def test_build_snapshot_manifest_is_deterministic_for_same_inputs() -> None:

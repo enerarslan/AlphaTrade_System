@@ -60,10 +60,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from quant_trading_system.models.training_lineage import (
+    append_training_run_event,
     build_data_quality_report,
-    compute_frame_content_hash,
     build_snapshot_manifest,
     compute_data_quality_hash,
+    compute_frame_content_hash,
     load_dataset_snapshot_bundle,
     load_registry_entries,
     persist_dataset_snapshot_bundle,
@@ -1329,13 +1330,19 @@ class ModelTrainer:
         self.nested_cv_trace: list[dict[str, Any]] = []
         self.replay_manifest_path: Path | None = None
         self.promotion_package_path: Path | None = None
+        self.artifacts_path: Path | None = None
+        self.run_id: str = str(self.config.model_name)
+        self.run_event_index_path: Path | None = None
         self._warm_start_model_cache: Any | None = None
         self.feature_cache_reused: bool = False
         self.features_materialized_in_run: bool = False
         self.features_persisted_to_postgres: bool = False
 
         # Metrics
-        self.training_metrics: dict = {"training_profile": self.config.training_profile}
+        self.training_metrics: dict = {
+            "training_profile": self.config.training_profile,
+            "run_id": self.run_id,
+        }
         self.start_time: datetime | None = None
         self.feature_pipeline_fingerprint = _compute_feature_pipeline_fingerprint()
 
@@ -1350,6 +1357,7 @@ class ModelTrainer:
         self.logger.info(f"Starting training pipeline for {self.config.model_type}")
         self.logger.info(f"Model name: {self.config.model_name}")
         set_global_seed(self.config.seed)
+        self._record_training_run_event("started")
 
         try:
             loaded_snapshot = False
@@ -1415,6 +1423,7 @@ class ModelTrainer:
 
             results = {
                 "success": passed_gates,
+                "run_id": self.run_id,
                 "model_path": model_path,
                 "model_type": self.config.model_type,
                 "model_name": self.config.model_name,
@@ -1461,18 +1470,242 @@ class ModelTrainer:
                     if self.promotion_package_path is not None
                     else None
                 ),
+                "artifacts_path": (
+                    str(self.artifacts_path) if self.artifacts_path is not None else None
+                ),
+                "run_event_index_path": (
+                    str(self.run_event_index_path)
+                    if self.run_event_index_path is not None
+                    else None
+                ),
                 "model_card": self.training_metrics.get("model_card", {}),
                 "deployment_plan": self.training_metrics.get("deployment_plan", {}),
             }
 
+            self._record_training_run_event("completed", results=results)
             self.logger.info(f"Training completed in {duration:.1f}s")
             self.logger.info(f"Validation gates passed: {passed_gates}")
 
             return results
 
+        except KeyboardInterrupt:
+            self._record_training_run_event("interrupted", error="keyboard_interrupt")
+            self.logger.error("Training interrupted by operator.")
+            raise
         except Exception as e:
+            self._record_training_run_event("failed", error=e)
             self.logger.error(f"Training failed: {e}")
             raise
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        """Convert numpy/pandas-heavy payloads into JSON-compatible structures."""
+        if isinstance(value, dict):
+            return {str(k): ModelTrainer._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [ModelTrainer._json_safe(v) for v in value]
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, pd.Series):
+            return [ModelTrainer._json_safe(v) for v in value.tolist()]
+        if isinstance(value, np.ndarray):
+            return [ModelTrainer._json_safe(v) for v in value.tolist()]
+        if isinstance(value, (np.bool_, bool)):
+            return bool(value)
+        if isinstance(value, (np.integer, int)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            return float(np.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0))
+        if isinstance(value, (datetime, pd.Timestamp)):
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            return ts.isoformat() if not pd.isna(ts) else None
+        if value is None or isinstance(value, str):
+            return value
+        return str(value)
+
+    @staticmethod
+    def _feature_family_name(feature_name: str) -> str:
+        """Map feature names into stable family buckets for selection diagnostics."""
+        tokens = [token for token in re.split(r"[^a-z0-9]+", str(feature_name).lower()) if token]
+        return tokens[0] if tokens else "other"
+
+    def _count_feature_families(self, feature_names: list[str]) -> dict[str, int]:
+        """Count selected or rejected features by inferred family."""
+        counts: dict[str, int] = {}
+        for feature_name in feature_names:
+            family = self._feature_family_name(feature_name)
+            counts[family] = counts.get(family, 0) + 1
+        return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+    def _build_feature_selection_audit(
+        self,
+        *,
+        old_feature_names: list[str],
+        selection_result: Any,
+        selected_features: list[str],
+    ) -> dict[str, Any]:
+        """Build a detailed feature-selection audit for training artifacts."""
+        information_coefficients = {
+            str(name): float(value)
+            for name, value in getattr(selection_result, "information_coefficients", {}).items()
+        }
+        stability_scores = {
+            str(name): float(score)
+            for name, score in getattr(selection_result, "stability_scores", {}).items()
+        }
+        screened_features = list(information_coefficients.keys())
+        screened_set = set(screened_features)
+        selected_set = set(selected_features)
+        correlation_pruned = {
+            str(name) for name in getattr(selection_result, "correlation_pruned_features", [])
+        }
+        low_stability = {
+            name
+            for name, score in stability_scores.items()
+            if float(score) < float(self.config.feature_selection_min_stability_support)
+        }
+        rejected_features: list[dict[str, Any]] = []
+        for feature_name in old_feature_names:
+            if feature_name in selected_set:
+                continue
+            rejection_reason = "information_coefficient"
+            if feature_name in correlation_pruned:
+                rejection_reason = "correlation_pruned"
+            elif feature_name in low_stability:
+                rejection_reason = "stability_support"
+            elif feature_name in screened_set:
+                rejection_reason = "max_feature_cap"
+            rejected_features.append(
+                {
+                    "feature": str(feature_name),
+                    "family": self._feature_family_name(feature_name),
+                    "reason": rejection_reason,
+                    "information_coefficient": float(information_coefficients.get(feature_name, 0.0)),
+                    "stability_score": float(stability_scores.get(feature_name, 0.0)),
+                }
+            )
+
+        diagnostics = dict(getattr(selection_result, "diagnostics", {}) or {})
+        return {
+            "selection_binding": bool(len(selected_features) < len(old_feature_names)),
+            "selected_feature_count": int(len(selected_features)),
+            "initial_feature_count": int(len(old_feature_names)),
+            "screened_feature_count": int(len(screened_features)),
+            "correlation_pruned_feature_count": int(len(correlation_pruned)),
+            "low_stability_feature_count": int(len(low_stability.difference(selected_set))),
+            "rejected_feature_count": int(len(rejected_features)),
+            "min_information_coefficient": float(self.config.feature_selection_min_ic),
+            "max_correlation": float(self.config.feature_selection_max_corr),
+            "max_features": int(self.config.feature_selection_max_features),
+            "min_stability_support": float(self.config.feature_selection_min_stability_support),
+            "selected_features": list(selected_features),
+            "screened_features": screened_features,
+            "correlation_pruned_features": sorted(correlation_pruned),
+            "rejected_features": rejected_features,
+            "selected_family_counts": self._count_feature_families(selected_features),
+            "rejected_family_counts": self._count_feature_families(
+                [str(item["feature"]) for item in rejected_features]
+            ),
+            "diagnostics": self._json_safe(diagnostics),
+        }
+
+    def _training_run_index_root(self) -> Path:
+        """Return the directory that stores durable training-run events."""
+        return Path(self.config.output_dir) / "run_index"
+
+    def _record_training_run_event(
+        self,
+        status: str,
+        *,
+        results: dict[str, Any] | None = None,
+        error: Exception | str | None = None,
+    ) -> None:
+        """Append a durable lifecycle event for the current training run."""
+        duration_seconds = 0.0
+        if self.start_time is not None:
+            duration_seconds = float(
+                max((datetime.now(timezone.utc) - self.start_time).total_seconds(), 0.0)
+            )
+
+        validation_passed = None
+        if isinstance(results, dict) and "passed_validation_gates" in results:
+            validation_passed = bool(results.get("passed_validation_gates"))
+
+        payload = {
+            "event_type": "training_run",
+            "status": str(status),
+            "run_id": self.run_id,
+            "model_name": self.config.model_name,
+            "model_type": self.config.model_type,
+            "training_profile": self.config.training_profile,
+            "timeframe": self.config.timeframe,
+            "primary_label_horizon": int(self.config.primary_label_horizon),
+            "output_dir": str(Path(self.config.output_dir)),
+            "duration_seconds": duration_seconds,
+            "validation_passed": validation_passed,
+            "snapshot_id": (
+                str(self.snapshot_manifest.get("snapshot_id"))
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "snapshot_manifest_path": (
+                str(self.snapshot_manifest_path) if self.snapshot_manifest_path is not None else None
+            ),
+            "dataset_snapshot_bundle_path": (
+                str(self.dataset_snapshot_bundle_manifest_path)
+                if self.dataset_snapshot_bundle_manifest_path is not None
+                else None
+            ),
+            "replay_manifest_path": (
+                str(self.replay_manifest_path) if self.replay_manifest_path is not None else None
+            ),
+            "promotion_package_path": (
+                str(self.promotion_package_path) if self.promotion_package_path is not None else None
+            ),
+            "artifacts_path": str(self.artifacts_path) if self.artifacts_path is not None else None,
+            "error": str(error) if error is not None else None,
+            "metrics": {
+                "mean_sharpe": float(self.training_metrics.get("mean_sharpe", 0.0)),
+                "mean_trade_count": float(self.training_metrics.get("mean_trade_count", 0.0)),
+                "mean_risk_adjusted_score": float(
+                    self.training_metrics.get("mean_risk_adjusted_score", 0.0)
+                ),
+                "holdout_sharpe": float(self.training_metrics.get("holdout_sharpe", 0.0)),
+                "holdout_max_drawdown": float(
+                    self.training_metrics.get("holdout_max_drawdown", 0.0)
+                ),
+                "holdout_symbol_sharpe_p25": float(
+                    self.training_metrics.get("holdout_symbol_sharpe_p25", 0.0)
+                ),
+                "pbo": float(self.training_metrics.get("pbo", 0.0)),
+                "white_reality_pvalue": float(
+                    self.training_metrics.get("white_reality_pvalue", 1.0)
+                ),
+            },
+        }
+
+        if self.data_quality_report is not None:
+            payload["data_quality"] = {
+                "passed": bool(self.data_quality_report.get("passed", False)),
+                "summary": self._json_safe(self.data_quality_report.get("summary", {})),
+                "threshold_breaches": self._json_safe(
+                    self.data_quality_report.get("threshold_breaches", {})
+                ),
+            }
+        if isinstance(results, dict):
+            payload["result"] = {
+                "success": bool(results.get("success", False)),
+                "model_path": results.get("model_path"),
+            }
+
+        try:
+            self.run_event_index_path = append_training_run_event(
+                self._training_run_index_root(),
+                self._json_safe(payload),
+            )
+            self.training_metrics["run_event_index_path"] = str(self.run_event_index_path)
+        except Exception as exc:  # pragma: no cover - logging fallback
+            self.logger.warning("Failed to append training-run event: %s", exc)
 
     def _load_data(self) -> None:
         """Phase 1: Load market data for training."""
@@ -3455,11 +3688,25 @@ class ModelTrainer:
             for name, score in selection_result.stability_scores.items()
             if name in keep_selected
         }
+        feature_selection_audit = self._build_feature_selection_audit(
+            old_feature_names=old_feature_names,
+            selection_result=selection_result,
+            selected_features=selected_features,
+        )
+        self.training_metrics["feature_selection_binding"] = float(
+            bool(feature_selection_audit.get("selection_binding", False))
+        )
+        self.training_metrics["feature_selection_audit"] = feature_selection_audit
         self.logger.info(
             "Feature selection reduced development matrix from %d to %d columns",
             len(old_feature_names),
             len(selected_features),
         )
+        if not feature_selection_audit.get("selection_binding", False):
+            self.logger.warning(
+                "Feature selection remained non-binding; development matrix stayed at %d columns.",
+                len(selected_features),
+            )
         if self.data_quality_report_hash is not None:
             self._build_training_snapshot_manifest()
 
@@ -7569,6 +7816,210 @@ class ModelTrainer:
             elif isinstance(value, list):
                 self.training_metrics[metric_key] = list(value)
 
+    def _record_signal_funnel_metrics(
+        self,
+        prefix: str,
+        summary: dict[str, Any],
+        *,
+        by_symbol: dict[str, Any] | None = None,
+        by_regime: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist signal-funnel diagnostics for artifact review and run analysis."""
+        self.training_metrics[f"{prefix}_signal_funnel"] = self._json_safe(summary)
+        if by_symbol:
+            self.training_metrics[f"{prefix}_signal_funnel_by_symbol"] = self._json_safe(by_symbol)
+        if by_regime:
+            self.training_metrics[f"{prefix}_signal_funnel_by_regime"] = self._json_safe(by_regime)
+        for key, value in summary.items():
+            if isinstance(value, (int, float, np.floating, np.integer)):
+                self.training_metrics[f"{prefix}_signal_funnel_{key}"] = float(value)
+
+    def _build_signal_funnel_summary(
+        self,
+        *,
+        probabilities: np.ndarray,
+        signal_values: np.ndarray,
+        trade_returns: np.ndarray,
+        policy_frame: pd.DataFrame | None = None,
+        symbols: np.ndarray | None = None,
+        regimes: np.ndarray | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Build row, symbol, and regime funnel summaries for trade-admission diagnostics."""
+        target_len = min(len(probabilities), len(signal_values), len(trade_returns))
+        if policy_frame is not None:
+            target_len = min(target_len, len(policy_frame))
+        if target_len <= 0:
+            empty_summary = {
+                "rows": 0,
+                "candidate_count": 0,
+                "selected_count": 0,
+                "candidate_rate": 0.0,
+                "selected_rate": 0.0,
+            }
+            return empty_summary, {}, {}
+
+        probabilities = np.asarray(probabilities, dtype=float)[-target_len:]
+        signal_values = np.asarray(signal_values, dtype=float)[-target_len:]
+        trade_returns = np.asarray(trade_returns, dtype=float)[-target_len:]
+        policy = (
+            policy_frame.iloc[-target_len:].reset_index(drop=True)
+            if policy_frame is not None
+            else None
+        )
+        symbol_values = None
+        if symbols is not None:
+            symbol_arr = np.asarray(symbols, dtype=object).reshape(-1)
+            if symbol_arr.size >= target_len:
+                symbol_values = symbol_arr[-target_len:]
+        regime_values = None
+        if regimes is not None:
+            regime_arr = np.asarray(regimes, dtype=object).reshape(-1)
+            if regime_arr.size >= target_len:
+                regime_values = regime_arr[-target_len:]
+
+        finite_probability_mask = np.isfinite(probabilities)
+        finite_trade_return_mask = np.isfinite(trade_returns)
+        candidate_mask = finite_probability_mask & (np.abs(signal_values) > 1e-8)
+        candidate_with_return_mask = candidate_mask & finite_trade_return_mask
+        long_candidate_mask = candidate_mask & (signal_values > 0.0)
+        short_candidate_mask = candidate_mask & (signal_values < 0.0)
+
+        regime_enabled_mask = np.ones(target_len, dtype=bool)
+        pass_probability_mask = np.ones(target_len, dtype=bool)
+        expected_edge_mask = np.ones(target_len, dtype=bool)
+        selected_mask = candidate_with_return_mask.copy()
+        blocked_by_regime_mask = np.zeros(target_len, dtype=bool)
+        blocked_by_probability_mask = np.zeros(target_len, dtype=bool)
+        blocked_by_expected_edge_mask = np.zeros(target_len, dtype=bool)
+
+        if policy is not None and not policy.empty:
+            if "regime_policy_enabled" in policy.columns:
+                regime_enabled_mask = policy["regime_policy_enabled"].to_numpy(dtype=bool)
+            if {
+                "edge_pass_probability",
+                "regime_policy_min_pass_probability",
+            }.issubset(policy.columns):
+                pass_probability_mask = (
+                    np.isfinite(policy["edge_pass_probability"].to_numpy(dtype=float))
+                    & (
+                        policy["edge_pass_probability"].to_numpy(dtype=float)
+                        >= policy["regime_policy_min_pass_probability"].to_numpy(dtype=float)
+                    )
+                )
+            if {"expected_edge", "regime_policy_min_expected_edge"}.issubset(policy.columns):
+                expected_edge_mask = (
+                    np.isfinite(policy["expected_edge"].to_numpy(dtype=float))
+                    & (
+                        policy["expected_edge"].to_numpy(dtype=float)
+                        >= policy["regime_policy_min_expected_edge"].to_numpy(dtype=float)
+                    )
+                )
+            if "edge_policy_pass" in policy.columns:
+                selected_mask = (
+                    candidate_with_return_mask
+                    & policy["edge_policy_pass"].to_numpy(dtype=bool)
+                )
+            blocked_by_regime_mask = candidate_mask & ~regime_enabled_mask
+            blocked_by_probability_mask = (
+                candidate_mask & regime_enabled_mask & ~pass_probability_mask
+            )
+            blocked_by_expected_edge_mask = (
+                candidate_mask
+                & regime_enabled_mask
+                & pass_probability_mask
+                & ~expected_edge_mask
+            )
+
+        def _candidate_return_mean(mask: np.ndarray) -> float:
+            values = trade_returns[mask & np.isfinite(trade_returns)]
+            return float(np.mean(values)) if values.size else 0.0
+
+        def _selected_win_rate(mask: np.ndarray) -> float:
+            values = trade_returns[mask & np.isfinite(trade_returns)]
+            return float(np.mean(values > 0.0)) if values.size else 0.0
+
+        def _summary_for_mask(mask: np.ndarray) -> dict[str, Any]:
+            group_rows = int(np.count_nonzero(mask))
+            group_candidate_mask = candidate_mask & mask
+            group_candidate_with_return_mask = candidate_with_return_mask & mask
+            group_selected_mask = selected_mask & mask
+            candidate_count = int(np.count_nonzero(group_candidate_mask))
+            selected_count = int(np.count_nonzero(group_selected_mask))
+            candidate_mean_trade_return = _candidate_return_mean(group_candidate_with_return_mask)
+            selected_mean_trade_return = _candidate_return_mean(group_selected_mask)
+            return {
+                "rows": group_rows,
+                "candidate_count": candidate_count,
+                "candidate_with_return_count": int(np.count_nonzero(group_candidate_with_return_mask)),
+                "selected_count": selected_count,
+                "candidate_rate": float(candidate_count / group_rows) if group_rows else 0.0,
+                "selected_rate": float(selected_count / group_rows) if group_rows else 0.0,
+                "selected_vs_candidate_rate": (
+                    float(selected_count / candidate_count) if candidate_count else 0.0
+                ),
+                "blocked_by_regime_count": int(np.count_nonzero(blocked_by_regime_mask & mask)),
+                "blocked_by_probability_count": int(
+                    np.count_nonzero(blocked_by_probability_mask & mask)
+                ),
+                "blocked_by_expected_edge_count": int(
+                    np.count_nonzero(blocked_by_expected_edge_mask & mask)
+                ),
+                "candidate_mean_trade_return": candidate_mean_trade_return,
+                "selected_mean_trade_return": selected_mean_trade_return,
+                "selected_edge_lift": float(
+                    selected_mean_trade_return - candidate_mean_trade_return
+                )
+                if candidate_count
+                else 0.0,
+                "selected_win_rate": _selected_win_rate(group_selected_mask),
+            }
+
+        full_mask = np.ones(target_len, dtype=bool)
+        summary = _summary_for_mask(full_mask)
+        summary.update(
+            {
+                "rows": int(target_len),
+                "finite_probability_count": int(np.count_nonzero(finite_probability_mask)),
+                "finite_trade_return_count": int(np.count_nonzero(finite_trade_return_mask)),
+                "zero_signal_count": int(np.count_nonzero(np.abs(signal_values) <= 1e-8)),
+                "long_candidate_count": int(np.count_nonzero(long_candidate_mask)),
+                "short_candidate_count": int(np.count_nonzero(short_candidate_mask)),
+                "regime_enabled_candidate_count": int(
+                    np.count_nonzero(candidate_mask & regime_enabled_mask)
+                ),
+                "probability_gate_pass_count": int(
+                    np.count_nonzero(candidate_mask & regime_enabled_mask & pass_probability_mask)
+                ),
+                "expected_edge_gate_pass_count": int(
+                    np.count_nonzero(
+                        candidate_mask
+                        & regime_enabled_mask
+                        & pass_probability_mask
+                        & expected_edge_mask
+                    )
+                ),
+            }
+        )
+
+        def _group_breakdown(labels: np.ndarray | None) -> dict[str, Any]:
+            if labels is None:
+                return {}
+            normalized = (
+                pd.Series(labels, dtype="object")
+                .fillna("unknown")
+                .astype(str)
+                .str.strip()
+                .replace("", "unknown")
+                .to_numpy(dtype=object)
+            )
+            payload: dict[str, Any] = {}
+            for group_name in sorted({str(value) for value in normalized if str(value).strip()}):
+                group_mask = normalized == group_name
+                payload[str(group_name)] = _summary_for_mask(group_mask)
+            return payload
+
+        return summary, _group_breakdown(symbol_values), _group_breakdown(regime_values)
+
     def _evaluate_expected_edge_policy_holdout(
         self,
         policy_model: ExpectedEdgePolicyModel,
@@ -7613,6 +8064,9 @@ class ModelTrainer:
         holdout_regimes = None
         if self.holdout_regimes is not None and len(self.holdout_regimes) >= aligned_len:
             holdout_regimes = np.asarray(self.holdout_regimes, dtype=object)[-aligned_len:]
+        holdout_symbols = None
+        if self.holdout_symbols is not None and len(self.holdout_symbols) >= aligned_len:
+            holdout_symbols = np.asarray(self.holdout_symbols, dtype=object)[-aligned_len:]
 
         policy_frame = policy_model.predict_policy(
             holdout_frame,
@@ -7640,6 +8094,23 @@ class ModelTrainer:
             )
             if not np.isfinite(correlation):
                 correlation = 0.0
+
+        holdout_funnel_summary, holdout_funnel_by_symbol, holdout_funnel_by_regime = (
+            self._build_signal_funnel_summary(
+                probabilities=holdout_probabilities,
+                signal_values=holdout_signal,
+                trade_returns=holdout_trade_returns,
+                policy_frame=policy_frame,
+                symbols=holdout_symbols,
+                regimes=holdout_regimes,
+            )
+        )
+        self._record_signal_funnel_metrics(
+            "expected_edge_holdout",
+            holdout_funnel_summary,
+            by_symbol=holdout_funnel_by_symbol,
+            by_regime=holdout_funnel_by_regime,
+        )
 
         return {
             "source": "holdout",
@@ -7714,6 +8185,48 @@ class ModelTrainer:
         if self.sample_weights is not None and len(self.sample_weights) >= target_len:
             sample_weights = np.asarray(self.sample_weights, dtype=float)[-target_len:]
 
+        candidate_mask = np.isfinite(trade_returns) & (np.abs(signal_values) > 1e-8)
+        candidate_rate = float(np.mean(candidate_mask)) if target_len else 0.0
+        candidate_floor = {
+            "rows": int(target_len),
+            "candidate_count": int(np.count_nonzero(candidate_mask)),
+            "candidate_rate": candidate_rate,
+            "finite_trade_return_count": int(np.count_nonzero(np.isfinite(trade_returns))),
+            "configured_min_samples": int(self.config.expected_edge_min_samples),
+            "configured_min_coverage": float(self.config.expected_edge_min_coverage),
+            "meets_min_samples": bool(
+                np.count_nonzero(candidate_mask) >= int(self.config.expected_edge_min_samples)
+            ),
+            "meets_min_coverage": bool(
+                candidate_rate >= float(self.config.expected_edge_min_coverage)
+            ),
+            "long_candidate_count": int(np.count_nonzero(candidate_mask & (signal_values > 0.0))),
+            "short_candidate_count": int(np.count_nonzero(candidate_mask & (signal_values < 0.0))),
+        }
+        self.training_metrics["expected_edge_candidate_floor"] = self._json_safe(candidate_floor)
+        self._record_expected_edge_metrics("expected_edge_candidate_floor", candidate_floor)
+        aligned_symbols = None
+        if self.row_symbols is not None and len(self.row_symbols) >= target_len:
+            aligned_symbols = np.asarray(self.row_symbols, dtype=object)[-target_len:]
+        aligned_regimes = None
+        if self.regimes is not None and len(self.regimes) >= target_len:
+            aligned_regimes = np.asarray(self.regimes, dtype=object)[-target_len:]
+        training_funnel_precheck, training_funnel_by_symbol, training_funnel_by_regime = (
+            self._build_signal_funnel_summary(
+                probabilities=probabilities,
+                signal_values=signal_values,
+                trade_returns=trade_returns,
+                symbols=aligned_symbols,
+                regimes=aligned_regimes,
+            )
+        )
+        self._record_signal_funnel_metrics(
+            "expected_edge_training_precheck",
+            training_funnel_precheck,
+            by_symbol=training_funnel_by_symbol,
+            by_regime=training_funnel_by_regime,
+        )
+
         policy_model = ExpectedEdgePolicyModel(
             config=ExpectedEdgePolicyConfig(
                 min_samples=int(self.config.expected_edge_min_samples),
@@ -7758,15 +8271,28 @@ class ModelTrainer:
             self.config.expected_edge_max_signal_scale
         )
         self._record_expected_edge_metrics("expected_edge_training", training_summary)
-        aligned_regimes = None
-        if self.regimes is not None and len(self.regimes) >= target_len:
-            aligned_regimes = np.asarray(self.regimes, dtype=object)[-target_len:]
         training_policy_frame = policy_model.predict_policy(
             feature_frame,
             probabilities=probabilities,
             long_threshold=float(long_threshold),
             short_threshold=float(short_threshold),
             signal_values=signal_values,
+        )
+        training_funnel_summary, training_funnel_by_symbol, training_funnel_by_regime = (
+            self._build_signal_funnel_summary(
+                probabilities=probabilities,
+                signal_values=signal_values,
+                trade_returns=trade_returns,
+                policy_frame=training_policy_frame,
+                symbols=aligned_symbols,
+                regimes=aligned_regimes,
+            )
+        )
+        self._record_signal_funnel_metrics(
+            "expected_edge_training",
+            training_funnel_summary,
+            by_symbol=training_funnel_by_symbol,
+            by_regime=training_funnel_by_regime,
         )
         regime_policy = derive_regime_conditioned_policy(
             regimes=aligned_regimes,
@@ -9253,10 +9779,20 @@ class ModelTrainer:
                 )
                 holdout_regime_metrics[str(regime_name)] = {
                     "rows": float(regime_rows),
+                    "accuracy": float(regime_metrics.get("accuracy", 0.0)),
                     "sharpe": float(regime_metrics.get("sharpe", 0.0)),
                     "max_drawdown": float(regime_metrics.get("max_drawdown", 0.0)),
                     "trade_count": float(regime_metrics.get("trade_count", 0.0)),
+                    "win_rate": float(regime_metrics.get("win_rate", 0.0)),
+                    "turnover": float(regime_metrics.get("turnover", 0.0)),
+                    "active_signal_rate": float(regime_metrics.get("active_signal_rate", 0.0)),
+                    "annual_return": float(regime_metrics.get("annual_return", 0.0)),
+                    "calmar": float(regime_metrics.get("calmar", 0.0)),
+                    "cvar_95": float(regime_metrics.get("cvar_95", 0.0)),
                     "risk_adjusted_score": float(regime_metrics.get("risk_adjusted_score", -1e9)),
+                    "sharpe_observation_confidence": float(
+                        regime_metrics.get("sharpe_observation_confidence", 0.0)
+                    ),
                     "symbol_concentration_hhi": float(
                         regime_metrics.get("symbol_concentration_hhi", 0.0)
                     ),
@@ -9317,9 +9853,16 @@ class ModelTrainer:
                 )
                 holdout_symbol_metrics[str(symbol_name)] = {
                     "rows": float(symbol_rows),
+                    "accuracy": float(symbol_metrics.get("accuracy", 0.0)),
                     "sharpe": float(symbol_metrics.get("sharpe", 0.0)),
                     "max_drawdown": float(symbol_metrics.get("max_drawdown", 0.0)),
                     "trade_count": float(symbol_metrics.get("trade_count", 0.0)),
+                    "win_rate": float(symbol_metrics.get("win_rate", 0.0)),
+                    "turnover": float(symbol_metrics.get("turnover", 0.0)),
+                    "active_signal_rate": float(symbol_metrics.get("active_signal_rate", 0.0)),
+                    "annual_return": float(symbol_metrics.get("annual_return", 0.0)),
+                    "calmar": float(symbol_metrics.get("calmar", 0.0)),
+                    "cvar_95": float(symbol_metrics.get("cvar_95", 0.0)),
                     "risk_adjusted_score": float(symbol_metrics.get("risk_adjusted_score", -1e9)),
                     "sharpe_observation_confidence": float(
                         symbol_metrics.get("sharpe_observation_confidence", 0.0)
@@ -10911,6 +11454,7 @@ class ModelTrainer:
         # Save training artifacts
         if self.config.save_artifacts:
             artifacts = {
+                "run_id": self.run_id,
                 "config": self.config.__dict__,
                 "cv_results": self.cv_results,
                 "validation_results": self.validation_results,
@@ -10936,6 +11480,9 @@ class ModelTrainer:
                 "promotion_package_path": (
                     str(self.promotion_package_path) if self.promotion_package_path else None
                 ),
+                "run_event_index_path": (
+                    str(self.run_event_index_path) if self.run_event_index_path else None
+                ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -10943,6 +11490,7 @@ class ModelTrainer:
             with open(artifacts_path, "w") as f:
                 json.dump(artifacts, f, indent=2, default=str)
 
+            self.artifacts_path = artifacts_path
             self.logger.info(f"Artifacts saved to: {artifacts_path}")
 
             # Save meta-model if trained
