@@ -421,6 +421,11 @@ def _find_reusable_snapshot_bundle(config: "TrainingConfig") -> Path | None:
 LIGHTGBM_FAMILY_MODELS = {"lightgbm", "lightgbm_ranker", "lightgbm_regressor"}
 RANKING_MODELS = {"lightgbm_ranker"}
 REGRESSION_MODELS = {"xgboost_regressor", "lightgbm_regressor"}
+LIGHTGBM_MIN_DATA_IN_LEAF_SEARCH_MIN = 16
+LIGHTGBM_MIN_DATA_IN_LEAF_SEARCH_MAX = 128
+LIGHTGBM_MIN_DATA_IN_LEAF_FIT_MAX = 160
+LIGHTGBM_DEAD_SCORE_STD_EPS = 1e-6
+LIGHTGBM_DEAD_SCORE_SPAN_EPS = 1e-5
 
 MANDATORY_MODEL_TECH_STACK = {
     "postgresql_data": True,
@@ -652,7 +657,12 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
             section = all_cfg.get("xgboost", {})
         if not section and model_type == "lightgbm_regressor":
             section = all_cfg.get("lightgbm", {})
-        params = dict(section.get("classifier", {}))
+        subsection_name = "classifier"
+        if model_type.endswith("_regressor"):
+            subsection_name = "regressor"
+        elif model_type == "lightgbm_ranker":
+            subsection_name = "ranker"
+        params = dict(section.get(subsection_name, section.get("classifier", {})))
     elif model_type in {"lstm", "transformer", "tcn"}:
         params = dict(all_cfg.get(model_type, {}))
     else:
@@ -1343,6 +1353,7 @@ class ModelTrainer:
         self.cost_aware_event_returns: np.ndarray | None = None
         self.holdout_features: pd.DataFrame | None = None
         self.holdout_labels: pd.Series | None = None
+        self.holdout_close_prices: pd.Series | None = None
         self.holdout_timestamps: np.ndarray | None = None
         self.holdout_symbols: np.ndarray | None = None
         self.holdout_regimes: np.ndarray | None = None
@@ -1478,20 +1489,20 @@ class ModelTrainer:
             # Phase 5: Cross-Validation Training
             self._train_with_cv()
 
-            # Phase 6: Multiple testing / overfitting diagnostics before gating.
-            if self.config.apply_multiple_testing:
-                self._apply_multiple_testing_correction()
-
-            # Phase 7: Validation Gates (includes DSR/PBO hard checks)
-            passed_gates = self._validate_model()
-
-            # Phase 8: Meta-Labeling (if enabled)
+            # Phase 6: Meta-Labeling (if enabled)
             if self.config.use_meta_labeling:
                 self._train_meta_labeler()
 
-            # Phase 8.5: OOF expected-edge policy (if enabled)
+            # Phase 6.5: OOF expected-edge policy (if enabled)
             if self.config.enable_expected_edge_policy:
                 self._train_expected_edge_policy()
+
+            # Phase 7: Multiple testing / overfitting diagnostics before gating.
+            if self.config.apply_multiple_testing:
+                self._apply_multiple_testing_correction()
+
+            # Phase 8: Validation Gates (includes DSR/PBO hard checks)
+            passed_gates = self._validate_model()
 
             # Phase 9: SHAP Explainability
             if self.config.compute_shap:
@@ -3154,6 +3165,7 @@ class ModelTrainer:
 
         self.holdout_features = None
         self.holdout_labels = None
+        self.holdout_close_prices = None
         self.holdout_timestamps = None
         self.holdout_symbols = None
         self.holdout_regimes = None
@@ -3173,6 +3185,11 @@ class ModelTrainer:
                 )
             else:
                 self.holdout_labels = holdout_frame["label"].astype(int).reset_index(drop=True)
+            self.holdout_close_prices = (
+                holdout_frame["close"].reset_index(drop=True)
+                if "close" in holdout_frame.columns
+                else None
+            )
             self.holdout_timestamps = holdout_frame["timestamp"].to_numpy()
             self.holdout_symbols = holdout_frame["symbol"].astype(str).to_numpy()
             self.holdout_regimes = (
@@ -3542,6 +3559,186 @@ class ModelTrainer:
         if int(np.sum(groups)) != len(ts_arr):
             return np.array([len(ts_arr)], dtype=int)
         return groups
+
+    @staticmethod
+    def _rank_scores_to_unit_interval(values: np.ndarray | list[float]) -> np.ndarray:
+        """Map arbitrary scores into a probability-like unit interval using average ranks."""
+        raw_values = np.asarray(values, dtype=float).reshape(-1)
+        if raw_values.size == 0:
+            return raw_values.astype(float)
+
+        normalized = np.full(raw_values.shape, 0.5, dtype=float)
+        finite_mask = np.isfinite(raw_values)
+        finite_values = raw_values[finite_mask]
+        if finite_values.size <= 1:
+            return normalized
+        if float(np.max(finite_values) - np.min(finite_values)) <= 1e-12:
+            normalized[finite_mask] = 0.5
+            return normalized
+
+        order = np.argsort(finite_values, kind="mergesort")
+        sorted_values = finite_values[order]
+        ranks = np.empty(sorted_values.size, dtype=float)
+        start = 0
+        while start < sorted_values.size:
+            end = start + 1
+            while end < sorted_values.size and np.isclose(
+                sorted_values[end],
+                sorted_values[start],
+                rtol=1e-9,
+                atol=1e-12,
+            ):
+                end += 1
+            ranks[order[start:end]] = 0.5 * float(start + end - 1)
+            start = end
+
+        normalized[finite_mask] = np.clip(
+            (ranks + 0.5) / float(sorted_values.size),
+            0.0,
+            1.0,
+        )
+        return normalized
+
+    def _normalize_ranker_scores(
+        self,
+        raw_scores: np.ndarray | list[float],
+        timestamps: np.ndarray | list[Any] | None = None,
+    ) -> np.ndarray:
+        """Convert ranker scores into comparable unit-interval ranks."""
+        scores = np.asarray(raw_scores, dtype=float).reshape(-1)
+        if scores.size == 0:
+            return scores.astype(float)
+
+        normalization_mode = "global_percentile"
+        normalized: np.ndarray | None = None
+        if timestamps is not None:
+            timestamp_values = np.asarray(timestamps)
+            if timestamp_values.size == scores.size:
+                groups = self._build_ranking_groups(timestamp_values)
+                if (
+                    groups.size > 0
+                    and int(np.sum(groups)) == scores.size
+                    and int(np.max(groups)) > 1
+                ):
+                    normalized = np.empty(scores.size, dtype=float)
+                    start = 0
+                    for group_size in groups.tolist():
+                        end = start + int(group_size)
+                        normalized[start:end] = self._rank_scores_to_unit_interval(
+                            scores[start:end]
+                        )
+                        start = end
+                    if start == scores.size:
+                        normalization_mode = "query_percentile"
+                    else:
+                        normalized = None
+
+        if normalized is None:
+            normalized = self._rank_scores_to_unit_interval(scores)
+
+        self.training_metrics["ranker_score_normalization"] = normalization_mode
+        return normalized
+
+    def _ranker_scoring_contract(self) -> dict[str, Any]:
+        """Return the persisted runtime contract required for ranker parity."""
+        return {
+            "normalization": "query_percentile",
+            "query_key": "timestamp",
+            "requires_cross_sectional_panel": True,
+        }
+
+    def _attach_ranker_runtime_metadata(self, model: Any) -> None:
+        """Persist ranker runtime metadata on the fitted estimator for downstream consumers."""
+        if not self._is_ranker_model():
+            return
+
+        payload = self._ranker_scoring_contract()
+        fit_feature_names = [str(name) for name in self.feature_names] if self.feature_names else []
+        for candidate in (model, getattr(model, "_model", None)):
+            if candidate is None:
+                continue
+            try:
+                candidate._alphatrade_ranker_scoring = payload
+            except Exception:
+                pass
+            if fit_feature_names:
+                try:
+                    candidate.feature_names = fit_feature_names
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _summarize_lightgbm_model_structure(model: Any) -> dict[str, Any]:
+        """Summarize LightGBM booster structure for dead-model detection."""
+        estimator = getattr(model, "_model", model)
+        booster = getattr(estimator, "booster_", None)
+        summary: dict[str, Any] = {
+            "available": False,
+            "num_trees": 0.0,
+            "split_count": 0.0,
+            "nonzero_feature_count": 0.0,
+            "has_splits": False,
+        }
+        if booster is None:
+            return summary
+
+        summary["available"] = True
+        try:
+            split_importance = np.asarray(
+                booster.feature_importance(importance_type="split"),
+                dtype=float,
+            ).reshape(-1)
+        except Exception:
+            split_importance = np.array([], dtype=float)
+
+        try:
+            num_trees = float(booster.num_trees())
+        except Exception:
+            num_trees = float(len(getattr(estimator, "estimators_", [])))
+
+        split_count = float(np.sum(split_importance)) if split_importance.size > 0 else 0.0
+        nonzero_feature_count = (
+            float(np.count_nonzero(split_importance > 0.0)) if split_importance.size > 0 else 0.0
+        )
+        summary.update(
+            {
+                "num_trees": num_trees,
+                "split_count": split_count,
+                "nonzero_feature_count": nonzero_feature_count,
+                "has_splits": bool(split_count > 0.0),
+            }
+        )
+        return summary
+
+    @staticmethod
+    def _is_dead_probability_summary(summary: dict[str, Any] | None) -> bool:
+        """Return True when score dispersion has effectively collapsed."""
+        if not isinstance(summary, dict):
+            return False
+        finite_count = int(summary.get("finite_count", summary.get("rows", 0)) or 0)
+        std = float(summary.get("std", 0.0) or 0.0)
+        span = float(summary.get("span", 0.0) or 0.0)
+        return bool(
+            finite_count <= 1
+            or span <= LIGHTGBM_DEAD_SCORE_SPAN_EPS
+            or std <= LIGHTGBM_DEAD_SCORE_STD_EPS
+        )
+
+    def _is_dead_lightgbm_model(
+        self,
+        model: Any,
+        *,
+        probability_summary: dict[str, Any] | None = None,
+    ) -> bool:
+        """Return True when LightGBM failed to learn usable structure or score dispersion."""
+        if not self._is_lightgbm_family_model():
+            return False
+        structure_summary = self._summarize_lightgbm_model_structure(model)
+        if structure_summary.get("available") and not bool(
+            structure_summary.get("has_splits", False)
+        ):
+            return True
+        return self._is_dead_probability_summary(probability_summary)
 
     def _primary_horizon(self) -> int:
         """Return configured primary horizon used for horizon-specific policies."""
@@ -5412,8 +5609,12 @@ class ModelTrainer:
                     )
 
                     y_pred = np.asarray(model.predict(X_test))
-                    y_proba = np.asarray(self._get_predictions_proba(model, X_test))
-                    train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+                    y_proba = np.asarray(
+                        self._get_predictions_proba(model, X_test, timestamps=test_ts)
+                    )
+                    train_proba = np.asarray(
+                        self._get_predictions_proba(model, X_train, timestamps=train_ts)
+                    )
                     train_forward_returns = (
                         np.asarray(self.primary_forward_returns[train_idx], dtype=float)
                         if isinstance(self.primary_forward_returns, np.ndarray)
@@ -5864,8 +6065,32 @@ class ModelTrainer:
                         )
 
                         y_pred = np.asarray(model.predict(X_val))
-                        y_proba = np.asarray(self._get_predictions_proba(model, X_val))
-                        train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+                        y_proba = np.asarray(
+                            self._get_predictions_proba(
+                                model,
+                                X_val,
+                                timestamps=(
+                                    np.asarray(
+                                        _ts_outer_train[inner_val_idx], dtype="datetime64[ns]"
+                                    )
+                                    if _ts_outer_train is not None
+                                    else None
+                                ),
+                            )
+                        )
+                        train_proba = np.asarray(
+                            self._get_predictions_proba(
+                                model,
+                                X_train,
+                                timestamps=(
+                                    np.asarray(
+                                        _ts_outer_train[inner_train_idx], dtype="datetime64[ns]"
+                                    )
+                                    if _ts_outer_train is not None
+                                    else None
+                                ),
+                            )
+                        )
                         train_forward_returns = (
                             np.asarray(_forward_outer_train[inner_train_idx], dtype=float)
                             if _forward_outer_train is not None
@@ -6105,8 +6330,12 @@ class ModelTrainer:
                 continue
 
             y_pred = np.asarray(model.predict(X_outer_test))
-            y_proba = np.asarray(self._get_predictions_proba(model, X_outer_test))
-            train_proba = np.asarray(self._get_predictions_proba(model, X_outer_train))
+            y_proba = np.asarray(
+                self._get_predictions_proba(model, X_outer_test, timestamps=ts_outer_test)
+            )
+            train_proba = np.asarray(
+                self._get_predictions_proba(model, X_outer_train, timestamps=ts_outer_train)
+            )
             long_threshold, short_threshold = self._derive_signal_thresholds(
                 train_proba,
                 train_labels=y_outer_train,
@@ -6327,6 +6556,13 @@ class ModelTrainer:
         from sklearn.model_selection import GridSearchCV
 
         model = self._create_base_model()
+        scoring: str | None
+        if self._is_ranker_model():
+            scoring = None
+        elif self._is_regression_model():
+            scoring = "neg_mean_squared_error"
+        else:
+            scoring = "roc_auc"
 
         if self.config.model_type == "xgboost":
             param_grid = {
@@ -6344,7 +6580,7 @@ class ModelTrainer:
             param_grid = {}
 
         grid_search = GridSearchCV(
-            model, param_grid, cv=3, scoring="accuracy", n_jobs=self.config.n_jobs
+            model, param_grid, cv=3, scoring=scoring, n_jobs=self.config.n_jobs
         )
         grid_search.fit(self.features, self.labels)
 
@@ -6357,6 +6593,13 @@ class ModelTrainer:
         from scipy.stats import randint, uniform
 
         model = self._create_base_model()
+        scoring: str | None
+        if self._is_ranker_model():
+            scoring = None
+        elif self._is_regression_model():
+            scoring = "neg_mean_squared_error"
+        else:
+            scoring = "roc_auc"
 
         if self.config.model_type == "xgboost":
             param_distributions = {
@@ -6372,7 +6615,7 @@ class ModelTrainer:
             param_distributions,
             n_iter=self.config.n_trials,
             cv=3,
-            scoring="accuracy",
+            scoring=scoring,
             n_jobs=self.config.n_jobs,
         )
         random_search.fit(self.features, self.labels)
@@ -6411,9 +6654,8 @@ class ModelTrainer:
 
         if self._is_lightgbm_family_model():
             effective_train = max(128, int(min_train_size if min_train_size is not None else 1024))
-            leaf_floor = max(30, int(np.ceil(float(effective_train) * 0.06)))
-            leaf_ceiling = max(leaf_floor, min(220, int(np.ceil(float(effective_train) * 0.24))))
-            num_leaves_high = max(24, min(48, int(np.ceil(float(effective_train) * 0.12))))
+            leaf_floor, leaf_ceiling = self._resolve_lightgbm_leaf_bounds(effective_train)
+            num_leaves_high = max(24, min(96, int(np.ceil(np.sqrt(float(effective_train)) * 2.0))))
             estimators_high = max(260, min(520, int(np.ceil(float(effective_train) * 0.60))))
 
             base_space = lambda trial: {
@@ -6430,7 +6672,7 @@ class ModelTrainer:
                 "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.03, 0.35),
                 "max_bin": trial.suggest_int("max_bin", 127, 191),
             }
-            if self.config.model_type in {"lightgbm", "lightgbm_ranker"}:
+            if self.config.model_type == "lightgbm":
                 return lambda trial: {
                     **base_space(trial),
                     "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.95, 1.15),
@@ -6513,20 +6755,57 @@ class ModelTrainer:
             candidates = [max_lookback]
         return sorted(set(candidates))
 
+    @staticmethod
+    def _resolve_lightgbm_leaf_bounds(train_size: int | None) -> tuple[int, int]:
+        """Return a realistic min-data-in-leaf search range for LightGBM folds."""
+        effective_train = max(128, int(train_size if train_size is not None else 1024))
+        if effective_train <= 512:
+            leaf_floor = LIGHTGBM_MIN_DATA_IN_LEAF_SEARCH_MIN
+        elif effective_train <= 5_000:
+            leaf_floor = 20
+        elif effective_train <= 50_000:
+            leaf_floor = 24
+        else:
+            leaf_floor = 32
+
+        leaf_ceiling = min(
+            LIGHTGBM_MIN_DATA_IN_LEAF_SEARCH_MAX,
+            max(
+                leaf_floor + 12,
+                int(np.ceil(np.sqrt(float(effective_train)) * 0.35)),
+            ),
+        )
+        return int(leaf_floor), int(max(leaf_ceiling, leaf_floor))
+
+    @classmethod
+    def _resolve_lightgbm_leaf_cap(cls, train_size: int) -> int:
+        """Return the maximum leaf size allowed after fold-size adjustment."""
+        leaf_floor, _ = cls._resolve_lightgbm_leaf_bounds(train_size)
+        effective_train = max(128, int(train_size))
+        leaf_cap = min(
+            LIGHTGBM_MIN_DATA_IN_LEAF_FIT_MAX,
+            max(
+                leaf_floor + 12,
+                int(np.ceil(np.sqrt(float(effective_train)) * 0.45)),
+            ),
+        )
+        return int(max(leaf_cap, leaf_floor))
+
     def _prepare_params_for_train_size(self, params: dict, train_size: int) -> dict:
         """Adjust sequence model params for current CV fold size."""
         adjusted = dict(params)
 
         if self._is_lightgbm_family_model():
-            leaf_floor = max(20, int(max(1, train_size) * 0.05))
+            leaf_floor, _ = self._resolve_lightgbm_leaf_bounds(train_size)
+            leaf_cap = self._resolve_lightgbm_leaf_cap(train_size)
             existing_leaf = int(
                 adjusted.get("min_data_in_leaf", adjusted.get("min_child_samples", 20))
             )
-            effective_leaf = max(existing_leaf, leaf_floor)
+            effective_leaf = int(np.clip(existing_leaf, leaf_floor, leaf_cap))
             adjusted["min_data_in_leaf"] = effective_leaf
             adjusted["min_child_samples"] = effective_leaf
 
-            max_leaves = max(16, min(48, int(max(16, train_size // max(effective_leaf, 1)))))
+            max_leaves = max(16, min(96, int(max(16, train_size // max(effective_leaf, 1)))))
             existing_leaves = int(adjusted.get("num_leaves", 31))
             adjusted["num_leaves"] = int(np.clip(existing_leaves, 16, max_leaves))
 
@@ -6548,10 +6827,12 @@ class ModelTrainer:
             adjusted["bagging_freq"] = max(1, int(adjusted.get("bagging_freq", 1)))
             adjusted["lambda_l1"] = max(0.10, float(adjusted.get("lambda_l1", 0.10)))
             adjusted["lambda_l2"] = max(1.00, float(adjusted.get("lambda_l2", 1.00)))
-            if self.config.model_type in {"lightgbm", "lightgbm_ranker"}:
+            if self.config.model_type == "lightgbm":
                 adjusted["scale_pos_weight"] = float(
                     np.clip(float(adjusted.get("scale_pos_weight", 1.0)), 0.90, 1.30)
                 )
+            else:
+                adjusted.pop("scale_pos_weight", None)
 
         if self.config.model_type not in {"lstm", "transformer", "tcn"}:
             return adjusted
@@ -6912,6 +7193,7 @@ class ModelTrainer:
         """Derive leakage-safe long/short thresholds from training probabilities."""
         default_long = 0.55
         default_short = 0.45
+        ranker_mode = self._is_ranker_model()
         if train_proba is None:
             return default_long, default_short
 
@@ -6922,6 +7204,16 @@ class ModelTrainer:
             return default_long, default_short
 
         values = np.clip(values, 0.0, 1.0)
+        distribution_summary = self._summarize_probability_distribution(values)
+        if self._is_dead_probability_summary(distribution_summary):
+            proba_center = float(np.clip(distribution_summary.get("mean", 0.5), 0.0, 1.0))
+            long_threshold = float(np.clip(max(default_long, proba_center + 0.05), 0.55, 0.99))
+            short_threshold = float(np.clip(min(default_short, proba_center - 0.05), 0.01, 0.45))
+            if long_threshold <= short_threshold:
+                long_threshold = 0.75
+                short_threshold = 0.25
+            return long_threshold, short_threshold
+
         target_trades = self._effective_trade_target(int(values.size))
         threshold_policy = self._horizon_threshold_policy()
         target_rate_base = min(0.35, max(0.05, float(target_trades) / float(values.size)))
@@ -7014,31 +7306,33 @@ class ModelTrainer:
                 )
             )
             symmetric_tails = sorted(
-                set(
-                    [
-                        tail_rate,
-                        0.04,
-                        0.06,
-                        0.08,
-                        0.10,
-                        0.12,
-                        0.15,
-                        0.18,
-                        0.22,
-                        0.26,
-                    ]
-                )
+                {
+                    tail_rate,
+                    0.04,
+                    0.06,
+                    0.08,
+                    0.10,
+                    0.12,
+                    0.15,
+                    0.18,
+                    0.22,
+                    0.26,
+                }
             )
             candidate_pairs: list[tuple[float, float]] = [(tail, tail) for tail in symmetric_tails]
-            candidate_pairs.extend(
-                [
-                    (long_tail_prior, short_tail_prior),
-                    (min(0.40, long_tail_prior * 1.20), short_tail_prior),
-                    (long_tail_prior, min(0.40, short_tail_prior * 1.20)),
-                    (min(0.40, max(long_tail_prior, 0.22)), max(0.05, short_tail_prior * 0.70)),
-                    (min(0.40, max(long_tail_prior, 0.26)), 0.05),
-                ]
-            )
+            if not ranker_mode:
+                candidate_pairs.extend(
+                    [
+                        (long_tail_prior, short_tail_prior),
+                        (min(0.40, long_tail_prior * 1.20), short_tail_prior),
+                        (long_tail_prior, min(0.40, short_tail_prior * 1.20)),
+                        (
+                            min(0.40, max(long_tail_prior, 0.22)),
+                            max(0.05, short_tail_prior * 0.70),
+                        ),
+                        (min(0.40, max(long_tail_prior, 0.26)), 0.05),
+                    ]
+                )
             candidate_pairs = sorted(
                 {
                     (float(np.clip(lp, 0.03, 0.40)), float(np.clip(sp, 0.03, 0.40)))
@@ -7091,7 +7385,7 @@ class ModelTrainer:
                     activity_penalty += float(
                         0.75 * (min_entry_rate - entry_rate) / max(min_entry_rate, 1e-9)
                     )
-                calibration_penalty = float(np.mean((values - y_bin) ** 2))
+                calibration_penalty = 0.0 if ranker_mode else float(np.mean((values - y_bin) ** 2))
                 score = (
                     (0.65 * directional_acc)
                     + (0.20 * activity_score)
@@ -7188,7 +7482,7 @@ class ModelTrainer:
             long_threshold = float(np.clip(proba_center + adaptive_band, 0.52, 0.72))
             short_threshold = float(np.clip(proba_center - adaptive_band, 0.28, 0.48))
 
-        if returns_arr is not None and returns_arr.size == values.size:
+        if (not ranker_mode) and returns_arr is not None and returns_arr.size == values.size:
             side_signals = np.where(
                 values >= long_threshold,
                 1.0,
@@ -7224,19 +7518,20 @@ class ModelTrainer:
                 long_threshold = max(long_threshold, edge_floor)
                 short_threshold = min(short_threshold, edge_cap)
 
-        if label_positive_rate is not None:
+        if (not ranker_mode) and label_positive_rate is not None:
             if label_positive_rate >= 0.52:
                 short_threshold = min(short_threshold, 0.20)
             elif label_positive_rate <= 0.48:
                 long_threshold = max(long_threshold, 0.80)
 
-        regime_long_shift, regime_short_shift = self._infer_regime_side_bias(
-            regimes_arr,
-            returns_arr,
-        )
-        if abs(regime_long_shift) > 1e-9 or abs(regime_short_shift) > 1e-9:
-            long_threshold = float(np.clip(long_threshold + regime_long_shift, 0.51, 0.95))
-            short_threshold = float(np.clip(short_threshold + regime_short_shift, 0.05, 0.49))
+        if not ranker_mode:
+            regime_long_shift, regime_short_shift = self._infer_regime_side_bias(
+                regimes_arr,
+                returns_arr,
+            )
+            if abs(regime_long_shift) > 1e-9 or abs(regime_short_shift) > 1e-9:
+                long_threshold = float(np.clip(long_threshold + regime_long_shift, 0.51, 0.95))
+                short_threshold = float(np.clip(short_threshold + regime_short_shift, 0.05, 0.49))
 
         if (
             regimes_arr is not None
@@ -7265,6 +7560,17 @@ class ModelTrainer:
                 if safety_shift > 0.0:
                     long_threshold = float(np.clip(long_threshold + safety_shift, 0.52, 0.94))
                     short_threshold = float(np.clip(short_threshold - safety_shift, 0.06, 0.48))
+
+        if ranker_mode:
+            half_gap = float(
+                np.clip(
+                    ((max(0.0, long_threshold - 0.5) + max(0.0, 0.5 - short_threshold)) / 2.0),
+                    max(0.03, min_gap / 2.0),
+                    0.45,
+                )
+            )
+            long_threshold = float(np.clip(0.5 + half_gap, 0.51, 0.95))
+            short_threshold = float(np.clip(0.5 - half_gap, 0.05, 0.49))
 
         if long_threshold - short_threshold < min_gap:
             long_threshold = default_long
@@ -7368,8 +7674,24 @@ class ModelTrainer:
             )
 
             y_pred = np.asarray(model.predict(X_test))
-            y_proba = np.asarray(self._get_predictions_proba(model, X_test))
-            train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+            y_proba_raw = np.asarray(
+                self._get_raw_predictions_proba(model, X_test, timestamps=test_ts)
+            )
+            train_proba_raw = np.asarray(
+                self._get_raw_predictions_proba(model, X_train, timestamps=train_ts)
+            )
+            if self._is_dead_lightgbm_model(
+                model,
+                probability_summary=self._summarize_probability_distribution(train_proba_raw),
+            ) or self._is_dead_probability_summary(
+                self._summarize_probability_distribution(y_proba_raw)
+            ):
+                continue
+
+            y_proba = np.asarray(self._get_predictions_proba(model, X_test, timestamps=test_ts))
+            train_proba = np.asarray(
+                self._get_predictions_proba(model, X_train, timestamps=train_ts)
+            )
             train_forward_returns = (
                 np.asarray(self.primary_forward_returns[train_idx], dtype=float)
                 if isinstance(self.primary_forward_returns, np.ndarray)
@@ -7469,6 +7791,7 @@ class ModelTrainer:
         self.cv_active_return_series = []
         self.oof_primary_proba = np.full(len(y), np.nan, dtype=float)
         self.oof_primary_proba_raw = np.full(len(y), np.nan, dtype=float)
+        self.training_metrics["lightgbm_dead_cv_fold_count"] = 0.0
         splits = self._generate_cv_splits(X, y)
 
         for fold_idx, (train_idx, test_idx) in enumerate(splits):
@@ -7491,6 +7814,17 @@ class ModelTrainer:
             )
             fold_params = self._augment_params_for_train_labels(fold_params, y_train)
             model = self._create_model(params=fold_params)
+            train_ts = (
+                np.asarray(self.timestamps[train_idx], dtype="datetime64[ns]")
+                if self.timestamps is not None and len(self.timestamps) == len(y)
+                else None
+            )
+            test_ts = (
+                np.asarray(self.timestamps[test_idx], dtype="datetime64[ns]")
+                if self.timestamps is not None and len(self.timestamps) == len(y)
+                else None
+            )
+
             self._fit_model(
                 model=model,
                 X_train=X_train,
@@ -7498,23 +7832,39 @@ class ModelTrainer:
                 X_val=X_test,
                 y_val=y_test,
                 sample_weights=w_train,
-                train_timestamps=(
-                    np.asarray(self.timestamps[train_idx], dtype="datetime64[ns]")
-                    if self.timestamps is not None and len(self.timestamps) == len(y)
-                    else None
-                ),
-                val_timestamps=(
-                    np.asarray(self.timestamps[test_idx], dtype="datetime64[ns]")
-                    if self.timestamps is not None and len(self.timestamps) == len(y)
-                    else None
-                ),
+                train_timestamps=train_ts,
+                val_timestamps=test_ts,
             )
 
             # Evaluate
             y_pred = np.asarray(model.predict(X_test))
-            y_proba_raw = np.asarray(self._get_raw_predictions_proba(model, X_test))
-            y_proba = np.asarray(self._get_predictions_proba(model, X_test))
-            train_proba = np.asarray(self._get_predictions_proba(model, X_train))
+            y_proba_raw = np.asarray(
+                self._get_raw_predictions_proba(model, X_test, timestamps=test_ts)
+            )
+            train_proba_raw = np.asarray(
+                self._get_raw_predictions_proba(model, X_train, timestamps=train_ts)
+            )
+            y_proba = np.asarray(self._get_predictions_proba(model, X_test, timestamps=test_ts))
+            dead_train_summary = self._summarize_probability_distribution(train_proba_raw)
+            dead_eval_summary = self._summarize_probability_distribution(y_proba_raw)
+            if self._is_dead_lightgbm_model(
+                model,
+                probability_summary=dead_train_summary,
+            ) or self._is_dead_probability_summary(dead_eval_summary):
+                self.training_metrics["lightgbm_dead_cv_fold_count"] = float(
+                    self.training_metrics.get("lightgbm_dead_cv_fold_count", 0.0) + 1.0
+                )
+                self.logger.warning(
+                    "Fold %d: rejecting dead LightGBM model (split_count=%s, raw_std=%.8f, raw_span=%.8f)",
+                    fold_idx + 1,
+                    int(self._summarize_lightgbm_model_structure(model).get("split_count", 0.0)),
+                    float(dead_eval_summary.get("std", 0.0)),
+                    float(dead_eval_summary.get("span", 0.0)),
+                )
+                continue
+            train_proba = np.asarray(
+                self._get_predictions_proba(model, X_train, timestamps=train_ts)
+            )
             train_forward_returns = (
                 np.asarray(self.primary_forward_returns[train_idx], dtype=float)
                 if isinstance(self.primary_forward_returns, np.ndarray)
@@ -8046,11 +8396,25 @@ class ModelTrainer:
         if train_timestamps is None:
             raise ValueError("Ranker training requires train_timestamps for query grouping.")
 
+        fit_feature_names = (
+            [str(name) for name in self.feature_names]
+            if self.feature_names and len(self.feature_names) == int(X_train.shape[1])
+            else []
+        )
+        X_train_fit: Any = (
+            pd.DataFrame(X_train, columns=fit_feature_names) if fit_feature_names else X_train
+        )
+        X_val_fit: Any = (
+            pd.DataFrame(X_val, columns=fit_feature_names)
+            if fit_feature_names and X_val is not None
+            else X_val
+        )
+
         train_group = self._build_ranking_groups(train_timestamps)
         if train_group.size == 0:
-            train_group = np.array([int(len(X_train))], dtype=int)
-        if int(np.sum(train_group)) != int(len(X_train)):
-            train_group = np.array([int(len(X_train))], dtype=int)
+            train_group = np.array([int(len(X_train_fit))], dtype=int)
+        if int(np.sum(train_group)) != int(len(X_train_fit)):
+            train_group = np.array([int(len(X_train_fit))], dtype=int)
 
         use_eval = (
             X_val is not None
@@ -8071,7 +8435,7 @@ class ModelTrainer:
                 {
                     "group": train_group,
                     "sample_weight": sample_weights,
-                    "eval_set": [(X_val, y_val)],
+                    "eval_set": [(X_val_fit, y_val)],
                     "eval_group": [eval_group],
                     "eval_at": [1, 3, 5, 10],
                 }
@@ -8082,7 +8446,7 @@ class ModelTrainer:
             candidate_calls.append(
                 {
                     "group": train_group,
-                    "eval_set": [(X_val, y_val)],
+                    "eval_set": [(X_val_fit, y_val)],
                     "eval_group": [eval_group],
                     "eval_at": [1, 3, 5, 10],
                 }
@@ -8092,7 +8456,8 @@ class ModelTrainer:
         last_error: Exception | None = None
         for kwargs in candidate_calls:
             try:
-                model.fit(X_train, y_train, **kwargs)
+                model.fit(X_train_fit, y_train, **kwargs)
+                self._attach_ranker_runtime_metadata(model)
                 return
             except (TypeError, ValueError) as exc:
                 last_error = exc
@@ -8100,7 +8465,8 @@ class ModelTrainer:
 
         if last_error is not None:
             raise last_error
-        model.fit(X_train, y_train, group=train_group)
+        model.fit(X_train_fit, y_train, group=train_group)
+        self._attach_ranker_runtime_metadata(model)
 
     def _load_warm_start_model(self) -> Any | None:
         """Load optional prior model artifact for final production refit only."""
@@ -8141,6 +8507,8 @@ class ModelTrainer:
     def _supports_probability_calibration(self) -> bool:
         """Return whether this model family supports probability calibration."""
         if not bool(self.config.enable_probability_calibration):
+            return False
+        if self._is_ranker_model():
             return False
         if self.config.model_type in {"xgboost_regressor", "lightgbm_regressor"}:
             return False
@@ -8217,13 +8585,18 @@ class ModelTrainer:
         }
         if not bool(self.config.probability_calibration_guardrail_enabled):
             return True, summary
-        if raw_arr.size <= 0 or calibrated_arr.size != raw_arr.size or label_arr.size != raw_arr.size:
+        if (
+            raw_arr.size <= 0
+            or calibrated_arr.size != raw_arr.size
+            or label_arr.size != raw_arr.size
+        ):
             summary["reason"] = "guardrail_unavailable"
             return True, summary
 
         signed_returns = (
             np.asarray(train_returns, dtype=float).reshape(-1)
-            if train_returns is not None and len(np.asarray(train_returns).reshape(-1)) == raw_arr.size
+            if train_returns is not None
+            and len(np.asarray(train_returns).reshape(-1)) == raw_arr.size
             else None
         )
         aligned_regimes = (
@@ -8291,9 +8664,7 @@ class ModelTrainer:
                 "raw_active_rate": raw_active_rate,
                 "calibrated_active_rate": calibrated_active_rate,
                 "min_allowed_active_rate": float(min_allowed_active_rate),
-                "active_rate_ratio": float(
-                    calibrated_active_rate / max(raw_active_rate, 1e-9)
-                ),
+                "active_rate_ratio": float(calibrated_active_rate / max(raw_active_rate, 1e-9)),
                 "raw_std": raw_std,
                 "raw_span": raw_span,
                 "calibrated_std": float(calibrated_summary.get("std", 0.0)),
@@ -8512,6 +8883,343 @@ class ModelTrainer:
             if derived_long > derived_short:
                 return float(derived_long), float(derived_short)
         return 0.55, 0.45
+
+    def _apply_meta_signal_filter(
+        self,
+        *,
+        feature_frame: pd.DataFrame | None,
+        signal_values: np.ndarray,
+        close_prices: pd.Series | np.ndarray | None,
+        confidence: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        """Apply the fitted meta-labeler to directional signals when runtime inputs exist."""
+        signal = np.asarray(signal_values, dtype=float).reshape(-1)
+        resolved_confidence = np.clip(
+            np.asarray(
+                confidence if confidence is not None else (np.abs(signal) > 1e-8).astype(float),
+                dtype=float,
+            ).reshape(-1),
+            0.0,
+            1.0,
+        )
+        candidate_mask = np.abs(signal) > 1e-8
+        summary: dict[str, Any] = {
+            "applied": False,
+            "candidate_count": int(np.count_nonzero(candidate_mask)),
+            "retained_count": int(np.count_nonzero(candidate_mask)),
+            "candidate_rate": float(np.mean(candidate_mask)) if signal.size else 0.0,
+            "retained_rate": float(np.mean(candidate_mask)) if signal.size else 0.0,
+            "retention_ratio": 1.0 if np.any(candidate_mask) else 0.0,
+            "confidence_mean": (
+                float(np.mean(resolved_confidence[candidate_mask]))
+                if np.any(candidate_mask)
+                else 0.0
+            ),
+        }
+        if (
+            (not self.config.use_meta_labeling)
+            or self.meta_model is None
+            or feature_frame is None
+            or close_prices is None
+            or (not hasattr(self.meta_model, "filter_signals"))
+        ):
+            return signal, resolved_confidence, summary
+
+        feature_df = feature_frame.reset_index(drop=True).copy()
+        close_series = pd.Series(close_prices).reset_index(drop=True)
+        target_len = min(len(feature_df), len(close_series), len(signal), len(resolved_confidence))
+        if target_len <= 0:
+            return signal, resolved_confidence, summary
+
+        signal = signal[-target_len:]
+        resolved_confidence = resolved_confidence[-target_len:]
+        feature_df = feature_df.iloc[-target_len:].reset_index(drop=True)
+        close_series = close_series.iloc[-target_len:].reset_index(drop=True)
+        primary_direction = pd.Series(np.sign(signal), index=feature_df.index, dtype=float)
+        meta_threshold = float(
+            np.clip(
+                self.training_metrics.get(
+                    "meta_label_min_confidence",
+                    self.config.meta_label_min_confidence,
+                ),
+                0.45,
+                0.95,
+            )
+        )
+        try:
+            filtered = self.meta_model.filter_signals(
+                feature_df.fillna(0.0),
+                primary_direction,
+                prices=close_series,
+                threshold=meta_threshold,
+            )
+        except Exception as exc:
+            summary["reason"] = f"meta_filter_failed:{exc}"
+            self.logger.warning("Meta filter skipped during training evaluation: %s", exc)
+            return signal, resolved_confidence, summary
+
+        filtered_signal = (
+            pd.to_numeric(
+                filtered.get("filtered_signal", primary_direction),
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .to_numpy(dtype=float)
+        )
+        meta_confidence = pd.to_numeric(
+            filtered.get("confidence", np.nan),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        filtered_values = np.where(
+            filtered_signal > 0.0,
+            np.maximum(signal, 0.0),
+            np.where(filtered_signal < 0.0, np.minimum(signal, 0.0), 0.0),
+        )
+        resolved_confidence = np.clip(
+            np.where(np.isfinite(meta_confidence), meta_confidence, resolved_confidence),
+            0.0,
+            1.0,
+        )
+        retained_mask = np.abs(filtered_values) > 1e-8
+        retained_count = int(np.count_nonzero(retained_mask))
+        candidate_count = int(np.count_nonzero(candidate_mask[-target_len:]))
+        summary.update(
+            {
+                "applied": True,
+                "candidate_count": candidate_count,
+                "retained_count": retained_count,
+                "candidate_rate": float(candidate_count / target_len) if target_len else 0.0,
+                "retained_rate": float(retained_count / target_len) if target_len else 0.0,
+                "retention_ratio": (
+                    float(retained_count / candidate_count) if candidate_count > 0 else 0.0
+                ),
+                "confidence_mean": (
+                    float(np.mean(resolved_confidence[retained_mask]))
+                    if retained_count > 0
+                    else 0.0
+                ),
+                "threshold": meta_threshold,
+            }
+        )
+        return filtered_values, resolved_confidence, summary
+
+    def _summarize_policy_adjusted_signal_stream(
+        self,
+        *,
+        signal_values: np.ndarray,
+        trade_returns: np.ndarray,
+        timestamps: np.ndarray | None = None,
+        policy_frame: pd.DataFrame | None = None,
+    ) -> dict[str, Any]:
+        """Summarize the realized holdout stream after expected-edge admission and sizing."""
+        signal = np.asarray(signal_values, dtype=float).reshape(-1)
+        realized = np.asarray(trade_returns, dtype=float).reshape(-1)
+        target_len = min(len(signal), len(realized))
+        if policy_frame is not None:
+            target_len = min(target_len, len(policy_frame))
+        if timestamps is not None:
+            target_len = min(target_len, len(np.asarray(timestamps).reshape(-1)))
+        if target_len <= 0:
+            return {
+                "policy_signal_count": 0,
+                "policy_selected_count": 0,
+                "policy_selected_rate": 0.0,
+                "policy_trade_count": 0.0,
+                "policy_active_signal_rate": 0.0,
+                "policy_turnover": 0.0,
+                "policy_sharpe": 0.0,
+                "policy_max_drawdown": 0.0,
+                "policy_trade_return_observations": 0.0,
+                "policy_sharpe_observation_confidence": 0.0,
+                "policy_annual_return": 0.0,
+                "policy_calmar": 0.0,
+                "policy_underwater_ratio": 0.0,
+                "policy_selected_mean_trade_return": 0.0,
+                "policy_selected_win_rate": 0.0,
+            }
+
+        signal = signal[-target_len:]
+        realized = np.nan_to_num(realized[-target_len:], nan=0.0, posinf=0.0, neginf=0.0)
+        policy = (
+            policy_frame.iloc[-target_len:].reset_index(drop=True)
+            if policy_frame is not None
+            else None
+        )
+        aligned_timestamps = None
+        if timestamps is not None:
+            aligned_timestamps = np.asarray(timestamps).reshape(-1)[-target_len:]
+
+        adjusted_signal = signal.copy()
+        if policy is not None and not policy.empty:
+            policy_pass = (
+                policy["edge_policy_pass"].to_numpy(dtype=bool)
+                if "edge_policy_pass" in policy.columns
+                else (np.abs(signal) > 1e-8)
+            )
+            policy_scale = (
+                np.clip(policy["edge_policy_scale"].to_numpy(dtype=float), 0.0, 1.5)
+                if "edge_policy_scale" in policy.columns
+                else np.where(policy_pass, 1.0, 0.0).astype(float)
+            )
+            adjusted_signal = np.where(
+                policy_pass,
+                np.sign(signal) * np.abs(signal) * policy_scale,
+                0.0,
+            )
+
+        trade_mask = np.abs(adjusted_signal) > 1e-8
+        prev_signal = np.concatenate([[0.0], adjusted_signal[:-1]])
+        entry_mask = trade_mask & (
+            (np.abs(prev_signal) <= 1e-8) | (np.sign(adjusted_signal) != np.sign(prev_signal))
+        )
+        turnover_series = np.abs(np.diff(np.concatenate([[0.0], adjusted_signal])))
+        row_returns = np.where(trade_mask, np.abs(adjusted_signal) * realized, 0.0)
+        portfolio = self._aggregate_panel_portfolio_series(
+            timestamps=aligned_timestamps,
+            net_returns=row_returns,
+            turnover_series=turnover_series,
+            trade_mask=trade_mask,
+            entry_mask=entry_mask,
+        )
+        portfolio_returns = np.asarray(portfolio["portfolio_returns"], dtype=float)
+        portfolio_turnover = np.asarray(portfolio["portfolio_turnover_series"], dtype=float)
+        portfolio_trade_mask = np.asarray(portfolio["portfolio_trade_mask"], dtype=bool)
+        portfolio_entry_mask = np.asarray(portfolio["portfolio_entry_mask"], dtype=bool)
+        trade_return_series = portfolio_returns[portfolio_trade_mask]
+        performance_returns = (
+            portfolio_returns if portfolio_returns.size > 0 else trade_return_series
+        )
+
+        turnover = float(np.mean(portfolio_turnover)) if portfolio_turnover.size > 0 else 0.0
+        trade_count = int(np.count_nonzero(portfolio_entry_mask))
+        active_signal_rate = (
+            float(np.mean(portfolio_trade_mask)) if portfolio_trade_mask.size > 0 else 0.0
+        )
+        std = float(np.std(performance_returns)) if performance_returns.size > 0 else 0.0
+        annualization_periods = float(self._annualization_periods())
+        sharpe = (
+            float(np.mean(performance_returns) / std * np.sqrt(annualization_periods))
+            if std > 1e-12
+            else 0.0
+        )
+        max_dd = self._max_drawdown(performance_returns)
+        trade_obs_count = int(len(trade_return_series))
+        min_obs_for_confident_sharpe = max(
+            6,
+            int(round(float(self._effective_trade_target(int(target_len))) * 0.80)),
+        )
+        sharpe_observation_confidence = float(
+            np.clip(
+                float(trade_obs_count) / float(max(1, min_obs_for_confident_sharpe)),
+                0.10,
+                1.0,
+            )
+        )
+        sharpe = float(sharpe * sharpe_observation_confidence)
+        annual_return = (
+            float(np.mean(performance_returns) * annualization_periods)
+            if performance_returns.size > 0
+            else 0.0
+        )
+        calmar = annual_return / max_dd if max_dd > 1e-9 else annual_return
+        if performance_returns.size > 0:
+            cumulative_equity = np.cumsum(performance_returns)
+            running_peak = np.maximum.accumulate(cumulative_equity)
+            underwater_ratio = float(np.mean(cumulative_equity < (running_peak - 1e-12)))
+        else:
+            underwater_ratio = 0.0
+
+        return {
+            "policy_signal_count": int(np.count_nonzero(np.abs(signal) > 1e-8)),
+            "policy_selected_count": int(np.count_nonzero(trade_mask)),
+            "policy_selected_rate": float(np.mean(trade_mask)) if target_len else 0.0,
+            "policy_trade_count": float(trade_count),
+            "policy_active_signal_rate": float(active_signal_rate),
+            "policy_turnover": float(turnover),
+            "policy_sharpe": float(sharpe),
+            "policy_max_drawdown": float(max_dd),
+            "policy_trade_return_observations": float(trade_obs_count),
+            "policy_sharpe_observation_confidence": float(sharpe_observation_confidence),
+            "policy_annual_return": float(annual_return),
+            "policy_calmar": float(calmar),
+            "policy_underwater_ratio": float(underwater_ratio),
+            "policy_selected_mean_trade_return": (
+                float(np.mean(trade_return_series)) if trade_return_series.size else 0.0
+            ),
+            "policy_selected_win_rate": (
+                float(np.mean(trade_return_series > 0.0)) if trade_return_series.size else 0.0
+            ),
+        }
+
+    def _resolve_effective_holdout_metric_payload(self) -> dict[str, Any]:
+        """Resolve which holdout metrics should drive gates and overfitting diagnostics."""
+        payload = {
+            "source": "base",
+            "sharpe": float(self.training_metrics.get("holdout_sharpe", 0.0)),
+            "trade_count": float(self.training_metrics.get("holdout_trade_count", 0.0)),
+            "active_signal_rate": float(
+                self.training_metrics.get("holdout_active_signal_rate", 0.0)
+            ),
+            "max_drawdown": float(self.training_metrics.get("holdout_max_drawdown", 0.0)),
+            "trade_return_observations": float(
+                self.training_metrics.get("holdout_trade_return_observations", 0.0)
+            ),
+            "sharpe_observation_confidence": float(
+                self.training_metrics.get("holdout_sharpe_observation_confidence", 0.0)
+            ),
+        }
+        expected_edge_enabled = bool(self.training_metrics.get("expected_edge_policy_enabled", 0.0))
+        policy_sharpe = float(
+            self.training_metrics.get("expected_edge_holdout_policy_sharpe", np.nan)
+        )
+        if expected_edge_enabled and np.isfinite(policy_sharpe):
+            payload.update(
+                {
+                    "source": "expected_edge_policy",
+                    "sharpe": policy_sharpe,
+                    "trade_count": float(
+                        self.training_metrics.get("expected_edge_holdout_policy_trade_count", 0.0)
+                    ),
+                    "active_signal_rate": float(
+                        self.training_metrics.get(
+                            "expected_edge_holdout_policy_active_signal_rate",
+                            self.training_metrics.get("expected_edge_holdout_selected_rate", 0.0),
+                        )
+                    ),
+                    "max_drawdown": float(
+                        self.training_metrics.get("expected_edge_holdout_policy_max_drawdown", 0.0)
+                    ),
+                    "trade_return_observations": float(
+                        self.training_metrics.get(
+                            "expected_edge_holdout_policy_trade_return_observations",
+                            self.training_metrics.get("expected_edge_holdout_selected_count", 0.0),
+                        )
+                    ),
+                    "sharpe_observation_confidence": float(
+                        self.training_metrics.get(
+                            "expected_edge_holdout_policy_sharpe_observation_confidence",
+                            0.0,
+                        )
+                    ),
+                }
+            )
+        self.training_metrics["effective_holdout_metric_source"] = payload["source"]
+        self.training_metrics["effective_holdout_trade_count_metric"] = float(
+            payload["trade_count"]
+        )
+        self.training_metrics["effective_holdout_active_signal_rate_metric"] = float(
+            payload["active_signal_rate"]
+        )
+        self.training_metrics["effective_holdout_max_drawdown_metric"] = float(
+            payload["max_drawdown"]
+        )
+        self.training_metrics["effective_holdout_trade_return_observations"] = float(
+            payload["trade_return_observations"]
+        )
+        self.training_metrics["effective_holdout_sharpe_observation_confidence"] = float(
+            payload["sharpe_observation_confidence"]
+        )
+        return payload
 
     def _record_expected_edge_metrics(self, prefix: str, summary: dict[str, Any]) -> None:
         """Flatten expected-edge summaries into training metrics for artifacts."""
@@ -9093,7 +9801,14 @@ class ModelTrainer:
 
         X_holdout = self.holdout_features.values
         holdout_probabilities = self._align_probabilities(
-            np.asarray(self._get_predictions_proba(self.model, X_holdout), dtype=float),
+            np.asarray(
+                self._get_predictions_proba(
+                    self.model,
+                    X_holdout,
+                    timestamps=self.holdout_timestamps,
+                ),
+                dtype=float,
+            ),
             len(self.holdout_features),
         )
         holdout_signal = derive_base_signal(
@@ -9106,28 +9821,40 @@ class ModelTrainer:
             event_net_returns=self.holdout_cost_aware_event_returns,
             event_directions=self.holdout_primary_event_directions,
         )
-        holdout_trade_returns = self._resolve_trade_realized_returns(
-            holdout_signed_returns,
-            holdout_signal,
-        )
-        if holdout_trade_returns is None:
+        if holdout_signed_returns is None:
             return {"source": "missing_returns"}
 
         aligned_len = min(
-            len(self.holdout_features), len(holdout_probabilities), len(holdout_trade_returns)
+            len(self.holdout_features), len(holdout_probabilities), len(holdout_signed_returns)
         )
         if aligned_len <= 1:
             return {"source": "insufficient_rows"}
         holdout_frame = self.holdout_features.iloc[-aligned_len:].reset_index(drop=True)
         holdout_probabilities = holdout_probabilities[-aligned_len:]
         holdout_signal = holdout_signal[-aligned_len:]
-        holdout_trade_returns = holdout_trade_returns[-aligned_len:]
+        holdout_signed_returns = holdout_signed_returns[-aligned_len:]
+        holdout_confidence = np.clip(np.abs(holdout_probabilities - 0.5) * 2.0, 0.0, 1.0)
+        holdout_signal, holdout_confidence, meta_summary = self._apply_meta_signal_filter(
+            feature_frame=holdout_frame,
+            signal_values=holdout_signal,
+            close_prices=self.holdout_close_prices,
+            confidence=holdout_confidence,
+        )
+        holdout_trade_returns = self._resolve_trade_realized_returns(
+            holdout_signed_returns,
+            holdout_signal,
+        )
+        if holdout_trade_returns is None:
+            return {"source": "missing_returns"}
         holdout_regimes = None
         if self.holdout_regimes is not None and len(self.holdout_regimes) >= aligned_len:
             holdout_regimes = np.asarray(self.holdout_regimes, dtype=object)[-aligned_len:]
         holdout_symbols = None
         if self.holdout_symbols is not None and len(self.holdout_symbols) >= aligned_len:
             holdout_symbols = np.asarray(self.holdout_symbols, dtype=object)[-aligned_len:]
+        holdout_timestamps = None
+        if self.holdout_timestamps is not None and len(self.holdout_timestamps) >= aligned_len:
+            holdout_timestamps = np.asarray(self.holdout_timestamps)[-aligned_len:]
 
         policy_frame = policy_model.predict_policy(
             holdout_frame,
@@ -9135,6 +9862,7 @@ class ModelTrainer:
             long_threshold=float(long_threshold),
             short_threshold=float(short_threshold),
             signal_values=holdout_signal,
+            confidence=holdout_confidence,
             regimes=holdout_regimes,
             regime_policy=regime_policy,
         )
@@ -9174,6 +9902,12 @@ class ModelTrainer:
             by_symbol=holdout_funnel_by_symbol,
             by_regime=holdout_funnel_by_regime,
         )
+        policy_stream_summary = self._summarize_policy_adjusted_signal_stream(
+            signal_values=holdout_signal,
+            trade_returns=holdout_trade_returns,
+            timestamps=holdout_timestamps,
+            policy_frame=policy_frame,
+        )
 
         return {
             "source": "holdout",
@@ -9195,10 +9929,13 @@ class ModelTrainer:
                 else 0.0
             ),
             "expected_edge_correlation": correlation,
+            "meta_filter_applied": float(bool(meta_summary.get("applied", False))),
+            "meta_signal_retention_ratio": float(meta_summary.get("retention_ratio", 0.0)),
             "regime_policy_enabled": float(bool(regime_policy and regime_policy.get("enabled"))),
             "regime_count": float(
                 len(regime_policy.get("regimes", {})) if isinstance(regime_policy, dict) else 0
             ),
+            **policy_stream_summary,
         }
 
     def _train_expected_edge_policy(self) -> None:
@@ -9232,10 +9969,26 @@ class ModelTrainer:
         feature_frame = self.features.iloc[-target_len:].reset_index(drop=True)
         probabilities = probabilities[-target_len:]
         signed_returns = signed_returns[-target_len:]
+        close_prices = (
+            self.close_prices.iloc[-target_len:].reset_index(drop=True)
+            if self.close_prices is not None and len(self.close_prices) >= target_len
+            else None
+        )
         signal_values = derive_base_signal(
             probabilities,
             long_threshold=float(long_threshold),
             short_threshold=float(short_threshold),
+        )
+        signal_confidence = np.clip(np.abs(probabilities - 0.5) * 2.0, 0.0, 1.0)
+        signal_values, signal_confidence, meta_summary = self._apply_meta_signal_filter(
+            feature_frame=feature_frame,
+            signal_values=signal_values,
+            close_prices=close_prices,
+            confidence=signal_confidence,
+        )
+        self._record_summary_metrics(
+            "expected_edge_meta_filter",
+            meta_summary,
         )
         trade_returns = self._resolve_trade_realized_returns(signed_returns, signal_values)
         if trade_returns is None:
@@ -9309,6 +10062,7 @@ class ModelTrainer:
                 long_threshold=float(long_threshold),
                 short_threshold=float(short_threshold),
                 signal_values=signal_values,
+                confidence=signal_confidence,
                 sample_weights=sample_weights,
             )
         except ValueError as exc:
@@ -9338,6 +10092,7 @@ class ModelTrainer:
             long_threshold=float(long_threshold),
             short_threshold=float(short_threshold),
             signal_values=signal_values,
+            confidence=signal_confidence,
         )
         training_funnel_summary, training_funnel_by_symbol, training_funnel_by_regime = (
             self._build_signal_funnel_summary(
@@ -9393,12 +10148,11 @@ class ModelTrainer:
             len(regime_policy.get("regimes", {})) if isinstance(regime_policy, dict) else 0,
         )
 
-    def _get_raw_predictions_proba(self, model, X) -> np.ndarray:
+    def _get_raw_predictions_proba(self, model, X, timestamps=None) -> np.ndarray:
         """Get raw prediction probabilities from model before post-hoc calibration."""
         if self._is_ranker_model():
             raw_scores = np.asarray(model.predict(X), dtype=float).reshape(-1)
-            clipped = np.clip(raw_scores, -20.0, 20.0)
-            return (1.0 / (1.0 + np.exp(-clipped))).astype(float)
+            return self._normalize_ranker_scores(raw_scores, timestamps=timestamps).astype(float)
 
         try:
             if hasattr(model, "predict_proba"):
@@ -9420,9 +10174,12 @@ class ModelTrainer:
 
         return np.zeros(len(X))
 
-    def _get_predictions_proba(self, model, X) -> np.ndarray:
+    def _get_predictions_proba(self, model, X, timestamps=None) -> np.ndarray:
         """Get prediction probabilities from model, applying attached calibration when present."""
-        raw_values = np.asarray(self._get_raw_predictions_proba(model, X), dtype=float).reshape(-1)
+        raw_values = np.asarray(
+            self._get_raw_predictions_proba(model, X, timestamps=timestamps),
+            dtype=float,
+        ).reshape(-1)
         payload = self._resolve_probability_calibration_payload(model)
         if payload is None:
             return raw_values
@@ -9524,7 +10281,8 @@ class ModelTrainer:
                 if aligned_symbols is not None and len(aligned_symbols) == len(sort_idx):
                     aligned_symbols = aligned_symbols[sort_idx]
 
-        if self._is_regression_model():
+        ranker_mode = self._is_ranker_model()
+        if self._is_regression_model() or ranker_mode:
             y_pred_binary = (y_proba >= 0.5).astype(int)
             y_true_binary = (y_true > 0.0).astype(int)
         else:
@@ -9539,14 +10297,15 @@ class ModelTrainer:
                 else y_true
             )
 
+        regression_proxy = y_proba if (self._is_regression_model() or ranker_mode) else y_pred
         metrics = {
             "accuracy": float(accuracy_score(y_true_binary, y_pred_binary)),
             "precision": float(precision_score(y_true_binary, y_pred_binary, zero_division=0)),
             "recall": float(recall_score(y_true_binary, y_pred_binary, zero_division=0)),
             "f1": float(f1_score(y_true_binary, y_pred_binary, zero_division=0)),
-            "mse": float(mean_squared_error(y_true, y_pred)),
-            "r2": float(r2_score(y_true, y_pred)) if len(set(y_true)) > 1 else 0.0,
-            "brier_score": float(np.mean((y_proba - y_true_binary) ** 2)),
+            "mse": float(mean_squared_error(y_true, regression_proxy)),
+            "r2": float(r2_score(y_true, regression_proxy)) if len(set(y_true)) > 1 else 0.0,
+            "brier_score": (0.0 if ranker_mode else float(np.mean((y_proba - y_true_binary) ** 2))),
         }
 
         if len(y_proba) > 1:
@@ -9821,7 +10580,10 @@ class ModelTrainer:
         sharpe_component = float(self.config.objective_weight_sharpe * sharpe)
         drawdown_penalty = float(-self.config.objective_weight_drawdown * max_drawdown)
         turnover_penalty = float(-self.config.objective_weight_turnover * turnover)
-        calibration_penalty = float(-self.config.objective_weight_calibration * brier_score)
+        calibration_weight = (
+            0.0 if self._is_ranker_model() else self.config.objective_weight_calibration
+        )
+        calibration_penalty = float(-calibration_weight * brier_score)
         cvar_penalty = float(-self.config.objective_weight_cvar * max(0.0, expected_shortfall))
         expected_shortfall_cap = float(max(1e-6, self.config.objective_expected_shortfall_cap))
         tail_risk_excess = float(
@@ -9886,6 +10648,7 @@ class ModelTrainer:
         """Build execution-aware position profile from probabilities."""
         y_proba = np.asarray(y_proba, dtype=float)
         n_samples = len(y_proba)
+        ranker_mode = self._is_ranker_model()
         if n_samples == 0:
             return {
                 "base_long_threshold_series": np.array([], dtype=float),
@@ -9919,6 +10682,7 @@ class ModelTrainer:
                         "dynamic_relaxation_level": 0.0,
                         "forced_tail_applied": False,
                         "emergency_relaxation_applied": False,
+                        "dead_score_guard_triggered": False,
                         "cooldown_suppressed_count": 0,
                         "symbol_cap_suppressed_count": 0,
                         "mean_long_threshold_shift": 0.0,
@@ -9945,6 +10709,8 @@ class ModelTrainer:
         dynamic_relaxation_level = 0.0
         forced_tail_applied = False
         emergency_relaxation_applied = False
+        probability_summary = self._summarize_probability_distribution(y_proba)
+        dead_score_guard_triggered = self._is_dead_probability_summary(probability_summary)
         if self.config.dynamic_no_trade_band:
             uncertainty = 1.0 - (2.0 * np.abs(y_proba - 0.5))
             uncertainty = np.clip(uncertainty, 0.0, 1.0)
@@ -9979,10 +10745,17 @@ class ModelTrainer:
 
         raw_signals = _generate_signals(long_series, short_series)
 
-        if self.config.dynamic_no_trade_band and adaptive_band.size > 0:
+        if (
+            self.config.dynamic_no_trade_band
+            and adaptive_band.size > 0
+            and not dead_score_guard_triggered
+        ):
             target_activity_rate = min(
-                0.30,
-                max(0.02, float(self._effective_trade_target(n_samples)) / float(n_samples)),
+                0.18 if ranker_mode else 0.30,
+                max(
+                    0.01 if ranker_mode else 0.02,
+                    float(self._effective_trade_target(n_samples)) / float(n_samples),
+                ),
             )
             observed_activity = float(np.mean(raw_signals != 0.0))
             if observed_activity < (target_activity_rate * 0.50):
@@ -9999,11 +10772,31 @@ class ModelTrainer:
 
             if observed_activity < (target_activity_rate * 0.50):
                 forced_tail_applied = True
-                forced_tail = float(min(0.35, max(0.06, target_activity_rate * 1.25)))
+                forced_tail = float(
+                    min(
+                        0.18 if ranker_mode else 0.35,
+                        max(
+                            0.04 if ranker_mode else 0.06,
+                            target_activity_rate * (1.10 if ranker_mode else 1.25),
+                        ),
+                    )
+                )
                 forced_long = float(np.quantile(y_proba, 1.0 - forced_tail))
                 forced_short = float(np.quantile(y_proba, forced_tail))
-                forced_long = float(np.clip(forced_long, 0.53, 0.70))
-                forced_short = float(np.clip(forced_short, 0.30, 0.47))
+                forced_long = float(
+                    np.clip(
+                        forced_long,
+                        0.56 if ranker_mode else 0.53,
+                        0.68 if ranker_mode else 0.70,
+                    )
+                )
+                forced_short = float(
+                    np.clip(
+                        forced_short,
+                        0.32 if ranker_mode else 0.30,
+                        0.44 if ranker_mode else 0.47,
+                    )
+                )
                 long_series = np.minimum(long_series, np.full(n_samples, forced_long, dtype=float))
                 short_series = np.maximum(
                     short_series, np.full(n_samples, forced_short, dtype=float)
@@ -10015,9 +10808,30 @@ class ModelTrainer:
                 emergency_relaxation_applied = True
                 center = float(np.clip(np.median(y_proba), 0.45, 0.55))
                 dispersion = float(np.std(y_proba))
-                center_band = float(np.clip(max(0.02, dispersion * 0.75), 0.02, 0.10))
-                emergency_long = float(np.clip(center + center_band, 0.51, 0.66))
-                emergency_short = float(np.clip(center - center_band, 0.34, 0.49))
+                center_band = float(
+                    np.clip(
+                        max(
+                            0.015 if ranker_mode else 0.02,
+                            dispersion * (0.60 if ranker_mode else 0.75),
+                        ),
+                        0.015 if ranker_mode else 0.02,
+                        0.06 if ranker_mode else 0.10,
+                    )
+                )
+                emergency_long = float(
+                    np.clip(
+                        center + center_band,
+                        0.53 if ranker_mode else 0.51,
+                        0.63 if ranker_mode else 0.66,
+                    )
+                )
+                emergency_short = float(
+                    np.clip(
+                        center - center_band,
+                        0.37 if ranker_mode else 0.34,
+                        0.47 if ranker_mode else 0.49,
+                    )
+                )
                 long_series = np.minimum(
                     long_series, np.full(n_samples, emergency_long, dtype=float)
                 )
@@ -10027,7 +10841,7 @@ class ModelTrainer:
                 raw_signals = _generate_signals(long_series, short_series)
 
             # Regime-conditioned biasing from model confidence trend (leakage-safe).
-            if n_samples >= 12:
+            if (not ranker_mode) and n_samples >= 12:
                 centered_proba = y_proba - 0.5
                 drift_window = max(8, int(self.config.label_volatility_lookback))
                 rolling_mean = (
@@ -10211,6 +11025,7 @@ class ModelTrainer:
             "dynamic_relaxation_level": float(dynamic_relaxation_level),
             "forced_tail_applied": bool(forced_tail_applied),
             "emergency_relaxation_applied": bool(emergency_relaxation_applied),
+            "dead_score_guard_triggered": bool(dead_score_guard_triggered),
             "cooldown_suppressed_count": int(cooldown_suppressed_count),
             "symbol_cap_suppressed_count": int(symbol_cap_suppressed_count),
             "mean_long_threshold_shift": float(np.mean(long_series - base_long_series)),
@@ -10795,6 +11610,11 @@ class ModelTrainer:
             warm_start_model = self._load_warm_start_model()
         self._fit_model_full_dataset(final_model, X, y, weights, warm_start_model=warm_start_model)
         self.model = final_model
+        if self._is_lightgbm_family_model():
+            self._record_summary_metrics(
+                "final_model_structure",
+                self._summarize_lightgbm_model_structure(final_model),
+            )
         self._attach_probability_calibrator_to_model(self.model)
         self.training_metrics["final_refit_samples"] = float(len(X))
         self.logger.info(f"Final production model refit completed on {len(X)} samples")
@@ -10909,9 +11729,27 @@ class ModelTrainer:
         X_holdout = self.holdout_features.values
         y_holdout = self.holdout_labels.to_numpy(dtype=float)
         y_holdout_pred = np.asarray(self.model.predict(X_holdout))
-        y_holdout_raw_proba = np.asarray(self._get_raw_predictions_proba(self.model, X_holdout))
-        y_holdout_proba = np.asarray(self._get_predictions_proba(self.model, X_holdout))
-        train_proba = np.asarray(self._get_predictions_proba(self.model, self.features.values))
+        y_holdout_raw_proba = np.asarray(
+            self._get_raw_predictions_proba(
+                self.model,
+                X_holdout,
+                timestamps=self.holdout_timestamps,
+            )
+        )
+        y_holdout_proba = np.asarray(
+            self._get_predictions_proba(
+                self.model,
+                X_holdout,
+                timestamps=self.holdout_timestamps,
+            )
+        )
+        train_proba = np.asarray(
+            self._get_predictions_proba(
+                self.model,
+                self.features.values,
+                timestamps=self.timestamps,
+            )
+        )
         train_labels = self.labels.to_numpy(dtype=float) if self.labels is not None else None
         long_threshold, short_threshold = self._derive_signal_thresholds(
             train_proba,
@@ -11486,8 +12324,11 @@ class ModelTrainer:
             self._effective_trade_target(mean_test_size if mean_test_size > 0 else None)
         )
         self.training_metrics["effective_min_trades_gate"] = effective_min_trades
+        effective_holdout = self._resolve_effective_holdout_metric_payload()
         holdout_available = float(self.training_metrics.get("holdout_rows", 0.0)) > 0.0
-        holdout_sharpe = float(self.training_metrics.get("holdout_sharpe", -1.0))
+        holdout_sharpe = float(
+            effective_holdout.get("sharpe", self.training_metrics.get("holdout_sharpe", -1.0))
+        )
         effective_holdout_sharpe = (
             float(self._effective_holdout_sharpe_metric(holdout_sharpe))
             if holdout_available
@@ -11505,7 +12346,7 @@ class ModelTrainer:
         self.training_metrics["effective_holdout_sharpe_consistency_metric"] = (
             holdout_sharpe_consistency
         )
-        holdout_trade_count_metric = float(self.training_metrics.get("holdout_trade_count", np.nan))
+        holdout_trade_count_metric = float(effective_holdout.get("trade_count", np.nan))
         if not np.isfinite(holdout_trade_count_metric):
             holdout_trade_count_metric = float(
                 self.training_metrics.get(
@@ -11514,20 +12355,16 @@ class ModelTrainer:
                 )
             )
         holdout_active_signal_rate_metric = float(
-            self.training_metrics.get("holdout_active_signal_rate", np.nan)
+            effective_holdout.get("active_signal_rate", np.nan)
         )
         if not np.isfinite(holdout_active_signal_rate_metric):
             holdout_active_signal_rate_metric = (
                 1.0 if holdout_available and holdout_trade_count_metric > 0.0 else 0.0
             )
-        self.training_metrics["effective_holdout_trade_count_metric"] = holdout_trade_count_metric
-        self.training_metrics["effective_holdout_active_signal_rate_metric"] = (
-            holdout_active_signal_rate_metric
-        )
         holdout_worst_regime_sharpe = float(
             self.training_metrics.get("holdout_worst_regime_sharpe", holdout_sharpe)
         )
-        holdout_drawdown = float(self.training_metrics.get("holdout_max_drawdown", 1.0))
+        holdout_drawdown = float(effective_holdout.get("max_drawdown", 1.0))
         holdout_symbol_coverage = float(
             self.training_metrics.get(
                 "holdout_symbol_coverage_ratio",
@@ -11578,6 +12415,41 @@ class ModelTrainer:
                 self.training_metrics.get("holdout_regime_shift", 0.0),
             )
         )
+        oof_raw_summary = {
+            "finite_count": self.training_metrics.get(
+                "oof_raw_probability_distribution_finite_count", 0.0
+            ),
+            "std": self.training_metrics.get("oof_raw_probability_distribution_std", 0.0),
+            "span": self.training_metrics.get("oof_raw_probability_distribution_span", 0.0),
+        }
+        holdout_raw_summary = {
+            "finite_count": self.training_metrics.get(
+                "holdout_raw_probability_distribution_finite_count",
+                self.training_metrics.get("holdout_rows", 0.0),
+            ),
+            "std": self.training_metrics.get("holdout_raw_probability_distribution_std", 0.0),
+            "span": self.training_metrics.get("holdout_raw_probability_distribution_span", 0.0),
+        }
+        lightgbm_structure_gate_passed = (not self._is_lightgbm_family_model()) or (
+            float(self.training_metrics.get("final_model_structure_split_count", 0.0)) > 0.0
+        )
+        oof_dispersion_gate_passed = (
+            not self._is_lightgbm_family_model()
+        ) or not self._is_dead_probability_summary(oof_raw_summary)
+        holdout_dispersion_gate_passed = (
+            (not self._is_lightgbm_family_model())
+            or (not holdout_available)
+            or not self._is_dead_probability_summary(holdout_raw_summary)
+        )
+        self.training_metrics["lightgbm_structure_gate_passed"] = float(
+            lightgbm_structure_gate_passed
+        )
+        self.training_metrics["lightgbm_oof_dispersion_gate_passed"] = float(
+            oof_dispersion_gate_passed
+        )
+        self.training_metrics["lightgbm_holdout_dispersion_gate_passed"] = float(
+            holdout_dispersion_gate_passed
+        )
         if not holdout_available:
             self.logger.warning(
                 "Holdout block unavailable for this validation pass; "
@@ -11614,6 +12486,16 @@ class ModelTrainer:
                 self.training_metrics.get("mean_risk_adjusted_score", -1.0) > 0.0,
                 self.training_metrics.get("mean_risk_adjusted_score", -1.0),
                 0.0,
+            ),
+            "lightgbm_booster_has_splits": (
+                lightgbm_structure_gate_passed,
+                1.0 if lightgbm_structure_gate_passed else 0.0,
+                1.0,
+            ),
+            "lightgbm_oof_score_dispersion": (
+                oof_dispersion_gate_passed,
+                1.0 if oof_dispersion_gate_passed else 0.0,
+                1.0,
             ),
             "oof_prediction_coverage": (
                 (
@@ -11671,6 +12553,11 @@ class ModelTrainer:
                 ((holdout_trade_count_metric > 0.0) if holdout_available else True),
                 holdout_trade_count_metric if holdout_available else 1.0,
                 0.0,
+            ),
+            "lightgbm_holdout_score_dispersion": (
+                holdout_dispersion_gate_passed if holdout_available else True,
+                (1.0 if (holdout_dispersion_gate_passed if holdout_available else True) else 0.0),
+                1.0,
             ),
             "holdout_active_signal_rate_positive": (
                 ((holdout_active_signal_rate_metric > 0.0) if holdout_available else True),
@@ -11829,6 +12716,8 @@ class ModelTrainer:
                 "min_accuracy",
                 "min_win_rate",
                 "risk_adjusted_positive",
+                "lightgbm_booster_has_splits",
+                "lightgbm_oof_score_dispersion",
                 "min_deflated_sharpe",
                 "max_deflated_sharpe_pvalue",
                 "max_pbo",
@@ -11843,6 +12732,7 @@ class ModelTrainer:
                 "max_drawdown",
                 "max_holdout_drawdown",
                 "min_trades",
+                "lightgbm_holdout_score_dispersion",
                 "holdout_trade_count_positive",
                 "holdout_active_signal_rate_positive",
                 "max_regime_shift",
@@ -12254,12 +13144,16 @@ class ModelTrainer:
             pbo = float(np.nan_to_num(pbo, nan=1.0, posinf=1.0, neginf=1.0))
             pbo_upper_95 = float(np.clip(pbo_diagnostics.get("pbo_ci_upper_95", pbo), 0.0, 1.0))
             pbo_reliability = float(np.clip(pbo_diagnostics.get("pbo_reliability", 0.0), 0.0, 1.0))
+            effective_holdout = self._resolve_effective_holdout_metric_payload()
             holdout_available = float(self.training_metrics.get("holdout_rows", 0.0)) > 0.0
             holdout_sharpe = float(
-                self.training_metrics.get(
-                    "holdout_sharpe",
+                effective_holdout.get(
+                    "sharpe",
                     self.training_metrics.get("mean_sharpe", 0.0),
                 )
+            )
+            self.training_metrics["pbo_holdout_metric_source"] = str(
+                effective_holdout.get("source", "base")
             )
             sharpe_gap_baseline = max(abs(sharpe), 0.25)
             holdout_gap_ratio = (
@@ -12378,14 +13272,10 @@ class ModelTrainer:
     def _effective_holdout_sharpe_metric(self, holdout_sharpe: float) -> float:
         """Shrink holdout Sharpe by confidence and CV->holdout deterioration."""
         holdout_rows = max(0.0, float(self.training_metrics.get("holdout_rows", 0.0)))
-        holdout_trade_obs = max(
-            0.0,
-            float(self.training_metrics.get("holdout_trade_return_observations", 0.0)),
-        )
+        effective_holdout = self._resolve_effective_holdout_metric_payload()
+        holdout_trade_obs = max(0.0, float(effective_holdout.get("trade_return_observations", 0.0)))
         holdout_sharpe_confidence = float(
-            np.clip(
-                self.training_metrics.get("holdout_sharpe_observation_confidence", 0.0), 0.0, 1.0
-            )
+            np.clip(effective_holdout.get("sharpe_observation_confidence", 0.0), 0.0, 1.0)
         )
         expected_trade_target = float(
             self._effective_trade_target(int(round(holdout_rows)) if holdout_rows > 0 else None)
@@ -12422,6 +13312,9 @@ class ModelTrainer:
         self.training_metrics["holdout_sharpe_gate_obs_coverage"] = float(obs_coverage)
         self.training_metrics["holdout_sharpe_gate_regime_coverage"] = float(regime_coverage)
         self.training_metrics["holdout_sharpe_gap_ratio"] = float(degradation_ratio)
+        self.training_metrics["holdout_sharpe_gate_metric_source"] = str(
+            effective_holdout.get("source", "base")
+        )
 
         return adjusted_holdout_sharpe
 
@@ -12839,6 +13732,7 @@ class ModelTrainer:
                     "expected_edge_regime_policy", {}
                 ),
             },
+            "ranker_scoring": (self._ranker_scoring_contract() if self._is_ranker_model() else {}),
             "promotion_passed": bool(self.validation_results.get("all_passed", False)),
             "snapshot_id": (
                 self.snapshot_manifest.get("snapshot_id")

@@ -112,16 +112,113 @@ class DummyRankerModel:
 
 
 def test_promotion_signal_adapter_uses_training_parity_for_ranker_scores():
-    adapter = PromotionSignalAdapter(SimpleNamespace(model_type="lightgbm_ranker"))
+    adapter = PromotionSignalAdapter(
+        SimpleNamespace(
+            model_type="lightgbm_ranker",
+            ranker_score_normalization="query_percentile",
+            ranker_requires_cross_sectional_panel=True,
+        )
+    )
+    timestamps = np.array(
+        [
+            "2025-01-02T10:00:00Z",
+            "2025-01-02T10:00:00Z",
+            "2025-01-02T10:00:00Z",
+        ],
+        dtype="datetime64[ns]",
+    )
 
     probabilities, raw_scores = adapter._predict_model_probabilities(
         DummyRankerModel(),
         np.zeros((3, 1), dtype=float),
+        timestamps=timestamps,
     )
 
-    expected = 1.0 / (1.0 + np.exp(-np.array([-2.0, 0.0, 2.0], dtype=float)))
     np.testing.assert_allclose(raw_scores, np.array([-2.0, 0.0, 2.0], dtype=float))
-    np.testing.assert_allclose(probabilities, expected)
+    np.testing.assert_allclose(
+        probabilities,
+        np.array([1.0 / 6.0, 0.5, 5.0 / 6.0], dtype=float),
+    )
+
+
+def test_promotion_signal_adapter_scores_ranker_cross_sectionally_across_symbols():
+    class FeatureDrivenRanker:
+        feature_names = ["feat_a", "feat_b"]
+
+        def predict(self, X):
+            X = np.asarray(X, dtype=float)
+            return X[:, 0]
+
+    adapter = PromotionSignalAdapter(
+        SimpleNamespace(
+            model_type="lightgbm_ranker",
+            feature_names=("feat_a", "feat_b"),
+            feature_groups=("statistical",),
+            symbols=("AAPL", "MSFT"),
+            timeframe="15Min",
+            timeframes=("15Min",),
+            enable_cross_sectional=True,
+            enable_reference_features=False,
+            enable_tick_microstructure_features=False,
+            long_threshold=0.70,
+            short_threshold=0.30,
+            horizon_bars=5,
+            max_holding_bars=5,
+            take_profit_pct=0.02,
+            stop_loss_pct=0.01,
+            meta_label_enabled=False,
+            meta_label_threshold=None,
+            model_source="promotion_package:test_ranker",
+            long_side_policy={},
+            short_side_policy={},
+            expected_edge_policy_enabled=False,
+            expected_edge_policy={},
+            enable_universe_quality_gate=False,
+            universe_quality_policy={},
+            ranker_score_normalization="query_percentile",
+            ranker_query_key="timestamp",
+            ranker_requires_cross_sectional_panel=True,
+        )
+    )
+    adapter._model = FeatureDrivenRanker()
+
+    timestamps = pd.to_datetime(
+        ["2025-01-02T10:00:00Z", "2025-01-02T10:15:00Z"],
+        utc=True,
+    )
+    raw_data = {
+        "AAPL": pd.DataFrame({"timestamp": timestamps, "close": [100.0, 101.0]}),
+        "MSFT": pd.DataFrame({"timestamp": timestamps, "close": [200.0, 199.0]}),
+    }
+    features = {
+        "AAPL": pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "feat_a": [0.2, 0.9],
+                "feat_b": [0.0, 0.0],
+                "regime": ["normal_range", "normal_range"],
+            }
+        ),
+        "MSFT": pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "feat_a": [0.8, 0.1],
+                "feat_b": [0.0, 0.0],
+                "regime": ["normal_range", "normal_range"],
+            }
+        ),
+    }
+
+    signal_frames = adapter.generate_signal_frames(raw_data, features=features)
+
+    np.testing.assert_allclose(
+        signal_frames["AAPL"]["probability"].to_numpy(dtype=float),
+        np.array([0.25, 0.75], dtype=float),
+    )
+    np.testing.assert_allclose(
+        signal_frames["MSFT"]["probability"].to_numpy(dtype=float),
+        np.array([0.75, 0.25], dtype=float),
+    )
 
 
 def test_promotion_signal_adapter_applies_attached_probability_calibration():
@@ -683,6 +780,31 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
     ] == pytest.approx(0.75)
     assert package.enable_universe_quality_gate is True
     assert package.universe_quality_policy["min_rows"] == 900
+
+
+def test_load_promotion_package_defaults_ranker_runtime_contract(tmp_path: Path):
+    model_path = tmp_path / "ranker_model.pkl"
+    package_path = tmp_path / "ranker_model.promotion_package.json"
+
+    with model_path.open("wb") as handle:
+        pickle.dump(DummyRankerModel(), handle)
+
+    package_payload = {
+        "schema_version": "1.0.0",
+        "model_name": "ranker_model",
+        "model_type": "lightgbm_ranker",
+        "model_path": str(model_path),
+        "feature_contract": {"selected_features": ["feat_a"]},
+        "signal_policy": {"long_threshold": 0.6, "short_threshold": 0.4},
+        "training_config": {"symbols": ["AAPL", "MSFT"], "timeframe": "15Min"},
+    }
+    package_path.write_text(json.dumps(package_payload), encoding="utf-8")
+
+    package = load_promotion_package(package_path)
+
+    assert package.ranker_score_normalization == "query_percentile"
+    assert package.ranker_query_key == "timestamp"
+    assert package.ranker_requires_cross_sectional_panel is True
 
 
 def test_backtest_runner_generates_signals_from_promotion_package(tmp_path: Path):

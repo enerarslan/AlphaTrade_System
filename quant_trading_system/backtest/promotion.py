@@ -100,6 +100,71 @@ def _align_vector(values: Any, length: int, fill_value: float = 0.0) -> np.ndarr
     return arr[-length:]
 
 
+def _rank_scores_to_unit_interval(values: np.ndarray | list[float]) -> np.ndarray:
+    """Map arbitrary ranker scores into a unit interval using stable average ranks."""
+    raw_values = np.asarray(values, dtype=float).reshape(-1)
+    if raw_values.size == 0:
+        return raw_values.astype(float)
+
+    normalized = np.full(raw_values.shape, 0.5, dtype=float)
+    finite_mask = np.isfinite(raw_values)
+    finite_values = raw_values[finite_mask]
+    if finite_values.size <= 1:
+        return normalized
+    if float(np.max(finite_values) - np.min(finite_values)) <= 1e-12:
+        normalized[finite_mask] = 0.5
+        return normalized
+
+    order = np.argsort(finite_values, kind="mergesort")
+    sorted_values = finite_values[order]
+    ranks = np.empty(sorted_values.size, dtype=float)
+    start = 0
+    while start < sorted_values.size:
+        end = start + 1
+        while end < sorted_values.size and np.isclose(
+            sorted_values[end],
+            sorted_values[start],
+            rtol=1e-9,
+            atol=1e-12,
+        ):
+            end += 1
+        ranks[order[start:end]] = 0.5 * float(start + end - 1)
+        start = end
+
+    normalized[finite_mask] = np.clip((ranks + 0.5) / float(sorted_values.size), 0.0, 1.0)
+    return normalized
+
+
+def _normalize_ranker_scores(
+    raw_scores: np.ndarray | list[float],
+    *,
+    timestamps: np.ndarray | list[Any] | None = None,
+    normalization_mode: str = "query_percentile",
+) -> np.ndarray:
+    """Normalize ranker scores globally or within timestamp queries."""
+    scores = np.asarray(raw_scores, dtype=float).reshape(-1)
+    if scores.size == 0:
+        return scores.astype(float)
+
+    mode = str(normalization_mode or "query_percentile").strip().lower()
+    if mode != "query_percentile" or timestamps is None:
+        return _rank_scores_to_unit_interval(scores)
+
+    timestamp_values = pd.to_datetime(np.asarray(timestamps), utc=True, errors="coerce")
+    if timestamp_values.size != scores.size or np.asarray(pd.isna(timestamp_values)).any():
+        return _rank_scores_to_unit_interval(scores)
+
+    normalized = np.empty(scores.size, dtype=float)
+    ts_arr = np.asarray(timestamp_values, dtype="datetime64[ns]")
+    change_points = np.flatnonzero(ts_arr[1:] != ts_arr[:-1]) + 1
+    boundaries = np.concatenate(([0], change_points, [scores.size]))
+    start = 0
+    for end in boundaries[1:]:
+        normalized[start:end] = _rank_scores_to_unit_interval(scores[start:end])
+        start = int(end)
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class PromotionPackageContract:
     """Resolved promotion package contract used by backtest and replay."""
@@ -142,6 +207,9 @@ class PromotionPackageContract:
     min_confidence_position_scale: float
     expected_edge_policy_enabled: bool
     expected_edge_policy: dict[str, Any]
+    ranker_score_normalization: str | None
+    ranker_query_key: str | None
+    ranker_requires_cross_sectional_panel: bool
     enable_universe_quality_gate: bool
     universe_quality_policy: dict[str, Any]
 
@@ -191,6 +259,9 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     expected_edge_policy = raw_payload.get("expected_edge_policy", {})
     if not isinstance(expected_edge_policy, dict):
         expected_edge_policy = {}
+    ranker_scoring = raw_payload.get("ranker_scoring", {})
+    if not isinstance(ranker_scoring, dict):
+        ranker_scoring = {}
 
     position_sizing_policy = raw_payload.get("position_sizing_policy", {})
     if not isinstance(position_sizing_policy, dict):
@@ -214,7 +285,11 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     )
     feature_groups = tuple(_normalize_string_list(raw_feature_groups))
     enable_cross_sectional = bool(
-        _coalesce(feature_contract.get("enable_cross_sectional"), training_config.get("enable_cross_sectional"), False)
+        _coalesce(
+            feature_contract.get("enable_cross_sectional"),
+            training_config.get("enable_cross_sectional"),
+            False,
+        )
     )
     enable_reference_features = bool(
         _coalesce(
@@ -314,24 +389,25 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     if expected_edge_model_path is not None and not expected_edge_model_path.exists():
         expected_edge_model_path = None
 
-    meta_label_enabled = bool(
-        _coalesce(signal_policy.get("meta_label_enabled"), meta_model_path is not None)
-    ) and meta_model_path is not None
+    meta_label_enabled = (
+        bool(_coalesce(signal_policy.get("meta_label_enabled"), meta_model_path is not None))
+        and meta_model_path is not None
+    )
     meta_label_threshold = _coalesce(
         signal_policy.get("meta_label_threshold"),
         artifacts_training_metrics.get("meta_label_min_confidence"),
         training_config.get("meta_label_min_confidence"),
     )
-    meta_label_threshold = (
-        None if meta_label_threshold is None else float(meta_label_threshold)
-    )
+    meta_label_threshold = None if meta_label_threshold is None else float(meta_label_threshold)
 
     raw_cost_model = raw_payload.get("execution_cost_model", {})
     if not isinstance(raw_cost_model, dict):
         raw_cost_model = {}
     cost_model = {
         "spread_bps": float(
-            _coalesce(raw_cost_model.get("spread_bps"), training_config.get("label_spread_bps"), 0.0)
+            _coalesce(
+                raw_cost_model.get("spread_bps"), training_config.get("label_spread_bps"), 0.0
+            )
         ),
         "slippage_bps": float(
             _coalesce(
@@ -341,7 +417,9 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
             )
         ),
         "impact_bps": float(
-            _coalesce(raw_cost_model.get("impact_bps"), training_config.get("label_impact_bps"), 0.0)
+            _coalesce(
+                raw_cost_model.get("impact_bps"), training_config.get("label_impact_bps"), 0.0
+            )
         ),
     }
 
@@ -361,12 +439,28 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         _coalesce(position_sizing_policy.get("min_confidence_position_scale"), 0.0)
     )
     min_confidence_position_scale = min(1.0, max(0.0, min_confidence_position_scale))
-    expected_edge_policy_enabled = bool(
-        _coalesce(expected_edge_policy.get("enabled"), expected_edge_model_path is not None)
-    ) and expected_edge_model_path is not None
-
+    expected_edge_policy_enabled = (
+        bool(_coalesce(expected_edge_policy.get("enabled"), expected_edge_model_path is not None))
+        and expected_edge_model_path is not None
+    )
     model_name = str(_coalesce(raw_payload.get("model_name"), model_path.stem)).strip()
-    model_type = str(_coalesce(raw_payload.get("model_type"), training_config.get("model_type"), "")).strip()
+    model_type = str(
+        _coalesce(raw_payload.get("model_type"), training_config.get("model_type"), "")
+    ).strip()
+    ranker_score_normalization = _coalesce(
+        ranker_scoring.get("normalization"),
+        "query_percentile" if "rank" in model_type.lower() else None,
+    )
+    ranker_query_key = _coalesce(
+        ranker_scoring.get("query_key"),
+        "timestamp" if "rank" in model_type.lower() else None,
+    )
+    ranker_requires_cross_sectional_panel = bool(
+        _coalesce(
+            ranker_scoring.get("requires_cross_sectional_panel"),
+            True if "rank" in model_type.lower() else False,
+        )
+    )
     model_source = str(
         _coalesce(signal_policy.get("model_source"), f"promotion_package:{model_name}")
     ).strip()
@@ -386,12 +480,16 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     feature_schema_version = _coalesce(
         feature_contract.get("feature_schema_version"),
         raw_payload.get("feature_schema_version"),
-        raw_payload.get("snapshot_manifest", {}).get("feature_schema_version")
-        if isinstance(raw_payload.get("snapshot_manifest"), dict)
-        else None,
-        artifacts_payload.get("snapshot_manifest", {}).get("feature_schema_version")
-        if isinstance(artifacts_payload.get("snapshot_manifest"), dict)
-        else None,
+        (
+            raw_payload.get("snapshot_manifest", {}).get("feature_schema_version")
+            if isinstance(raw_payload.get("snapshot_manifest"), dict)
+            else None
+        ),
+        (
+            artifacts_payload.get("snapshot_manifest", {}).get("feature_schema_version")
+            if isinstance(artifacts_payload.get("snapshot_manifest"), dict)
+            else None
+        ),
     )
     feature_schema_version = (
         None if feature_schema_version is None else str(feature_schema_version).strip() or None
@@ -436,6 +534,15 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         min_confidence_position_scale=min_confidence_position_scale,
         expected_edge_policy_enabled=expected_edge_policy_enabled,
         expected_edge_policy=expected_edge_policy,
+        ranker_score_normalization=(
+            None
+            if ranker_score_normalization is None
+            else str(ranker_score_normalization).strip() or None
+        ),
+        ranker_query_key=(
+            None if ranker_query_key is None else str(ranker_query_key).strip() or None
+        ),
+        ranker_requires_cross_sectional_panel=ranker_requires_cross_sectional_panel,
         enable_universe_quality_gate=enable_universe_quality_gate,
         universe_quality_policy=universe_quality_policy,
     )
@@ -546,6 +653,12 @@ class PromotionSignalAdapter:
             self._expected_edge_model = _load_pickle(expected_edge_model_path)
         return self._expected_edge_model
 
+    def _is_ranker_contract(self, model: Any | None = None) -> bool:
+        """Return True when the promotion contract requires ranker scoring semantics."""
+        model_type = str(getattr(self.contract, "model_type", "") or "").strip().lower()
+        model_class_name = type(model).__name__.lower() if model is not None else ""
+        return "rank" in model_type or "ranker" in model_class_name
+
     def _choose_pipeline(self) -> Any:
         groups = resolve_feature_groups(self.contract)
         if self.use_gpu and CUDF_AVAILABLE:
@@ -651,9 +764,13 @@ class PromotionSignalAdapter:
                 float(
                     _coalesce(
                         policy.get("min_rows"),
-                        getattr(self.contract, "raw_payload", {}).get("training_config", {}).get("symbol_quality_min_rows")
-                        if isinstance(getattr(self.contract, "raw_payload", {}), dict)
-                        else None,
+                        (
+                            getattr(self.contract, "raw_payload", {})
+                            .get("training_config", {})
+                            .get("symbol_quality_min_rows")
+                            if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                            else None
+                        ),
                         1200,
                     )
                 )
@@ -661,50 +778,60 @@ class PromotionSignalAdapter:
             max_missing_ratio=float(
                 _coalesce(
                     policy.get("max_missing_ratio"),
-                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
-                        "symbol_quality_max_missing_ratio"
-                    )
-                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
-                    else None,
+                    (
+                        getattr(self.contract, "raw_payload", {})
+                        .get("training_config", {})
+                        .get("symbol_quality_max_missing_ratio")
+                        if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                        else None
+                    ),
                     0.12,
                 )
             ),
             max_extreme_move_ratio=float(
                 _coalesce(
                     policy.get("max_extreme_move_ratio"),
-                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
-                        "symbol_quality_max_extreme_move_ratio"
-                    )
-                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
-                    else None,
+                    (
+                        getattr(self.contract, "raw_payload", {})
+                        .get("training_config", {})
+                        .get("symbol_quality_max_extreme_move_ratio")
+                        if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                        else None
+                    ),
                     0.08,
                 )
             ),
             max_corporate_action_ratio=float(
                 _coalesce(
                     policy.get("max_corporate_action_ratio"),
-                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
-                        "symbol_quality_max_corporate_action_ratio"
-                    )
-                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
-                    else None,
+                    (
+                        getattr(self.contract, "raw_payload", {})
+                        .get("training_config", {})
+                        .get("symbol_quality_max_corporate_action_ratio")
+                        if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                        else None
+                    ),
                     0.02,
                 )
             ),
             min_median_dollar_volume=float(
                 _coalesce(
                     policy.get("min_median_dollar_volume"),
-                    getattr(self.contract, "raw_payload", {}).get("training_config", {}).get(
-                        "symbol_quality_min_median_dollar_volume"
-                    )
-                    if isinstance(getattr(self.contract, "raw_payload", {}), dict)
-                    else None,
+                    (
+                        getattr(self.contract, "raw_payload", {})
+                        .get("training_config", {})
+                        .get("symbol_quality_min_median_dollar_volume")
+                        if isinstance(getattr(self.contract, "raw_payload", {}), dict)
+                        else None
+                    ),
                     1_000_000.0,
                 )
             ),
         )
 
-    def _assess_runtime_symbol_quality(self, data: dict[str, pd.DataFrame]) -> dict[str, dict[str, Any]]:
+    def _assess_runtime_symbol_quality(
+        self, data: dict[str, pd.DataFrame]
+    ) -> dict[str, dict[str, Any]]:
         """Assess symbol quality for promotion-package backtest/paper inference."""
         thresholds = self._resolve_symbol_quality_thresholds()
         if thresholds is None:
@@ -719,8 +846,7 @@ class PromotionSignalAdapter:
             else {}
         )
         selected_symbols = {
-            value.upper()
-            for value in _normalize_string_list(policy.get("selected_symbols"))
+            value.upper() for value in _normalize_string_list(policy.get("selected_symbols"))
         }
         contract_symbols = getattr(self.contract, "symbols", ())
         if not selected_symbols and contract_symbols:
@@ -848,7 +974,9 @@ class PromotionSignalAdapter:
                     timeframe_groups = list(groups)
                     if timeframe != base_timeframe:
                         timeframe_groups = [
-                            group for group in timeframe_groups if group != FeatureGroup.CROSS_SECTIONAL
+                            group
+                            for group in timeframe_groups
+                            if group != FeatureGroup.CROSS_SECTIONAL
                         ]
                     layered_frames[timeframe] = self._compute_symbol_feature_frame(
                         df=timeframe_frame,
@@ -909,31 +1037,37 @@ class PromotionSignalAdapter:
         merged = merged.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
         split: dict[str, pd.DataFrame] = {}
         for symbol in merged["symbol"].dropna().unique().tolist():
-            split[str(symbol)] = (
-                merged[merged["symbol"] == symbol].copy().reset_index(drop=True)
-            )
+            split[str(symbol)] = merged[merged["symbol"] == symbol].copy().reset_index(drop=True)
         return split
 
-    def _predict_model_probabilities(self, model: Any, X_valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _predict_model_probabilities(
+        self,
+        model: Any,
+        X_valid: np.ndarray,
+        *,
+        timestamps: np.ndarray | list[Any] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return probability-like scores using the same transforms as training."""
-        model_type = str(self.contract.model_type or "").strip().lower()
-        model_class_name = type(model).__name__.lower()
-        is_ranker_model = "rank" in model_type or "ranker" in model_class_name
+        is_ranker_model = self._is_ranker_contract(model)
 
         if is_ranker_model:
             raw_scores = np.asarray(model.predict(X_valid), dtype=float).reshape(-1)
-            clipped = np.clip(raw_scores, -20.0, 20.0)
-            score = 1.0 / (1.0 + np.exp(-clipped))
-            payload = self._resolve_probability_calibration_payload(model)
-            if payload is not None:
-                score = self._apply_probability_calibration(score, payload)
+            score = _normalize_ranker_scores(
+                raw_scores,
+                timestamps=timestamps,
+                normalization_mode=str(
+                    getattr(self.contract, "ranker_score_normalization", None) or "query_percentile"
+                ),
+            )
             return score.astype(float), raw_scores.astype(float)
 
         try:
             if hasattr(model, "predict_proba"):
                 probabilities = np.asarray(model.predict_proba(X_valid), dtype=float)
                 if probabilities.ndim == 2:
-                    score = probabilities[:, -1] if probabilities.shape[1] >= 2 else probabilities[:, 0]
+                    score = (
+                        probabilities[:, -1] if probabilities.shape[1] >= 2 else probabilities[:, 0]
+                    )
                 else:
                     score = probabilities.reshape(-1)
                 raw_score = score.astype(float)
@@ -962,7 +1096,102 @@ class PromotionSignalAdapter:
             close_series = pd.Series(pdf["Close"])
         else:
             close_series = pd.Series(np.full(length, np.nan, dtype=float))
-        return pd.to_numeric(close_series, errors="coerce").reset_index(drop=True).reindex(range(length))
+        return (
+            pd.to_numeric(close_series, errors="coerce")
+            .reset_index(drop=True)
+            .reindex(range(length))
+        )
+
+    def _score_ranker_panel(
+        self,
+        *,
+        model: Any,
+        normalized_data: dict[str, pd.DataFrame],
+        feature_frames: dict[str, pd.DataFrame],
+        required_features: list[str],
+        quality_assessments: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Score ranker inputs across the full timestamp panel to preserve training parity."""
+        payloads: dict[str, dict[str, Any]] = {}
+        panel_parts: list[pd.DataFrame] = []
+
+        for symbol, raw_frame in normalized_data.items():
+            feature_df = feature_frames.get(symbol)
+            if feature_df is None:
+                raise ValueError(f"Missing feature frame for promotion symbol {symbol}")
+            symbol_frame = feature_df.copy().reset_index(drop=True)
+            missing_features = [
+                feature_name
+                for feature_name in required_features
+                if feature_name not in symbol_frame.columns
+            ]
+            if missing_features:
+                preview = ", ".join(missing_features[:10])
+                raise ValueError(
+                    f"Missing {len(missing_features)} required features for {symbol}: {preview}"
+                )
+
+            X_df = (
+                symbol_frame.loc[:, required_features]
+                .apply(pd.to_numeric, errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+            )
+            valid_mask = X_df.notna().all(axis=1)
+            probability = np.full(len(X_df), np.nan, dtype=float)
+            raw_prediction = np.full(len(X_df), np.nan, dtype=float)
+            timestamps = _extract_timestamps(raw_frame).reindex(range(len(X_df)))
+            payloads[symbol] = {
+                "symbol_frame": symbol_frame,
+                "X_df": X_df,
+                "valid_mask": valid_mask,
+                "probability": probability,
+                "raw_prediction": raw_prediction,
+                "timestamps": timestamps,
+            }
+
+            quality = quality_assessments.get(symbol, {"passes": True})
+            if not bool(quality.get("passes", True)) or not bool(valid_mask.any()):
+                continue
+
+            candidate_rows = X_df.loc[valid_mask].copy()
+            candidate_rows["timestamp"] = pd.to_datetime(
+                timestamps.loc[valid_mask].to_numpy(),
+                utc=True,
+                errors="coerce",
+            )
+            candidate_rows["symbol"] = str(symbol)
+            candidate_rows["row_index"] = np.flatnonzero(valid_mask.to_numpy(dtype=bool))
+            candidate_rows = candidate_rows.dropna(subset=["timestamp"])
+            if not candidate_rows.empty:
+                panel_parts.append(candidate_rows)
+
+        if not panel_parts:
+            return payloads
+
+        panel = (
+            pd.concat(panel_parts, ignore_index=True)
+            .sort_values(["timestamp", "symbol", "row_index"], kind="stable")
+            .reset_index(drop=True)
+        )
+        panel_scores, panel_raw = self._predict_model_probabilities(
+            model,
+            panel.loc[:, required_features].to_numpy(dtype=float),
+            timestamps=panel["timestamp"].to_numpy(),
+        )
+        panel["probability"] = np.clip(panel_scores, 0.0, 1.0)
+        panel["raw_prediction"] = panel_raw
+
+        for symbol, symbol_panel in panel.groupby("symbol", sort=False):
+            payload = payloads.get(str(symbol))
+            if payload is None:
+                continue
+            row_index = symbol_panel["row_index"].to_numpy(dtype=int)
+            payload["probability"][row_index] = symbol_panel["probability"].to_numpy(dtype=float)
+            payload["raw_prediction"][row_index] = symbol_panel["raw_prediction"].to_numpy(
+                dtype=float
+            )
+
+        return payloads
 
     def generate_signal_frames(
         self,
@@ -985,8 +1214,7 @@ class PromotionSignalAdapter:
 
         feature_frames = features or self.compute_features(data)
         normalized_data = {
-            str(symbol).strip().upper(): _to_pandas_frame(frame)
-            for symbol, frame in data.items()
+            str(symbol).strip().upper(): _to_pandas_frame(frame) for symbol, frame in data.items()
         }
         quality_assessments = self._assess_runtime_symbol_quality(normalized_data)
         effective_long_threshold, effective_short_threshold = self._effective_thresholds()
@@ -1000,6 +1228,17 @@ class PromotionSignalAdapter:
         regime_policy_payload = (
             expected_edge_policy_payload.get("regime_conditioned_policy", {})
             if isinstance(expected_edge_policy_payload.get("regime_conditioned_policy", {}), dict)
+            else {}
+        )
+        ranker_payloads = (
+            self._score_ranker_panel(
+                model=model,
+                normalized_data=normalized_data,
+                feature_frames=feature_frames,
+                required_features=required_features,
+                quality_assessments=quality_assessments,
+            )
+            if self._is_ranker_contract(model)
             else {}
         )
         signal_frames: dict[str, pd.DataFrame] = {}
@@ -1055,36 +1294,48 @@ class PromotionSignalAdapter:
                 )
                 continue
 
-            feature_df = feature_frames.get(symbol)
-            if feature_df is None:
-                raise ValueError(f"Missing feature frame for promotion symbol {symbol}")
-            symbol_frame = feature_df.copy().reset_index(drop=True)
-            missing_features = [
-                feature_name for feature_name in required_features if feature_name not in symbol_frame.columns
-            ]
-            if missing_features:
-                preview = ", ".join(missing_features[:10])
-                raise ValueError(
-                    f"Missing {len(missing_features)} required features for {symbol}: {preview}"
-                )
+            scoring_payload = ranker_payloads.get(symbol)
+            if scoring_payload is not None:
+                symbol_frame = scoring_payload["symbol_frame"].copy()
+                X_df = scoring_payload["X_df"].copy()
+                valid_mask = scoring_payload["valid_mask"].copy()
+                probability = np.asarray(scoring_payload["probability"], dtype=float)
+                raw_prediction = np.asarray(scoring_payload["raw_prediction"], dtype=float)
+            else:
+                feature_df = feature_frames.get(symbol)
+                if feature_df is None:
+                    raise ValueError(f"Missing feature frame for promotion symbol {symbol}")
+                symbol_frame = feature_df.copy().reset_index(drop=True)
+                missing_features = [
+                    feature_name
+                    for feature_name in required_features
+                    if feature_name not in symbol_frame.columns
+                ]
+                if missing_features:
+                    preview = ", ".join(missing_features[:10])
+                    raise ValueError(
+                        f"Missing {len(missing_features)} required features for {symbol}: {preview}"
+                    )
 
-            X_df = (
-                symbol_frame.loc[:, required_features]
-                .apply(pd.to_numeric, errors="coerce")
-                .replace([np.inf, -np.inf], np.nan)
+                X_df = (
+                    symbol_frame.loc[:, required_features]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                )
+                valid_mask = X_df.notna().all(axis=1)
+                probability = np.full(len(X_df), np.nan, dtype=float)
+                raw_prediction = np.full(len(X_df), np.nan, dtype=float)
+                if bool(valid_mask.any()):
+                    score, raw = self._predict_model_probabilities(
+                        model,
+                        X_df.loc[valid_mask].to_numpy(dtype=float),
+                    )
+                    probability[valid_mask.to_numpy()] = np.clip(score, 0.0, 1.0)
+                    raw_prediction[valid_mask.to_numpy()] = raw
+
+            runtime_regimes = self._resolve_runtime_regimes(
+                symbol_frame, raw_frame, length=len(X_df)
             )
-            valid_mask = X_df.notna().all(axis=1)
-            probability = np.full(len(X_df), np.nan, dtype=float)
-            raw_prediction = np.full(len(X_df), np.nan, dtype=float)
-            if bool(valid_mask.any()):
-                score, raw = self._predict_model_probabilities(
-                    model,
-                    X_df.loc[valid_mask].to_numpy(dtype=float),
-                )
-                probability[valid_mask.to_numpy()] = np.clip(score, 0.0, 1.0)
-                raw_prediction[valid_mask.to_numpy()] = raw
-
-            runtime_regimes = self._resolve_runtime_regimes(symbol_frame, raw_frame, length=len(X_df))
             regime_policy_frame = resolve_regime_policy_frame(
                 runtime_regimes,
                 regime_policy_payload,
@@ -1136,7 +1387,8 @@ class PromotionSignalAdapter:
                 1.0,
             )
             signal_values[short_mask] = -np.clip(
-                (regime_short_threshold[short_mask] - probability[short_mask]) / short_scale[short_mask],
+                (regime_short_threshold[short_mask] - probability[short_mask])
+                / short_scale[short_mask],
                 0.0,
                 1.0,
             )
@@ -1236,67 +1488,105 @@ class PromotionSignalAdapter:
                     regimes=runtime_regimes,
                     regime_policy=regime_policy_payload,
                 )
-                expected_edge = pd.to_numeric(
-                    pd.Series(_align_vector(edge_policy.get("expected_edge"), len(X_df), 0.0)),
-                    errors="coerce",
-                ).fillna(0.0).to_numpy(dtype=float)
-                edge_pass_probability = pd.to_numeric(
-                    pd.Series(
-                        _align_vector(edge_policy.get("edge_pass_probability"), len(X_df), 0.0)
-                    ),
-                    errors="coerce",
-                ).fillna(0.0).to_numpy(dtype=float)
-                edge_loss_probability = pd.to_numeric(
-                    pd.Series(
-                        _align_vector(edge_policy.get("edge_loss_probability"), len(X_df), 0.0)
-                    ),
-                    errors="coerce",
-                ).fillna(0.0).to_numpy(dtype=float)
-                edge_policy_pass = pd.Series(
-                    _align_vector(edge_policy.get("edge_policy_pass"), len(X_df), 0.0)
-                ).fillna(False).astype(bool).to_numpy(dtype=bool)
-                edge_policy_scale = pd.to_numeric(
-                    pd.Series(_align_vector(edge_policy.get("edge_policy_scale"), len(X_df), 0.0)),
-                    errors="coerce",
-                ).fillna(0.0).to_numpy(dtype=float)
-                edge_policy_confidence_scale = pd.to_numeric(
-                    pd.Series(
-                        _align_vector(
-                            edge_policy.get("edge_policy_confidence_scale"),
-                            len(X_df),
-                            0.0,
-                        )
-                    ),
-                    errors="coerce",
-                ).fillna(0.0).to_numpy(dtype=float)
+                expected_edge = (
+                    pd.to_numeric(
+                        pd.Series(_align_vector(edge_policy.get("expected_edge"), len(X_df), 0.0)),
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
+                edge_pass_probability = (
+                    pd.to_numeric(
+                        pd.Series(
+                            _align_vector(edge_policy.get("edge_pass_probability"), len(X_df), 0.0)
+                        ),
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
+                edge_loss_probability = (
+                    pd.to_numeric(
+                        pd.Series(
+                            _align_vector(edge_policy.get("edge_loss_probability"), len(X_df), 0.0)
+                        ),
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
+                edge_policy_pass = (
+                    pd.Series(_align_vector(edge_policy.get("edge_policy_pass"), len(X_df), 0.0))
+                    .fillna(False)
+                    .astype(bool)
+                    .to_numpy(dtype=bool)
+                )
+                edge_policy_scale = (
+                    pd.to_numeric(
+                        pd.Series(
+                            _align_vector(edge_policy.get("edge_policy_scale"), len(X_df), 0.0)
+                        ),
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
+                edge_policy_confidence_scale = (
+                    pd.to_numeric(
+                        pd.Series(
+                            _align_vector(
+                                edge_policy.get("edge_policy_confidence_scale"),
+                                len(X_df),
+                                0.0,
+                            )
+                        ),
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    .to_numpy(dtype=float)
+                )
                 runtime_regimes = _align_vector(
                     edge_policy.get("runtime_regime"),
                     len(X_df),
                     "normal_range",
                 ).astype(object)
-                regime_enabled = pd.Series(
-                    _align_vector(edge_policy.get("regime_policy_enabled"), len(X_df), 0.0)
-                ).fillna(False).astype(bool).to_numpy(dtype=bool)
-                regime_signal_scale = pd.to_numeric(
+                regime_enabled = (
                     pd.Series(
-                        _align_vector(
-                            edge_policy.get("regime_policy_signal_scale"),
-                            len(X_df),
-                            1.0,
-                        )
-                    ),
-                    errors="coerce",
-                ).fillna(1.0).to_numpy(dtype=float)
-                regime_confidence_scale = pd.to_numeric(
-                    pd.Series(
-                        _align_vector(
-                            edge_policy.get("edge_policy_confidence_scale"),
-                            len(X_df),
-                            1.0,
-                        )
-                    ),
-                    errors="coerce",
-                ).fillna(1.0).to_numpy(dtype=float)
+                        _align_vector(edge_policy.get("regime_policy_enabled"), len(X_df), 0.0)
+                    )
+                    .fillna(False)
+                    .astype(bool)
+                    .to_numpy(dtype=bool)
+                )
+                regime_signal_scale = (
+                    pd.to_numeric(
+                        pd.Series(
+                            _align_vector(
+                                edge_policy.get("regime_policy_signal_scale"),
+                                len(X_df),
+                                1.0,
+                            )
+                        ),
+                        errors="coerce",
+                    )
+                    .fillna(1.0)
+                    .to_numpy(dtype=float)
+                )
+                regime_confidence_scale = (
+                    pd.to_numeric(
+                        pd.Series(
+                            _align_vector(
+                                edge_policy.get("edge_policy_confidence_scale"),
+                                len(X_df),
+                                1.0,
+                            )
+                        ),
+                        errors="coerce",
+                    )
+                    .fillna(1.0)
+                    .to_numpy(dtype=float)
+                )
                 signal_values = np.where(edge_policy_pass, signal_values * edge_policy_scale, 0.0)
                 confidence = np.clip(
                     np.where(

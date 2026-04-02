@@ -1594,10 +1594,38 @@ def test_prepare_params_for_train_size_regularizes_lightgbm():
     assert adjusted["num_leaves"] <= 20
     assert adjusted["max_depth"] <= 6
     assert adjusted["n_estimators"] <= 420
-    assert adjusted["min_data_in_leaf"] >= 20
+    assert 16 <= adjusted["min_data_in_leaf"] <= 160
     assert adjusted["learning_rate"] >= 0.015
     assert adjusted["lambda_l1"] >= 0.10
     assert adjusted["lambda_l2"] >= 1.00
+
+
+def test_prepare_params_for_train_size_caps_lightgbm_leaf_regularization_for_large_folds():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm"))
+    adjusted = trainer._prepare_params_for_train_size(
+        {
+            "min_data_in_leaf": 9000,
+            "num_leaves": 256,
+        },
+        train_size=150000,
+    )
+
+    assert 32 <= adjusted["min_data_in_leaf"] <= 160
+    assert adjusted["num_leaves"] <= 96
+
+
+def test_prepare_params_for_train_size_removes_ranker_classifier_only_knobs():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    adjusted = trainer._prepare_params_for_train_size(
+        {
+            "min_data_in_leaf": 12,
+            "scale_pos_weight": 1.25,
+        },
+        train_size=8000,
+    )
+
+    assert "scale_pos_weight" not in adjusted
+    assert adjusted["min_data_in_leaf"] >= 24
 
 
 def test_optuna_search_space_regularizes_lightgbm_for_small_folds():
@@ -1624,8 +1652,56 @@ def test_optuna_search_space_regularizes_lightgbm_for_small_folds():
     assert trial.int_bounds["max_depth"][1] == 6
     assert trial.int_bounds["bagging_freq"][1] == 4
     assert trial.float_bounds["scale_pos_weight"][1] == pytest.approx(1.15)
-    assert params["min_data_in_leaf"] >= 30
+    assert trial.int_bounds["min_data_in_leaf"] == (16, 28)
     assert params["max_bin"] <= 191
+
+
+def test_optuna_search_space_caps_lightgbm_leaf_search_for_large_folds():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm"))
+    search_space = trainer._get_optuna_search_space(min_train_size=150000)
+    assert search_space is not None
+
+    class DummyTrial:
+        def __init__(self):
+            self.int_bounds = {}
+            self.float_bounds = {}
+
+        def suggest_int(self, name, low, high, **kwargs):
+            self.int_bounds[name] = (low, high)
+            return high
+
+        def suggest_float(self, name, low, high, **kwargs):
+            self.float_bounds[name] = (low, high)
+            return high
+
+    trial = DummyTrial()
+    params = search_space(trial)
+
+    assert trial.int_bounds["min_data_in_leaf"] == (32, 128)
+    assert params["min_data_in_leaf"] == 128
+
+
+def test_optuna_search_space_does_not_add_classifier_weights_to_ranker():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    search_space = trainer._get_optuna_search_space(min_train_size=10000)
+    assert search_space is not None
+
+    class DummyTrial:
+        def __init__(self):
+            self.int_bounds = {}
+            self.float_bounds = {}
+
+        def suggest_int(self, name, low, high, **kwargs):
+            self.int_bounds[name] = (low, high)
+            return high
+
+        def suggest_float(self, name, low, high, **kwargs):
+            self.float_bounds[name] = (low, high)
+            return high
+
+    params = search_space(DummyTrial())
+
+    assert "scale_pos_weight" not in params
 
 
 def test_optuna_search_space_regularizes_xgboost_for_small_folds():
@@ -2002,10 +2078,43 @@ def test_compute_objective_components_adds_tail_risk_penalty():
     assert components["objective_expected_shortfall_cap"] == pytest.approx(0.01)
 
 
+def test_compute_objective_components_disables_ranker_calibration_penalty():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            objective_weight_calibration=0.60,
+        )
+    )
+
+    components = trainer._compute_objective_components(
+        sharpe=0.2,
+        max_drawdown=0.05,
+        turnover=0.1,
+        brier_score=0.35,
+        trade_count=15,
+        cvar=-0.02,
+        skew=0.1,
+        expected_shortfall=0.04,
+        symbol_concentration_hhi=0.50,
+        equity_break=0.0,
+        evaluation_size=120,
+    )
+
+    assert components["objective_calibration_penalty"] == pytest.approx(0.0)
+
+
 def test_load_model_defaults_random_forest_windows_forces_single_job(monkeypatch):
     monkeypatch.setattr(train_script.os, "name", "nt", raising=False)
     defaults = train_script._load_model_defaults("random_forest", use_gpu=True)
     assert defaults.get("n_jobs") == 1
+
+
+def test_load_model_defaults_uses_dedicated_lightgbm_ranker_section():
+    defaults = train_script._load_model_defaults("lightgbm_ranker")
+
+    assert defaults["objective"] == "lambdarank"
+    assert defaults["metric"] == "ndcg"
+    assert defaults["min_data_in_leaf"] == 24
 
 
 def test_load_model_defaults_lightgbm_uses_cuda_when_gpu_enabled():
@@ -2102,7 +2211,7 @@ def test_evaluate_holdout_performance_aligns_sequence_model_outputs(monkeypatch)
         dtype="datetime64[ns]",
     )
 
-    def _fake_get_predictions_proba(model, X):
+    def _fake_get_predictions_proba(model, X, **kwargs):
         if len(X) == 6:
             return np.array([0.8, 0.2, 0.7, 0.3], dtype=float)
         return np.linspace(0.4, 0.6, len(X), dtype=float)
@@ -2174,12 +2283,16 @@ def test_evaluate_holdout_performance_records_probability_and_execution_diagnost
     monkeypatch.setattr(
         trainer,
         "_get_raw_predictions_proba",
-        lambda model, X: holdout_raw if len(X) == rows else trainer.oof_primary_proba_raw,
+        lambda model, X, **kwargs: (
+            holdout_raw if len(X) == rows else trainer.oof_primary_proba_raw
+        ),
     )
     monkeypatch.setattr(
         trainer,
         "_get_predictions_proba",
-        lambda model, X: holdout_calibrated if len(X) == rows else trainer.oof_primary_proba,
+        lambda model, X, **kwargs: (
+            holdout_calibrated if len(X) == rows else trainer.oof_primary_proba
+        ),
     )
     monkeypatch.setattr(trainer, "_derive_signal_thresholds", lambda *args, **kwargs: (0.60, 0.40))
     monkeypatch.setattr(
@@ -2265,7 +2378,7 @@ def test_evaluate_holdout_performance_records_tail_loss_contributors(monkeypatch
     monkeypatch.setattr(
         trainer,
         "_get_predictions_proba",
-        lambda model, X: (
+        lambda model, X, **kwargs: (
             np.concatenate([np.full(30, 0.80, dtype=float), np.full(30, 0.20, dtype=float)])
             if len(X) == rows
             else np.linspace(0.4, 0.6, len(X), dtype=float)
@@ -2597,7 +2710,7 @@ def test_build_execution_profile_relaxes_band_when_activity_too_low():
             dynamic_no_trade_band=True,
         )
     )
-    y_proba = np.full(120, 0.565, dtype=float)
+    y_proba = np.linspace(0.561, 0.569, 120, dtype=float)
     realized = np.full(120, 0.001, dtype=float)
 
     profile = trainer._build_execution_profile(
@@ -2607,6 +2720,7 @@ def test_build_execution_profile_relaxes_band_when_activity_too_low():
         realized_returns=realized,
     )
 
+    assert profile["diagnostics"]["band_adjustment_summary"]["dead_score_guard_triggered"] is False
     assert np.count_nonzero(profile["raw_signals"]) > 0
     assert float(np.mean(profile["long_threshold_series"])) < 0.58
 
@@ -2848,6 +2962,70 @@ def test_build_execution_profile_regime_bias_suppresses_counter_trend_side():
     )
 
     assert float(np.mean(profile["short_threshold_series"])) <= 0.34
+
+
+def test_ranker_execution_profile_skips_directional_drift_bias():
+    ranker = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            dynamic_no_trade_band=True,
+        )
+    )
+    classifier = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            dynamic_no_trade_band=True,
+        )
+    )
+    rng = np.random.default_rng(202)
+    trend = np.linspace(0.50, 0.68, 180)
+    y_proba = np.clip(trend + rng.normal(loc=0.0, scale=0.01, size=180), 0.01, 0.99)
+
+    ranker_profile = ranker._build_execution_profile(
+        y_proba=y_proba,
+        long_threshold=0.57,
+        short_threshold=0.43,
+        realized_returns=None,
+    )
+    classifier_profile = classifier._build_execution_profile(
+        y_proba=y_proba,
+        long_threshold=0.57,
+        short_threshold=0.43,
+        realized_returns=None,
+    )
+
+    assert float(np.mean(ranker_profile["short_threshold_series"])) > float(
+        np.mean(classifier_profile["short_threshold_series"])
+    )
+    assert float(
+        ranker_profile["diagnostics"]["final_signal_summary"]["active_signal_rate"]
+    ) < float(classifier_profile["diagnostics"]["final_signal_summary"]["active_signal_rate"])
+
+
+def test_execution_profile_dead_scores_fail_closed_without_activity_rescue():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm",
+            dynamic_no_trade_band=True,
+            execution_cooldown_bars=0,
+        )
+    )
+
+    profile = trainer._build_execution_profile(
+        y_proba=np.full(120, 0.6190485, dtype=float),
+        long_threshold=0.70,
+        short_threshold=0.55,
+        realized_returns=None,
+    )
+
+    assert profile["diagnostics"]["band_adjustment_summary"]["dead_score_guard_triggered"] is True
+    assert profile["diagnostics"]["final_signal_summary"]["active_signal_rate"] == pytest.approx(
+        0.0
+    )
+    assert profile["diagnostics"]["band_adjustment_summary"]["forced_tail_applied"] is False
+    assert (
+        profile["diagnostics"]["band_adjustment_summary"]["emergency_relaxation_applied"] is False
+    )
 
 
 def test_build_execution_profile_is_realized_return_leakage_safe():
@@ -3233,6 +3411,34 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     assert payload["universe_quality_policy"]["dropped_symbols"] == ["TSLA"]
 
 
+def test_write_promotion_package_persists_ranker_runtime_contract(tmp_path):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            model_name="pkg_ranker",
+            output_dir=str(tmp_path),
+            save_artifacts=False,
+        )
+    )
+    trainer.feature_names = ["feat_a", "feat_b"]
+    trainer.training_metrics = {
+        "holdout_long_threshold": 0.60,
+        "holdout_short_threshold": 0.40,
+    }
+    trainer.validation_results = {"all_passed": True}
+
+    package_path = trainer._write_promotion_package(
+        output_dir=tmp_path,
+        model_path=tmp_path / "pkg_ranker.pkl",
+        replay_manifest_path=None,
+    )
+    payload = json.loads(package_path.read_text(encoding="utf-8"))
+
+    assert payload["ranker_scoring"]["normalization"] == "query_percentile"
+    assert payload["ranker_scoring"]["query_key"] == "timestamp"
+    assert payload["ranker_scoring"]["requires_cross_sectional_panel"] is True
+
+
 def test_train_expected_edge_policy_records_training_and_holdout_metrics():
     class DummyProbabilityModel:
         def predict_proba(self, X):
@@ -3275,6 +3481,7 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
     trainer.holdout_regimes = np.array(
         ["trend_up", "trend_up", "high_vol", "high_vol"], dtype=object
     )
+    trainer.holdout_close_prices = pd.Series([101.0, 102.0, 99.0, 98.0], dtype=float)
     trainer.holdout_primary_forward_returns = np.array([0.014, 0.010, -0.011, -0.013], dtype=float)
     trainer.training_metrics["holdout_long_threshold"] = 0.60
     trainer.training_metrics["holdout_short_threshold"] = 0.40
@@ -3306,6 +3513,7 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
     assert trainer.training_metrics["expected_edge_holdout_regime_policy_enabled"] == pytest.approx(
         1.0
     )
+    assert trainer.training_metrics["expected_edge_holdout_policy_trade_count"] >= 1
     assert (
         trainer.training_metrics["expected_edge_holdout_signal_funnel_by_regime"]["high_vol"][
             "candidate_count"
@@ -3369,6 +3577,7 @@ def test_run_records_training_run_events(monkeypatch, tmp_path):
             compute_shap=False,
             use_meta_labeling=False,
             enable_expected_edge_policy=False,
+            apply_multiple_testing=False,
         )
     )
     events: list[dict[str, object]] = []
@@ -3417,6 +3626,61 @@ def test_run_records_training_run_events(monkeypatch, tmp_path):
     assert str(result["run_event_index_path"]).endswith("training_runs.jsonl")
     assert events[-1]["event"]["metrics"]["mean_trade_count"] == 120.0
     assert str(events[-1]["index_root"]).endswith("run_index")
+
+
+def test_run_trains_secondary_policies_before_multiple_testing_and_validation(
+    monkeypatch, tmp_path
+):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            output_dir=str(tmp_path),
+            save_artifacts=False,
+            optimize=False,
+            compute_shap=False,
+            use_meta_labeling=True,
+            enable_expected_edge_policy=True,
+            apply_multiple_testing=True,
+        )
+    )
+    call_order: list[str] = []
+
+    monkeypatch.setattr(trainer, "_load_data", lambda: None)
+    monkeypatch.setattr(trainer, "_compute_features", lambda: None)
+    monkeypatch.setattr(trainer, "_create_labels", lambda: None)
+    monkeypatch.setattr(trainer, "_apply_feature_selection", lambda: None)
+    monkeypatch.setattr(trainer, "_persist_features_to_postgres_if_needed", lambda: None)
+    monkeypatch.setattr(trainer, "_validate_no_future_leakage", lambda: None)
+    monkeypatch.setattr(trainer, "_train_with_cv", lambda: call_order.append("cv"))
+    monkeypatch.setattr(trainer, "_train_meta_labeler", lambda: call_order.append("meta"))
+    monkeypatch.setattr(
+        trainer,
+        "_train_expected_edge_policy",
+        lambda: call_order.append("expected_edge"),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_apply_multiple_testing_correction",
+        lambda: call_order.append("multiple_testing"),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_validate_model",
+        lambda: call_order.append("validate") or True,
+    )
+    monkeypatch.setattr(trainer, "_build_model_card", lambda: {"summary": "ok"})
+    monkeypatch.setattr(
+        trainer,
+        "_build_deployment_plan",
+        lambda passed_validation: {"ready_for_production": bool(passed_validation)},
+    )
+    monkeypatch.setattr(trainer, "_record_pre_promotion_checklist", lambda: None)
+    monkeypatch.setattr(trainer, "_save_model", lambda: str(tmp_path / "model.pkl"))
+
+    result = trainer.run()
+
+    assert result["success"] is True
+    assert call_order == ["cv", "meta", "expected_edge", "multiple_testing", "validate"]
 
 
 def test_run_snapshot_only_persists_review_and_skips_model_fitting(monkeypatch, tmp_path):
@@ -4268,6 +4532,122 @@ def test_build_ranking_groups_segments_by_timestamp():
     assert groups.tolist() == [2, 1, 3]
 
 
+def test_ranker_raw_predictions_are_normalized_within_timestamp_queries():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    timestamps = np.array(
+        [
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:01:00",
+            "2024-01-01T10:01:00",
+            "2024-01-01T10:01:00",
+        ],
+        dtype="datetime64[ns]",
+    )
+
+    class DummyRanker:
+        def predict(self, X):
+            return np.array([3.0, 1.0, 2.0, 10.0, 20.0, 30.0], dtype=float)
+
+    normalized = trainer._get_raw_predictions_proba(
+        DummyRanker(),
+        np.zeros((6, 2), dtype=float),
+        timestamps=timestamps,
+    )
+
+    np.testing.assert_allclose(
+        normalized,
+        np.array([5.0 / 6.0, 1.0 / 6.0, 0.5, 1.0 / 6.0, 0.5, 5.0 / 6.0], dtype=float),
+    )
+    assert trainer.training_metrics["ranker_score_normalization"] == "query_percentile"
+
+
+def test_ranker_raw_predictions_flat_query_scores_map_to_midpoint():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    timestamps = np.array(
+        [
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:01:00",
+            "2024-01-01T10:01:00",
+        ],
+        dtype="datetime64[ns]",
+    )
+
+    class DummyRanker:
+        def predict(self, X):
+            return np.array([4.0, 4.0, 4.0, 9.0, 9.0], dtype=float)
+
+    normalized = trainer._get_raw_predictions_proba(
+        DummyRanker(),
+        np.zeros((5, 2), dtype=float),
+        timestamps=timestamps,
+    )
+
+    np.testing.assert_allclose(normalized, np.full(5, 0.5, dtype=float))
+
+
+def test_ranker_probability_calibration_is_disabled():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            enable_probability_calibration=True,
+        )
+    )
+
+    assert trainer._supports_probability_calibration() is False
+
+
+def test_ranker_fold_metrics_use_probability_proxy_for_scoring():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            dynamic_no_trade_band=False,
+            execution_cooldown_bars=0,
+        )
+    )
+
+    y_true = np.array([0.0, 1.0, 1.0, 0.0], dtype=float)
+    y_pred = np.array([10.0, -8.0, 7.0, -6.0], dtype=float)
+    y_proba = np.array([0.20, 0.80, 0.70, 0.30], dtype=float)
+
+    metrics = trainer._calculate_fold_metrics(
+        y_true=y_true,
+        y_pred=y_pred,
+        y_proba=y_proba,
+        long_threshold=0.70,
+        short_threshold=0.30,
+    )
+
+    assert metrics["accuracy"] == pytest.approx(1.0)
+    assert metrics["mse"] == pytest.approx(float(np.mean((y_true - y_proba) ** 2)))
+    assert metrics["brier_score"] == pytest.approx(0.0)
+
+
+def test_ranker_thresholds_remain_symmetric_under_side_bias_inputs():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="lightgbm_ranker", min_trades=40)
+    )
+    base_scores = np.array([1.0 / 6.0, 0.5, 5.0 / 6.0], dtype=float)
+    train_proba = np.tile(base_scores, 140)
+    train_labels = np.tile(np.array([0.0, 1.0, 1.0], dtype=float), 140)
+    train_returns = np.full(train_proba.shape, 0.0015, dtype=float)
+    train_regimes = np.array((["bull_trend"] * 210) + (["bear_trend"] * 210), dtype=object)
+
+    long_threshold, short_threshold = trainer._derive_signal_thresholds(
+        train_proba,
+        train_labels=train_labels,
+        train_returns=train_returns,
+        train_regimes=train_regimes,
+    )
+
+    assert long_threshold > 0.5
+    assert short_threshold < 0.5
+    assert long_threshold - 0.5 == pytest.approx(0.5 - short_threshold, abs=1e-9)
+
+
 def test_horizon_leaderboards_assign_per_horizon_candidates():
     rows = [
         {
@@ -4565,6 +4945,11 @@ def test_validate_model_records_three_layer_gate_failures():
         "mean_symbol_concentration_hhi": 0.20,
         "holdout_rows": 280.0,
         "holdout_sharpe": 0.20,
+        "holdout_trade_count": 24.0,
+        "holdout_active_signal_rate": 0.12,
+        "holdout_trade_return_observations": 24.0,
+        "holdout_sharpe_observation_confidence": 1.0,
+        "holdout_regime_count_evaluated": 1.0,
         "holdout_worst_regime_sharpe": 0.05,
         "holdout_max_drawdown": 0.12,
         "holdout_symbol_coverage_ratio": 0.80,
@@ -4743,6 +5128,108 @@ def test_validate_model_holdout_sharpe_gate_uses_confidence_adjustment():
     assert passed is False
     assert trainer.validation_results["gates"]["min_holdout_sharpe"][0] is False
     assert trainer.training_metrics["effective_holdout_sharpe_gate_metric"] < 0.0
+
+
+def test_validate_model_prefers_expected_edge_holdout_metrics_when_available():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            use_meta_labeling=False,
+            require_nested_trace_for_promotion=False,
+            require_objective_breakdown_for_promotion=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 0.70,
+        "mean_accuracy": 0.60,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.55,
+        "mean_trade_count": 150.0,
+        "mean_test_size": 500.0,
+        "mean_risk_adjusted_score": 0.30,
+        "mean_symbol_concentration_hhi": 0.20,
+        "white_reality_stat": 0.12,
+        "white_reality_pvalue": 0.05,
+        "deflated_sharpe": 0.20,
+        "deflated_sharpe_p_value": 0.05,
+        "pbo": 0.20,
+        "effective_pbo_gate_metric": 0.20,
+        "holdout_rows": 180.0,
+        "holdout_sharpe": -0.40,
+        "holdout_trade_count": 0.0,
+        "holdout_active_signal_rate": 0.0,
+        "holdout_max_drawdown": 0.40,
+        "holdout_worst_regime_sharpe": 0.05,
+        "holdout_symbol_coverage_ratio": 0.80,
+        "holdout_symbol_sharpe_p25": 0.00,
+        "holdout_symbol_underwater_ratio": 0.20,
+        "expected_edge_policy_enabled": 1.0,
+        "expected_edge_holdout_policy_sharpe": 0.35,
+        "expected_edge_holdout_policy_trade_count": 30.0,
+        "expected_edge_holdout_policy_active_signal_rate": 0.12,
+        "expected_edge_holdout_policy_max_drawdown": 0.10,
+        "expected_edge_holdout_policy_trade_return_observations": 30.0,
+        "expected_edge_holdout_policy_sharpe_observation_confidence": 1.0,
+    }
+
+    passed = trainer._validate_model()
+
+    assert passed is True
+    assert trainer.training_metrics["effective_holdout_metric_source"] == "expected_edge_policy"
+    assert trainer.validation_results["gates"]["min_holdout_sharpe"][0] is True
+    assert trainer.validation_results["gates"]["holdout_trade_count_positive"][0] is True
+    assert trainer.validation_results["gates"]["holdout_active_signal_rate_positive"][0] is True
+
+
+def test_validate_model_fails_dead_lightgbm_structure_and_score_dispersion():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm",
+            use_meta_labeling=False,
+            require_nested_trace_for_promotion=False,
+            require_objective_breakdown_for_promotion=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 0.80,
+        "mean_accuracy": 0.60,
+        "mean_max_drawdown": 0.08,
+        "mean_win_rate": 0.56,
+        "mean_trade_count": 150.0,
+        "mean_test_size": 500.0,
+        "mean_risk_adjusted_score": 0.40,
+        "white_reality_stat": 0.15,
+        "white_reality_pvalue": 0.05,
+        "deflated_sharpe": 0.25,
+        "deflated_sharpe_p_value": 0.05,
+        "pbo": 0.20,
+        "effective_pbo_gate_metric": 0.20,
+        "holdout_rows": 180.0,
+        "holdout_sharpe": 0.30,
+        "holdout_trade_count": 20.0,
+        "holdout_active_signal_rate": 0.10,
+        "holdout_trade_return_observations": 20.0,
+        "holdout_sharpe_observation_confidence": 1.0,
+        "holdout_max_drawdown": 0.10,
+        "holdout_worst_regime_sharpe": 0.02,
+        "holdout_symbol_coverage_ratio": 0.85,
+        "holdout_symbol_sharpe_p25": 0.00,
+        "holdout_symbol_underwater_ratio": 0.10,
+        "final_model_structure_split_count": 0.0,
+        "oof_raw_probability_distribution_finite_count": 150.0,
+        "oof_raw_probability_distribution_std": 0.0,
+        "oof_raw_probability_distribution_span": 0.0,
+        "holdout_raw_probability_distribution_finite_count": 80.0,
+        "holdout_raw_probability_distribution_std": 0.0,
+        "holdout_raw_probability_distribution_span": 0.0,
+    }
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["gates"]["lightgbm_booster_has_splits"][0] is False
+    assert trainer.validation_results["gates"]["lightgbm_oof_score_dispersion"][0] is False
+    assert trainer.validation_results["gates"]["lightgbm_holdout_score_dispersion"][0] is False
 
 
 def test_validate_model_fails_when_holdout_symbol_coverage_breaches():
