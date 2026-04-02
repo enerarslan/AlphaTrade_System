@@ -220,6 +220,7 @@ def _attach_explicit_profile_overrides(
     argv: list[str] | None,
 ) -> argparse.Namespace:
     """Track CLI options that were explicitly provided, even when equal to parser defaults."""
+
     def _resolve_action(
         candidate_parser: argparse.ArgumentParser,
         option: str,
@@ -308,7 +309,9 @@ def _build_snapshot_feature_selection_signature(config: "TrainingConfig") -> dic
 
 def _build_snapshot_training_scope(config: "TrainingConfig") -> dict[str, Any]:
     """Return deterministic data/feature/label scope for snapshot auto-reuse."""
-    symbols = sorted({str(symbol).strip().upper() for symbol in config.symbols if str(symbol).strip()})
+    symbols = sorted(
+        {str(symbol).strip().upper() for symbol in config.symbols if str(symbol).strip()}
+    )
     feature_groups = sorted(
         {str(group).strip().lower() for group in config.feature_groups if str(group).strip()}
     )
@@ -346,7 +349,9 @@ def _build_snapshot_training_scope(config: "TrainingConfig") -> dict[str, Any]:
         "symbol_quality_min_rows": int(config.symbol_quality_min_rows),
         "symbol_quality_min_symbols": int(config.symbol_quality_min_symbols),
         "symbol_quality_max_missing_ratio": float(config.symbol_quality_max_missing_ratio),
-        "symbol_quality_max_extreme_move_ratio": float(config.symbol_quality_max_extreme_move_ratio),
+        "symbol_quality_max_extreme_move_ratio": float(
+            config.symbol_quality_max_extreme_move_ratio
+        ),
         "symbol_quality_max_corporate_action_ratio": float(
             config.symbol_quality_max_corporate_action_ratio
         ),
@@ -411,6 +416,8 @@ def _find_reusable_snapshot_bundle(config: "TrainingConfig") -> Path | None:
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1]
+
+
 LIGHTGBM_FAMILY_MODELS = {"lightgbm", "lightgbm_ranker", "lightgbm_regressor"}
 RANKING_MODELS = {"lightgbm_ranker"}
 REGRESSION_MODELS = {"xgboost_regressor", "lightgbm_regressor"}
@@ -990,6 +997,11 @@ class TrainingConfig:
     meta_label_dynamic_threshold: bool = True
     enable_probability_calibration: bool = True
     probability_calibration_method: str = "isotonic"
+    probability_calibration_guardrail_enabled: bool = True
+    probability_calibration_min_dispersion_ratio: float = 0.05
+    probability_calibration_min_oof_active_rate: float = 0.01
+    probability_calibration_min_oof_active_rate_ratio: float = 0.20
+    probability_calibration_max_near_mid_rate: float = 0.98
     enable_expected_edge_policy: bool = True
     expected_edge_min_samples: int = 120
     expected_edge_min_coverage: float = 0.55
@@ -1152,6 +1164,21 @@ class TrainingConfig:
         if calibration_method not in {"isotonic", "sigmoid"}:
             raise ValueError("probability_calibration_method must be 'isotonic' or 'sigmoid'")
         self.probability_calibration_method = calibration_method
+        self.probability_calibration_guardrail_enabled = bool(
+            self.probability_calibration_guardrail_enabled
+        )
+        self.probability_calibration_min_dispersion_ratio = float(
+            np.clip(float(self.probability_calibration_min_dispersion_ratio), 0.0, 1.0)
+        )
+        self.probability_calibration_min_oof_active_rate = float(
+            np.clip(float(self.probability_calibration_min_oof_active_rate), 0.0, 1.0)
+        )
+        self.probability_calibration_min_oof_active_rate_ratio = float(
+            np.clip(float(self.probability_calibration_min_oof_active_rate_ratio), 0.0, 1.0)
+        )
+        self.probability_calibration_max_near_mid_rate = float(
+            np.clip(float(self.probability_calibration_max_near_mid_rate), 0.50, 1.0)
+        )
         self.enable_expected_edge_policy = bool(self.enable_expected_edge_policy)
         self.expected_edge_min_samples = max(32, int(self.expected_edge_min_samples))
         self.expected_edge_min_coverage = float(
@@ -1264,9 +1291,7 @@ class TrainingConfig:
         )
         self.warm_start_model_path = str(self.warm_start_model_path or "").strip()
         self.label_apply_uniqueness_weighting = bool(self.label_apply_uniqueness_weighting)
-        self.label_uniqueness_weight_floor = max(
-            0.01, float(self.label_uniqueness_weight_floor)
-        )
+        self.label_uniqueness_weight_floor = max(0.01, float(self.label_uniqueness_weight_floor))
         self.label_apply_volatility_inverse_weighting = bool(
             self.label_apply_volatility_inverse_weighting
         )
@@ -1336,6 +1361,7 @@ class ModelTrainer:
         self.probability_calibrator: Any = None
         self.probability_calibration_method_resolved: str | None = None
         self.oof_primary_proba: np.ndarray | None = None
+        self.oof_primary_proba_raw: np.ndarray | None = None
         self.cv_return_series: list[np.ndarray] = []
         self.cv_active_return_series: list[np.ndarray] = []
         self.sample_weights: np.ndarray | None = None
@@ -1551,7 +1577,9 @@ class ModelTrainer:
                     str(self.artifacts_path) if self.artifacts_path is not None else None
                 ),
                 "snapshot_review_path": (
-                    str(self.snapshot_review_path) if self.snapshot_review_path is not None else None
+                    str(self.snapshot_review_path)
+                    if self.snapshot_review_path is not None
+                    else None
                 ),
                 "run_event_index_path": (
                     str(self.run_event_index_path)
@@ -1661,7 +1689,9 @@ class ModelTrainer:
                     "feature": str(feature_name),
                     "family": self._feature_family_name(feature_name),
                     "reason": rejection_reason,
-                    "information_coefficient": float(information_coefficients.get(feature_name, 0.0)),
+                    "information_coefficient": float(
+                        information_coefficients.get(feature_name, 0.0)
+                    ),
                     "stability_score": float(stability_scores.get(feature_name, 0.0)),
                 }
             )
@@ -1909,7 +1939,9 @@ class ModelTrainer:
                 else None
             ),
             "snapshot_manifest_path": (
-                str(self.snapshot_manifest_path) if self.snapshot_manifest_path is not None else None
+                str(self.snapshot_manifest_path)
+                if self.snapshot_manifest_path is not None
+                else None
             ),
             "dataset_snapshot_bundle_path": (
                 str(self.dataset_snapshot_bundle_manifest_path)
@@ -1920,7 +1952,9 @@ class ModelTrainer:
                 str(self.replay_manifest_path) if self.replay_manifest_path is not None else None
             ),
             "promotion_package_path": (
-                str(self.promotion_package_path) if self.promotion_package_path is not None else None
+                str(self.promotion_package_path)
+                if self.promotion_package_path is not None
+                else None
             ),
             "artifacts_path": str(self.artifacts_path) if self.artifacts_path is not None else None,
             "error": str(error) if error is not None else None,
@@ -2593,23 +2627,23 @@ class ModelTrainer:
         target_size = int(self.config.target_universe_size)
         if target_size <= 0:
             result = session.execute(
-                text(
-                    """
+                text("""
                     SELECT DISTINCT symbol
                     FROM ohlcv_bars
                     WHERE timeframe = :timeframe
                       AND (:start_date IS NULL OR timestamp >= :start_date)
                       AND (:end_date IS NULL OR timestamp <= :end_date)
                     ORDER BY symbol
-                    """
-                ),
+                    """),
                 {
                     "timeframe": timeframe,
                     "start_date": start_date,
                     "end_date": end_date,
                 },
             )
-            symbols = [str(row[0]).strip().upper() for row in result.fetchall() if str(row[0]).strip()]
+            symbols = [
+                str(row[0]).strip().upper() for row in result.fetchall() if str(row[0]).strip()
+            ]
             self.training_metrics["database_universe_requested_timeframes"] = list(
                 requested_timeframe_scope
             )
@@ -2621,8 +2655,7 @@ class ModelTrainer:
             target_size + int(self.config.universe_selection_buffer_size),
         )
         result = session.execute(
-            text(
-                """
+            text("""
                 WITH base_metrics AS (
                     SELECT
                         symbol,
@@ -2664,8 +2697,7 @@ class ModelTrainer:
                     active_days DESC,
                     symbol ASC
                 LIMIT :candidate_limit
-                """
-            ).bindparams(bindparam("requested_timeframes", expanding=True)),
+                """).bindparams(bindparam("requested_timeframes", expanding=True)),
             {
                 "timeframe": timeframe,
                 "requested_timeframes": requested_timeframe_scope,
@@ -2677,9 +2709,7 @@ class ModelTrainer:
         )
         candidate_rows = result.fetchall()
         symbols = [
-            str(row[0]).strip().upper()
-            for row in candidate_rows
-            if row and str(row[0]).strip()
+            str(row[0]).strip().upper() for row in candidate_rows if row and str(row[0]).strip()
         ]
         full_timeframe_coverage_count = sum(
             1
@@ -2694,8 +2724,7 @@ class ModelTrainer:
         )
         if preferred_reference_symbols:
             reference_result = session.execute(
-                text(
-                    """
+                text("""
                     SELECT DISTINCT symbol
                     FROM ohlcv_bars
                     WHERE timeframe = :timeframe
@@ -2703,8 +2732,7 @@ class ModelTrainer:
                       AND (:start_date IS NULL OR timestamp >= :start_date)
                       AND (:end_date IS NULL OR timestamp <= :end_date)
                     ORDER BY symbol
-                    """
-                ).bindparams(bindparam("symbols", expanding=True)),
+                    """).bindparams(bindparam("symbols", expanding=True)),
                 {
                     "timeframe": timeframe,
                     "symbols": preferred_reference_symbols,
@@ -2745,10 +2773,11 @@ class ModelTrainer:
         from sqlalchemy import bindparam
 
         if not symbols:
-            return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(
+                columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"]
+            )
 
-        query = text(
-            """
+        query = text("""
             SELECT
                 symbol,
                 timestamp,
@@ -2763,13 +2792,14 @@ class ModelTrainer:
               AND (:start_date IS NULL OR timestamp >= :start_date)
               AND (:end_date IS NULL OR timestamp <= :end_date)
             ORDER BY symbol, timestamp
-            """
-        ).bindparams(bindparam("symbols", expanding=True))
+            """).bindparams(bindparam("symbols", expanding=True))
 
         result = session.execute(
             query,
             {
-                "symbols": [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()],
+                "symbols": [
+                    str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()
+                ],
                 "timeframe": normalize_timeframe(timeframe),
                 "start_date": start_date,
                 "end_date": end_date,
@@ -3364,7 +3394,9 @@ class ModelTrainer:
                 "--windows-fallback-features is enabled."
             )
             self._compute_features_fallback()
-            self.features_materialized_in_run = bool(self.features is not None and not self.features.empty)
+            self.features_materialized_in_run = bool(
+                self.features is not None and not self.features.empty
+            )
             return
         if os.name == "nt":
             self.logger.info("Windows runtime detected: enforcing full feature pipeline.")
@@ -3391,7 +3423,9 @@ class ModelTrainer:
         else:
             self._compute_features_full_pipeline()
 
-        self.features_materialized_in_run = bool(self.features is not None and not self.features.empty)
+        self.features_materialized_in_run = bool(
+            self.features is not None and not self.features.empty
+        )
 
     def _persist_features_to_postgres_if_needed(self) -> None:
         """Persist only freshly materialized post-selection features."""
@@ -3404,13 +3438,19 @@ class ModelTrainer:
             self.logger.info("Skipping feature persistence to PostgreSQL for this run")
             return
         if self.snapshot_replay_loaded:
-            self.logger.info("Skipping feature persistence because snapshot replay supplied features")
+            self.logger.info(
+                "Skipping feature persistence because snapshot replay supplied features"
+            )
             return
         if self.feature_cache_reused:
-            self.logger.info("Skipping feature persistence because PostgreSQL feature cache was reused")
+            self.logger.info(
+                "Skipping feature persistence because PostgreSQL feature cache was reused"
+            )
             return
         if not self.features_materialized_in_run:
-            self.logger.info("Skipping feature persistence because no new feature matrix was materialized")
+            self.logger.info(
+                "Skipping feature persistence because no new feature matrix was materialized"
+            )
             return
         self._store_features_to_postgres()
 
@@ -3890,7 +3930,9 @@ class ModelTrainer:
                 feature_set = pipeline.compute(
                     df_pl,
                     symbol=symbol,
-                    universe_data=(universe_data if group == FeatureGroup.CROSS_SECTIONAL else None),
+                    universe_data=(
+                        universe_data if group == FeatureGroup.CROSS_SECTIONAL else None
+                    ),
                     use_cache=feature_config.use_cache,
                 )
                 group_feature_count = len(feature_set.features)
@@ -3903,7 +3945,10 @@ class ModelTrainer:
                     time.perf_counter() - group_start,
                 )
             except Exception as e:
-                if self.config.allow_feature_group_fallback and group == FeatureGroup.CROSS_SECTIONAL:
+                if (
+                    self.config.allow_feature_group_fallback
+                    and group == FeatureGroup.CROSS_SECTIONAL
+                ):
                     self.logger.warning(
                         "%s: cross-sectional features skipped due to runtime error: %s",
                         symbol,
@@ -4002,7 +4047,9 @@ class ModelTrainer:
             )
 
         if base_timeframe not in feature_frames:
-            raise RuntimeError(f"Base timeframe {base_timeframe} features missing for symbol {symbol}")
+            raise RuntimeError(
+                f"Base timeframe {base_timeframe} features missing for symbol {symbol}"
+            )
 
         aligned = engine.align_feature_frames(
             base_frame=feature_frames[base_timeframe],
@@ -4021,7 +4068,12 @@ class ModelTrainer:
 
         if not self.config.enable_feature_selection:
             return
-        if self.features is None or self.features.empty or self.labels is None or len(self.labels) == 0:
+        if (
+            self.features is None
+            or self.features.empty
+            or self.labels is None
+            or len(self.labels) == 0
+        ):
             return
 
         old_feature_names = [str(name) for name in self.feature_names]
@@ -4041,10 +4093,14 @@ class ModelTrainer:
             ),
         )
         selected_features = [
-            feature for feature in selection_result.selected_features if feature in self.features.columns
+            feature
+            for feature in selection_result.selected_features
+            if feature in self.features.columns
         ]
         if not selected_features:
-            self.logger.warning("Feature selection returned no candidates; keeping original matrix.")
+            self.logger.warning(
+                "Feature selection returned no candidates; keeping original matrix."
+            )
             return
 
         self.features = self.features[selected_features].copy()
@@ -4198,7 +4254,8 @@ class ModelTrainer:
                     [
                         column
                         for column in features_df.columns
-                        if column not in {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
+                        if column
+                        not in {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
                     ]
                 ),
             )
@@ -4335,7 +4392,10 @@ class ModelTrainer:
         if schema_payload.get("cache_stage") != "post_selection":
             self.logger.info("Feature cache stage changed; recomputing features.")
             return None
-        if schema_payload.get("feature_selection_signature") != self._feature_selection_schema_signature():
+        if (
+            schema_payload.get("feature_selection_signature")
+            != self._feature_selection_schema_signature()
+        ):
             self.logger.info("Feature selection cache signature changed; recomputing features.")
             return None
 
@@ -4457,7 +4517,9 @@ class ModelTrainer:
         if self.development_frame is not None and not self.development_frame.empty:
             export_source = self.development_frame
         required_export_cols = ["symbol", "timestamp", *feature_cols]
-        missing_export_cols = [col for col in required_export_cols if col not in export_source.columns]
+        missing_export_cols = [
+            col for col in required_export_cols if col not in export_source.columns
+        ]
         if missing_export_cols:
             raise KeyError(
                 f"Persisted feature source is missing required columns: {missing_export_cols}"
@@ -4515,8 +4577,7 @@ class ModelTrainer:
             with raw_conn.cursor() as cursor:
                 cursor.execute("SET statement_timeout = '600000ms'")
                 cursor.execute("SET synchronous_commit = OFF")
-                cursor.execute(
-                    f"""
+                cursor.execute(f"""
                     CREATE TEMP TABLE IF NOT EXISTS {stage_table} (
                         symbol TEXT NOT NULL,
                         timestamp TIMESTAMPTZ NOT NULL,
@@ -4525,8 +4586,7 @@ class ModelTrainer:
                         feature_set_id TEXT NOT NULL,
                         value DOUBLE PRECISION NOT NULL
                     )
-                    """
-                )
+                    """)
                 raw_conn.commit()
 
                 if resume_offset == 0:
@@ -4569,8 +4629,7 @@ class ModelTrainer:
                             feature_set_id=feature_set_id,
                         )
                         if staged_rows > 0:
-                            cursor.execute(
-                                f"""
+                            cursor.execute(f"""
                                 INSERT INTO features (
                                     symbol,
                                     timestamp,
@@ -4589,8 +4648,7 @@ class ModelTrainer:
                                 FROM {stage_table}
                                 ON CONFLICT (symbol, timestamp, timeframe, feature_name, feature_set_id)
                                 DO UPDATE SET value = EXCLUDED.value
-                                """
-                            )
+                                """)
                             cursor.execute(f"TRUNCATE TABLE {stage_table}")
                             total_upserted_rows += staged_rows
 
@@ -4660,9 +4718,7 @@ class ModelTrainer:
             feature_set_id=feature_set_id,
             symbol=stage_df["symbol"].astype(str),
             feature_name=stage_df["feature_name"].astype(str),
-        )[
-            ["symbol", "timestamp", "timeframe", "feature_name", "feature_set_id", "value"]
-        ]
+        )[["symbol", "timestamp", "timeframe", "feature_name", "feature_set_id", "value"]]
 
         buffer = io.StringIO()
         stage_df.to_csv(
@@ -5505,9 +5561,7 @@ class ModelTrainer:
                 study_info["study_name"],
                 int(study_info.get("finalized_trials", 0)),
             )
-        study_info.update(
-            self._optuna_trial_state_summary(study, optuna)
-        )
+        study_info.update(self._optuna_trial_state_summary(study, optuna))
         study_info["remaining_trials"] = int(
             max(int(self.config.n_trials) - int(study_info.get("finalized_trials", 0)), 0)
         )
@@ -7414,6 +7468,7 @@ class ModelTrainer:
         self.cv_return_series = []
         self.cv_active_return_series = []
         self.oof_primary_proba = np.full(len(y), np.nan, dtype=float)
+        self.oof_primary_proba_raw = np.full(len(y), np.nan, dtype=float)
         splits = self._generate_cv_splits(X, y)
 
         for fold_idx, (train_idx, test_idx) in enumerate(splits):
@@ -7457,6 +7512,7 @@ class ModelTrainer:
 
             # Evaluate
             y_pred = np.asarray(model.predict(X_test))
+            y_proba_raw = np.asarray(self._get_raw_predictions_proba(model, X_test))
             y_proba = np.asarray(self._get_predictions_proba(model, X_test))
             train_proba = np.asarray(self._get_predictions_proba(model, X_train))
             train_forward_returns = (
@@ -7475,7 +7531,7 @@ class ModelTrainer:
             )
 
             y_eval = np.asarray(y_test)
-            eval_len = min(len(y_pred), len(y_eval), len(y_proba), len(test_idx))
+            eval_len = min(len(y_pred), len(y_eval), len(y_proba_raw), len(y_proba), len(test_idx))
             if eval_len != len(y_eval):
                 if eval_len <= 1:
                     self.logger.warning(
@@ -7484,11 +7540,13 @@ class ModelTrainer:
                     continue
                 y_eval = y_eval[-eval_len:]
                 y_pred = y_pred[-eval_len:]
+                y_proba_raw = y_proba_raw[-eval_len:]
                 y_proba = y_proba[-eval_len:]
                 self.logger.info(
                     f"Fold {fold_idx + 1}: aligned sequence outputs to {eval_len} samples"
                 )
             eval_indices = np.asarray(test_idx[-eval_len:], dtype=int)
+            self.oof_primary_proba_raw[eval_indices] = y_proba_raw
             self.oof_primary_proba[eval_indices] = y_proba
 
             # Calculate metrics
@@ -8136,6 +8194,131 @@ class ModelTrainer:
             "calibrator": self.probability_calibrator,
         }
 
+    def _evaluate_probability_calibration_guardrails(
+        self,
+        *,
+        raw_values: np.ndarray,
+        calibrated_values: np.ndarray,
+        labels: np.ndarray,
+        train_returns: np.ndarray | None = None,
+        train_regimes: np.ndarray | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Reject post-hoc calibration when it collapses OOF dispersion or activity."""
+        raw_arr = np.asarray(raw_values, dtype=float).reshape(-1)
+        calibrated_arr = np.asarray(calibrated_values, dtype=float).reshape(-1)
+        label_arr = np.asarray(labels, dtype=float).reshape(-1)
+        summary: dict[str, Any] = {
+            "enabled": bool(self.config.probability_calibration_guardrail_enabled),
+            "accepted": True,
+            "reason": "guardrail_disabled",
+            "activity_collapse": False,
+            "dispersion_collapse": False,
+            "rejection_reasons": [],
+        }
+        if not bool(self.config.probability_calibration_guardrail_enabled):
+            return True, summary
+        if raw_arr.size <= 0 or calibrated_arr.size != raw_arr.size or label_arr.size != raw_arr.size:
+            summary["reason"] = "guardrail_unavailable"
+            return True, summary
+
+        signed_returns = (
+            np.asarray(train_returns, dtype=float).reshape(-1)
+            if train_returns is not None and len(np.asarray(train_returns).reshape(-1)) == raw_arr.size
+            else None
+        )
+        aligned_regimes = (
+            np.asarray(train_regimes, dtype=object).reshape(-1)
+            if train_regimes is not None
+            and len(np.asarray(train_regimes, dtype=object).reshape(-1)) == raw_arr.size
+            else None
+        )
+        raw_summary = self._summarize_probability_distribution(raw_arr)
+        calibrated_summary = self._summarize_probability_distribution(calibrated_arr)
+        shift_summary = self._summarize_probability_shift(raw_arr, calibrated_arr)
+        raw_long, raw_short = self._derive_signal_thresholds(
+            raw_arr,
+            train_labels=label_arr,
+            train_returns=signed_returns,
+            train_regimes=aligned_regimes,
+        )
+        calibrated_long, calibrated_short = self._derive_signal_thresholds(
+            calibrated_arr,
+            train_labels=label_arr,
+            train_returns=signed_returns,
+            train_regimes=aligned_regimes,
+        )
+        raw_hits = self._summarize_threshold_hits(raw_arr, raw_long, raw_short)
+        calibrated_hits = self._summarize_threshold_hits(
+            calibrated_arr,
+            calibrated_long,
+            calibrated_short,
+        )
+        raw_active_rate = float(raw_hits.get("active_rate", 0.0))
+        calibrated_active_rate = float(calibrated_hits.get("active_rate", 0.0))
+        min_active_rate = float(self.config.probability_calibration_min_oof_active_rate)
+        min_active_rate_ratio = float(self.config.probability_calibration_min_oof_active_rate_ratio)
+        min_dispersion_ratio = float(self.config.probability_calibration_min_dispersion_ratio)
+        near_mid_limit = float(self.config.probability_calibration_max_near_mid_rate)
+        guardable_raw_active_rate = max(0.02, min_active_rate)
+        min_allowed_active_rate = max(min_active_rate, raw_active_rate * min_active_rate_ratio)
+        raw_std = float(raw_summary.get("std", 0.0))
+        raw_span = float(raw_summary.get("span", 0.0))
+        std_ratio = float(shift_summary.get("std_ratio", 1.0))
+        span_ratio = float(shift_summary.get("span_ratio", 1.0))
+        activity_collapse = bool(
+            raw_active_rate >= guardable_raw_active_rate
+            and calibrated_active_rate + 1e-9 < min_allowed_active_rate
+        )
+        dispersion_collapse = bool(
+            (raw_std > 1e-6 or raw_span > 1e-5)
+            and std_ratio + 1e-12 < min_dispersion_ratio
+            and span_ratio + 1e-12 < min_dispersion_ratio
+            and float(calibrated_summary.get("near_mid_rate", 0.0)) >= near_mid_limit
+        )
+        rejection_reasons: list[str] = []
+        if activity_collapse:
+            rejection_reasons.append("activity_collapse")
+        if dispersion_collapse:
+            rejection_reasons.append("dispersion_collapse")
+        accepted = not rejection_reasons
+        summary.update(
+            {
+                "accepted": bool(accepted),
+                "reason": "passed" if accepted else ",".join(rejection_reasons),
+                "activity_collapse": bool(activity_collapse),
+                "dispersion_collapse": bool(dispersion_collapse),
+                "rejection_reasons": list(rejection_reasons),
+                "raw_active_rate": raw_active_rate,
+                "calibrated_active_rate": calibrated_active_rate,
+                "min_allowed_active_rate": float(min_allowed_active_rate),
+                "active_rate_ratio": float(
+                    calibrated_active_rate / max(raw_active_rate, 1e-9)
+                ),
+                "raw_std": raw_std,
+                "raw_span": raw_span,
+                "calibrated_std": float(calibrated_summary.get("std", 0.0)),
+                "calibrated_span": float(calibrated_summary.get("span", 0.0)),
+                "std_ratio": std_ratio,
+                "span_ratio": span_ratio,
+                "raw_near_mid_rate": float(raw_summary.get("near_mid_rate", 0.0)),
+                "calibrated_near_mid_rate": float(calibrated_summary.get("near_mid_rate", 0.0)),
+                "raw_tail_rate": float(raw_summary.get("tail_rate", 0.0)),
+                "calibrated_tail_rate": float(calibrated_summary.get("tail_rate", 0.0)),
+                "raw_long_threshold": float(raw_long),
+                "raw_short_threshold": float(raw_short),
+                "calibrated_long_threshold": float(calibrated_long),
+                "calibrated_short_threshold": float(calibrated_short),
+            }
+        )
+        self._record_summary_metrics("probability_calibration_guardrails", summary)
+        self.training_metrics["probability_calibration_guardrail_raw_threshold_hits"] = (
+            self._json_safe(raw_hits)
+        )
+        self.training_metrics["probability_calibration_guardrail_calibrated_threshold_hits"] = (
+            self._json_safe(calibrated_hits)
+        )
+        return accepted, summary
+
     def _fit_probability_calibrator_from_oof(self) -> None:
         """Fit a post-hoc probability calibrator from out-of-fold predictions only."""
         self.probability_calibrator = None
@@ -8143,12 +8326,17 @@ class ModelTrainer:
         self.training_metrics["probability_calibration_enabled"] = 0.0
         if not self._supports_probability_calibration():
             self.training_metrics["probability_calibration_reason"] = "disabled_or_unsupported"
+            self._refresh_oof_probability_diagnostics()
             return
-        if self.oof_primary_proba is None or self.labels is None:
+        raw_source = self.oof_primary_proba_raw
+        if raw_source is None:
+            raw_source = self.oof_primary_proba
+        self._refresh_oof_probability_diagnostics()
+        if raw_source is None or self.labels is None:
             self.training_metrics["probability_calibration_reason"] = "missing_oof_predictions"
             return
 
-        raw_values = np.asarray(self.oof_primary_proba, dtype=float).reshape(-1)
+        raw_values = np.asarray(raw_source, dtype=float).reshape(-1)
         labels = pd.to_numeric(self.labels, errors="coerce").to_numpy(dtype=float).reshape(-1)
         if raw_values.size != labels.size or raw_values.size == 0:
             self.training_metrics["probability_calibration_reason"] = "shape_mismatch"
@@ -8201,6 +8389,43 @@ class ModelTrainer:
             self.training_metrics["probability_calibration_brier_after"] = brier_after
             return
 
+        signed_returns = self._resolve_signed_realized_returns(
+            forward_returns=self.primary_forward_returns,
+            event_net_returns=self.cost_aware_event_returns,
+            event_directions=self.primary_event_directions,
+        )
+        masked_signed_returns = None
+        if signed_returns is not None and len(signed_returns) == len(raw_values):
+            masked_signed_returns = np.asarray(signed_returns, dtype=float)[mask]
+        masked_regimes = None
+        if self.regimes is not None and len(self.regimes) == len(raw_values):
+            masked_regimes = np.asarray(self.regimes, dtype=object)[mask]
+        guardrail_passed, guardrail_summary = self._evaluate_probability_calibration_guardrails(
+            raw_values=X_cal,
+            calibrated_values=calibrated,
+            labels=y_cal,
+            train_returns=masked_signed_returns,
+            train_regimes=masked_regimes,
+        )
+        self.training_metrics["probability_calibration_guardrails"] = self._json_safe(
+            guardrail_summary
+        )
+        if not guardrail_passed:
+            self.training_metrics["probability_calibration_reason"] = "guardrail_" + str(
+                guardrail_summary.get("reason", "rejected")
+            )
+            self.training_metrics["probability_calibration_brier_before"] = brier_before
+            self.training_metrics["probability_calibration_brier_after"] = brier_after
+            self.training_metrics["probability_calibration_brier_improvement"] = float(
+                brier_before - brier_after
+            )
+            self._refresh_oof_probability_diagnostics()
+            self.logger.warning(
+                "Probability calibration rejected by OOF guardrail (%s); keeping raw scores.",
+                guardrail_summary.get("reason", "rejected"),
+            )
+            return
+
         self.probability_calibrator = calibrator
         self.probability_calibration_method_resolved = resolved_method
         self.oof_primary_proba[mask] = calibrated
@@ -8214,9 +8439,9 @@ class ModelTrainer:
             brier_before - brier_after
         )
         self.training_metrics["probability_calibration_reason"] = "applied"
+        self._refresh_oof_probability_diagnostics()
         self.logger.info(
-            "Probability calibration applied using %s on %d OOF rows "
-            "(Brier %.6f -> %.6f)",
+            "Probability calibration applied using %s on %d OOF rows " "(Brier %.6f -> %.6f)",
             resolved_method,
             len(X_cal),
             brier_before,
@@ -8271,7 +8496,11 @@ class ModelTrainer:
         """Resolve the admission thresholds used by the edge policy layer."""
         long_threshold = float(self.training_metrics.get("holdout_long_threshold", np.nan))
         short_threshold = float(self.training_metrics.get("holdout_short_threshold", np.nan))
-        if np.isfinite(long_threshold) and np.isfinite(short_threshold) and long_threshold > short_threshold:
+        if (
+            np.isfinite(long_threshold)
+            and np.isfinite(short_threshold)
+            and long_threshold > short_threshold
+        ):
             return long_threshold, short_threshold
         if self.oof_primary_proba is not None and self.labels is not None:
             derived_long, derived_short = self._derive_signal_thresholds(
@@ -8311,6 +8540,364 @@ class ModelTrainer:
         for key, value in summary.items():
             if isinstance(value, (int, float, np.floating, np.integer)):
                 self.training_metrics[f"{prefix}_signal_funnel_{key}"] = float(value)
+
+    def _record_summary_metrics(self, metric_name: str, summary: dict[str, Any]) -> None:
+        """Persist generic diagnostics payloads and flatten scalar metrics for artifacts."""
+        self.training_metrics[metric_name] = self._json_safe(summary)
+        for key, value in summary.items():
+            if isinstance(value, (np.bool_, bool)):
+                self.training_metrics[f"{metric_name}_{key}"] = float(value)
+            elif isinstance(value, (int, float, np.floating, np.integer)):
+                self.training_metrics[f"{metric_name}_{key}"] = float(value)
+
+    @staticmethod
+    def _summarize_probability_distribution(probabilities: np.ndarray) -> dict[str, Any]:
+        """Summarize score spread to diagnose compression toward the no-trade region."""
+        values = np.asarray(probabilities, dtype=float).reshape(-1)
+        rows = int(values.size)
+        finite = np.clip(values[np.isfinite(values)], 0.0, 1.0)
+        summary: dict[str, Any] = {
+            "rows": rows,
+            "finite_count": int(finite.size),
+            "non_finite_count": int(rows - finite.size),
+        }
+        if finite.size <= 0:
+            summary.update(
+                {
+                    "min": 0.0,
+                    "max": 0.0,
+                    "mean": 0.0,
+                    "std": 0.0,
+                    "span": 0.0,
+                    "p01": 0.0,
+                    "p05": 0.0,
+                    "p25": 0.0,
+                    "p50": 0.0,
+                    "p75": 0.0,
+                    "p95": 0.0,
+                    "p99": 0.0,
+                    "near_mid_count": 0,
+                    "near_mid_rate": 0.0,
+                    "low_confidence_count": 0,
+                    "low_confidence_rate": 0.0,
+                    "tail_count": 0,
+                    "tail_rate": 0.0,
+                }
+            )
+            return summary
+
+        distance_from_mid = np.abs(finite - 0.5)
+        summary.update(
+            {
+                "min": float(np.min(finite)),
+                "max": float(np.max(finite)),
+                "mean": float(np.mean(finite)),
+                "std": float(np.std(finite)),
+                "span": float(np.max(finite) - np.min(finite)),
+                "p01": float(np.quantile(finite, 0.01)),
+                "p05": float(np.quantile(finite, 0.05)),
+                "p25": float(np.quantile(finite, 0.25)),
+                "p50": float(np.quantile(finite, 0.50)),
+                "p75": float(np.quantile(finite, 0.75)),
+                "p95": float(np.quantile(finite, 0.95)),
+                "p99": float(np.quantile(finite, 0.99)),
+                "near_mid_count": int(np.count_nonzero(distance_from_mid <= 0.02)),
+                "near_mid_rate": float(np.mean(distance_from_mid <= 0.02)),
+                "low_confidence_count": int(np.count_nonzero(distance_from_mid <= 0.05)),
+                "low_confidence_rate": float(np.mean(distance_from_mid <= 0.05)),
+                "tail_count": int(np.count_nonzero(distance_from_mid >= 0.10)),
+                "tail_rate": float(np.mean(distance_from_mid >= 0.10)),
+            }
+        )
+        return summary
+
+    @staticmethod
+    def _summarize_probability_shift(
+        baseline_values: np.ndarray,
+        comparison_values: np.ndarray,
+    ) -> dict[str, Any]:
+        """Summarize how much a second score stream compresses or widens probability spread."""
+        baseline = np.asarray(baseline_values, dtype=float).reshape(-1)
+        comparison = np.asarray(comparison_values, dtype=float).reshape(-1)
+        target_len = min(len(baseline), len(comparison))
+        summary: dict[str, Any] = {
+            "rows": int(target_len),
+            "finite_count": 0,
+            "non_finite_count": int(target_len),
+        }
+        if target_len <= 0:
+            summary.update(
+                {
+                    "mean_delta": 0.0,
+                    "std_delta": 0.0,
+                    "mean_abs_delta": 0.0,
+                    "p50_abs_delta": 0.0,
+                    "p95_abs_delta": 0.0,
+                    "max_abs_delta": 0.0,
+                    "toward_mid_count": 0,
+                    "toward_mid_rate": 0.0,
+                    "away_from_mid_count": 0,
+                    "away_from_mid_rate": 0.0,
+                    "mid_cross_count": 0,
+                    "mid_cross_rate": 0.0,
+                    "std_ratio": 1.0,
+                    "span_ratio": 1.0,
+                }
+            )
+            return summary
+
+        baseline = np.clip(baseline[-target_len:], 0.0, 1.0)
+        comparison = np.clip(comparison[-target_len:], 0.0, 1.0)
+        finite_mask = np.isfinite(baseline) & np.isfinite(comparison)
+        baseline = baseline[finite_mask]
+        comparison = comparison[finite_mask]
+        summary["finite_count"] = int(baseline.size)
+        summary["non_finite_count"] = int(target_len - baseline.size)
+        if baseline.size <= 0:
+            summary.update(
+                {
+                    "mean_delta": 0.0,
+                    "std_delta": 0.0,
+                    "mean_abs_delta": 0.0,
+                    "p50_abs_delta": 0.0,
+                    "p95_abs_delta": 0.0,
+                    "max_abs_delta": 0.0,
+                    "toward_mid_count": 0,
+                    "toward_mid_rate": 0.0,
+                    "away_from_mid_count": 0,
+                    "away_from_mid_rate": 0.0,
+                    "mid_cross_count": 0,
+                    "mid_cross_rate": 0.0,
+                    "std_ratio": 1.0,
+                    "span_ratio": 1.0,
+                }
+            )
+            return summary
+
+        delta = comparison - baseline
+        baseline_mid_distance = np.abs(baseline - 0.5)
+        comparison_mid_distance = np.abs(comparison - 0.5)
+        toward_mid = comparison_mid_distance < (baseline_mid_distance - 1e-9)
+        away_from_mid = comparison_mid_distance > (baseline_mid_distance + 1e-9)
+        mid_cross = (
+            ((baseline - 0.5) * (comparison - 0.5) < 0.0)
+            & (baseline_mid_distance > 1e-8)
+            & (comparison_mid_distance > 1e-8)
+        )
+        baseline_std = float(np.std(baseline))
+        comparison_std = float(np.std(comparison))
+        baseline_span = float(np.max(baseline) - np.min(baseline))
+        comparison_span = float(np.max(comparison) - np.min(comparison))
+        abs_delta = np.abs(delta)
+        summary.update(
+            {
+                "mean_delta": float(np.mean(delta)),
+                "std_delta": float(np.std(delta)),
+                "mean_abs_delta": float(np.mean(abs_delta)),
+                "p50_abs_delta": float(np.quantile(abs_delta, 0.50)),
+                "p95_abs_delta": float(np.quantile(abs_delta, 0.95)),
+                "max_abs_delta": float(np.max(abs_delta)),
+                "toward_mid_count": int(np.count_nonzero(toward_mid)),
+                "toward_mid_rate": float(np.mean(toward_mid)),
+                "away_from_mid_count": int(np.count_nonzero(away_from_mid)),
+                "away_from_mid_rate": float(np.mean(away_from_mid)),
+                "mid_cross_count": int(np.count_nonzero(mid_cross)),
+                "mid_cross_rate": float(np.mean(mid_cross)),
+                "std_ratio": (
+                    float(comparison_std / baseline_std) if baseline_std > 1e-12 else 1.0
+                ),
+                "span_ratio": (
+                    float(comparison_span / baseline_span) if baseline_span > 1e-12 else 1.0
+                ),
+            }
+        )
+        return summary
+
+    @staticmethod
+    def _summarize_threshold_hits(
+        probabilities: np.ndarray,
+        long_thresholds: float | np.ndarray,
+        short_thresholds: float | np.ndarray,
+    ) -> dict[str, Any]:
+        """Summarize score hits above/below thresholds to expose no-trade compression."""
+        values = np.asarray(probabilities, dtype=float).reshape(-1)
+        if np.isscalar(long_thresholds):
+            long_values = np.full(len(values), float(long_thresholds), dtype=float)
+        else:
+            long_values = np.asarray(long_thresholds, dtype=float).reshape(-1)
+        if np.isscalar(short_thresholds):
+            short_values = np.full(len(values), float(short_thresholds), dtype=float)
+        else:
+            short_values = np.asarray(short_thresholds, dtype=float).reshape(-1)
+        target_len = min(len(values), len(long_values), len(short_values))
+        summary: dict[str, Any] = {
+            "rows": int(target_len),
+            "finite_count": 0,
+            "non_finite_count": int(target_len),
+        }
+        if target_len <= 0:
+            summary.update(
+                {
+                    "long_hit_count": 0,
+                    "short_hit_count": 0,
+                    "active_count": 0,
+                    "within_band_count": 0,
+                    "long_hit_rate": 0.0,
+                    "short_hit_rate": 0.0,
+                    "active_rate": 0.0,
+                    "within_band_rate": 0.0,
+                    "mean_long_threshold": 0.0,
+                    "mean_short_threshold": 0.0,
+                    "mean_threshold_gap": 0.0,
+                    "min_threshold_gap": 0.0,
+                    "max_threshold_gap": 0.0,
+                    "threshold_overlap_count": 0,
+                }
+            )
+            return summary
+
+        values = values[-target_len:]
+        long_values = long_values[-target_len:]
+        short_values = short_values[-target_len:]
+        finite_mask = np.isfinite(values) & np.isfinite(long_values) & np.isfinite(short_values)
+        values = values[finite_mask]
+        long_values = long_values[finite_mask]
+        short_values = short_values[finite_mask]
+        summary["finite_count"] = int(values.size)
+        summary["non_finite_count"] = int(target_len - values.size)
+        if values.size <= 0:
+            summary.update(
+                {
+                    "long_hit_count": 0,
+                    "short_hit_count": 0,
+                    "active_count": 0,
+                    "within_band_count": 0,
+                    "long_hit_rate": 0.0,
+                    "short_hit_rate": 0.0,
+                    "active_rate": 0.0,
+                    "within_band_rate": 0.0,
+                    "mean_long_threshold": 0.0,
+                    "mean_short_threshold": 0.0,
+                    "mean_threshold_gap": 0.0,
+                    "min_threshold_gap": 0.0,
+                    "max_threshold_gap": 0.0,
+                    "threshold_overlap_count": 0,
+                }
+            )
+            return summary
+
+        long_hit = values >= long_values
+        short_hit = values <= short_values
+        active = long_hit | short_hit
+        gap = long_values - short_values
+        summary.update(
+            {
+                "long_hit_count": int(np.count_nonzero(long_hit)),
+                "short_hit_count": int(np.count_nonzero(short_hit)),
+                "active_count": int(np.count_nonzero(active)),
+                "within_band_count": int(np.count_nonzero(~active)),
+                "long_hit_rate": float(np.mean(long_hit)),
+                "short_hit_rate": float(np.mean(short_hit)),
+                "active_rate": float(np.mean(active)),
+                "within_band_rate": float(np.mean(~active)),
+                "mean_long_threshold": float(np.mean(long_values)),
+                "mean_short_threshold": float(np.mean(short_values)),
+                "mean_threshold_gap": float(np.mean(gap)),
+                "min_threshold_gap": float(np.min(gap)),
+                "max_threshold_gap": float(np.max(gap)),
+                "threshold_overlap_count": int(np.count_nonzero(gap <= 0.0)),
+            }
+        )
+        return summary
+
+    @staticmethod
+    def _summarize_signal_activity(
+        signal_values: np.ndarray,
+        *,
+        positions: np.ndarray | None = None,
+        trade_mask: np.ndarray | None = None,
+        entry_mask: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """Summarize final signal activity after execution-aware filtering."""
+        signals = np.asarray(signal_values, dtype=float).reshape(-1)
+        rows = int(signals.size)
+        active_mask = np.isfinite(signals) & (np.abs(signals) > 1e-8)
+        summary: dict[str, Any] = {
+            "rows": rows,
+            "active_signal_count": int(np.count_nonzero(active_mask)),
+            "active_signal_rate": float(np.mean(active_mask)) if rows else 0.0,
+            "long_signal_count": int(np.count_nonzero(signals > 1e-8)),
+            "short_signal_count": int(np.count_nonzero(signals < -1e-8)),
+        }
+        if positions is not None:
+            position_values = np.asarray(positions, dtype=float).reshape(-1)
+            target_len = min(len(position_values), rows)
+            if target_len > 0:
+                position_values = position_values[-target_len:]
+                summary["position_active_count"] = int(
+                    np.count_nonzero(np.abs(position_values) > 1e-8)
+                )
+                summary["mean_abs_position"] = float(np.mean(np.abs(position_values)))
+        if trade_mask is not None:
+            trade_values = np.asarray(trade_mask, dtype=bool).reshape(-1)
+            target_len = min(len(trade_values), rows)
+            if target_len > 0:
+                summary["trade_mask_count"] = int(np.count_nonzero(trade_values[-target_len:]))
+        if entry_mask is not None:
+            entry_values = np.asarray(entry_mask, dtype=bool).reshape(-1)
+            target_len = min(len(entry_values), rows)
+            if target_len > 0:
+                summary["entry_count"] = int(np.count_nonzero(entry_values[-target_len:]))
+        return summary
+
+    def _refresh_oof_probability_diagnostics(
+        self,
+        *,
+        long_threshold: float | None = None,
+        short_threshold: float | None = None,
+    ) -> None:
+        """Refresh OOF diagnostics after calibration or threshold changes."""
+        raw_values = (
+            np.asarray(self.oof_primary_proba_raw, dtype=float).reshape(-1)
+            if self.oof_primary_proba_raw is not None
+            else None
+        )
+        calibrated_values = (
+            np.asarray(self.oof_primary_proba, dtype=float).reshape(-1)
+            if self.oof_primary_proba is not None
+            else None
+        )
+        if raw_values is None and calibrated_values is None:
+            return
+        if raw_values is None and calibrated_values is not None:
+            raw_values = calibrated_values.copy()
+        if calibrated_values is None and raw_values is not None:
+            calibrated_values = raw_values.copy()
+        if raw_values is None or calibrated_values is None:
+            return
+
+        self._record_summary_metrics(
+            "oof_raw_probability_distribution",
+            self._summarize_probability_distribution(raw_values),
+        )
+        self._record_summary_metrics(
+            "oof_calibrated_probability_distribution",
+            self._summarize_probability_distribution(calibrated_values),
+        )
+        self._record_summary_metrics(
+            "oof_raw_to_calibrated_probability_shift",
+            self._summarize_probability_shift(raw_values, calibrated_values),
+        )
+        if long_threshold is None or short_threshold is None:
+            return
+        self._record_summary_metrics(
+            "oof_raw_threshold_hits",
+            self._summarize_threshold_hits(raw_values, long_threshold, short_threshold),
+        )
+        self._record_summary_metrics(
+            "oof_calibrated_threshold_hits",
+            self._summarize_threshold_hits(calibrated_values, long_threshold, short_threshold),
+        )
 
     def _build_signal_funnel_summary(
         self,
@@ -8377,35 +8964,27 @@ class ModelTrainer:
                 "edge_pass_probability",
                 "regime_policy_min_pass_probability",
             }.issubset(policy.columns):
-                pass_probability_mask = (
-                    np.isfinite(policy["edge_pass_probability"].to_numpy(dtype=float))
-                    & (
-                        policy["edge_pass_probability"].to_numpy(dtype=float)
-                        >= policy["regime_policy_min_pass_probability"].to_numpy(dtype=float)
-                    )
+                pass_probability_mask = np.isfinite(
+                    policy["edge_pass_probability"].to_numpy(dtype=float)
+                ) & (
+                    policy["edge_pass_probability"].to_numpy(dtype=float)
+                    >= policy["regime_policy_min_pass_probability"].to_numpy(dtype=float)
                 )
             if {"expected_edge", "regime_policy_min_expected_edge"}.issubset(policy.columns):
-                expected_edge_mask = (
-                    np.isfinite(policy["expected_edge"].to_numpy(dtype=float))
-                    & (
-                        policy["expected_edge"].to_numpy(dtype=float)
-                        >= policy["regime_policy_min_expected_edge"].to_numpy(dtype=float)
-                    )
+                expected_edge_mask = np.isfinite(policy["expected_edge"].to_numpy(dtype=float)) & (
+                    policy["expected_edge"].to_numpy(dtype=float)
+                    >= policy["regime_policy_min_expected_edge"].to_numpy(dtype=float)
                 )
             if "edge_policy_pass" in policy.columns:
-                selected_mask = (
-                    candidate_with_return_mask
-                    & policy["edge_policy_pass"].to_numpy(dtype=bool)
+                selected_mask = candidate_with_return_mask & policy["edge_policy_pass"].to_numpy(
+                    dtype=bool
                 )
             blocked_by_regime_mask = candidate_mask & ~regime_enabled_mask
             blocked_by_probability_mask = (
                 candidate_mask & regime_enabled_mask & ~pass_probability_mask
             )
             blocked_by_expected_edge_mask = (
-                candidate_mask
-                & regime_enabled_mask
-                & pass_probability_mask
-                & ~expected_edge_mask
+                candidate_mask & regime_enabled_mask & pass_probability_mask & ~expected_edge_mask
             )
 
         def _candidate_return_mean(mask: np.ndarray) -> float:
@@ -8428,7 +9007,9 @@ class ModelTrainer:
             return {
                 "rows": group_rows,
                 "candidate_count": candidate_count,
-                "candidate_with_return_count": int(np.count_nonzero(group_candidate_with_return_mask)),
+                "candidate_with_return_count": int(
+                    np.count_nonzero(group_candidate_with_return_mask)
+                ),
                 "selected_count": selected_count,
                 "candidate_rate": float(candidate_count / group_rows) if group_rows else 0.0,
                 "selected_rate": float(selected_count / group_rows) if group_rows else 0.0,
@@ -8444,11 +9025,11 @@ class ModelTrainer:
                 ),
                 "candidate_mean_trade_return": candidate_mean_trade_return,
                 "selected_mean_trade_return": selected_mean_trade_return,
-                "selected_edge_lift": float(
-                    selected_mean_trade_return - candidate_mean_trade_return
-                )
-                if candidate_count
-                else 0.0,
+                "selected_edge_lift": (
+                    float(selected_mean_trade_return - candidate_mean_trade_return)
+                    if candidate_count
+                    else 0.0
+                ),
                 "selected_win_rate": _selected_win_rate(group_selected_mask),
             }
 
@@ -8532,7 +9113,9 @@ class ModelTrainer:
         if holdout_trade_returns is None:
             return {"source": "missing_returns"}
 
-        aligned_len = min(len(self.holdout_features), len(holdout_probabilities), len(holdout_trade_returns))
+        aligned_len = min(
+            len(self.holdout_features), len(holdout_probabilities), len(holdout_trade_returns)
+        )
         if aligned_len <= 1:
             return {"source": "insufficient_rows"}
         holdout_frame = self.holdout_features.iloc[-aligned_len:].reset_index(drop=True)
@@ -8561,7 +9144,9 @@ class ModelTrainer:
             & policy_frame["edge_policy_pass"].to_numpy(dtype=bool)
             & np.isfinite(holdout_trade_returns)
         )
-        candidate_returns = holdout_trade_returns[candidate_mask & np.isfinite(holdout_trade_returns)]
+        candidate_returns = holdout_trade_returns[
+            candidate_mask & np.isfinite(holdout_trade_returns)
+        ]
         selected_returns = holdout_trade_returns[selected_mask]
         expected_edge = policy_frame["expected_edge"].to_numpy(dtype=float)
         corr_mask = candidate_mask & np.isfinite(holdout_trade_returns) & np.isfinite(expected_edge)
@@ -8612,9 +9197,7 @@ class ModelTrainer:
             "expected_edge_correlation": correlation,
             "regime_policy_enabled": float(bool(regime_policy and regime_policy.get("enabled"))),
             "regime_count": float(
-                len(regime_policy.get("regimes", {}))
-                if isinstance(regime_policy, dict)
-                else 0
+                len(regime_policy.get("regimes", {})) if isinstance(regime_policy, dict) else 0
             ),
         }
 
@@ -9050,7 +9633,9 @@ class ModelTrainer:
                 else 0.0
             )
             calmar = annual_return / max_dd if max_dd > 1e-9 else annual_return
-            cumulative_pnl = float(np.sum(performance_returns)) if performance_returns.size > 0 else 0.0
+            cumulative_pnl = (
+                float(np.sum(performance_returns)) if performance_returns.size > 0 else 0.0
+            )
             loss_pnl = (
                 float(np.sum(performance_returns[performance_returns < 0.0]))
                 if performance_returns.size > 0
@@ -9297,12 +9882,14 @@ class ModelTrainer:
         realized_returns: np.ndarray | None = None,
         timestamps: np.ndarray | None = None,
         symbols: np.ndarray | None = None,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, Any]:
         """Build execution-aware position profile from probabilities."""
         y_proba = np.asarray(y_proba, dtype=float)
         n_samples = len(y_proba)
         if n_samples == 0:
             return {
+                "base_long_threshold_series": np.array([], dtype=float),
+                "base_short_threshold_series": np.array([], dtype=float),
                 "long_threshold_series": np.array([], dtype=float),
                 "short_threshold_series": np.array([], dtype=float),
                 "raw_signals": np.array([], dtype=float),
@@ -9310,11 +9897,54 @@ class ModelTrainer:
                 "turnover_series": np.array([], dtype=float),
                 "trade_mask": np.array([], dtype=bool),
                 "entry_mask": np.array([], dtype=bool),
+                "diagnostics": {
+                    "base_threshold_hits": self._summarize_threshold_hits(
+                        np.array([], dtype=float),
+                        np.array([], dtype=float),
+                        np.array([], dtype=float),
+                    ),
+                    "band_threshold_hits": self._summarize_threshold_hits(
+                        np.array([], dtype=float),
+                        np.array([], dtype=float),
+                        np.array([], dtype=float),
+                    ),
+                    "final_signal_summary": self._summarize_signal_activity(
+                        np.array([], dtype=float),
+                    ),
+                    "band_adjustment_summary": {
+                        "rows": 0,
+                        "dynamic_band_enabled": bool(self.config.dynamic_no_trade_band),
+                        "target_activity_rate": 0.0,
+                        "dynamic_relaxation_applied": False,
+                        "dynamic_relaxation_level": 0.0,
+                        "forced_tail_applied": False,
+                        "emergency_relaxation_applied": False,
+                        "cooldown_suppressed_count": 0,
+                        "symbol_cap_suppressed_count": 0,
+                        "mean_long_threshold_shift": 0.0,
+                        "mean_short_threshold_shift": 0.0,
+                        "max_long_threshold_shift": 0.0,
+                        "max_short_threshold_shift": 0.0,
+                        "adaptive_band_mean": 0.0,
+                        "adaptive_band_max": 0.0,
+                        "adaptive_band_nonzero_count": 0,
+                        "base_active_rate": 0.0,
+                        "band_active_rate": 0.0,
+                        "final_signal_rate": 0.0,
+                        "suppressed_signal_count": 0,
+                    },
+                },
             }
 
-        long_series = np.full(n_samples, float(long_threshold), dtype=float)
-        short_series = np.full(n_samples, float(short_threshold), dtype=float)
+        base_long_series = np.full(n_samples, float(long_threshold), dtype=float)
+        base_short_series = np.full(n_samples, float(short_threshold), dtype=float)
+        long_series = base_long_series.copy()
+        short_series = base_short_series.copy()
         adaptive_band = np.zeros(n_samples, dtype=float)
+        target_activity_rate = 0.0
+        dynamic_relaxation_level = 0.0
+        forced_tail_applied = False
+        emergency_relaxation_applied = False
         if self.config.dynamic_no_trade_band:
             uncertainty = 1.0 - (2.0 * np.abs(y_proba - 0.5))
             uncertainty = np.clip(uncertainty, 0.0, 1.0)
@@ -9360,6 +9990,7 @@ class ModelTrainer:
                 relaxation = float(
                     np.clip(shortfall / max(target_activity_rate * 0.50, 1e-9), 0.0, 1.0)
                 )
+                dynamic_relaxation_level = float(max(dynamic_relaxation_level, float(relaxation)))
                 relaxed_band = adaptive_band * (1.0 - 0.75 * relaxation)
                 long_series = np.clip(float(long_threshold) + relaxed_band, 0.51, 0.995)
                 short_series = np.clip(float(short_threshold) - relaxed_band, 0.005, 0.49)
@@ -9367,6 +9998,7 @@ class ModelTrainer:
                 observed_activity = float(np.mean(raw_signals != 0.0))
 
             if observed_activity < (target_activity_rate * 0.50):
+                forced_tail_applied = True
                 forced_tail = float(min(0.35, max(0.06, target_activity_rate * 1.25)))
                 forced_long = float(np.quantile(y_proba, 1.0 - forced_tail))
                 forced_short = float(np.quantile(y_proba, forced_tail))
@@ -9380,6 +10012,7 @@ class ModelTrainer:
                 observed_activity = float(np.mean(raw_signals != 0.0))
 
             if observed_activity < (target_activity_rate * 0.50):
+                emergency_relaxation_applied = True
                 center = float(np.clip(np.median(y_proba), 0.45, 0.55))
                 dispersion = float(np.std(y_proba))
                 center_band = float(np.clip(max(0.02, dispersion * 0.75), 0.02, 0.10))
@@ -9444,13 +10077,17 @@ class ModelTrainer:
 
                 raw_signals = _generate_signals(long_series, short_series)
 
+        band_threshold_hits = self._summarize_threshold_hits(y_proba, long_series, short_series)
+
         # Execution cooldown suppresses immediate direction flips in noisy regions.
         cooldown_bars = int(self.config.execution_cooldown_bars)
+        cooldown_suppressed_count = 0
         if cooldown_bars > 0 and n_samples > 1:
-            filtered_signals = raw_signals.copy()
+            pre_cooldown_signals = raw_signals.copy()
+            filtered_signals = pre_cooldown_signals.copy()
             last_entry_idx = -(10**9)
             last_direction = 0.0
-            for idx, signal in enumerate(raw_signals):
+            for idx, signal in enumerate(pre_cooldown_signals):
                 if signal == 0.0:
                     continue
                 direction = float(np.sign(signal))
@@ -9461,15 +10098,22 @@ class ModelTrainer:
                     last_entry_idx = idx
                     last_direction = direction
             raw_signals = filtered_signals
+            cooldown_suppressed_count = int(
+                np.count_nonzero(
+                    (np.abs(pre_cooldown_signals) > 1e-8) & (np.abs(raw_signals) <= 1e-8)
+                )
+            )
 
         # Symbol diversification guardrail: thin weakest entries from dominant symbols
         # to reduce concentration risk while preserving strongest edges.
+        symbol_cap_suppressed_count = 0
         if symbols is not None:
             symbols_arr = np.asarray(symbols, dtype=object).reshape(-1)
             if symbols_arr.size == n_samples:
                 unique_symbols = pd.unique(pd.Series(symbols_arr.astype(str)))
                 unique_count = int(len(unique_symbols))
                 if unique_count >= 2:
+                    pre_symbol_cap_signals = raw_signals.copy()
                     min_balanced_share = float(1.0 / max(1, unique_count))
                     symbol_share_cap = float(
                         max(
@@ -9517,6 +10161,11 @@ class ModelTrainer:
                         if not changed:
                             break
                     raw_signals = adjusted_signals
+                    symbol_cap_suppressed_count = int(
+                        np.count_nonzero(
+                            (np.abs(pre_symbol_cap_signals) > 1e-8) & (np.abs(raw_signals) <= 1e-8)
+                        )
+                    )
 
         proba_proxy = np.abs(np.diff(y_proba, prepend=y_proba[0]))
         rolling_vol = (
@@ -9543,8 +10192,49 @@ class ModelTrainer:
         entry_mask = trade_mask & (
             (np.abs(prev_positions) <= 1e-8) | (np.sign(positions) != np.sign(prev_positions))
         )
+        base_threshold_hits = self._summarize_threshold_hits(
+            y_proba,
+            base_long_series,
+            base_short_series,
+        )
+        final_signal_summary = self._summarize_signal_activity(
+            raw_signals,
+            positions=positions,
+            trade_mask=trade_mask,
+            entry_mask=entry_mask,
+        )
+        band_adjustment_summary = {
+            "rows": int(n_samples),
+            "dynamic_band_enabled": bool(self.config.dynamic_no_trade_band),
+            "target_activity_rate": float(target_activity_rate),
+            "dynamic_relaxation_applied": bool(dynamic_relaxation_level > 0.0),
+            "dynamic_relaxation_level": float(dynamic_relaxation_level),
+            "forced_tail_applied": bool(forced_tail_applied),
+            "emergency_relaxation_applied": bool(emergency_relaxation_applied),
+            "cooldown_suppressed_count": int(cooldown_suppressed_count),
+            "symbol_cap_suppressed_count": int(symbol_cap_suppressed_count),
+            "mean_long_threshold_shift": float(np.mean(long_series - base_long_series)),
+            "mean_short_threshold_shift": float(np.mean(base_short_series - short_series)),
+            "max_long_threshold_shift": float(np.max(long_series - base_long_series)),
+            "max_short_threshold_shift": float(np.max(base_short_series - short_series)),
+            "adaptive_band_mean": float(np.mean(adaptive_band)) if adaptive_band.size > 0 else 0.0,
+            "adaptive_band_max": float(np.max(adaptive_band)) if adaptive_band.size > 0 else 0.0,
+            "adaptive_band_nonzero_count": int(np.count_nonzero(adaptive_band > 1e-12)),
+            "base_active_rate": float(base_threshold_hits.get("active_rate", 0.0)),
+            "band_active_rate": float(band_threshold_hits.get("active_rate", 0.0)),
+            "final_signal_rate": float(final_signal_summary.get("active_signal_rate", 0.0)),
+            "suppressed_signal_count": int(
+                max(
+                    0,
+                    int(band_threshold_hits.get("active_count", 0))
+                    - int(final_signal_summary.get("active_signal_count", 0)),
+                )
+            ),
+        }
 
         return {
+            "base_long_threshold_series": base_long_series.astype(float),
+            "base_short_threshold_series": base_short_series.astype(float),
             "long_threshold_series": long_series.astype(float),
             "short_threshold_series": short_series.astype(float),
             "raw_signals": raw_signals.astype(float),
@@ -9552,6 +10242,12 @@ class ModelTrainer:
             "turnover_series": turnover_series.astype(float),
             "trade_mask": trade_mask.astype(bool),
             "entry_mask": entry_mask.astype(bool),
+            "diagnostics": {
+                "base_threshold_hits": base_threshold_hits,
+                "band_threshold_hits": band_threshold_hits,
+                "final_signal_summary": final_signal_summary,
+                "band_adjustment_summary": band_adjustment_summary,
+            },
         }
 
     def _compute_single_stream_net_returns(
@@ -9565,7 +10261,7 @@ class ModelTrainer:
         returns_are_cost_aware: bool,
         timestamps: np.ndarray | None,
         symbols: np.ndarray | None,
-    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         """Compute execution profile and net returns for a single stream."""
         execution_profile = self._build_execution_profile(
             y_proba=y_proba,
@@ -9674,7 +10370,7 @@ class ModelTrainer:
         timestamps: np.ndarray | None = None,
         symbols: np.ndarray | None = None,
         return_details: bool = False,
-    ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
+    ) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
         """Compute strategy net returns from model signals and realized returns."""
         y_true = np.asarray(y_true)
         y_proba = np.asarray(y_proba)
@@ -9683,6 +10379,11 @@ class ModelTrainer:
             empty_returns = np.array([], dtype=float)
             if return_details:
                 return empty_returns, {
+                    "base_long_threshold_series": np.array([], dtype=float),
+                    "base_short_threshold_series": np.array([], dtype=float),
+                    "long_threshold_series": np.array([], dtype=float),
+                    "short_threshold_series": np.array([], dtype=float),
+                    "raw_signals": np.array([], dtype=float),
                     "positions": np.array([], dtype=float),
                     "turnover_series": np.array([], dtype=float),
                     "trade_mask": np.array([], dtype=bool),
@@ -9752,6 +10453,11 @@ class ModelTrainer:
 
         if unique_symbol_count >= 2:
             row_net_returns = np.zeros(n_rows, dtype=float)
+            row_base_long_threshold_series = np.full(n_rows, float(long_threshold), dtype=float)
+            row_base_short_threshold_series = np.full(n_rows, float(short_threshold), dtype=float)
+            row_long_threshold_series = np.full(n_rows, float(long_threshold), dtype=float)
+            row_short_threshold_series = np.full(n_rows, float(short_threshold), dtype=float)
+            row_raw_signals = np.zeros(n_rows, dtype=float)
             row_positions = np.zeros(n_rows, dtype=float)
             row_turnover = np.zeros(n_rows, dtype=float)
             row_trade_mask = np.zeros(n_rows, dtype=bool)
@@ -9793,6 +10499,38 @@ class ModelTrainer:
                     symbols=None,
                 )
                 row_net_returns[symbol_idx] = np.asarray(symbol_net, dtype=float)
+                row_base_long_threshold_series[symbol_idx] = np.asarray(
+                    symbol_details.get(
+                        "base_long_threshold_series",
+                        np.full(len(symbol_idx), float(long_threshold), dtype=float),
+                    ),
+                    dtype=float,
+                )
+                row_base_short_threshold_series[symbol_idx] = np.asarray(
+                    symbol_details.get(
+                        "base_short_threshold_series",
+                        np.full(len(symbol_idx), float(short_threshold), dtype=float),
+                    ),
+                    dtype=float,
+                )
+                row_long_threshold_series[symbol_idx] = np.asarray(
+                    symbol_details.get(
+                        "long_threshold_series",
+                        np.full(len(symbol_idx), float(long_threshold), dtype=float),
+                    ),
+                    dtype=float,
+                )
+                row_short_threshold_series[symbol_idx] = np.asarray(
+                    symbol_details.get(
+                        "short_threshold_series",
+                        np.full(len(symbol_idx), float(short_threshold), dtype=float),
+                    ),
+                    dtype=float,
+                )
+                row_raw_signals[symbol_idx] = np.asarray(
+                    symbol_details.get("raw_signals", np.zeros(len(symbol_idx), dtype=float)),
+                    dtype=float,
+                )
                 row_positions[symbol_idx] = np.asarray(
                     symbol_details.get("positions", np.zeros(len(symbol_idx))),
                     dtype=float,
@@ -9810,7 +10548,12 @@ class ModelTrainer:
                     dtype=bool,
                 )
 
-            execution_profile: dict[str, np.ndarray] = {
+            execution_profile: dict[str, Any] = {
+                "base_long_threshold_series": row_base_long_threshold_series,
+                "base_short_threshold_series": row_base_short_threshold_series,
+                "long_threshold_series": row_long_threshold_series,
+                "short_threshold_series": row_short_threshold_series,
+                "raw_signals": row_raw_signals,
                 "positions": row_positions,
                 "turnover_series": row_turnover,
                 "trade_mask": row_trade_mask,
@@ -10166,6 +10909,7 @@ class ModelTrainer:
         X_holdout = self.holdout_features.values
         y_holdout = self.holdout_labels.to_numpy(dtype=float)
         y_holdout_pred = np.asarray(self.model.predict(X_holdout))
+        y_holdout_raw_proba = np.asarray(self._get_raw_predictions_proba(self.model, X_holdout))
         y_holdout_proba = np.asarray(self._get_predictions_proba(self.model, X_holdout))
         train_proba = np.asarray(self._get_predictions_proba(self.model, self.features.values))
         train_labels = self.labels.to_numpy(dtype=float) if self.labels is not None else None
@@ -10176,9 +10920,16 @@ class ModelTrainer:
             train_regimes=self.regimes,
         )
         holdout_raw_rows = int(len(y_holdout))
-        holdout_eval_len = min(len(y_holdout), len(y_holdout_pred), len(y_holdout_proba))
+        holdout_eval_len = min(
+            len(y_holdout),
+            len(y_holdout_pred),
+            len(y_holdout_raw_proba),
+            len(y_holdout_proba),
+        )
         if holdout_eval_len <= 1:
-            self.logger.warning("Insufficient aligned holdout predictions, skipping holdout metrics")
+            self.logger.warning(
+                "Insufficient aligned holdout predictions, skipping holdout metrics"
+            )
             return
 
         def _align_holdout_array(
@@ -10196,6 +10947,7 @@ class ModelTrainer:
         if holdout_eval_len != holdout_raw_rows:
             y_holdout = y_holdout[-holdout_eval_len:]
             y_holdout_pred = y_holdout_pred[-holdout_eval_len:]
+            y_holdout_raw_proba = y_holdout_raw_proba[-holdout_eval_len:]
             y_holdout_proba = y_holdout_proba[-holdout_eval_len:]
             self.logger.info("Aligned holdout sequence outputs to %d samples", holdout_eval_len)
 
@@ -10214,6 +10966,212 @@ class ModelTrainer:
             self.holdout_primary_event_directions,
             dtype=float,
         )
+        if holdout_timestamps is not None and len(holdout_timestamps) == len(y_holdout):
+            ts_dt = pd.to_datetime(holdout_timestamps, utc=True, errors="coerce")
+            if not ts_dt.isna().all():
+                sort_idx = np.argsort(
+                    np.asarray(ts_dt.view("int64"), dtype=np.int64), kind="stable"
+                )
+                y_holdout = y_holdout[sort_idx]
+                y_holdout_pred = y_holdout_pred[sort_idx]
+                y_holdout_raw_proba = y_holdout_raw_proba[sort_idx]
+                y_holdout_proba = y_holdout_proba[sort_idx]
+                holdout_timestamps = holdout_timestamps[sort_idx]
+                if holdout_symbols_arr is not None and len(holdout_symbols_arr) == len(sort_idx):
+                    holdout_symbols_arr = holdout_symbols_arr[sort_idx]
+                if holdout_regimes is not None and len(holdout_regimes) == len(sort_idx):
+                    holdout_regimes = holdout_regimes[sort_idx]
+                if holdout_primary_forward_returns is not None and len(
+                    holdout_primary_forward_returns
+                ) == len(sort_idx):
+                    holdout_primary_forward_returns = holdout_primary_forward_returns[sort_idx]
+                if holdout_cost_aware_event_returns is not None and len(
+                    holdout_cost_aware_event_returns
+                ) == len(sort_idx):
+                    holdout_cost_aware_event_returns = holdout_cost_aware_event_returns[sort_idx]
+                if holdout_primary_event_directions is not None and len(
+                    holdout_primary_event_directions
+                ) == len(sort_idx):
+                    holdout_primary_event_directions = holdout_primary_event_directions[sort_idx]
+
+        self._refresh_oof_probability_diagnostics(
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+        )
+        self._record_summary_metrics(
+            "holdout_raw_probability_distribution",
+            self._summarize_probability_distribution(y_holdout_raw_proba),
+        )
+        self._record_summary_metrics(
+            "holdout_calibrated_probability_distribution",
+            self._summarize_probability_distribution(y_holdout_proba),
+        )
+        self._record_summary_metrics(
+            "holdout_raw_to_calibrated_probability_shift",
+            self._summarize_probability_shift(y_holdout_raw_proba, y_holdout_proba),
+        )
+        self._record_summary_metrics(
+            "holdout_raw_threshold_hits",
+            self._summarize_threshold_hits(y_holdout_raw_proba, long_threshold, short_threshold),
+        )
+        self._record_summary_metrics(
+            "holdout_calibrated_threshold_hits",
+            self._summarize_threshold_hits(y_holdout_proba, long_threshold, short_threshold),
+        )
+
+        holdout_signed_returns = self._resolve_signed_realized_returns(
+            forward_returns=holdout_primary_forward_returns,
+            event_net_returns=holdout_cost_aware_event_returns,
+            event_directions=holdout_primary_event_directions,
+        )
+        holdout_base_signal = derive_base_signal(
+            y_holdout_proba,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+        )
+        holdout_trade_returns = self._resolve_trade_realized_returns(
+            holdout_signed_returns,
+            holdout_base_signal,
+        )
+        _, holdout_execution_details = self._compute_net_returns(
+            y_holdout,
+            y_holdout_proba,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+            realized_forward_returns=holdout_primary_forward_returns,
+            event_net_returns=holdout_cost_aware_event_returns,
+            event_directions=holdout_primary_event_directions,
+            timestamps=holdout_timestamps,
+            symbols=holdout_symbols_arr,
+            return_details=True,
+        )
+        holdout_execution_long_series = np.asarray(
+            holdout_execution_details.get(
+                "long_threshold_series",
+                np.full(len(y_holdout_proba), float(long_threshold), dtype=float),
+            ),
+            dtype=float,
+        )
+        holdout_execution_short_series = np.asarray(
+            holdout_execution_details.get(
+                "short_threshold_series",
+                np.full(len(y_holdout_proba), float(short_threshold), dtype=float),
+            ),
+            dtype=float,
+        )
+        holdout_execution_signal = np.asarray(
+            holdout_execution_details.get("raw_signals", holdout_base_signal),
+            dtype=float,
+        )
+        holdout_execution_threshold_hits = self._summarize_threshold_hits(
+            y_holdout_proba,
+            holdout_execution_long_series,
+            holdout_execution_short_series,
+        )
+        self._record_summary_metrics(
+            "holdout_execution_threshold_hits",
+            holdout_execution_threshold_hits,
+        )
+        holdout_execution_signal_activity = self._summarize_signal_activity(
+            holdout_execution_signal,
+            positions=holdout_execution_details.get("positions"),
+            trade_mask=holdout_execution_details.get(
+                "portfolio_trade_mask",
+                holdout_execution_details.get("trade_mask"),
+            ),
+            entry_mask=holdout_execution_details.get(
+                "portfolio_entry_mask",
+                holdout_execution_details.get("entry_mask"),
+            ),
+        )
+        self._record_summary_metrics(
+            "holdout_execution_signal_activity",
+            holdout_execution_signal_activity,
+        )
+        holdout_execution_base_long_series = np.asarray(
+            holdout_execution_details.get(
+                "base_long_threshold_series",
+                np.full(len(y_holdout_proba), float(long_threshold), dtype=float),
+            ),
+            dtype=float,
+        )
+        holdout_execution_base_short_series = np.asarray(
+            holdout_execution_details.get(
+                "base_short_threshold_series",
+                np.full(len(y_holdout_proba), float(short_threshold), dtype=float),
+            ),
+            dtype=float,
+        )
+        self._record_summary_metrics(
+            "holdout_execution_band_adjustment_summary",
+            {
+                "rows": int(len(y_holdout_proba)),
+                "mean_long_threshold_shift": float(
+                    np.mean(holdout_execution_long_series - holdout_execution_base_long_series)
+                ),
+                "mean_short_threshold_shift": float(
+                    np.mean(holdout_execution_base_short_series - holdout_execution_short_series)
+                ),
+                "max_long_threshold_shift": float(
+                    np.max(holdout_execution_long_series - holdout_execution_base_long_series)
+                ),
+                "max_short_threshold_shift": float(
+                    np.max(holdout_execution_base_short_series - holdout_execution_short_series)
+                ),
+                "base_active_rate": float(
+                    self.training_metrics.get("holdout_calibrated_threshold_hits_active_rate", 0.0)
+                ),
+                "band_active_rate": float(holdout_execution_threshold_hits.get("active_rate", 0.0)),
+                "final_signal_rate": float(
+                    holdout_execution_signal_activity.get("active_signal_rate", 0.0)
+                ),
+                "suppressed_signal_count": int(
+                    max(
+                        0,
+                        int(holdout_execution_threshold_hits.get("active_count", 0))
+                        - int(holdout_execution_signal_activity.get("active_signal_count", 0)),
+                    )
+                ),
+            },
+        )
+        if holdout_trade_returns is not None:
+            holdout_base_funnel, holdout_base_by_symbol, holdout_base_by_regime = (
+                self._build_signal_funnel_summary(
+                    probabilities=y_holdout_proba,
+                    signal_values=holdout_base_signal,
+                    trade_returns=holdout_trade_returns,
+                    symbols=holdout_symbols_arr,
+                    regimes=holdout_regimes,
+                )
+            )
+            self._record_signal_funnel_metrics(
+                "holdout_base",
+                holdout_base_funnel,
+                by_symbol=holdout_base_by_symbol,
+                by_regime=holdout_base_by_regime,
+            )
+            holdout_execution_trade_returns = self._resolve_trade_realized_returns(
+                holdout_signed_returns,
+                holdout_execution_signal,
+            )
+            if holdout_execution_trade_returns is not None:
+                (
+                    holdout_execution_funnel,
+                    holdout_execution_by_symbol,
+                    holdout_execution_by_regime,
+                ) = self._build_signal_funnel_summary(
+                    probabilities=y_holdout_proba,
+                    signal_values=holdout_execution_signal,
+                    trade_returns=holdout_execution_trade_returns,
+                    symbols=holdout_symbols_arr,
+                    regimes=holdout_regimes,
+                )
+                self._record_signal_funnel_metrics(
+                    "holdout_execution",
+                    holdout_execution_funnel,
+                    by_symbol=holdout_execution_by_symbol,
+                    by_regime=holdout_execution_by_regime,
+                )
 
         holdout_metrics = self._calculate_fold_metrics(
             y_true=y_holdout,
@@ -10271,7 +11229,8 @@ class ModelTrainer:
                     ),
                     timestamps=(
                         np.asarray(holdout_timestamps, dtype="datetime64[ns]")[regime_mask]
-                        if holdout_timestamps is not None and len(holdout_timestamps) == len(y_holdout)
+                        if holdout_timestamps is not None
+                        and len(holdout_timestamps) == len(y_holdout)
                         else None
                     ),
                     symbols=(
@@ -10353,7 +11312,8 @@ class ModelTrainer:
                     ),
                     timestamps=(
                         np.asarray(holdout_timestamps, dtype="datetime64[ns]")[symbol_mask]
-                        if holdout_timestamps is not None and len(holdout_timestamps) == len(y_holdout)
+                        if holdout_timestamps is not None
+                        and len(holdout_timestamps) == len(y_holdout)
                         else None
                     ),
                     symbols=holdout_symbols_arr[symbol_mask],
@@ -10477,7 +11437,11 @@ class ModelTrainer:
         )
         self.training_metrics["holdout_side_policy"] = holdout_side_policy
         for side_name in ("long", "short"):
-            policy = holdout_side_policy.get(side_name, {}) if isinstance(holdout_side_policy, dict) else {}
+            policy = (
+                holdout_side_policy.get(side_name, {})
+                if isinstance(holdout_side_policy, dict)
+                else {}
+            )
             for metric_name in (
                 "enabled",
                 "signal_scale",
@@ -10540,6 +11504,25 @@ class ModelTrainer:
         )
         self.training_metrics["effective_holdout_sharpe_consistency_metric"] = (
             holdout_sharpe_consistency
+        )
+        holdout_trade_count_metric = float(self.training_metrics.get("holdout_trade_count", np.nan))
+        if not np.isfinite(holdout_trade_count_metric):
+            holdout_trade_count_metric = float(
+                self.training_metrics.get(
+                    "holdout_trade_return_observations",
+                    1.0 if holdout_available else 0.0,
+                )
+            )
+        holdout_active_signal_rate_metric = float(
+            self.training_metrics.get("holdout_active_signal_rate", np.nan)
+        )
+        if not np.isfinite(holdout_active_signal_rate_metric):
+            holdout_active_signal_rate_metric = (
+                1.0 if holdout_available and holdout_trade_count_metric > 0.0 else 0.0
+            )
+        self.training_metrics["effective_holdout_trade_count_metric"] = holdout_trade_count_metric
+        self.training_metrics["effective_holdout_active_signal_rate_metric"] = (
+            holdout_active_signal_rate_metric
         )
         holdout_worst_regime_sharpe = float(
             self.training_metrics.get("holdout_worst_regime_sharpe", holdout_sharpe)
@@ -10683,6 +11666,16 @@ class ModelTrainer:
                     self.config.max_white_reality_pvalue,
                 ),
                 self.config.max_white_reality_pvalue,
+            ),
+            "holdout_trade_count_positive": (
+                ((holdout_trade_count_metric > 0.0) if holdout_available else True),
+                holdout_trade_count_metric if holdout_available else 1.0,
+                0.0,
+            ),
+            "holdout_active_signal_rate_positive": (
+                ((holdout_active_signal_rate_metric > 0.0) if holdout_available else True),
+                holdout_active_signal_rate_metric if holdout_available else 1.0,
+                0.0,
             ),
             "min_holdout_sharpe": (
                 (
@@ -10850,6 +11843,8 @@ class ModelTrainer:
                 "max_drawdown",
                 "max_holdout_drawdown",
                 "min_trades",
+                "holdout_trade_count_positive",
+                "holdout_active_signal_rate_positive",
                 "max_regime_shift",
                 "max_symbol_concentration_hhi",
                 "min_holdout_regime_sharpe",
@@ -11730,7 +12725,9 @@ class ModelTrainer:
         package_dir.mkdir(parents=True, exist_ok=True)
         artifacts_path = output_dir / f"{self.config.model_name}_artifacts.json"
         meta_model_path = (
-            output_dir / f"{self.config.model_name}_meta.pkl" if self.meta_model is not None else None
+            output_dir / f"{self.config.model_name}_meta.pkl"
+            if self.meta_model is not None
+            else None
         )
         expected_edge_model_path = (
             output_dir / f"{self.config.model_name}_expected_edge.pkl"
@@ -11738,7 +12735,9 @@ class ModelTrainer:
             else None
         )
         selected_features = list(
-            self.training_metrics.get("feature_selection_selected_features", self.feature_names or [])
+            self.training_metrics.get(
+                "feature_selection_selected_features", self.feature_names or []
+            )
         )
         cost_model = self.config.to_trading_cost_model()
 
@@ -11826,7 +12825,9 @@ class ModelTrainer:
                 "min_signal_scale": float(self.config.expected_edge_min_signal_scale),
                 "max_signal_scale": float(self.config.expected_edge_max_signal_scale),
                 "selected_context_features": list(
-                    self.training_metrics.get("expected_edge_training_selected_context_features", [])
+                    self.training_metrics.get(
+                        "expected_edge_training_selected_context_features", []
+                    )
                 ),
                 "training_summary": self.training_metrics.get("expected_edge_training_summary", {}),
                 "holdout_summary": self.training_metrics.get("expected_edge_holdout_summary", {}),
@@ -12039,7 +13040,9 @@ class ModelTrainer:
                 )
             ),
             "snapshot_manifest_path": (
-                str(self.snapshot_manifest_path) if self.snapshot_manifest_path is not None else None
+                str(self.snapshot_manifest_path)
+                if self.snapshot_manifest_path is not None
+                else None
             ),
             "data_quality_report_path": (
                 str(self.data_quality_report_path)
@@ -12189,7 +13192,9 @@ class ModelTrainer:
                 else None
             ),
             "snapshot_manifest_path": (
-                str(self.snapshot_manifest_path) if self.snapshot_manifest_path is not None else None
+                str(self.snapshot_manifest_path)
+                if self.snapshot_manifest_path is not None
+                else None
             ),
             "data_quality_report_path": (
                 str(self.data_quality_report_path)
@@ -12516,6 +13521,25 @@ def _build_pre_promotion_checklist(payload: dict[str, Any]) -> dict[str, Any]:
         int(round(_payload_metric(payload, "symbol_quality_dropped_symbols", 0.0))),
         len(_payload_list(payload, "symbol_quality_dropped_list")),
     )
+    expected_edge_candidate_floor_payload = metrics.get(
+        "expected_edge_candidate_floor",
+        payload.get("expected_edge_candidate_floor", {}),
+    )
+    expected_edge_candidate_count = _payload_metric(
+        payload,
+        "expected_edge_candidate_floor_candidate_count",
+        np.nan,
+    )
+    if not np.isfinite(expected_edge_candidate_count) and isinstance(
+        expected_edge_candidate_floor_payload, dict
+    ):
+        expected_edge_candidate_count = float(
+            expected_edge_candidate_floor_payload.get("candidate_count", 0.0)
+        )
+    if not np.isfinite(expected_edge_candidate_count):
+        expected_edge_candidate_count = 0.0
+    holdout_trade_count = _payload_metric(payload, "holdout_trade_count", 0.0)
+    holdout_active_signal_rate = _payload_metric(payload, "holdout_active_signal_rate", 0.0)
 
     checks = {
         "snapshot_lineage_present": {
@@ -12555,6 +13579,13 @@ def _build_pre_promotion_checklist(payload: dict[str, Any]) -> dict[str, Any]:
             "comparator": "is",
             "reason": expected_edge_reason or None,
         },
+        "expected_edge_candidate_floor_positive": {
+            "passed": expected_edge_candidate_count > 0.0,
+            "actual": expected_edge_candidate_count,
+            "threshold": 0.0,
+            "comparator": ">",
+            "reason": expected_edge_reason or None,
+        },
         "mean_trade_count": {
             "passed": _payload_metric(payload, "mean_trade_count", 0.0)
             >= PRE_PROMOTION_WORK_PLAN_THRESHOLDS["mean_trade_count_min"],
@@ -12567,6 +13598,18 @@ def _build_pre_promotion_checklist(payload: dict[str, Any]) -> dict[str, Any]:
             > PRE_PROMOTION_WORK_PLAN_THRESHOLDS["mean_risk_adjusted_score_min"],
             "actual": _payload_metric(payload, "mean_risk_adjusted_score", -1.0),
             "threshold": PRE_PROMOTION_WORK_PLAN_THRESHOLDS["mean_risk_adjusted_score_min"],
+            "comparator": ">",
+        },
+        "holdout_trade_count_positive": {
+            "passed": holdout_trade_count > 0.0,
+            "actual": holdout_trade_count,
+            "threshold": 0.0,
+            "comparator": ">",
+        },
+        "holdout_active_signal_rate_positive": {
+            "passed": holdout_active_signal_rate > 0.0,
+            "actual": holdout_active_signal_rate,
+            "threshold": 0.0,
             "comparator": ">",
         },
         "holdout_max_drawdown": {
@@ -12606,8 +13649,12 @@ def _build_pre_promotion_checklist(payload: dict[str, Any]) -> dict[str, Any]:
         "failed_checks": failed_checks,
         "model_name": str(payload.get("model_name") or ""),
         "model_type": str(payload.get("model_type") or ""),
-        "training_profile": str(payload.get("training_profile") or metrics.get("training_profile") or ""),
-        "primary_label_horizon": int(max(_payload_metric(payload, "primary_label_horizon", 0.0), 0.0)),
+        "training_profile": str(
+            payload.get("training_profile") or metrics.get("training_profile") or ""
+        ),
+        "primary_label_horizon": int(
+            max(_payload_metric(payload, "primary_label_horizon", 0.0), 0.0)
+        ),
         "snapshot_id": snapshot_id or None,
         "dataset_bundle_hash": dataset_bundle_hash or None,
         "data_quality_report_hash": data_quality_report_hash or None,
@@ -12660,15 +13707,11 @@ def _build_training_comparison_summary(rows: list[dict[str, Any]]) -> list[dict[
                     - float(baseline.get("mean_risk_adjusted_score", 0.0)),
                     "holdout_sharpe_delta": float(challenger.get("holdout_sharpe", 0.0))
                     - float(baseline.get("holdout_sharpe", 0.0)),
-                    "holdout_max_drawdown_delta": float(
-                        challenger.get("holdout_max_drawdown", 0.0)
-                    )
+                    "holdout_max_drawdown_delta": float(challenger.get("holdout_max_drawdown", 0.0))
                     - float(baseline.get("holdout_max_drawdown", 0.0)),
                     "pbo_delta": float(challenger.get("pbo", 0.0))
                     - float(baseline.get("pbo", 0.0)),
-                    "white_reality_pvalue_delta": float(
-                        challenger.get("white_reality_pvalue", 0.0)
-                    )
+                    "white_reality_pvalue_delta": float(challenger.get("white_reality_pvalue", 0.0))
                     - float(baseline.get("white_reality_pvalue", 0.0)),
                     "pre_promotion_ready": bool(challenger.get("pre_promotion_ready", 0.0)),
                     "failed_checks": list(challenger.get("pre_promotion_failed_checks", [])),
@@ -12720,7 +13763,9 @@ def _load_snapshot_bundle_identity(bundle_path: str | Path | None) -> dict[str, 
     if not isinstance(snapshot_manifest, dict):
         snapshot_manifest = {}
     return {
-        "snapshot_id": str(payload.get("snapshot_id") or snapshot_manifest.get("snapshot_id") or ""),
+        "snapshot_id": str(
+            payload.get("snapshot_id") or snapshot_manifest.get("snapshot_id") or ""
+        ),
         "dataset_bundle_hash": str(payload.get("bundle_hash") or ""),
         "data_quality_report_hash": str(
             snapshot_manifest.get("data_quality_report_hash")
@@ -12747,7 +13792,9 @@ def _match_pre_promotion_rows(
     if not filtered:
         return []
 
-    research_rows = [row for row in filtered if str(row.get("training_profile") or "") == "research"]
+    research_rows = [
+        row for row in filtered if str(row.get("training_profile") or "") == "research"
+    ]
     if research_rows:
         filtered = research_rows
 
@@ -13851,9 +14898,7 @@ def run_training(args: argparse.Namespace) -> int:
                 label_apply_volatility_inverse_weighting=bool(
                     _cfg_value(
                         "label_apply_volatility_inverse_weighting",
-                        not bool(
-                            getattr(args, "disable_volatility_inverse_weighting", False)
-                        ),
+                        not bool(getattr(args, "disable_volatility_inverse_weighting", False)),
                     )
                 ),
                 label_volatility_weight_cap=float(
@@ -13956,9 +15001,7 @@ def run_training(args: argparse.Namespace) -> int:
                 enable_tick_microstructure_features=bool(
                     _cfg_value(
                         "enable_tick_microstructure_features",
-                        not bool(
-                            getattr(args, "disable_tick_microstructure_features", False)
-                        ),
+                        not bool(getattr(args, "disable_tick_microstructure_features", False)),
                     )
                 ),
                 cross_sectional_user_locked=bool(
@@ -14235,9 +15278,7 @@ def run_training(args: argparse.Namespace) -> int:
                         )
                     checklist = promotion_precheck.get("checklist", {})
                     failed_checks = (
-                        checklist.get("failed_checks", [])
-                        if isinstance(checklist, dict)
-                        else []
+                        checklist.get("failed_checks", []) if isinstance(checklist, dict) else []
                     )
                     if failed_checks:
                         logger.error("Failed checklist items: %s", ", ".join(failed_checks))
@@ -14510,7 +15551,9 @@ def run_training(args: argparse.Namespace) -> int:
                         )
                         failed_checks = checklist.get("failed_checks", [])
                         if isinstance(failed_checks, list) and failed_checks:
-                            logger.info("Blocked by: %s", ", ".join(str(item) for item in failed_checks))
+                            logger.info(
+                                "Blocked by: %s", ", ".join(str(item) for item in failed_checks)
+                            )
             if result.get("promotion_package_path"):
                 logger.info(f"Promotion package: {result.get('promotion_package_path')}")
             if result.get("replay_manifest_path"):

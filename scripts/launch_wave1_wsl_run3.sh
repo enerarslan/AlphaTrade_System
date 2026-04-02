@@ -11,7 +11,7 @@ export PYTHONFAULTHANDLER=1
 
 log_file="logs/train_wave1_ranker_promotion_wsl_run3_gpucuda_h12.stdout.log"
 model_name="wave1_ranker_promotion_20260402_wsl_run3_gpucuda_h12"
-snapshot_bundle="models/snapshots/snap_76d371975b6e817d/dataset_bundle.manifest.json"
+snapshot_bundle="models/snapshots/snap_8803ebe20127c4fd/dataset_bundle.manifest.json"
 session_name="alphatrade_wave1_run3"
 launcher_script="$(dirname "$0")/wsl_tmux_launcher.sh"
 
@@ -26,7 +26,7 @@ command=(
   --training-profile promotion
   --dataset-snapshot-bundle "$snapshot_bundle"
   --strict-snapshot-replay
-  --symbols SPY QQQ AAPL MSFT NVDA AMD AMZN META GOOGL JPM XOM GLD
+  --symbols SPY QQQ AAPL MSFT NVDA AMD AMZN META GOOGL JPM XOM
   --timeframe 15Min
   --cv-method purged_kfold
   --n-splits 5

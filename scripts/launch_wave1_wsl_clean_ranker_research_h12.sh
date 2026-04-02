@@ -1,7 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <run-suffix> [extra train args...]" >&2
+  exit 1
+fi
+
+run_suffix="$1"
+shift
+
+approved_snapshot_id="snap_8803ebe20127c4fd"
+retired_snapshot_id="snap_76d371975b6e817d"
+snapshot_bundle="models/snapshots/${approved_snapshot_id}/dataset_bundle.manifest.json"
+symbols_file="data/training/universes/wave1_clean_core11_20260402.json"
+
+blocked_overrides=(
+  "--dataset-snapshot-bundle"
+  "--symbols"
+  "--symbols-file"
+  "--training-profile"
+)
+
+for arg in "$@"; do
+  if [[ "$arg" == *"${retired_snapshot_id}"* ]]; then
+    echo "Refusing retired snapshot override: ${arg}" >&2
+    exit 1
+  fi
+  for blocked in "${blocked_overrides[@]}"; do
+    if [[ "$arg" == "$blocked" ]]; then
+      echo "Refusing clean-run override for ${blocked}; edit the launcher intentionally instead." >&2
+      exit 1
+    fi
+  done
+done
+
 cd ~/AlphaTrade_wsl
+
+if [[ ! -f "$snapshot_bundle" ]]; then
+  echo "Approved clean snapshot bundle not found: $snapshot_bundle" >&2
+  exit 1
+fi
+
+if [[ ! -f "$symbols_file" ]]; then
+  echo "Approved clean universe file not found: $symbols_file" >&2
+  exit 1
+fi
 
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -9,10 +52,9 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONFAULTHANDLER=1
 
-log_file="logs/train_wave1_lightgbm_research_wsl_run2_gpucuda_h12.stdout.log"
-model_name="wave1_lightgbm_research_20260402_wsl_run2_gpucuda_h12"
-snapshot_bundle="models/snapshots/snap_8803ebe20127c4fd/dataset_bundle.manifest.json"
-session_name="alphatrade_wave1_run2"
+log_file="logs/train_wave1_ranker_research_${run_suffix}.stdout.log"
+model_name="wave1_ranker_research_20260402_${run_suffix}"
+session_name="alphatrade_${run_suffix}"
 launcher_script="$(dirname "$0")/wsl_tmux_launcher.sh"
 
 mkdir -p "$(dirname "$log_file")"
@@ -21,12 +63,12 @@ command=(
   .venv/bin/python
   main.py
   train
-  --model lightgbm
+  --model lightgbm_ranker
   --name "$model_name"
   --training-profile research
   --dataset-snapshot-bundle "$snapshot_bundle"
   --strict-snapshot-replay
-  --symbols SPY QQQ AAPL MSFT NVDA AMD AMZN META GOOGL JPM XOM
+  --symbols-file "$symbols_file"
   --timeframe 15Min
   --cv-method purged_kfold
   --n-splits 3
@@ -56,6 +98,7 @@ command=(
   --min-confidence-position-scale 0.20
   --probability-calibration-method isotonic
   --require-gpu
+  --max-cross-sectional-rows 500000
   "$@"
 )
 

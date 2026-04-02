@@ -403,7 +403,9 @@ def test_store_features_to_postgres_uses_development_frame_identifiers(monkeypat
     trainer._store_features_to_postgres()
 
     delete_calls = [
-        params for sql, params in fake_raw_connection.cursor_obj.executed if "DELETE FROM features" in sql
+        params
+        for sql, params in fake_raw_connection.cursor_obj.executed
+        if "DELETE FROM features" in sql
     ]
     assert delete_calls
     assert delete_calls[0][0] == ["AAPL", "MSFT"]
@@ -2134,13 +2136,103 @@ def test_evaluate_holdout_performance_aligns_sequence_model_outputs(monkeypatch)
     assert trainer.training_metrics["holdout_rows"] == pytest.approx(4.0)
 
 
+def test_evaluate_holdout_performance_records_probability_and_execution_diagnostics(monkeypatch):
+    class DummyModel:
+        def predict(self, X):
+            return np.where(np.arange(len(X)) % 2 == 0, 1.0, 0.0).astype(float)
+
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    trainer.model = DummyModel()
+    trainer.features = pd.DataFrame(np.random.rand(8, 2), columns=["f1", "f2"])
+    trainer.labels = pd.Series(np.tile(np.array([0, 1], dtype=float), 4))
+    trainer.primary_forward_returns = np.zeros(8, dtype=float)
+    trainer.regimes = np.array(["trend"] * 8, dtype=object)
+    trainer.training_metrics = {}
+    trainer.oof_primary_proba_raw = np.array(
+        [0.68, 0.62, 0.55, 0.45, 0.40, 0.35, 0.30, 0.25], dtype=float
+    )
+    trainer.oof_primary_proba = np.array(
+        [0.64, 0.60, 0.54, 0.46, 0.42, 0.38, 0.34, 0.30], dtype=float
+    )
+
+    rows = 4
+    trainer.holdout_features = pd.DataFrame(np.random.rand(rows, 2), columns=["f1", "f2"])
+    trainer.holdout_labels = pd.Series(np.array([1, 0, 1, 0], dtype=float))
+    trainer.holdout_symbols = np.array(["AAPL", "AAPL", "MSFT", "MSFT"], dtype=object)
+    trainer.holdout_regimes = np.array(["trend", "trend", "high_vol", "high_vol"], dtype=object)
+    trainer.holdout_primary_forward_returns = np.array([0.01, -0.002, 0.003, -0.01], dtype=float)
+    trainer.holdout_cost_aware_event_returns = np.array([0.01, 0.002, 0.003, 0.02], dtype=float)
+    trainer.holdout_primary_event_directions = np.array([1.0, 1.0, 1.0, -1.0], dtype=float)
+    trainer.holdout_timestamps = np.array(
+        pd.date_range("2024-01-01", periods=rows, freq="h", tz="UTC"),
+        dtype="datetime64[ns]",
+    )
+
+    holdout_raw = np.array([0.66, 0.52, 0.48, 0.34], dtype=float)
+    holdout_calibrated = np.array([0.61, 0.54, 0.46, 0.39], dtype=float)
+
+    monkeypatch.setattr(
+        trainer,
+        "_get_raw_predictions_proba",
+        lambda model, X: holdout_raw if len(X) == rows else trainer.oof_primary_proba_raw,
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_get_predictions_proba",
+        lambda model, X: holdout_calibrated if len(X) == rows else trainer.oof_primary_proba,
+    )
+    monkeypatch.setattr(trainer, "_derive_signal_thresholds", lambda *args, **kwargs: (0.60, 0.40))
+    monkeypatch.setattr(
+        trainer,
+        "_calculate_fold_metrics",
+        lambda *args, **kwargs: {
+            "accuracy": 0.5,
+            "sharpe": 0.1,
+            "max_drawdown": 0.02,
+            "trade_count": 1.0,
+            "active_signal_rate": 0.25,
+            "risk_adjusted_score": 0.02,
+        },
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_compute_net_returns",
+        lambda *args, **kwargs: (
+            np.array([0.0, 0.0, 0.0, 0.02], dtype=float),
+            {
+                "base_long_threshold_series": np.full(rows, 0.60, dtype=float),
+                "base_short_threshold_series": np.full(rows, 0.40, dtype=float),
+                "long_threshold_series": np.array([0.64, 0.63, 0.61, 0.62], dtype=float),
+                "short_threshold_series": np.array([0.36, 0.37, 0.39, 0.40], dtype=float),
+                "raw_signals": np.array([0.0, 0.0, 0.0, -1.0], dtype=float),
+                "positions": np.array([0.0, 0.0, 0.0, -1.0], dtype=float),
+                "trade_mask": np.array([False, False, False, True], dtype=bool),
+                "entry_mask": np.array([False, False, False, True], dtype=bool),
+                "portfolio_trade_mask": np.array([False, False, False, True], dtype=bool),
+                "portfolio_entry_mask": np.array([False, False, False, True], dtype=bool),
+            },
+        ),
+    )
+
+    trainer._evaluate_holdout_performance()
+
+    assert trainer.training_metrics["holdout_raw_probability_distribution"]["rows"] == 4
+    assert (
+        trainer.training_metrics["holdout_raw_to_calibrated_probability_shift"]["toward_mid_count"]
+        >= 2
+    )
+    assert trainer.training_metrics["holdout_execution_threshold_hits"]["active_count"] == 1
+    assert trainer.training_metrics["holdout_execution_signal_activity"]["entry_count"] == 1
+    assert trainer.training_metrics["holdout_base_signal_funnel"]["candidate_count"] == 2
+    assert trainer.training_metrics["holdout_execution_signal_funnel"]["candidate_count"] == 1
+    assert trainer.training_metrics["oof_calibrated_threshold_hits"]["active_count"] >= 1
+
+
 def test_evaluate_holdout_performance_records_tail_loss_contributors(monkeypatch):
     class DummyModel:
         def predict(self, X):
             if len(X) == 60:
-                return np.concatenate(
-                    [np.ones(30, dtype=float), np.zeros(30, dtype=float)]
-                )
+                return np.concatenate([np.ones(30, dtype=float), np.zeros(30, dtype=float)])
             return np.zeros(len(X), dtype=float)
 
     trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
@@ -2173,16 +2265,20 @@ def test_evaluate_holdout_performance_records_tail_loss_contributors(monkeypatch
     monkeypatch.setattr(
         trainer,
         "_get_predictions_proba",
-        lambda model, X: np.concatenate(
-            [np.full(30, 0.80, dtype=float), np.full(30, 0.20, dtype=float)]
-        )
-        if len(X) == rows
-        else np.linspace(0.4, 0.6, len(X), dtype=float),
+        lambda model, X: (
+            np.concatenate([np.full(30, 0.80, dtype=float), np.full(30, 0.20, dtype=float)])
+            if len(X) == rows
+            else np.linspace(0.4, 0.6, len(X), dtype=float)
+        ),
     )
     monkeypatch.setattr(trainer, "_derive_signal_thresholds", lambda *args, **kwargs: (0.55, 0.45))
 
     def _fake_calculate_fold_metrics(y_true, y_pred, y_proba, **kwargs):
-        symbols = np.asarray(kwargs.get("symbols"), dtype=object) if kwargs.get("symbols") is not None else None
+        symbols = (
+            np.asarray(kwargs.get("symbols"), dtype=object)
+            if kwargs.get("symbols") is not None
+            else None
+        )
         if symbols is not None and len(set(symbols.tolist())) == 1:
             group_name = str(symbols[0])
             if group_name == "AAPL":
@@ -2248,14 +2344,16 @@ def test_evaluate_holdout_performance_records_tail_loss_contributors(monkeypatch
 
     trainer._evaluate_holdout_performance()
 
-    assert trainer.training_metrics["holdout_symbol_metrics"]["AAPL"]["tail_loss_pnl"] == pytest.approx(
-        -0.018
-    )
-    assert trainer.training_metrics["holdout_symbol_metrics"]["AAPL"]["underwater_ratio"] == pytest.approx(
-        0.75
-    )
+    assert trainer.training_metrics["holdout_symbol_metrics"]["AAPL"][
+        "tail_loss_pnl"
+    ] == pytest.approx(-0.018)
+    assert trainer.training_metrics["holdout_symbol_metrics"]["AAPL"][
+        "underwater_ratio"
+    ] == pytest.approx(0.75)
     assert trainer.training_metrics["holdout_tail_loss_contributors_by_symbol"][0]["name"] == "AAPL"
-    assert trainer.training_metrics["holdout_tail_loss_contributors_by_regime"][0]["name"] == "crash"
+    assert (
+        trainer.training_metrics["holdout_tail_loss_contributors_by_regime"][0]["name"] == "crash"
+    )
 
 
 def test_calculate_fold_metrics_uses_active_trade_returns():
@@ -2725,6 +2823,10 @@ def test_build_execution_profile_emergency_relaxation_restores_activity():
     )
 
     assert np.count_nonzero(profile["raw_signals"]) > 0
+    diagnostics = profile["diagnostics"]
+    assert diagnostics["base_threshold_hits"]["active_count"] == 0
+    assert diagnostics["band_threshold_hits"]["active_count"] > 0
+    assert diagnostics["final_signal_summary"]["entry_count"] >= 1
 
 
 def test_build_execution_profile_regime_bias_suppresses_counter_trend_side():
@@ -3170,7 +3272,9 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
         }
     )
     trainer.holdout_symbols = np.array(["AAPL", "AAPL", "MSFT", "MSFT"], dtype=object)
-    trainer.holdout_regimes = np.array(["trend_up", "trend_up", "high_vol", "high_vol"], dtype=object)
+    trainer.holdout_regimes = np.array(
+        ["trend_up", "trend_up", "high_vol", "high_vol"], dtype=object
+    )
     trainer.holdout_primary_forward_returns = np.array([0.014, 0.010, -0.011, -0.013], dtype=float)
     trainer.training_metrics["holdout_long_threshold"] = 0.60
     trainer.training_metrics["holdout_short_threshold"] = 0.40
@@ -3181,24 +3285,33 @@ def test_train_expected_edge_policy_records_training_and_holdout_metrics():
     assert trainer.training_metrics["expected_edge_policy_enabled"] == pytest.approx(1.0)
     assert trainer.training_metrics["expected_edge_training_candidate_count"] >= 40
     assert trainer.training_metrics["expected_edge_holdout_selected_count"] >= 1
-    assert "flow_imbalance_signal" in trainer.training_metrics[
-        "expected_edge_training_selected_context_features"
-    ]
+    assert (
+        "flow_imbalance_signal"
+        in trainer.training_metrics["expected_edge_training_selected_context_features"]
+    )
     candidate_floor = trainer.training_metrics["expected_edge_candidate_floor"]
     assert candidate_floor["meets_min_samples"] is True
     assert candidate_floor["candidate_count"] >= 40
     training_funnel = trainer.training_metrics["expected_edge_training_signal_funnel"]
     assert training_funnel["candidate_count"] >= training_funnel["selected_count"]
-    assert trainer.training_metrics["expected_edge_training_signal_funnel_by_symbol"]["AAPL"][
-        "candidate_count"
-    ] >= 1
+    assert (
+        trainer.training_metrics["expected_edge_training_signal_funnel_by_symbol"]["AAPL"][
+            "candidate_count"
+        ]
+        >= 1
+    )
     regime_policy = trainer.training_metrics["expected_edge_regime_policy"]
     assert regime_policy["enabled"] is True
     assert sorted(regime_policy["regimes"].keys()) == ["high_vol", "trend_up"]
-    assert trainer.training_metrics["expected_edge_holdout_regime_policy_enabled"] == pytest.approx(1.0)
-    assert trainer.training_metrics["expected_edge_holdout_signal_funnel_by_regime"]["high_vol"][
-        "candidate_count"
-    ] >= 1
+    assert trainer.training_metrics["expected_edge_holdout_regime_policy_enabled"] == pytest.approx(
+        1.0
+    )
+    assert (
+        trainer.training_metrics["expected_edge_holdout_signal_funnel_by_regime"]["high_vol"][
+            "candidate_count"
+        ]
+        >= 1
+    )
 
 
 def test_train_expected_edge_policy_records_candidate_floor_when_skipped():
@@ -3223,9 +3336,9 @@ def test_train_expected_edge_policy_records_candidate_floor_when_skipped():
         [0.52] * 18 + [0.70, 0.72, 0.74, 0.26, 0.24, 0.22],
         dtype=float,
     )
-    trainer.primary_forward_returns = np.where(trainer.oof_primary_proba >= 0.5, 0.01, -0.01).astype(
-        float
-    )
+    trainer.primary_forward_returns = np.where(
+        trainer.oof_primary_proba >= 0.5, 0.01, -0.01
+    ).astype(float)
 
     trainer._train_expected_edge_policy()
 
@@ -3238,9 +3351,12 @@ def test_train_expected_edge_policy_records_candidate_floor_when_skipped():
     assert candidate_floor["meets_min_samples"] is False
     precheck_funnel = trainer.training_metrics["expected_edge_training_precheck_signal_funnel"]
     assert precheck_funnel["candidate_count"] == 6
-    assert trainer.training_metrics["expected_edge_training_precheck_signal_funnel_by_regime"][
-        "high_vol"
-    ]["candidate_count"] >= 1
+    assert (
+        trainer.training_metrics["expected_edge_training_precheck_signal_funnel_by_regime"][
+            "high_vol"
+        ]["candidate_count"]
+        >= 1
+    )
 
 
 def test_run_records_training_run_events(monkeypatch, tmp_path):
@@ -3418,9 +3534,7 @@ def test_run_snapshot_only_fast_fails_after_phase1_quality_review(monkeypatch, t
         trainer.data_quality_report = {
             "passed": False,
             "summary": {"symbol_count": 12},
-            "threshold_breaches": {
-                "missing_bars_ratio_max": {"actual": 0.18, "threshold": 0.05}
-            },
+            "threshold_breaches": {"missing_bars_ratio_max": {"actual": 0.18, "threshold": 0.05}},
             "top_missing_bar_symbols": [{"symbol": "GLD", "missing_bars_count": 42}],
             "top_missing_bar_windows": [],
         }
@@ -3491,7 +3605,9 @@ def test_run_snapshot_only_fast_fails_after_phase1_quality_review(monkeypatch, t
         )
         return review_payload
 
-    monkeypatch.setattr(trainer, "_persist_snapshot_review_only", _fake_persist_snapshot_review_only)
+    monkeypatch.setattr(
+        trainer, "_persist_snapshot_review_only", _fake_persist_snapshot_review_only
+    )
 
     result = trainer.run()
 
@@ -3520,7 +3636,10 @@ def test_build_snapshot_review_includes_bundle_aliases_and_top_level_checks(tmp_
             snapshot_only=True,
         )
     )
-    trainer.snapshot_manifest = {"snapshot_id": "snap_task1", "dataset_bundle_hash": "bundle_hash_task1"}
+    trainer.snapshot_manifest = {
+        "snapshot_id": "snap_task1",
+        "dataset_bundle_hash": "bundle_hash_task1",
+    }
     trainer.data_quality_report = {
         "passed": True,
         "summary": {"symbol_count": 11},
@@ -3546,13 +3665,11 @@ def test_build_snapshot_review_includes_bundle_aliases_and_top_level_checks(tmp_
     assert review["ready"] is True
     assert review["data_quality_passed"] is True
     assert review["no_silent_symbol_drop"] is True
-    assert (
-        review["dataset_snapshot_bundle_path"]
-        == str(trainer.dataset_snapshot_bundle_manifest_path)
+    assert review["dataset_snapshot_bundle_path"] == str(
+        trainer.dataset_snapshot_bundle_manifest_path
     )
-    assert (
-        review["dataset_bundle_manifest_path"]
-        == str(trainer.dataset_snapshot_bundle_manifest_path)
+    assert review["dataset_bundle_manifest_path"] == str(
+        trainer.dataset_snapshot_bundle_manifest_path
     )
     assert review["dataset_bundle_hash"] == "bundle_hash_task1"
 
@@ -3664,9 +3781,7 @@ def test_compute_symbol_multitimeframe_feature_frame_prefers_db_native_timeframe
     base_frame = pd.DataFrame(
         {
             "symbol": ["AAPL", "AAPL"],
-            "timestamp": pd.to_datetime(
-                ["2024-01-01T14:30:00Z", "2024-01-01T14:45:00Z"], utc=True
-            ),
+            "timestamp": pd.to_datetime(["2024-01-01T14:30:00Z", "2024-01-01T14:45:00Z"], utc=True),
             "open": [100.0, 101.0],
             "high": [101.0, 102.0],
             "low": [99.0, 100.0],
@@ -3950,11 +4065,14 @@ def test_build_pre_promotion_checklist_reports_failed_work_plan_checks():
                 "data_quality_report_passed": False,
                 "mean_trade_count": 11.0,
                 "mean_risk_adjusted_score": -2.0,
+                "holdout_trade_count": 0.0,
+                "holdout_active_signal_rate": 0.0,
                 "holdout_max_drawdown": 0.43,
                 "holdout_symbol_sharpe_p25": -1.18,
                 "pbo": 0.60,
                 "white_reality_pvalue": 0.12,
                 "expected_edge_policy_reason": "received 0 candidate trades",
+                "expected_edge_candidate_floor_candidate_count": 0.0,
                 "symbol_quality_dropped_symbols": 1.0,
             },
             "validation_results": {
@@ -3970,6 +4088,9 @@ def test_build_pre_promotion_checklist_reports_failed_work_plan_checks():
     assert checklist["ready"] is False
     assert "data_quality_passed" in checklist["failed_checks"]
     assert "expected_edge_trained" in checklist["failed_checks"]
+    assert "expected_edge_candidate_floor_positive" in checklist["failed_checks"]
+    assert "holdout_trade_count_positive" in checklist["failed_checks"]
+    assert "holdout_active_signal_rate_positive" in checklist["failed_checks"]
     assert checklist["checks"]["expected_edge_trained"]["reason"] == "received 0 candidate trades"
 
 
@@ -3991,6 +4112,8 @@ def test_build_training_matrix_captures_snapshot_identity_and_prepromotion_statu
                         "mean_risk_adjusted_score": 0.45,
                         "mean_trade_count": 155.0,
                         "holdout_sharpe": 0.62,
+                        "holdout_trade_count": 142.0,
+                        "holdout_active_signal_rate": 0.18,
                         "holdout_max_drawdown": 0.22,
                         "holdout_symbol_sharpe_p25": 0.04,
                         "deflated_sharpe": 0.35,
@@ -3998,6 +4121,7 @@ def test_build_training_matrix_captures_snapshot_identity_and_prepromotion_statu
                         "white_reality_pvalue": 0.04,
                         "expected_edge_policy_reason": "trained",
                         "expected_edge_policy_enabled": 1.0,
+                        "expected_edge_candidate_floor_candidate_count": 240.0,
                         "symbol_quality_dropped_symbols": 0.0,
                     },
                     "validation_results": {
@@ -4026,6 +4150,10 @@ def test_training_config_normalizes_limits_and_exports_cost_model():
         execution_turnover_cap=2.0,
         min_confidence_position_scale=2.0,
         probability_calibration_method="SIGMOID",
+        probability_calibration_min_dispersion_ratio=-1.0,
+        probability_calibration_min_oof_active_rate=2.0,
+        probability_calibration_min_oof_active_rate_ratio=2.0,
+        probability_calibration_max_near_mid_rate=0.40,
         primary_horizon_sweep=[-1, 5, 0, 3],
         label_spread_bps=1.5,
         label_slippage_bps=2.0,
@@ -4036,6 +4164,10 @@ def test_training_config_normalizes_limits_and_exports_cost_model():
     assert cfg.execution_turnover_cap == pytest.approx(1.0)
     assert cfg.min_confidence_position_scale == pytest.approx(1.0)
     assert cfg.probability_calibration_method == "sigmoid"
+    assert cfg.probability_calibration_min_dispersion_ratio == pytest.approx(0.0)
+    assert cfg.probability_calibration_min_oof_active_rate == pytest.approx(1.0)
+    assert cfg.probability_calibration_min_oof_active_rate_ratio == pytest.approx(1.0)
+    assert cfg.probability_calibration_max_near_mid_rate == pytest.approx(0.50)
     assert cfg.primary_horizon_sweep == [3, 5]
     assert cfg.to_trading_cost_model().execution_cost_bps == pytest.approx(7.0)
 
@@ -4062,6 +4194,38 @@ def test_fit_probability_calibrator_uses_resolved_method_when_attached():
     payload = fitted_model._alphatrade_probability_calibration
     assert payload["method"] == "sigmoid"
     assert payload["calibrator"] is trainer.probability_calibrator
+
+
+def test_fit_probability_calibrator_rejects_oof_collapse_guardrail():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm",
+            probability_calibration_method="sigmoid",
+            use_meta_labeling=False,
+        )
+    )
+    raw = np.linspace(0.6182, 0.6202, 240, dtype=float)
+    labels = np.tile(np.array([0, 1], dtype=float), 120)
+    trainer.oof_primary_proba_raw = raw.copy()
+    trainer.oof_primary_proba = raw.copy()
+    trainer.labels = pd.Series(labels)
+
+    trainer._fit_probability_calibrator_from_oof()
+
+    assert trainer.probability_calibrator is None
+    assert trainer.probability_calibration_method_resolved is None
+    assert trainer.training_metrics["probability_calibration_enabled"] == pytest.approx(0.0)
+    assert trainer.training_metrics["probability_calibration_reason"].startswith("guardrail_")
+    assert trainer.training_metrics["probability_calibration_guardrails_accepted"] == pytest.approx(
+        0.0
+    )
+    assert trainer.training_metrics[
+        "probability_calibration_guardrails_activity_collapse"
+    ] == pytest.approx(1.0)
+    assert trainer.training_metrics[
+        "probability_calibration_guardrails_dispersion_collapse"
+    ] == pytest.approx(1.0)
+    np.testing.assert_allclose(trainer.oof_primary_proba, raw)
 
 
 def test_get_predictions_proba_applies_attached_probability_calibration():
@@ -4655,6 +4819,46 @@ def test_validate_model_fails_when_holdout_symbol_underwater_ratio_breaches():
 
     assert passed is False
     assert trainer.validation_results["gates"]["max_holdout_symbol_underwater_ratio"][0] is False
+
+
+def test_validate_model_fails_when_holdout_has_no_trade_flow():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            use_meta_labeling=False,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 1.0,
+        "mean_accuracy": 0.65,
+        "mean_max_drawdown": 0.10,
+        "mean_win_rate": 0.60,
+        "mean_trade_count": 18.0,
+        "mean_test_size": 80.0,
+        "mean_risk_adjusted_score": 0.25,
+        "mean_symbol_concentration_hhi": 0.25,
+        "holdout_rows": 260.0,
+        "holdout_sharpe": 0.25,
+        "holdout_worst_regime_sharpe": 0.10,
+        "holdout_max_drawdown": 0.12,
+        "holdout_symbol_coverage_ratio": 0.85,
+        "holdout_symbol_sharpe_p25": 0.05,
+        "holdout_symbol_underwater_ratio": 0.20,
+        "holdout_trade_count": 0.0,
+        "holdout_active_signal_rate": 0.0,
+        "deflated_sharpe": 0.8,
+        "deflated_sharpe_p_value": 0.02,
+        "pbo": 0.20,
+        "nested_cv_trace": [{"outer_fold": 1}],
+        "objective_component_summary": {"objective_sharpe_component": 0.5},
+    }
+    trainer.nested_cv_trace = [{"outer_fold": 1}]
+
+    passed = trainer._validate_model()
+
+    assert passed is False
+    assert trainer.validation_results["gates"]["holdout_trade_count_positive"][0] is False
+    assert trainer.validation_results["gates"]["holdout_active_signal_rate_positive"][0] is False
 
 
 def test_auto_live_profile_applies_for_5y_46_symbol_dataset():
