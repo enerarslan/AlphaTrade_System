@@ -418,6 +418,23 @@ class ExpectedEdgePolicyModel:
         self._pass_model: Any | None = None
 
     @staticmethod
+    def resolve_effective_min_coverage(
+        *,
+        min_coverage: float,
+        min_samples: int,
+        row_count: int,
+    ) -> float:
+        """Scale row-share coverage to dataset size for selective but well-sampled policies."""
+        base_threshold = float(np.clip(float(min_coverage), 0.0, 1.0))
+        if row_count <= 0:
+            return base_threshold
+
+        # Require enough candidate density to exceed the absolute sample floor with buffer,
+        # but do not force highly selective strategies to satisfy an unrealistic row-share gate.
+        buffered_floor = (3.0 * float(max(1, int(min_samples)))) / float(max(1, int(row_count)))
+        return float(min(base_threshold, max(0.10, buffered_floor)))
+
+    @staticmethod
     def _feature_score(series: pd.Series, target: np.ndarray) -> float:
         """Score candidate context features with stable finite correlation."""
         values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
@@ -521,15 +538,21 @@ class ExpectedEdgePolicyModel:
         candidate_mask = np.isfinite(trade_return_values) & (np.abs(signal) > 1e-8)
         candidate_count = int(np.count_nonzero(candidate_mask))
         coverage = float(candidate_count / max(len(policy_frame), 1))
+        effective_min_coverage = self.resolve_effective_min_coverage(
+            min_coverage=float(self.config.min_coverage),
+            min_samples=int(self.config.min_samples),
+            row_count=int(len(policy_frame)),
+        )
         if candidate_count < int(self.config.min_samples):
             raise ValueError(
                 f"Expected-edge policy needs at least {self.config.min_samples} candidate trades; "
                 f"received {candidate_count}."
             )
-        if coverage < float(self.config.min_coverage):
+        if coverage < effective_min_coverage:
             raise ValueError(
                 f"Expected-edge policy coverage too low ({coverage:.2%} < "
-                f"{float(self.config.min_coverage):.2%})."
+                f"effective {effective_min_coverage:.2%}; "
+                f"configured {float(self.config.min_coverage):.2%})."
             )
 
         X_train = (
@@ -586,6 +609,8 @@ class ExpectedEdgePolicyModel:
         self.training_summary_ = {
             "candidate_count": int(candidate_count),
             "candidate_rate": float(coverage),
+            "effective_min_coverage": float(effective_min_coverage),
+            "configured_min_coverage": float(self.config.min_coverage),
             "selected_count": int(np.count_nonzero(selected_mask)),
             "selected_rate": float(np.mean(selected_mask)) if len(selected_mask) else 0.0,
             "candidate_mean_trade_return": float(np.mean(candidate_edge)) if candidate_edge.size else 0.0,

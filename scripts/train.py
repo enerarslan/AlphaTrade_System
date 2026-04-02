@@ -6271,6 +6271,9 @@ class ModelTrainer:
                                 "objective_symbol_concentration_penalty": float(
                                     metrics.get("objective_symbol_concentration_penalty", 0.0)
                                 ),
+                                "objective_symbol_tail_penalty": float(
+                                    metrics.get("objective_symbol_tail_penalty", 0.0)
+                                ),
                                 "objective_skew_penalty": float(
                                     metrics.get("objective_skew_penalty", 0.0)
                                 ),
@@ -6535,6 +6538,12 @@ class ModelTrainer:
                         "objective_tail_risk_penalty": float(
                             metrics.get("objective_tail_risk_penalty", 0.0)
                         ),
+                        "objective_symbol_concentration_penalty": float(
+                            metrics.get("objective_symbol_concentration_penalty", 0.0)
+                        ),
+                        "objective_symbol_tail_penalty": float(
+                            metrics.get("objective_symbol_tail_penalty", 0.0)
+                        ),
                         "objective_skew_penalty": float(metrics.get("objective_skew_penalty", 0.0)),
                         "objective_equity_break_penalty": float(
                             metrics.get("objective_equity_break_penalty", 0.0)
@@ -6615,6 +6624,8 @@ class ModelTrainer:
                 "objective_trade_activity_penalty",
                 "objective_cvar_penalty",
                 "objective_tail_risk_penalty",
+                "objective_symbol_concentration_penalty",
+                "objective_symbol_tail_penalty",
                 "objective_skew_penalty",
                 "objective_equity_break_penalty",
             ]
@@ -10096,6 +10107,11 @@ class ModelTrainer:
 
         candidate_mask = np.isfinite(trade_returns) & (np.abs(signal_values) > 1e-8)
         candidate_rate = float(np.mean(candidate_mask)) if target_len else 0.0
+        effective_min_coverage = ExpectedEdgePolicyModel.resolve_effective_min_coverage(
+            min_coverage=float(self.config.expected_edge_min_coverage),
+            min_samples=int(self.config.expected_edge_min_samples),
+            row_count=int(target_len),
+        )
         candidate_floor = {
             "rows": int(target_len),
             "candidate_count": int(np.count_nonzero(candidate_mask)),
@@ -10103,11 +10119,12 @@ class ModelTrainer:
             "finite_trade_return_count": int(np.count_nonzero(np.isfinite(trade_returns))),
             "configured_min_samples": int(self.config.expected_edge_min_samples),
             "configured_min_coverage": float(self.config.expected_edge_min_coverage),
+            "effective_min_coverage": float(effective_min_coverage),
             "meets_min_samples": bool(
                 np.count_nonzero(candidate_mask) >= int(self.config.expected_edge_min_samples)
             ),
             "meets_min_coverage": bool(
-                candidate_rate >= float(self.config.expected_edge_min_coverage)
+                candidate_rate >= float(effective_min_coverage)
             ),
             "long_candidate_count": int(np.count_nonzero(candidate_mask & (signal_values > 0.0))),
             "short_candidate_count": int(np.count_nonzero(candidate_mask & (signal_values < 0.0))),
@@ -10529,6 +10546,12 @@ class ModelTrainer:
                         symbol_concentration_hhi = float(np.sum(shares**2))
                         symbol_effective_count = float(1.0 / max(symbol_concentration_hhi, 1e-9))
                         entry_symbol_count = float(symbol_counts.shape[0])
+            symbol_tail_summary = self._summarize_symbol_tail_metrics(
+                net_returns=net_returns,
+                trade_mask=trade_mask,
+                symbols=aligned_symbols,
+                evaluation_size=int(len(y_proba)),
+            )
 
             equity_break = float(1.0 if max_dd > (self.config.max_drawdown * 1.5) else 0.0)
             objective_components = self._compute_objective_components(
@@ -10543,6 +10566,7 @@ class ModelTrainer:
                 symbol_concentration_hhi=symbol_concentration_hhi,
                 equity_break=equity_break,
                 evaluation_size=int(len(y_proba)),
+                symbol_sharpe_p25=float(symbol_tail_summary.get("symbol_sharpe_p25", 0.0)),
             )
 
             metrics.update(
@@ -10568,6 +10592,15 @@ class ModelTrainer:
                     "symbol_concentration_hhi": float(symbol_concentration_hhi),
                     "symbol_effective_count": float(symbol_effective_count),
                     "entry_symbol_count": float(entry_symbol_count),
+                    "symbol_count_total": float(symbol_tail_summary["symbol_count_total"]),
+                    "symbol_count_evaluated": float(symbol_tail_summary["symbol_count_evaluated"]),
+                    "symbol_coverage_ratio": float(symbol_tail_summary["symbol_coverage_ratio"]),
+                    "symbol_sharpe_p25": float(symbol_tail_summary["symbol_sharpe_p25"]),
+                    "symbol_sharpe_median": float(symbol_tail_summary["symbol_sharpe_median"]),
+                    "symbol_sharpe_worst": float(symbol_tail_summary["symbol_sharpe_worst"]),
+                    "symbol_sharpe_negative_share": float(
+                        symbol_tail_summary["symbol_sharpe_negative_share"]
+                    ),
                     "objective_sharpe_component": float(
                         objective_components["objective_sharpe_component"]
                     ),
@@ -10590,6 +10623,9 @@ class ModelTrainer:
                     "objective_symbol_concentration_penalty": float(
                         objective_components["objective_symbol_concentration_penalty"]
                     ),
+                    "objective_symbol_tail_penalty": float(
+                        objective_components["objective_symbol_tail_penalty"]
+                    ),
                     "objective_skew_penalty": float(objective_components["objective_skew_penalty"]),
                     "objective_equity_break_penalty": float(
                         objective_components["objective_equity_break_penalty"]
@@ -10597,6 +10633,9 @@ class ModelTrainer:
                     "objective_trade_target": float(objective_components["objective_trade_target"]),
                     "objective_expected_shortfall_cap": float(
                         objective_components["objective_expected_shortfall_cap"]
+                    ),
+                    "objective_symbol_tail_floor": float(
+                        objective_components["objective_symbol_tail_floor"]
                     ),
                     "risk_adjusted_score": float(objective_components["risk_adjusted_score"]),
                 }
@@ -10625,6 +10664,13 @@ class ModelTrainer:
                     "symbol_concentration_hhi": 0.0,
                     "symbol_effective_count": 0.0,
                     "entry_symbol_count": 0.0,
+                    "symbol_count_total": 0.0,
+                    "symbol_count_evaluated": 0.0,
+                    "symbol_coverage_ratio": 0.0,
+                    "symbol_sharpe_p25": 0.0,
+                    "symbol_sharpe_median": 0.0,
+                    "symbol_sharpe_worst": 0.0,
+                    "symbol_sharpe_negative_share": 0.0,
                     "objective_sharpe_component": 0.0,
                     "objective_drawdown_penalty": 0.0,
                     "objective_turnover_penalty": 0.0,
@@ -10633,6 +10679,8 @@ class ModelTrainer:
                     "objective_cvar_penalty": 0.0,
                     "objective_tail_risk_penalty": 0.0,
                     "objective_symbol_concentration_penalty": 0.0,
+                    "objective_symbol_tail_penalty": 0.0,
+                    "objective_symbol_tail_floor": 0.0,
                     "objective_skew_penalty": 0.0,
                     "objective_equity_break_penalty": 0.0,
                     "objective_trade_target": float(
@@ -10656,6 +10704,85 @@ class ModelTrainer:
 
         return sanitized_metrics
 
+    def _summarize_symbol_tail_metrics(
+        self,
+        *,
+        net_returns: np.ndarray,
+        trade_mask: np.ndarray,
+        symbols: np.ndarray | None,
+        evaluation_size: int,
+    ) -> dict[str, float]:
+        """Summarize cross-symbol tail robustness from fold-level execution returns."""
+        summary = {
+            "symbol_count_total": 0.0,
+            "symbol_count_evaluated": 0.0,
+            "symbol_coverage_ratio": 0.0,
+            "symbol_sharpe_p25": 0.0,
+            "symbol_sharpe_median": 0.0,
+            "symbol_sharpe_worst": 0.0,
+            "symbol_sharpe_negative_share": 0.0,
+        }
+        if symbols is None:
+            return summary
+
+        aligned_symbols = np.asarray(symbols, dtype=object).reshape(-1)
+        aligned_returns = np.asarray(net_returns, dtype=float).reshape(-1)
+        aligned_trade_mask = np.asarray(trade_mask, dtype=bool).reshape(-1)
+        if (
+            aligned_symbols.size != aligned_returns.size
+            or aligned_trade_mask.size != aligned_returns.size
+            or aligned_returns.size == 0
+        ):
+            return summary
+
+        unique_symbols = sorted({str(value).strip() for value in aligned_symbols if str(value).strip()})
+        if not unique_symbols:
+            return summary
+
+        summary["symbol_count_total"] = float(len(unique_symbols))
+        annualization_periods = float(self._annualization_periods())
+        sample_floor = max(12, int(round(0.01 * float(max(1, evaluation_size)))))
+        symbol_sharpes: list[float] = []
+        for symbol_name in unique_symbols:
+            symbol_mask = aligned_symbols == symbol_name
+            symbol_rows = int(np.count_nonzero(symbol_mask))
+            if symbol_rows < sample_floor:
+                continue
+
+            symbol_returns = aligned_returns[symbol_mask]
+            performance_returns = symbol_returns
+            std = float(np.std(performance_returns)) if performance_returns.size > 0 else 0.0
+            sharpe = (
+                float(np.mean(performance_returns) / std * np.sqrt(annualization_periods))
+                if std > 1e-12
+                else 0.0
+            )
+            trade_obs_count = int(np.count_nonzero(aligned_trade_mask[symbol_mask]))
+            min_obs_for_confident_sharpe = max(
+                6,
+                int(round(float(self._effective_trade_target(symbol_rows)) * 0.80)),
+            )
+            confidence = float(
+                np.clip(
+                    float(trade_obs_count) / float(max(1, min_obs_for_confident_sharpe)),
+                    0.10,
+                    1.0,
+                )
+            )
+            symbol_sharpes.append(float(sharpe * confidence))
+
+        if not symbol_sharpes:
+            return summary
+
+        sharpe_arr = np.asarray(symbol_sharpes, dtype=float)
+        summary["symbol_count_evaluated"] = float(sharpe_arr.size)
+        summary["symbol_coverage_ratio"] = float(sharpe_arr.size / max(1, len(unique_symbols)))
+        summary["symbol_sharpe_p25"] = float(np.quantile(sharpe_arr, 0.25))
+        summary["symbol_sharpe_median"] = float(np.median(sharpe_arr))
+        summary["symbol_sharpe_worst"] = float(np.min(sharpe_arr))
+        summary["symbol_sharpe_negative_share"] = float(np.mean(sharpe_arr < 0.0))
+        return summary
+
     def _compute_objective_components(
         self,
         *,
@@ -10670,6 +10797,7 @@ class ModelTrainer:
         symbol_concentration_hhi: float,
         equity_break: float,
         evaluation_size: int | None = None,
+        symbol_sharpe_p25: float | None = None,
     ) -> dict[str, float]:
         """Compute auditable objective component breakdown for optimization and promotion."""
         sharpe_component = float(self.config.objective_weight_sharpe * sharpe)
@@ -10692,6 +10820,14 @@ class ModelTrainer:
             -self.config.objective_weight_symbol_concentration
             * min(1.5, concentration_excess / 0.35)
         )
+        symbol_tail_penalty = 0.0
+        symbol_tail_floor = float(min(0.0, self.config.min_holdout_symbol_p25_sharpe))
+        if symbol_sharpe_p25 is not None:
+            tail_shortfall = max(0.0, symbol_tail_floor - float(symbol_sharpe_p25))
+            tail_scale = max(0.25, abs(symbol_tail_floor) + 0.10)
+            symbol_tail_penalty = float(
+                -self.config.objective_weight_tail_risk * min(2.0, tail_shortfall / tail_scale)
+            )
         skew_penalty = float(-self.config.objective_weight_skew * max(0.0, -float(skew)))
         equity_break_penalty = float(-2.0 * max(0.0, float(equity_break)))
         min_trades_target = self._effective_trade_target(evaluation_size)
@@ -10711,6 +10847,7 @@ class ModelTrainer:
             + cvar_penalty
             + tail_risk_penalty
             + symbol_concentration_penalty
+            + symbol_tail_penalty
             + skew_penalty
             + equity_break_penalty
         )
@@ -10723,6 +10860,8 @@ class ModelTrainer:
             "objective_cvar_penalty": cvar_penalty,
             "objective_tail_risk_penalty": tail_risk_penalty,
             "objective_symbol_concentration_penalty": symbol_concentration_penalty,
+            "objective_symbol_tail_penalty": symbol_tail_penalty,
+            "objective_symbol_tail_floor": float(symbol_tail_floor),
             "objective_skew_penalty": skew_penalty,
             "objective_equity_break_penalty": equity_break_penalty,
             "objective_trade_target": float(min_trades_target),
@@ -11757,6 +11896,7 @@ class ModelTrainer:
             "objective_cvar_penalty",
             "objective_tail_risk_penalty",
             "objective_symbol_concentration_penalty",
+            "objective_symbol_tail_penalty",
             "objective_skew_penalty",
             "objective_equity_break_penalty",
             "objective_expected_shortfall_cap",
@@ -11792,6 +11932,9 @@ class ModelTrainer:
             ),
             "objective_symbol_concentration_penalty": float(
                 self.training_metrics.get("mean_objective_symbol_concentration_penalty", 0.0)
+            ),
+            "objective_symbol_tail_penalty": float(
+                self.training_metrics.get("mean_objective_symbol_tail_penalty", 0.0)
             ),
             "objective_skew_penalty": float(
                 self.training_metrics.get("mean_objective_skew_penalty", 0.0)

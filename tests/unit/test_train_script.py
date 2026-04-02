@@ -2117,6 +2117,50 @@ def test_compute_objective_components_disables_ranker_calibration_penalty():
     assert components["objective_calibration_penalty"] == pytest.approx(0.0)
 
 
+def test_compute_objective_components_penalizes_negative_symbol_tail():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            objective_weight_tail_risk=0.80,
+            min_holdout_symbol_p25_sharpe=-0.10,
+        )
+    )
+
+    baseline = trainer._compute_objective_components(
+        sharpe=0.2,
+        max_drawdown=0.05,
+        turnover=0.1,
+        brier_score=0.2,
+        trade_count=15,
+        cvar=-0.02,
+        skew=0.1,
+        expected_shortfall=0.04,
+        symbol_concentration_hhi=0.20,
+        equity_break=0.0,
+        evaluation_size=120,
+        symbol_sharpe_p25=-0.05,
+    )
+    stressed = trainer._compute_objective_components(
+        sharpe=0.2,
+        max_drawdown=0.05,
+        turnover=0.1,
+        brier_score=0.2,
+        trade_count=15,
+        cvar=-0.02,
+        skew=0.1,
+        expected_shortfall=0.04,
+        symbol_concentration_hhi=0.20,
+        equity_break=0.0,
+        evaluation_size=120,
+        symbol_sharpe_p25=-0.55,
+    )
+
+    assert baseline["objective_symbol_tail_penalty"] == pytest.approx(0.0)
+    assert stressed["objective_symbol_tail_floor"] == pytest.approx(-0.10)
+    assert stressed["objective_symbol_tail_penalty"] < -1.0
+    assert stressed["risk_adjusted_score"] < baseline["risk_adjusted_score"]
+
+
 def test_load_model_defaults_random_forest_windows_forces_single_job(monkeypatch):
     monkeypatch.setattr(train_script.os, "name", "nt", raising=False)
     defaults = train_script._load_model_defaults("random_forest", use_gpu=True)
@@ -2548,6 +2592,87 @@ def test_calculate_fold_metrics_computes_symbol_concentration_penalty():
     assert metrics["symbol_concentration_hhi"] > 0.35
     assert metrics["symbol_effective_count"] >= 1.0
     assert metrics["objective_symbol_concentration_penalty"] < 0.0
+
+
+def test_calculate_fold_metrics_penalizes_negative_symbol_tail(monkeypatch):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            objective_weight_tail_risk=0.75,
+            min_holdout_symbol_p25_sharpe=-0.10,
+        )
+    )
+    y_proba = np.full(24, 0.80, dtype=float)
+    y_true = np.ones(24, dtype=float)
+    y_pred = np.ones(24, dtype=float)
+    symbols = np.array(["AAPL"] * 12 + ["MSFT"] * 12, dtype=object)
+    net_returns = np.array(
+        [
+            0.012,
+            0.010,
+            0.011,
+            0.009,
+            0.013,
+            0.008,
+            0.012,
+            0.010,
+            0.011,
+            0.009,
+            0.013,
+            0.008,
+            -0.010,
+            -0.012,
+            -0.009,
+            -0.011,
+            -0.013,
+            -0.008,
+            -0.010,
+            -0.012,
+            -0.009,
+            -0.011,
+            -0.013,
+            -0.008,
+        ],
+        dtype=float,
+    )
+
+    def _fake_compute_net_returns(
+        y_true,
+        y_proba,
+        long_threshold=0.55,
+        short_threshold=0.45,
+        realized_forward_returns=None,
+        event_net_returns=None,
+        event_directions=None,
+        timestamps=None,
+        symbols=None,
+        return_details=False,
+    ):
+        details = {
+            "positions": np.ones_like(net_returns, dtype=float),
+            "turnover_series": np.zeros_like(net_returns, dtype=float),
+            "trade_mask": np.ones_like(net_returns, dtype=bool),
+            "entry_mask": np.ones_like(net_returns, dtype=bool),
+        }
+        return (net_returns, details) if return_details else net_returns
+
+    monkeypatch.setattr(trainer, "_compute_net_returns", _fake_compute_net_returns)
+
+    metrics = trainer._calculate_fold_metrics(
+        y_true=y_true,
+        y_pred=y_pred,
+        y_proba=y_proba,
+        long_threshold=0.55,
+        short_threshold=0.45,
+        realized_forward_returns=net_returns,
+        symbols=symbols,
+    )
+
+    assert metrics["symbol_count_total"] == pytest.approx(2.0)
+    assert metrics["symbol_count_evaluated"] == pytest.approx(2.0)
+    assert metrics["symbol_sharpe_p25"] < -0.10
+    assert metrics["symbol_sharpe_worst"] < 0.0
+    assert metrics["objective_symbol_tail_penalty"] < 0.0
 
 
 def test_calculate_fold_metrics_sorts_execution_inputs_by_timestamp(monkeypatch):
@@ -3578,6 +3703,80 @@ def test_train_expected_edge_policy_records_candidate_floor_when_skipped():
             "high_vol"
         ]["candidate_count"]
         >= 1
+    )
+
+
+def test_train_expected_edge_policy_uses_effective_coverage_for_large_selective_dataset():
+    class DummyProbabilityModel:
+        def predict_proba(self, X):
+            X = np.asarray(X, dtype=float)
+            probability = np.clip(X[:, 0], 0.0, 1.0)
+            return np.column_stack([1.0 - probability, probability])
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            expected_edge_min_samples=40,
+            expected_edge_min_coverage=0.55,
+            save_artifacts=False,
+        )
+    )
+    rows = 600
+    probabilities = np.array([0.72] * 66 + [0.28] * 66 + [0.50] * 468, dtype=float)
+    flow_feature = np.linspace(-1.0, 1.0, rows, dtype=float)
+    trainer.features = pd.DataFrame(
+        {
+            "feat_a": probabilities,
+            "flow_imbalance_signal": flow_feature,
+            "macro_regime_score": np.sin(np.linspace(0.0, 6.28, rows)),
+        }
+    )
+    trainer.row_symbols = np.where(np.arange(rows) % 2 == 0, "AAPL", "MSFT").astype(object)
+    trainer.regimes = np.where(np.arange(rows) % 3 == 0, "high_vol", "trend_up").astype(object)
+    trainer.oof_primary_proba = probabilities.copy()
+    trainer.primary_forward_returns = np.where(
+        probabilities >= 0.55,
+        0.015,
+        np.where(probabilities <= 0.45, -0.012, 0.0),
+    ).astype(float)
+    trainer.sample_weights = np.ones(rows, dtype=float)
+    trainer.model = DummyProbabilityModel()
+    trainer.holdout_features = pd.DataFrame(
+        {
+            "feat_a": [0.70, 0.68, 0.31, 0.29, 0.50, 0.50],
+            "flow_imbalance_signal": [0.6, 0.3, -0.4, -0.7, 0.05, -0.05],
+            "macro_regime_score": [0.2, 0.1, -0.1, -0.2, 0.0, 0.0],
+        }
+    )
+    trainer.holdout_symbols = np.array(["AAPL", "AAPL", "MSFT", "MSFT", "AAPL", "MSFT"], dtype=object)
+    trainer.holdout_regimes = np.array(
+        ["trend_up", "trend_up", "high_vol", "high_vol", "trend_up", "high_vol"],
+        dtype=object,
+    )
+    trainer.holdout_close_prices = pd.Series([101.0, 102.0, 99.0, 98.0, 100.0, 100.0], dtype=float)
+    trainer.holdout_primary_forward_returns = np.array(
+        [0.014, 0.010, -0.011, -0.013, 0.0, 0.0],
+        dtype=float,
+    )
+    trainer.training_metrics["holdout_long_threshold"] = 0.60
+    trainer.training_metrics["holdout_short_threshold"] = 0.40
+
+    trainer._train_expected_edge_policy()
+
+    candidate_floor = trainer.training_metrics["expected_edge_candidate_floor"]
+    assert trainer.expected_edge_model is not None
+    assert trainer.training_metrics["expected_edge_policy_reason"] == "trained"
+    assert candidate_floor["candidate_count"] == 132
+    assert candidate_floor["candidate_rate"] == pytest.approx(132 / rows)
+    assert candidate_floor["configured_min_coverage"] == pytest.approx(0.55)
+    assert candidate_floor["effective_min_coverage"] == pytest.approx(0.20)
+    assert candidate_floor["candidate_rate"] < candidate_floor["configured_min_coverage"]
+    assert candidate_floor["meets_min_coverage"] is True
+    assert trainer.training_metrics["expected_edge_training_effective_min_coverage"] == pytest.approx(
+        0.20
+    )
+    assert trainer.training_metrics["expected_edge_training_configured_min_coverage"] == pytest.approx(
+        0.55
     )
 
 
