@@ -89,32 +89,101 @@ def _count_missing_daily_bars(timestamps: pd.Series) -> int:
     return int(missing)
 
 
-def estimate_missing_bars_count(timestamps: pd.Series) -> tuple[int, float | None]:
-    """Estimate missing bars count and inferred bar spacing from timestamps."""
-    ts = pd.to_datetime(timestamps, utc=True, errors="coerce").dropna().sort_values()
+def _summarize_daily_gap_windows(timestamps: pd.Series) -> list[dict[str, Any]]:
+    """Return structured missing-bar windows for business-day style series."""
+    if timestamps.empty:
+        return []
+
+    normalized = (
+        pd.to_datetime(timestamps, utc=True, errors="coerce").dropna().sort_values().reset_index(drop=True)
+    )
+    if len(normalized) < 2:
+        return []
+
+    windows: list[dict[str, Any]] = []
+    for prev, curr in zip(normalized.iloc[:-1], normalized.iloc[1:], strict=False):
+        if curr <= prev:
+            continue
+        expected = len(pd.date_range(prev.normalize(), curr.normalize(), freq=_US_TRADING_DAY))
+        missing = max(0, expected - 2)
+        if missing <= 0:
+            continue
+        gap_seconds = float((curr - prev).total_seconds())
+        windows.append(
+            {
+                "gap_start": _to_iso(prev),
+                "gap_end": _to_iso(curr),
+                "gap_seconds": _safe_float(gap_seconds),
+                "estimated_missing_bars": int(missing),
+            }
+        )
+    return windows
+
+
+def summarize_missing_bar_windows(
+    timestamps: pd.Series,
+) -> tuple[int, float | None, list[dict[str, Any]]]:
+    """Estimate missing bars and return the concrete gap windows that caused them."""
+    ts = (
+        pd.Series(pd.to_datetime(timestamps, utc=True, errors="coerce"))
+        .dropna()
+        .sort_values()
+        .reset_index(drop=True)
+    )
     if len(ts) < 2:
-        return 0, None
+        return 0, None, []
 
     diffs = ts.diff().dropna().dt.total_seconds()
     positive_diffs = diffs[diffs > 0]
     if positive_diffs.empty:
-        return 0, None
+        return 0, None, []
 
-    inferred_bar_seconds = float(np.median(positive_diffs.to_numpy()))
+    rounded_diffs = np.round(positive_diffs.to_numpy(dtype=float), 6)
+    unique_diffs, counts = np.unique(rounded_diffs, return_counts=True)
+    if len(unique_diffs) == 0:
+        return 0, None, []
+    max_count = int(np.max(counts))
+    inferred_bar_seconds = float(np.min(unique_diffs[counts == max_count]))
     if inferred_bar_seconds <= 0.0:
-        return 0, None
+        return 0, None, []
 
     if inferred_bar_seconds >= _DAILY_BAR_SECONDS_FLOOR:
-        return _count_missing_daily_bars(ts), inferred_bar_seconds
+        windows = _summarize_daily_gap_windows(ts)
+        missing_count = int(
+            sum(int(window.get("estimated_missing_bars", 0)) for window in windows)
+        )
+        return missing_count, inferred_bar_seconds, windows
 
     regular_gap_limit = inferred_bar_seconds * 1.5
     session_break_limit = max(inferred_bar_seconds * 24.0, 6.0 * 3600.0)
-    missing_from_gaps = np.where(
-        (positive_diffs > regular_gap_limit) & (positive_diffs <= session_break_limit),
-        np.floor(positive_diffs / inferred_bar_seconds) - 1.0,
-        0.0,
-    )
-    return int(np.maximum(missing_from_gaps, 0.0).sum()), inferred_bar_seconds
+    windows: list[dict[str, Any]] = []
+
+    for idx in range(1, len(ts)):
+        prev = ts.iloc[idx - 1]
+        curr = ts.iloc[idx]
+        gap_seconds = float((curr - prev).total_seconds())
+        if gap_seconds <= regular_gap_limit or gap_seconds > session_break_limit:
+            continue
+        missing = int(max(np.floor(gap_seconds / inferred_bar_seconds) - 1.0, 0.0))
+        if missing <= 0:
+            continue
+        windows.append(
+            {
+                "gap_start": _to_iso(prev),
+                "gap_end": _to_iso(curr),
+                "gap_seconds": _safe_float(gap_seconds),
+                "estimated_missing_bars": int(missing),
+            }
+        )
+
+    missing_count = int(sum(int(window["estimated_missing_bars"]) for window in windows))
+    return missing_count, inferred_bar_seconds, windows
+
+
+def estimate_missing_bars_count(timestamps: pd.Series) -> tuple[int, float | None]:
+    """Estimate missing bars count and inferred bar spacing from timestamps."""
+    missing_count, inferred_bar_seconds, _windows = summarize_missing_bar_windows(timestamps)
+    return int(missing_count), inferred_bar_seconds
 
 
 def build_data_quality_report(
@@ -151,15 +220,20 @@ def build_data_quality_report(
     corporate_action_jump_count = 0
     total_return_observations = 0
     per_symbol: dict[str, dict[str, Any]] = {}
+    top_missing_bar_symbols: list[dict[str, Any]] = []
+    top_missing_bar_windows: list[dict[str, Any]] = []
 
     for symbol, group in unique_df.groupby("symbol", sort=True):
         group = group.sort_values("timestamp").reset_index(drop=True)
         timestamps = group["timestamp"]
         symbol_missing = 0
         inferred_bar_seconds = None
+        symbol_gap_windows: list[dict[str, Any]] = []
 
         if len(timestamps) >= 2:
-            symbol_missing, inferred_bar_seconds = estimate_missing_bars_count(timestamps)
+            symbol_missing, inferred_bar_seconds, symbol_gap_windows = summarize_missing_bar_windows(
+                timestamps
+            )
 
         returns = group["close"].pct_change()
         returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -170,6 +244,32 @@ def build_data_quality_report(
         extreme_move_count += symbol_extreme
         corporate_action_jump_count += symbol_corporate_action_jump
         total_return_observations += int(len(returns))
+        sorted_gap_windows = sorted(
+            symbol_gap_windows,
+            key=lambda item: (
+                -int(item.get("estimated_missing_bars", 0)),
+                str(item.get("gap_start") or ""),
+                str(item.get("gap_end") or ""),
+            ),
+        )
+        gap_preview = sorted_gap_windows[:5]
+        largest_gap = gap_preview[0] if gap_preview else {}
+        if int(symbol_missing) > 0:
+            top_missing_bar_symbols.append(
+                {
+                    "symbol": str(symbol),
+                    "missing_bars_count": int(symbol_missing),
+                    "missing_gap_window_count": int(len(sorted_gap_windows)),
+                    "largest_missing_gap_bars": int(
+                        largest_gap.get("estimated_missing_bars", 0)
+                    ),
+                    "largest_missing_gap_start": largest_gap.get("gap_start"),
+                    "largest_missing_gap_end": largest_gap.get("gap_end"),
+                }
+            )
+            top_missing_bar_windows.extend(
+                [{"symbol": str(symbol), **window} for window in sorted_gap_windows[:10]]
+            )
 
         per_symbol[str(symbol)] = {
             "rows": int(len(group)),
@@ -177,6 +277,11 @@ def build_data_quality_report(
             "end": _to_iso(timestamps.iloc[-1]) if len(timestamps) else None,
             "inferred_bar_seconds": _safe_float(inferred_bar_seconds) if inferred_bar_seconds else None,
             "missing_bars_count": int(symbol_missing),
+            "missing_gap_window_count": int(len(sorted_gap_windows)),
+            "largest_missing_gap_bars": int(largest_gap.get("estimated_missing_bars", 0)),
+            "largest_missing_gap_start": largest_gap.get("gap_start"),
+            "largest_missing_gap_end": largest_gap.get("gap_end"),
+            "missing_bar_windows_preview": gap_preview,
             "extreme_move_count": int(symbol_extreme),
             "corporate_action_jump_count": int(symbol_corporate_action_jump),
         }
@@ -206,6 +311,23 @@ def build_data_quality_report(
             corporate_action_jump_ratio > merged_thresholds["corporate_action_jump_ratio_max"]
         ),
     }
+    top_missing_bar_symbols = sorted(
+        top_missing_bar_symbols,
+        key=lambda item: (
+            -int(item.get("missing_bars_count", 0)),
+            -int(item.get("largest_missing_gap_bars", 0)),
+            str(item.get("symbol") or ""),
+        ),
+    )[:10]
+    top_missing_bar_windows = sorted(
+        top_missing_bar_windows,
+        key=lambda item: (
+            -int(item.get("estimated_missing_bars", 0)),
+            str(item.get("symbol") or ""),
+            str(item.get("gap_start") or ""),
+            str(item.get("gap_end") or ""),
+        ),
+    )[:20]
 
     return {
         "schema_version": SNAPSHOT_MANIFEST_SCHEMA_VERSION,
@@ -223,10 +345,13 @@ def build_data_quality_report(
             "corporate_action_jump_count": int(corporate_action_jump_count),
             "corporate_action_jump_ratio": corporate_action_jump_ratio,
             "return_observations": int(total_return_observations),
+            "symbols_with_missing_bars": int(len(top_missing_bar_symbols)),
         },
         "thresholds": merged_thresholds,
         "threshold_breaches": breaches,
         "passed": not any(breaches.values()),
+        "top_missing_bar_symbols": top_missing_bar_symbols,
+        "top_missing_bar_windows": top_missing_bar_windows,
         "per_symbol": per_symbol,
     }
 
@@ -239,6 +364,8 @@ def compute_data_quality_hash(quality_report: dict[str, Any]) -> str:
         "thresholds": quality_report.get("thresholds", {}),
         "threshold_breaches": quality_report.get("threshold_breaches", {}),
         "passed": bool(quality_report.get("passed", False)),
+        "top_missing_bar_symbols": quality_report.get("top_missing_bar_symbols", []),
+        "top_missing_bar_windows": quality_report.get("top_missing_bar_windows", []),
         "per_symbol": quality_report.get("per_symbol", {}),
     }
     return _canonical_hash(canonical_payload)

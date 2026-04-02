@@ -173,6 +173,14 @@ Required actions:
 - replay only the promoted artifact
 - use paper trading to validate execution realism and policy behavior, not to compensate for a weak training candidate
 
+Operational procedure:
+
+- launch serious WSL runs through `scripts/launch_wave1_wsl_run*.sh`; they now auto-start inside `tmux` when available
+- resume an interrupted search by rerunning the same launch script with the same `--name`; Optuna state is persisted under `models/optuna_state`
+- if the session is still alive, reattach with `tmux attach -t <session_name>` instead of starting a second foreground process
+- strict-snapshot promotion runs now enforce a pre-promotion checklist against the latest matching research matrix before training starts
+- if an operator must bypass that guard intentionally, set `ALPHATRADE_FORCE_PROMOTION_PRECHECK_BYPASS=1` before launching `launch_wave1_wsl_run3.sh`
+
 ## 6. Recommended Next Runs
 
 ### Run A: Data-Quality Rebuild

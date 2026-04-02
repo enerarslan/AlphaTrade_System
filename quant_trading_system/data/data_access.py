@@ -21,10 +21,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import pandas as pd
 import polars as pl
 
 from quant_trading_system.core.data_types import OHLCVBar, Order, Position
 from quant_trading_system.core.exceptions import DataError, DataNotFoundError
+from quant_trading_system.core.utils import get_market_session_bounds
+from quant_trading_system.data.timeframe import (
+    DEFAULT_TIMEFRAME,
+    US_EQUITY_REGULAR_SESSION_MINUTES,
+    timeframe_to_minutes,
+)
 from quant_trading_system.database.connection import DatabaseManager, get_db_manager
 
 if TYPE_CHECKING:
@@ -33,6 +40,99 @@ if TYPE_CHECKING:
     from quant_trading_system.data.loader import DataLoader
 
 logger = logging.getLogger(__name__)
+
+
+def timeframe_uses_market_session_filter(timeframe: str | None) -> bool:
+    """Return whether a timeframe represents intraday US-equity bars."""
+    minutes = timeframe_to_minutes(timeframe, default=DEFAULT_TIMEFRAME)
+    return int(minutes) < int(US_EQUITY_REGULAR_SESSION_MINUTES)
+
+
+def filter_ohlcv_frame_to_market_session(
+    frame: pd.DataFrame | None,
+    *,
+    timeframe: str | None,
+    include_premarket: bool = False,
+    include_postmarket: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Filter OHLCV rows to the configured US-equity trading session window."""
+    if frame is None:
+        return pd.DataFrame(), {
+            "applied": False,
+            "reason": "no_frame",
+            "input_rows": 0,
+            "output_rows": 0,
+            "removed_rows": 0,
+        }
+    if frame.empty:
+        return frame.copy(), {
+            "applied": False,
+            "reason": "empty_frame",
+            "input_rows": 0,
+            "output_rows": 0,
+            "removed_rows": 0,
+        }
+    if "timestamp" not in frame.columns:
+        return frame.copy(), {
+            "applied": False,
+            "reason": "missing_timestamp_column",
+            "input_rows": int(len(frame)),
+            "output_rows": int(len(frame)),
+            "removed_rows": 0,
+        }
+    if not timeframe_uses_market_session_filter(timeframe):
+        return frame.copy(), {
+            "applied": False,
+            "reason": "non_intraday_timeframe",
+            "input_rows": int(len(frame)),
+            "output_rows": int(len(frame)),
+            "removed_rows": 0,
+        }
+
+    working = frame.copy()
+    timestamps_utc = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
+    session_mask = pd.Series(False, index=working.index, dtype=bool)
+    valid_mask = timestamps_utc.notna()
+    if not bool(valid_mask.any()):
+        filtered = working.loc[session_mask].copy()
+        return filtered.reset_index(drop=True), {
+            "applied": True,
+            "reason": "no_valid_timestamps",
+            "input_rows": int(len(frame)),
+            "output_rows": 0,
+            "removed_rows": int(len(frame)),
+            "include_premarket": bool(include_premarket),
+            "include_postmarket": bool(include_postmarket),
+        }
+
+    eastern_ts = timestamps_utc.loc[valid_mask].dt.tz_convert("America/New_York")
+    trading_day_mask = eastern_ts.dt.dayofweek < 5
+    trading_dates = eastern_ts.loc[trading_day_mask].dt.normalize().drop_duplicates().tolist()
+
+    for trading_date in trading_dates:
+        session_open, session_close = get_market_session_bounds(
+            pd.Timestamp(trading_date).to_pydatetime()
+        )
+        if include_premarket:
+            session_open = session_open.replace(hour=4, minute=0, second=0, microsecond=0)
+        if include_postmarket:
+            session_close = session_close.replace(hour=20, minute=0, second=0, microsecond=0)
+
+        date_mask = eastern_ts.dt.normalize() == trading_date
+        in_window = date_mask & (eastern_ts >= session_open) & (eastern_ts < session_close)
+        session_mask.loc[eastern_ts.index[in_window]] = True
+
+    filtered = working.loc[session_mask].copy().reset_index(drop=True)
+    return filtered, {
+        "applied": True,
+        "reason": "filtered_to_market_session",
+        "input_rows": int(len(frame)),
+        "output_rows": int(len(filtered)),
+        "removed_rows": int(len(frame) - len(filtered)),
+        "include_premarket": bool(include_premarket),
+        "include_postmarket": bool(include_postmarket),
+        "timeframe": str(timeframe or DEFAULT_TIMEFRAME),
+    }
 
 
 class DataAccessConfig:

@@ -84,6 +84,7 @@ from quant_trading_system.models.expected_edge_policy import (
     derive_base_signal,
     derive_regime_conditioned_policy,
 )
+from quant_trading_system.data.data_access import filter_ohlcv_frame_to_market_session
 from quant_trading_system.models.statistical_validation import (
     calculate_deflated_sharpe_ratio,
     calculate_probability_of_backtest_overfitting,
@@ -165,6 +166,15 @@ TRAINING_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     },
 }
 SNAPSHOT_TRAINING_SCOPE_SCHEMA_VERSION = "1.0.0"
+PRE_PROMOTION_CHECKLIST_SCHEMA_VERSION = "1.0.0"
+PRE_PROMOTION_WORK_PLAN_THRESHOLDS: dict[str, float] = {
+    "mean_trade_count_min": 100.0,
+    "mean_risk_adjusted_score_min": 0.0,
+    "holdout_max_drawdown_max": 0.35,
+    "holdout_symbol_sharpe_p25_min": -0.10,
+    "pbo_max": 0.45,
+    "white_reality_pvalue_max": 0.10,
+}
 
 
 def _normalize_training_profile(value: Any) -> str:
@@ -319,6 +329,8 @@ def _build_snapshot_training_scope(config: "TrainingConfig") -> dict[str, Any]:
         "end_date": str(config.end_date or ""),
         "timeframe": str(config.timeframe),
         "timeframes": timeframes,
+        "include_premarket": bool(config.include_premarket),
+        "include_postmarket": bool(config.include_postmarket),
         "feature_groups": feature_groups,
         "training_bar_mode": str(config.training_bar_mode),
         "intrinsic_bar_type": str(config.intrinsic_bar_type),
@@ -883,6 +895,8 @@ class TrainingConfig:
     end_date: str = ""
     timeframe: str = DEFAULT_TIMEFRAME
     timeframes: list[str] = field(default_factory=list)
+    include_premarket: bool = False
+    include_postmarket: bool = False
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
@@ -898,6 +912,8 @@ class TrainingConfig:
     optimizer: str = "optuna"  # optuna, grid, random, bayesian
     n_trials: int = 100
     n_jobs: int = -1
+    optuna_storage_dir: str = ""
+    optuna_resume_enabled: bool = True
     seed: int = 42
     use_nested_walk_forward: bool = True
     nested_outer_splits: int = 4
@@ -1081,8 +1097,12 @@ class TrainingConfig:
         self.feature_reuse_min_coverage = min(
             max(float(self.feature_reuse_min_coverage), 0.01), 0.95
         )
+        self.optuna_storage_dir = str(self.optuna_storage_dir or "").strip()
+        self.optuna_resume_enabled = bool(self.optuna_resume_enabled)
         self.timeframe = normalize_timeframe(self.timeframe)
         self.timeframes = normalize_timeframes(self.timeframe, self.timeframes)
+        self.include_premarket = bool(self.include_premarket)
+        self.include_postmarket = bool(self.include_postmarket)
         self.use_gpu = bool(self.use_gpu)
         self.require_gpu = bool(self.require_gpu)
         if self.require_gpu and not self.use_gpu:
@@ -1414,6 +1434,7 @@ class ModelTrainer:
             self.training_metrics["deployment_plan"] = self._build_deployment_plan(
                 passed_validation=bool(passed_gates)
             )
+            self._record_pre_promotion_checklist()
 
             # Phase 10: Save Model
             model_path = self._save_model()
@@ -1448,6 +1469,11 @@ class ModelTrainer:
                     else None
                 ),
                 "data_quality_report_hash": self.data_quality_report_hash,
+                "data_quality_report_passed": (
+                    bool(self.data_quality_report.get("passed", False))
+                    if isinstance(self.data_quality_report, dict)
+                    else None
+                ),
                 "feature_schema_version": (
                     str(self.snapshot_manifest.get("feature_schema_version"))
                     if isinstance(self.snapshot_manifest, dict)
@@ -1457,6 +1483,15 @@ class ModelTrainer:
                     str(self.dataset_snapshot_bundle_manifest_path)
                     if self.dataset_snapshot_bundle_manifest_path is not None
                     else None
+                ),
+                "dataset_bundle_hash": (
+                    str(self.dataset_snapshot_bundle_manifest.get("bundle_hash"))
+                    if isinstance(self.dataset_snapshot_bundle_manifest, dict)
+                    else (
+                        str(self.snapshot_manifest.get("dataset_bundle_hash"))
+                        if isinstance(self.snapshot_manifest, dict)
+                        else None
+                    )
                 ),
                 "label_diagnostics": self.label_diagnostics,
                 "nested_cv_trace": self.nested_cv_trace,
@@ -1480,6 +1515,7 @@ class ModelTrainer:
                 ),
                 "model_card": self.training_metrics.get("model_card", {}),
                 "deployment_plan": self.training_metrics.get("deployment_plan", {}),
+                "pre_promotion_checklist": self.training_metrics.get("pre_promotion_checklist", {}),
             }
 
             self._record_training_run_event("completed", results=results)
@@ -1613,6 +1649,185 @@ class ModelTrainer:
         """Return the directory that stores durable training-run events."""
         return Path(self.config.output_dir) / "run_index"
 
+    def _optuna_state_dir(self) -> Path:
+        """Return the directory that stores resumable Optuna state."""
+        configured = str(getattr(self.config, "optuna_storage_dir", "") or "").strip()
+        if configured:
+            return Path(configured)
+        return Path(self.config.output_dir) / "optuna_state"
+
+    def _build_optuna_study_artifacts(self, namespace: str) -> dict[str, Any]:
+        """Resolve deterministic names and file paths for one Optuna study."""
+        snapshot_id = (
+            str(self.snapshot_manifest.get("snapshot_id"))
+            if isinstance(self.snapshot_manifest, dict)
+            else "live_data"
+        )
+        raw_name = "__".join(
+            [
+                str(self.config.model_name),
+                str(self.config.model_type),
+                str(self.config.training_profile),
+                f"h{int(self.config.primary_label_horizon)}",
+                str(self.config.timeframe),
+                snapshot_id,
+                str(namespace),
+            ]
+        )
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")
+        if not safe_name:
+            safe_name = "optuna_study"
+        safe_name = safe_name[:120]
+        digest = hashlib.sha256(raw_name.encode("utf-8")).hexdigest()[:12]
+        study_name = f"{safe_name}_{digest}"
+        state_dir = self._optuna_state_dir()
+        return {
+            "namespace": str(namespace),
+            "study_name": study_name,
+            "state_dir": state_dir,
+            "storage_path": state_dir / f"{study_name}.sqlite3",
+            "manifest_path": state_dir / f"{study_name}.study.json",
+        }
+
+    @staticmethod
+    def _optuna_trial_state_summary(study: Any, optuna: Any) -> dict[str, int]:
+        """Summarize current Optuna trial states for resume bookkeeping."""
+        states = getattr(optuna, "trial", None)
+        trial_state = getattr(states, "TrialState", None)
+        counts = {
+            "existing_trials": 0,
+            "complete_trials": 0,
+            "pruned_trials": 0,
+            "failed_trials": 0,
+            "running_trials": 0,
+            "waiting_trials": 0,
+            "finalized_trials": 0,
+        }
+        if trial_state is None:
+            return counts
+
+        finalized_states = {
+            getattr(trial_state, "COMPLETE", object()),
+            getattr(trial_state, "PRUNED", object()),
+            getattr(trial_state, "FAIL", object()),
+        }
+        for trial in list(getattr(study, "trials", []) or []):
+            counts["existing_trials"] += 1
+            state = getattr(trial, "state", None)
+            if state == getattr(trial_state, "COMPLETE", None):
+                counts["complete_trials"] += 1
+            elif state == getattr(trial_state, "PRUNED", None):
+                counts["pruned_trials"] += 1
+            elif state == getattr(trial_state, "FAIL", None):
+                counts["failed_trials"] += 1
+            elif state == getattr(trial_state, "RUNNING", None):
+                counts["running_trials"] += 1
+            elif state == getattr(trial_state, "WAITING", None):
+                counts["waiting_trials"] += 1
+            if state in finalized_states:
+                counts["finalized_trials"] += 1
+        return counts
+
+    def _write_optuna_study_manifest(self, payload: dict[str, Any]) -> Path | None:
+        """Persist one Optuna study manifest for resume/debugging."""
+        manifest_path = payload.get("manifest_path")
+        if not manifest_path:
+            return None
+        path = Path(str(manifest_path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        safe_payload = self._json_safe(payload)
+        path.write_text(
+            json.dumps(safe_payload, indent=2, ensure_ascii=True, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        return path
+
+    def _prepare_optuna_study(
+        self,
+        optuna: Any,
+        *,
+        namespace: str,
+        direction: str,
+        sampler: Any,
+        pruner: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Create or resume an Optuna study backed by durable SQLite storage."""
+        artifacts = self._build_optuna_study_artifacts(namespace)
+        study_kwargs: dict[str, Any] = {
+            "direction": direction,
+            "sampler": sampler,
+            "pruner": pruner,
+            "study_name": artifacts["study_name"],
+        }
+        if self.config.optuna_resume_enabled:
+            state_dir = Path(artifacts["state_dir"])
+            state_dir.mkdir(parents=True, exist_ok=True)
+            storage_path = Path(artifacts["storage_path"]).resolve()
+            study_kwargs["storage"] = f"sqlite:///{storage_path.as_posix()}"
+            study_kwargs["load_if_exists"] = True
+
+        study = optuna.create_study(**study_kwargs)
+        summary = self._optuna_trial_state_summary(study, optuna)
+        study_info = {
+            **artifacts,
+            **summary,
+            "resume_enabled": bool(self.config.optuna_resume_enabled),
+            "resumed_from_storage": bool(
+                self.config.optuna_resume_enabled and summary["existing_trials"] > 0
+            ),
+            "remaining_trials": int(
+                max(int(self.config.n_trials) - int(summary["finalized_trials"]), 0)
+            ),
+            "direction": str(direction),
+            "run_id": self.run_id,
+            "model_name": self.config.model_name,
+            "model_type": self.config.model_type,
+            "training_profile": self.config.training_profile,
+            "primary_label_horizon": int(self.config.primary_label_horizon),
+            "snapshot_id": (
+                str(self.snapshot_manifest.get("snapshot_id"))
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "status": "prepared",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        manifest_path = self._write_optuna_study_manifest(study_info)
+        if manifest_path is not None:
+            study_info["manifest_path"] = manifest_path
+        return study, study_info
+
+    def _record_optuna_study_metrics(
+        self,
+        prefix: str,
+        study_info: dict[str, Any],
+    ) -> None:
+        """Flatten study persistence metadata into training metrics."""
+        self.training_metrics[f"{prefix}_study"] = self._json_safe(study_info)
+        for key in (
+            "study_name",
+            "remaining_trials",
+            "existing_trials",
+            "complete_trials",
+            "pruned_trials",
+            "failed_trials",
+            "running_trials",
+            "finalized_trials",
+        ):
+            value = study_info.get(key)
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                self.training_metrics[f"{prefix}_{key}"] = float(value)
+            elif value is not None:
+                self.training_metrics[f"{prefix}_{key}"] = value
+        for key in ("resume_enabled", "resumed_from_storage"):
+            self.training_metrics[f"{prefix}_{key}"] = float(bool(study_info.get(key, False)))
+        storage_path = study_info.get("storage_path")
+        if storage_path is not None:
+            self.training_metrics[f"{prefix}_storage_path"] = str(storage_path)
+        manifest_path = study_info.get("manifest_path")
+        if manifest_path is not None:
+            self.training_metrics[f"{prefix}_manifest_path"] = str(manifest_path)
+
     def _record_training_run_event(
         self,
         status: str,
@@ -1718,6 +1933,7 @@ class ModelTrainer:
         self._load_data_from_postgres()
         self._apply_corporate_action_adjustments()
         self._sanitize_loaded_data()
+        self._apply_market_session_filter()
         self._apply_symbol_universe_filters()
         self._apply_training_bar_mode()
         self._capture_data_quality_report()
@@ -1885,6 +2101,9 @@ class ModelTrainer:
 
         cleaned_rows = len(df)
         self.data = df.reset_index(drop=True)
+        base_timeframe = normalize_timeframe(self.config.timeframe)
+        if base_timeframe in self.ohlcv_panels_by_timeframe:
+            self.ohlcv_panels_by_timeframe[base_timeframe] = self.data.copy()
         self.training_metrics["sanitization_initial_rows"] = float(initial_rows)
         self.training_metrics["sanitization_cleaned_rows"] = float(cleaned_rows)
         self.training_metrics["sanitization_duplicate_rows_removed"] = float(duplicate_count)
@@ -1901,6 +2120,79 @@ class ModelTrainer:
             f"duplicates_removed={duplicate_count}, "
             f"invalid_ohlcv_removed={invalid_ohlcv_count}, "
             f"extreme_return_removed={extreme_return_count}"
+        )
+
+    def _apply_market_session_filter(self) -> None:
+        """Remove sparse out-of-session bars before quality and feature diagnostics."""
+        if self.data is None or self.data.empty:
+            raise ValueError("No data loaded for market-session filtering.")
+        requested_premarket = bool(self.config.include_premarket)
+        requested_postmarket = bool(self.config.include_postmarket)
+        panels = dict(getattr(self, "ohlcv_panels_by_timeframe", {}) or {})
+        base_timeframe = normalize_timeframe(self.config.timeframe)
+        if base_timeframe not in panels:
+            panels[base_timeframe] = self.data.copy()
+
+        filtered_panels: dict[str, pd.DataFrame] = {}
+        filter_summary: dict[str, dict[str, Any]] = {}
+        rows_removed = 0
+        any_filter_applied = False
+
+        for timeframe_name, panel in panels.items():
+            filtered_panel, metadata = filter_ohlcv_frame_to_market_session(
+                panel,
+                timeframe=timeframe_name,
+                include_premarket=requested_premarket,
+                include_postmarket=requested_postmarket,
+            )
+            if not filtered_panel.empty:
+                filtered_panel["timestamp"] = pd.to_datetime(
+                    filtered_panel["timestamp"], utc=True, errors="coerce"
+                )
+                filtered_panel = (
+                    filtered_panel.dropna(subset=["timestamp"])
+                    .sort_values(["symbol", "timestamp"])
+                    .reset_index(drop=True)
+                )
+            filtered_panels[normalize_timeframe(timeframe_name)] = filtered_panel
+            filter_summary[normalize_timeframe(timeframe_name)] = {
+                "applied": bool(metadata.get("applied", False)),
+                "reason": str(metadata.get("reason", "")),
+                "input_rows": int(metadata.get("input_rows", len(panel))),
+                "output_rows": int(metadata.get("output_rows", len(filtered_panel))),
+                "removed_rows": int(metadata.get("removed_rows", 0)),
+            }
+            rows_removed += int(metadata.get("removed_rows", 0))
+            any_filter_applied = any_filter_applied or bool(metadata.get("applied", False))
+
+        base_panel = filtered_panels.get(base_timeframe)
+        if base_panel is None or base_panel.empty:
+            raise ValueError(
+                "Market-session filter removed all base-timeframe rows; "
+                "verify the OHLCV session coverage."
+            )
+
+        self.ohlcv_panels_by_timeframe = filtered_panels
+        self.data = base_panel.copy().reset_index(drop=True)
+        self.training_metrics["market_session_filter_applied"] = bool(any_filter_applied)
+        self.training_metrics["market_session_include_premarket"] = bool(requested_premarket)
+        self.training_metrics["market_session_include_postmarket"] = bool(requested_postmarket)
+        self.training_metrics["market_session_rows_removed"] = float(rows_removed)
+        self.training_metrics["market_session_row_counts_by_timeframe"] = {
+            tf_name: {
+                "input_rows": int(summary["input_rows"]),
+                "output_rows": int(summary["output_rows"]),
+                "removed_rows": int(summary["removed_rows"]),
+            }
+            for tf_name, summary in filter_summary.items()
+        }
+        self.training_metrics["market_session_filter_summary"] = self._json_safe(filter_summary)
+        self.logger.info(
+            "Market-session filter applied: premarket=%s postmarket=%s base_rows=%d removed=%d",
+            requested_premarket,
+            requested_postmarket,
+            len(self.data),
+            rows_removed,
         )
 
     def _load_corporate_actions_for_adjustment(
@@ -2561,6 +2853,43 @@ class ModelTrainer:
         match = re.match(r"^([A-Z]+(?:\.[A-Z]+)?)(?:_.*)?$", normalized)
         return match.group(1) if match else normalized
 
+    def _record_data_quality_metrics(self) -> None:
+        """Flatten the active data-quality report into stable training metrics."""
+        if not isinstance(self.data_quality_report, dict) or not self.data_quality_report:
+            return
+
+        summary = self.data_quality_report.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = {}
+
+        self.training_metrics["data_quality_report_passed"] = bool(
+            self.data_quality_report.get("passed", False)
+        )
+        self.training_metrics["data_quality_symbol_count"] = float(summary.get("symbol_count", 0.0))
+        self.training_metrics["data_quality_missing_bars_count"] = float(
+            summary.get("missing_bars_count", 0.0)
+        )
+        self.training_metrics["data_quality_missing_bars_ratio"] = float(
+            summary.get("missing_bars_ratio", 0.0)
+        )
+        self.training_metrics["data_quality_duplicate_bars_count"] = float(
+            summary.get("duplicate_bars_count", 0.0)
+        )
+        self.training_metrics["data_quality_duplicate_bars_ratio"] = float(
+            summary.get("duplicate_bars_ratio", 0.0)
+        )
+        self.training_metrics["data_quality_symbols_with_missing_bars"] = float(
+            summary.get("symbols_with_missing_bars", 0.0)
+        )
+        self.training_metrics["data_quality_top_missing_bar_symbols"] = self._json_safe(
+            self.data_quality_report.get("top_missing_bar_symbols", [])
+        )
+        self.training_metrics["data_quality_top_missing_bar_windows"] = self._json_safe(
+            self.data_quality_report.get("top_missing_bar_windows", [])
+        )
+        if self.data_quality_report_hash:
+            self.training_metrics["data_quality_report_hash"] = str(self.data_quality_report_hash)
+
     def _capture_data_quality_report(self) -> None:
         """Build and cache quality report for the active training dataset."""
         if self.data is None or self.data.empty:
@@ -2578,6 +2907,7 @@ class ModelTrainer:
             thresholds=thresholds,
         )
         self.data_quality_report_hash = compute_data_quality_hash(self.data_quality_report)
+        self._record_data_quality_metrics()
 
         summary = self.data_quality_report.get("summary", {})
         self.logger.info(
@@ -2592,6 +2922,26 @@ class ModelTrainer:
                 "Data quality SLA breaches detected in training dataset. "
                 "Review quality report before model promotion."
             )
+            top_symbols = self.data_quality_report.get("top_missing_bar_symbols", [])
+            if isinstance(top_symbols, list) and top_symbols:
+                symbol_preview = ", ".join(
+                    f"{entry.get('symbol')}:{int(entry.get('missing_bars_count', 0))}"
+                    for entry in top_symbols[:5]
+                    if isinstance(entry, dict)
+                )
+                if symbol_preview:
+                    self.logger.warning("Top missing-bar symbols: %s", symbol_preview)
+            top_windows = self.data_quality_report.get("top_missing_bar_windows", [])
+            if isinstance(top_windows, list) and top_windows:
+                first_window = top_windows[0]
+                if isinstance(first_window, dict):
+                    self.logger.warning(
+                        "Largest missing-bar window: %s %s -> %s (missing=%s)",
+                        first_window.get("symbol", "unknown"),
+                        first_window.get("gap_start", "n/a"),
+                        first_window.get("gap_end", "n/a"),
+                        first_window.get("estimated_missing_bars", 0),
+                    )
 
     def _build_training_snapshot_manifest(self) -> None:
         """Create deterministic snapshot manifest after features are finalized."""
@@ -2884,6 +3234,7 @@ class ModelTrainer:
                     ) from exc
         if self.data_quality_report_hash is None and self.data_quality_report is not None:
             self.data_quality_report_hash = compute_data_quality_hash(self.data_quality_report)
+        self._record_data_quality_metrics()
         self.label_diagnostics = bundle.get("label_diagnostics", {}) or {}
         if self.label_diagnostics:
             self.training_metrics["label_positive_rate"] = float(
@@ -5074,19 +5425,48 @@ class ModelTrainer:
 
         sampler = optuna.samplers.TPESampler(seed=self.config.seed)
         pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1)
-        study = optuna.create_study(
+        study, study_info = self._prepare_optuna_study(
+            optuna,
+            namespace="primary_search",
             direction="maximize",
             sampler=sampler,
             pruner=pruner,
-            study_name=f"{self.config.model_type}_institutional_opt",
         )
-        study.optimize(
-            objective,
-            n_trials=self.config.n_trials,
-            n_jobs=1,
-            gc_after_trial=True,
-            show_progress_bar=False,
+        self._record_optuna_study_metrics("optuna", study_info)
+        if int(study_info.get("running_trials", 0)) > 0:
+            self.logger.warning(
+                "Optuna study %s contains %d stale running trial(s) from a prior interruption; "
+                "new trials will continue from durable storage.",
+                study_info["study_name"],
+                int(study_info["running_trials"]),
+            )
+        remaining_trials = int(study_info.get("remaining_trials", self.config.n_trials))
+        if remaining_trials > 0:
+            study.optimize(
+                objective,
+                n_trials=remaining_trials,
+                n_jobs=1,
+                gc_after_trial=True,
+                show_progress_bar=False,
+            )
+        else:
+            self.logger.info(
+                "Optuna study %s already has %d finalized trials; reusing saved search state.",
+                study_info["study_name"],
+                int(study_info.get("finalized_trials", 0)),
+            )
+        study_info.update(
+            self._optuna_trial_state_summary(study, optuna)
         )
+        study_info["remaining_trials"] = int(
+            max(int(self.config.n_trials) - int(study_info.get("finalized_trials", 0)), 0)
+        )
+        study_info["status"] = "completed"
+        study_info["recorded_at"] = datetime.now(timezone.utc).isoformat()
+        manifest_path = self._write_optuna_study_manifest(study_info)
+        if manifest_path is not None:
+            study_info["manifest_path"] = manifest_path
+        self._record_optuna_study_metrics("optuna", study_info)
 
         completed_trials = [
             t
@@ -5521,19 +5901,51 @@ class ModelTrainer:
                 trial.set_user_attr("inner_stability_penalty", float(stability_penalty))
                 return float(aggregate_score - stability_penalty - param_robustness_penalty)
 
-            study = optuna.create_study(
+            study, study_info = self._prepare_optuna_study(
+                optuna,
+                namespace=f"nested_outer_{int(outer_fold):02d}",
                 direction="maximize",
                 sampler=optuna.samplers.TPESampler(seed=self.config.seed + outer_fold),
                 pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=1),
-                study_name=f"{self.config.model_type}_nested_outer_{outer_fold}",
             )
-            study.optimize(
-                objective,
-                n_trials=self.config.n_trials,
-                n_jobs=1,
-                gc_after_trial=True,
-                show_progress_bar=False,
+            nested_studies = dict(self.training_metrics.get("nested_optuna_studies", {}) or {})
+            nested_studies[str(outer_fold)] = self._json_safe(study_info)
+            self.training_metrics["nested_optuna_studies"] = nested_studies
+            if int(study_info.get("running_trials", 0)) > 0:
+                self.logger.warning(
+                    "Outer fold %s: Optuna study %s contains %d stale running trial(s); "
+                    "resuming from durable storage.",
+                    outer_fold,
+                    study_info["study_name"],
+                    int(study_info["running_trials"]),
+                )
+            remaining_trials = int(study_info.get("remaining_trials", self.config.n_trials))
+            if remaining_trials > 0:
+                study.optimize(
+                    objective,
+                    n_trials=remaining_trials,
+                    n_jobs=1,
+                    gc_after_trial=True,
+                    show_progress_bar=False,
+                )
+            else:
+                self.logger.info(
+                    "Outer fold %s: reusing Optuna study %s with %d finalized trials.",
+                    outer_fold,
+                    study_info["study_name"],
+                    int(study_info.get("finalized_trials", 0)),
+                )
+            study_info.update(self._optuna_trial_state_summary(study, optuna))
+            study_info["remaining_trials"] = int(
+                max(int(self.config.n_trials) - int(study_info.get("finalized_trials", 0)), 0)
             )
+            study_info["status"] = "completed"
+            study_info["recorded_at"] = datetime.now(timezone.utc).isoformat()
+            manifest_path = self._write_optuna_study_manifest(study_info)
+            if manifest_path is not None:
+                study_info["manifest_path"] = manifest_path
+            nested_studies[str(outer_fold)] = self._json_safe(study_info)
+            self.training_metrics["nested_optuna_studies"] = nested_studies
 
             total_trials += int(len(study.trials))
             total_pruned += int(
@@ -5666,6 +6078,22 @@ class ModelTrainer:
                     "outer_candidate_status": (
                         "accepted" if outer_surface_stable else "rejected_unstable"
                     ),
+                    "optuna_study_name": str(study_info.get("study_name", "")),
+                    "optuna_storage_path": (
+                        str(study_info["storage_path"])
+                        if study_info.get("storage_path") is not None
+                        else None
+                    ),
+                    "optuna_manifest_path": (
+                        str(study_info["manifest_path"])
+                        if study_info.get("manifest_path") is not None
+                        else None
+                    ),
+                    "optuna_resumed_from_storage": bool(
+                        study_info.get("resumed_from_storage", False)
+                    ),
+                    "optuna_existing_trials": int(study_info.get("existing_trials", 0)),
+                    "optuna_finalized_trials": int(study_info.get("finalized_trials", 0)),
                     "best_params": best_params,
                     "objective_components": {
                         "objective_sharpe_component": float(
@@ -8572,14 +9000,31 @@ class ModelTrainer:
                 else 0.0
             )
             calmar = annual_return / max_dd if max_dd > 1e-9 else annual_return
+            cumulative_pnl = float(np.sum(performance_returns)) if performance_returns.size > 0 else 0.0
+            loss_pnl = (
+                float(np.sum(performance_returns[performance_returns < 0.0]))
+                if performance_returns.size > 0
+                else 0.0
+            )
+            if performance_returns.size > 0:
+                cumulative_equity = np.cumsum(performance_returns)
+                running_peak = np.maximum.accumulate(cumulative_equity)
+                underwater_ratio = float(np.mean(cumulative_equity < (running_peak - 1e-12)))
+            else:
+                underwater_ratio = 0.0
             if performance_returns.size > 0:
                 alpha = 0.05
                 tail_cutoff = float(np.quantile(performance_returns, alpha))
                 cvar = float(np.mean(performance_returns[performance_returns <= tail_cutoff]))
+                tail_loss_cutoff = float(np.quantile(performance_returns, 0.10))
+                tail_loss_pnl = float(
+                    np.sum(performance_returns[performance_returns <= tail_loss_cutoff])
+                )
                 expected_shortfall = float(abs(cvar))
                 skew = float(pd.Series(performance_returns).skew())
             else:
                 cvar = 0.0
+                tail_loss_pnl = 0.0
                 expected_shortfall = 0.0
                 skew = 0.0
 
@@ -8621,6 +9066,10 @@ class ModelTrainer:
                     "active_signal_rate": active_signal_rate,
                     "annual_return": annual_return,
                     "calmar": calmar,
+                    "pnl": cumulative_pnl,
+                    "loss_pnl": loss_pnl,
+                    "tail_loss_pnl": tail_loss_pnl,
+                    "underwater_ratio": underwater_ratio,
                     "trade_return_observations": float(len(trade_returns)),
                     "sharpe_observation_confidence": float(sharpe_observation_confidence),
                     "cvar_95": cvar,
@@ -8674,6 +9123,10 @@ class ModelTrainer:
                     "active_signal_rate": 0.0,
                     "annual_return": 0.0,
                     "calmar": 0.0,
+                    "pnl": 0.0,
+                    "loss_pnl": 0.0,
+                    "tail_loss_pnl": 0.0,
+                    "underwater_ratio": 0.0,
                     "trade_return_observations": 0.0,
                     "sharpe_observation_confidence": 0.0,
                     "cvar_95": 0.0,
@@ -9788,6 +10241,10 @@ class ModelTrainer:
                     "active_signal_rate": float(regime_metrics.get("active_signal_rate", 0.0)),
                     "annual_return": float(regime_metrics.get("annual_return", 0.0)),
                     "calmar": float(regime_metrics.get("calmar", 0.0)),
+                    "pnl": float(regime_metrics.get("pnl", 0.0)),
+                    "loss_pnl": float(regime_metrics.get("loss_pnl", 0.0)),
+                    "tail_loss_pnl": float(regime_metrics.get("tail_loss_pnl", 0.0)),
+                    "underwater_ratio": float(regime_metrics.get("underwater_ratio", 0.0)),
                     "cvar_95": float(regime_metrics.get("cvar_95", 0.0)),
                     "risk_adjusted_score": float(regime_metrics.get("risk_adjusted_score", -1e9)),
                     "sharpe_observation_confidence": float(
@@ -9862,6 +10319,10 @@ class ModelTrainer:
                     "active_signal_rate": float(symbol_metrics.get("active_signal_rate", 0.0)),
                     "annual_return": float(symbol_metrics.get("annual_return", 0.0)),
                     "calmar": float(symbol_metrics.get("calmar", 0.0)),
+                    "pnl": float(symbol_metrics.get("pnl", 0.0)),
+                    "loss_pnl": float(symbol_metrics.get("loss_pnl", 0.0)),
+                    "tail_loss_pnl": float(symbol_metrics.get("tail_loss_pnl", 0.0)),
+                    "underwater_ratio": float(symbol_metrics.get("underwater_ratio", 0.0)),
                     "cvar_95": float(symbol_metrics.get("cvar_95", 0.0)),
                     "risk_adjusted_score": float(symbol_metrics.get("risk_adjusted_score", -1e9)),
                     "sharpe_observation_confidence": float(
@@ -9884,9 +10345,47 @@ class ModelTrainer:
                 holdout_symbol_worst_sharpe = float(np.min(symbol_sharpes))
                 holdout_symbol_underwater_ratio = float(np.mean(symbol_sharpes < 0.0))
 
+        def _top_tail_contributors(
+            metrics_by_group: dict[str, dict[str, float]],
+            *,
+            top_k: int = 8,
+        ) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for group_name, group_metrics in metrics_by_group.items():
+                tail_loss_pnl = float(group_metrics.get("tail_loss_pnl", 0.0))
+                pnl = float(group_metrics.get("pnl", 0.0))
+                if tail_loss_pnl >= 0.0 and pnl >= 0.0:
+                    continue
+                rows.append(
+                    {
+                        "name": str(group_name),
+                        "tail_loss_pnl": tail_loss_pnl,
+                        "pnl": pnl,
+                        "loss_pnl": float(group_metrics.get("loss_pnl", 0.0)),
+                        "underwater_ratio": float(group_metrics.get("underwater_ratio", 0.0)),
+                        "trade_count": float(group_metrics.get("trade_count", 0.0)),
+                        "sharpe": float(group_metrics.get("sharpe", 0.0)),
+                        "max_drawdown": float(group_metrics.get("max_drawdown", 0.0)),
+                    }
+                )
+            rows.sort(
+                key=lambda item: (
+                    float(item.get("tail_loss_pnl", 0.0)),
+                    float(item.get("pnl", 0.0)),
+                    -float(item.get("trade_count", 0.0)),
+                )
+            )
+            return rows[:top_k]
+
+        holdout_tail_loss_contributors_by_symbol = _top_tail_contributors(holdout_symbol_metrics)
+        holdout_tail_loss_contributors_by_regime = _top_tail_contributors(holdout_regime_metrics)
+
         self.training_metrics["holdout_worst_regime_sharpe"] = float(holdout_worst_regime_sharpe)
         self.training_metrics["holdout_regime_count_evaluated"] = float(len(holdout_regime_metrics))
         self.training_metrics["holdout_regime_metrics"] = holdout_regime_metrics
+        self.training_metrics["holdout_tail_loss_contributors_by_regime"] = (
+            holdout_tail_loss_contributors_by_regime
+        )
         self.training_metrics["holdout_symbol_count_total"] = float(holdout_symbol_count_total)
         self.training_metrics["holdout_symbol_count_evaluated"] = float(
             holdout_symbol_count_evaluated
@@ -9902,6 +10401,9 @@ class ModelTrainer:
             holdout_symbol_underwater_ratio
         )
         self.training_metrics["holdout_symbol_metrics"] = holdout_symbol_metrics
+        self.training_metrics["holdout_tail_loss_contributors_by_symbol"] = (
+            holdout_tail_loss_contributors_by_symbol
+        )
 
         for key, value in holdout_metrics.items():
             if isinstance(value, (int, float, np.floating, np.integer)):
@@ -10520,6 +11022,39 @@ class ModelTrainer:
                 "max_symbol_entry_share": float(self.config.execution_max_symbol_entry_share),
             },
         }
+
+    def _record_pre_promotion_checklist(self) -> dict[str, Any]:
+        """Persist research-readiness evidence used to authorize promotion runs."""
+        checklist = _build_pre_promotion_checklist(
+            {
+                "model_name": self.config.model_name,
+                "model_type": self.config.model_type,
+                "training_profile": self.config.training_profile,
+                "snapshot_id": (
+                    str(self.snapshot_manifest.get("snapshot_id"))
+                    if isinstance(self.snapshot_manifest, dict)
+                    else None
+                ),
+                "dataset_bundle_hash": (
+                    str(self.dataset_snapshot_bundle_manifest.get("bundle_hash"))
+                    if isinstance(self.dataset_snapshot_bundle_manifest, dict)
+                    else (
+                        str(self.snapshot_manifest.get("dataset_bundle_hash"))
+                        if isinstance(self.snapshot_manifest, dict)
+                        else None
+                    )
+                ),
+                "data_quality_report_hash": self.data_quality_report_hash,
+                "training_metrics": self.training_metrics,
+                "validation_results": self.validation_results,
+            }
+        )
+        self.training_metrics["pre_promotion_checklist"] = self._json_safe(checklist)
+        self.training_metrics["pre_promotion_ready"] = 1.0 if checklist.get("ready", False) else 0.0
+        self.training_metrics["pre_promotion_failed_checks"] = list(
+            checklist.get("failed_checks", [])
+        )
+        return checklist
 
     def _train_meta_labeler(self) -> None:
         """
@@ -11616,6 +12151,44 @@ def _metric_as_float(metrics: dict[str, Any], key: str, default: float = 0.0) ->
     return float(np.nan_to_num(casted, nan=default, posinf=default, neginf=default))
 
 
+def _payload_metrics(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return training_metrics when available, otherwise an empty mapping."""
+    metrics = payload.get("training_metrics", {})
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def _payload_metric(payload: dict[str, Any], key: str, default: float = 0.0) -> float:
+    """Read a numeric metric from either training_metrics or a flattened benchmark row."""
+    metrics = _payload_metrics(payload)
+    if key in metrics:
+        return _metric_as_float(metrics, key, default)
+    return _metric_as_float(payload, key, default)
+
+
+def _payload_bool(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    """Read a boolean value from either training_metrics or a flattened benchmark row."""
+    metrics = _payload_metrics(payload)
+    if key in metrics:
+        return bool(metrics.get(key, default))
+    return bool(payload.get(key, default))
+
+
+def _payload_list(payload: dict[str, Any], key: str) -> list[Any]:
+    """Read a list payload from either training_metrics or a flattened benchmark row."""
+    metrics = _payload_metrics(payload)
+    value = metrics.get(key) if key in metrics else payload.get(key)
+    return list(value) if isinstance(value, list) else []
+
+
+def _snapshot_comparison_key(payload: dict[str, Any]) -> str:
+    """Choose the strongest available immutable snapshot identity for comparisons."""
+    for key in ("dataset_bundle_hash", "data_quality_report_hash", "snapshot_id"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return "unversioned_snapshot"
+
+
 def _extract_validation_layer_states(payload: dict[str, Any]) -> dict[str, bool]:
     """Extract normalized layer pass/fail states from result payload."""
     if not isinstance(payload, dict):
@@ -11632,6 +12205,348 @@ def _extract_validation_layer_states(payload: dict[str, Any]) -> dict[str, bool]
         if isinstance(layer_payload, dict):
             layer_states[layer_name] = bool(layer_payload.get("passed", False))
     return layer_states
+
+
+def _build_pre_promotion_checklist(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build the work-plan checklist used to authorize promotion runs."""
+    layer_states = _extract_validation_layer_states(payload)
+    validation_layers_ready = (
+        all(layer_states.values()) if layer_states else bool(payload.get("success", False))
+    )
+    snapshot_id = str(payload.get("snapshot_id") or "").strip()
+    dataset_bundle_hash = str(payload.get("dataset_bundle_hash") or "").strip()
+    data_quality_report_hash = str(payload.get("data_quality_report_hash") or "").strip()
+    metrics = _payload_metrics(payload)
+    expected_edge_reason = str(
+        metrics.get("expected_edge_policy_reason", payload.get("expected_edge_policy_reason", ""))
+    ).strip()
+    expected_edge_trained = bool(
+        _payload_metric(payload, "expected_edge_policy_enabled", 0.0) > 0.0
+        or expected_edge_reason == "trained"
+    )
+    dropped_symbols = max(
+        int(round(_payload_metric(payload, "symbol_quality_dropped_symbols", 0.0))),
+        len(_payload_list(payload, "symbol_quality_dropped_list")),
+    )
+
+    checks = {
+        "snapshot_lineage_present": {
+            "passed": bool(snapshot_id),
+            "actual": bool(snapshot_id),
+            "threshold": True,
+            "comparator": "is",
+        },
+        "dataset_bundle_hash_present": {
+            "passed": bool(dataset_bundle_hash),
+            "actual": bool(dataset_bundle_hash),
+            "threshold": True,
+            "comparator": "is",
+        },
+        "data_quality_passed": {
+            "passed": _payload_bool(payload, "data_quality_report_passed", False),
+            "actual": _payload_bool(payload, "data_quality_report_passed", False),
+            "threshold": True,
+            "comparator": "is",
+        },
+        "validation_layers_ready": {
+            "passed": bool(validation_layers_ready),
+            "actual": bool(validation_layers_ready),
+            "threshold": True,
+            "comparator": "is",
+        },
+        "no_silent_symbol_drop": {
+            "passed": int(dropped_symbols) == 0,
+            "actual": int(dropped_symbols),
+            "threshold": 0,
+            "comparator": "<=",
+        },
+        "expected_edge_trained": {
+            "passed": bool(expected_edge_trained),
+            "actual": bool(expected_edge_trained),
+            "threshold": True,
+            "comparator": "is",
+            "reason": expected_edge_reason or None,
+        },
+        "mean_trade_count": {
+            "passed": _payload_metric(payload, "mean_trade_count", 0.0)
+            >= PRE_PROMOTION_WORK_PLAN_THRESHOLDS["mean_trade_count_min"],
+            "actual": _payload_metric(payload, "mean_trade_count", 0.0),
+            "threshold": PRE_PROMOTION_WORK_PLAN_THRESHOLDS["mean_trade_count_min"],
+            "comparator": ">=",
+        },
+        "mean_risk_adjusted_score": {
+            "passed": _payload_metric(payload, "mean_risk_adjusted_score", -1.0)
+            > PRE_PROMOTION_WORK_PLAN_THRESHOLDS["mean_risk_adjusted_score_min"],
+            "actual": _payload_metric(payload, "mean_risk_adjusted_score", -1.0),
+            "threshold": PRE_PROMOTION_WORK_PLAN_THRESHOLDS["mean_risk_adjusted_score_min"],
+            "comparator": ">",
+        },
+        "holdout_max_drawdown": {
+            "passed": _payload_metric(payload, "holdout_max_drawdown", 1.0)
+            <= PRE_PROMOTION_WORK_PLAN_THRESHOLDS["holdout_max_drawdown_max"],
+            "actual": _payload_metric(payload, "holdout_max_drawdown", 1.0),
+            "threshold": PRE_PROMOTION_WORK_PLAN_THRESHOLDS["holdout_max_drawdown_max"],
+            "comparator": "<=",
+        },
+        "holdout_symbol_sharpe_p25": {
+            "passed": _payload_metric(payload, "holdout_symbol_sharpe_p25", -1.0)
+            >= PRE_PROMOTION_WORK_PLAN_THRESHOLDS["holdout_symbol_sharpe_p25_min"],
+            "actual": _payload_metric(payload, "holdout_symbol_sharpe_p25", -1.0),
+            "threshold": PRE_PROMOTION_WORK_PLAN_THRESHOLDS["holdout_symbol_sharpe_p25_min"],
+            "comparator": ">=",
+        },
+        "pbo": {
+            "passed": _payload_metric(payload, "pbo", 1.0)
+            <= PRE_PROMOTION_WORK_PLAN_THRESHOLDS["pbo_max"],
+            "actual": _payload_metric(payload, "pbo", 1.0),
+            "threshold": PRE_PROMOTION_WORK_PLAN_THRESHOLDS["pbo_max"],
+            "comparator": "<=",
+        },
+        "white_reality_pvalue": {
+            "passed": _payload_metric(payload, "white_reality_pvalue", 1.0)
+            <= PRE_PROMOTION_WORK_PLAN_THRESHOLDS["white_reality_pvalue_max"],
+            "actual": _payload_metric(payload, "white_reality_pvalue", 1.0),
+            "threshold": PRE_PROMOTION_WORK_PLAN_THRESHOLDS["white_reality_pvalue_max"],
+            "comparator": "<=",
+        },
+    }
+    failed_checks = [name for name, state in checks.items() if not bool(state.get("passed", False))]
+
+    return {
+        "schema_version": PRE_PROMOTION_CHECKLIST_SCHEMA_VERSION,
+        "ready": not failed_checks,
+        "failed_checks": failed_checks,
+        "model_name": str(payload.get("model_name") or ""),
+        "model_type": str(payload.get("model_type") or ""),
+        "training_profile": str(payload.get("training_profile") or metrics.get("training_profile") or ""),
+        "primary_label_horizon": int(max(_payload_metric(payload, "primary_label_horizon", 0.0), 0.0)),
+        "snapshot_id": snapshot_id or None,
+        "dataset_bundle_hash": dataset_bundle_hash or None,
+        "data_quality_report_hash": data_quality_report_hash or None,
+        "checks": checks,
+        "validation_layers": layer_states,
+    }
+
+
+def _build_training_comparison_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build explicit baseline-vs-challenger deltas on the same snapshot identity."""
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            horizon = int(float(row.get("primary_label_horizon", 0)))
+        except (TypeError, ValueError):
+            horizon = 0
+        grouped.setdefault((horizon, _snapshot_comparison_key(row)), []).append(row)
+
+    summary: list[dict[str, Any]] = []
+    for (horizon, snapshot_key), group_rows in sorted(grouped.items(), key=lambda item: item[0]):
+        ordered = sorted(
+            group_rows,
+            key=lambda row: float(row.get("governance_score", -1e9)),
+            reverse=True,
+        )
+        if not ordered:
+            continue
+        baseline = ordered[0]
+        baseline_view = {
+            "run_id": str(baseline.get("run_id") or ""),
+            "model_name": str(baseline.get("model_name") or ""),
+            "model_type": str(baseline.get("model_type") or ""),
+            "governance_score": float(baseline.get("governance_score", 0.0)),
+            "pre_promotion_ready": bool(baseline.get("pre_promotion_ready", 0.0)),
+        }
+        challengers = []
+        for challenger in ordered[1:]:
+            challengers.append(
+                {
+                    "run_id": str(challenger.get("run_id") or ""),
+                    "model_name": str(challenger.get("model_name") or ""),
+                    "model_type": str(challenger.get("model_type") or ""),
+                    "governance_score_delta": float(challenger.get("governance_score", 0.0))
+                    - float(baseline.get("governance_score", 0.0)),
+                    "mean_trade_count_delta": float(challenger.get("mean_trade_count", 0.0))
+                    - float(baseline.get("mean_trade_count", 0.0)),
+                    "mean_risk_adjusted_score_delta": float(
+                        challenger.get("mean_risk_adjusted_score", 0.0)
+                    )
+                    - float(baseline.get("mean_risk_adjusted_score", 0.0)),
+                    "holdout_sharpe_delta": float(challenger.get("holdout_sharpe", 0.0))
+                    - float(baseline.get("holdout_sharpe", 0.0)),
+                    "holdout_max_drawdown_delta": float(
+                        challenger.get("holdout_max_drawdown", 0.0)
+                    )
+                    - float(baseline.get("holdout_max_drawdown", 0.0)),
+                    "pbo_delta": float(challenger.get("pbo", 0.0))
+                    - float(baseline.get("pbo", 0.0)),
+                    "white_reality_pvalue_delta": float(
+                        challenger.get("white_reality_pvalue", 0.0)
+                    )
+                    - float(baseline.get("white_reality_pvalue", 0.0)),
+                    "pre_promotion_ready": bool(challenger.get("pre_promotion_ready", 0.0)),
+                    "failed_checks": list(challenger.get("pre_promotion_failed_checks", [])),
+                }
+            )
+        summary.append(
+            {
+                "comparison_group_key": f"h{horizon}:{snapshot_key[:16]}",
+                "primary_label_horizon": int(max(horizon, 0)),
+                "snapshot_id": baseline.get("snapshot_id") or None,
+                "dataset_bundle_hash": baseline.get("dataset_bundle_hash") or None,
+                "data_quality_report_hash": baseline.get("data_quality_report_hash") or None,
+                "training_profile": str(baseline.get("training_profile") or ""),
+                "baseline": baseline_view,
+                "challengers": challengers,
+            }
+        )
+    return summary
+
+
+def _load_latest_training_matrix_rows(output_dir: Path) -> tuple[list[dict[str, Any]], Path | None]:
+    """Load the newest persisted training matrix for promotion preflight checks."""
+    bench_dir = Path(output_dir) / "benchmarks"
+    if not bench_dir.exists():
+        return [], None
+    for matrix_path in sorted(bench_dir.glob("training_matrix_*.json"), reverse=True):
+        try:
+            payload = json.loads(matrix_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rows = payload.get("rows", [])
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)], matrix_path
+    return [], None
+
+
+def _load_snapshot_bundle_identity(bundle_path: str | Path | None) -> dict[str, str]:
+    """Extract immutable snapshot identifiers from a dataset bundle manifest."""
+    if not bundle_path:
+        return {}
+    path = Path(bundle_path)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    snapshot_manifest = payload.get("snapshot_manifest", {})
+    if not isinstance(snapshot_manifest, dict):
+        snapshot_manifest = {}
+    return {
+        "snapshot_id": str(payload.get("snapshot_id") or snapshot_manifest.get("snapshot_id") or ""),
+        "dataset_bundle_hash": str(payload.get("bundle_hash") or ""),
+        "data_quality_report_hash": str(
+            snapshot_manifest.get("data_quality_report_hash")
+            or payload.get("data_quality_report_hash")
+            or ""
+        ),
+    }
+
+
+def _match_pre_promotion_rows(
+    rows: list[dict[str, Any]],
+    *,
+    model_type: str,
+    primary_label_horizon: int,
+    bundle_identity: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Filter persisted benchmark rows down to the relevant research baseline candidates."""
+    filtered = [
+        row
+        for row in rows
+        if str(row.get("model_type") or "") == str(model_type)
+        and int(float(row.get("primary_label_horizon", 0) or 0)) == int(primary_label_horizon)
+    ]
+    if not filtered:
+        return []
+
+    research_rows = [row for row in filtered if str(row.get("training_profile") or "") == "research"]
+    if research_rows:
+        filtered = research_rows
+
+    for key in ("dataset_bundle_hash", "snapshot_id", "data_quality_report_hash"):
+        expected = str(bundle_identity.get(key) or "").strip()
+        if not expected:
+            continue
+        exact = [row for row in filtered if str(row.get(key) or "").strip() == expected]
+        if exact:
+            filtered = exact
+            break
+
+    filtered.sort(
+        key=lambda row: (
+            float(row.get("pre_promotion_ready", 0.0)),
+            float(row.get("governance_score", -1e9)),
+            -float(row.get("rank", 1e9)),
+        ),
+        reverse=True,
+    )
+    return filtered
+
+
+def _evaluate_promotion_precheck(
+    *,
+    output_dir: Path,
+    model_type: str,
+    primary_label_horizon: int,
+    dataset_snapshot_bundle_path: str,
+    bypass: bool = False,
+) -> dict[str, Any]:
+    """Decide whether a strict-snapshot promotion run is allowed to start."""
+    bundle_identity = _load_snapshot_bundle_identity(dataset_snapshot_bundle_path)
+    rows, matrix_path = _load_latest_training_matrix_rows(output_dir)
+    if bypass:
+        return {
+            "blocked": False,
+            "bypassed": True,
+            "reason": "operator_bypass",
+            "matrix_path": str(matrix_path) if matrix_path is not None else None,
+            "bundle_identity": bundle_identity,
+        }
+    if not rows:
+        return {
+            "blocked": True,
+            "bypassed": False,
+            "reason": "missing_training_matrix",
+            "message": "No prior training matrix found for promotion precheck.",
+            "matrix_path": None,
+            "bundle_identity": bundle_identity,
+        }
+
+    matched_rows = _match_pre_promotion_rows(
+        rows,
+        model_type=model_type,
+        primary_label_horizon=primary_label_horizon,
+        bundle_identity=bundle_identity,
+    )
+    if not matched_rows:
+        return {
+            "blocked": True,
+            "bypassed": False,
+            "reason": "no_matching_research_candidate",
+            "message": "No matching research candidate was found for the requested promotion snapshot.",
+            "matrix_path": str(matrix_path) if matrix_path is not None else None,
+            "bundle_identity": bundle_identity,
+        }
+
+    candidate = matched_rows[0]
+    checklist = candidate.get("pre_promotion_checklist", {})
+    if not isinstance(checklist, dict) or not checklist:
+        checklist = _build_pre_promotion_checklist(candidate)
+    blocked = not bool(checklist.get("ready", False))
+    return {
+        "blocked": blocked,
+        "bypassed": False,
+        "reason": "failed_checklist" if blocked else "passed",
+        "message": (
+            "Research candidate did not clear the pre-promotion checklist."
+            if blocked
+            else "Research candidate cleared the pre-promotion checklist."
+        ),
+        "matrix_path": str(matrix_path) if matrix_path is not None else None,
+        "bundle_identity": bundle_identity,
+        "candidate": candidate,
+        "checklist": checklist,
+    }
 
 
 def _governance_score(result: dict[str, Any]) -> float:
@@ -11686,6 +12601,9 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
         if not isinstance(metrics, dict):
             metrics = {}
         layer_states = _extract_validation_layer_states(result)
+        pre_promotion_checklist = result.get("pre_promotion_checklist", {})
+        if not isinstance(pre_promotion_checklist, dict) or not pre_promotion_checklist:
+            pre_promotion_checklist = _build_pre_promotion_checklist(result)
         deployment_plan = result.get("deployment_plan", {})
         if not isinstance(deployment_plan, dict):
             deployment_plan = {}
@@ -11706,7 +12624,23 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
             {
                 "model_type": str(model_type),
                 "primary_label_horizon": int(max(primary_horizon, 0)),
+                "training_profile": str(
+                    result.get("training_profile") or metrics.get("training_profile") or ""
+                ),
                 "run_id": str(result.get("run_id") or ""),
+                "snapshot_id": str(result.get("snapshot_id") or ""),
+                "data_quality_report_hash": str(result.get("data_quality_report_hash") or ""),
+                "data_quality_report_passed": (
+                    1.0
+                    if bool(
+                        result.get(
+                            "data_quality_report_passed",
+                            metrics.get("data_quality_report_passed", False),
+                        )
+                    )
+                    else 0.0
+                ),
+                "dataset_bundle_hash": str(result.get("dataset_bundle_hash") or ""),
                 "success": bool(result.get("success", False)),
                 "governance_score": _governance_score(result),
                 "mean_accuracy": _metric_as_float(metrics, "mean_accuracy", 0.0),
@@ -11724,6 +12658,9 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
                 "holdout_sharpe": _metric_as_float(metrics, "holdout_sharpe", 0.0),
                 "holdout_max_drawdown": _metric_as_float(metrics, "holdout_max_drawdown", 1.0),
                 "holdout_regime_shift": _metric_as_float(metrics, "holdout_regime_shift", 0.0),
+                "holdout_symbol_sharpe_p25": _metric_as_float(
+                    metrics, "holdout_symbol_sharpe_p25", 0.0
+                ),
                 "layer_model_utility_pass": (
                     1.0 if layer_states.get("model_utility", False) else 0.0
                 ),
@@ -11745,6 +12682,27 @@ def _build_training_matrix(results: list[tuple[str, dict[str, Any]]]) -> list[di
                     metrics, "holdout_symbol_concentration_hhi", 0.0
                 ),
                 "mean_trade_count": _metric_as_float(metrics, "mean_trade_count", 0.0),
+                "expected_edge_policy_trained": (
+                    1.0
+                    if (
+                        _metric_as_float(metrics, "expected_edge_policy_enabled", 0.0) > 0.0
+                        or str(metrics.get("expected_edge_policy_reason", "")).strip() == "trained"
+                    )
+                    else 0.0
+                ),
+                "symbol_quality_dropped_symbols": _metric_as_float(
+                    metrics, "symbol_quality_dropped_symbols", 0.0
+                ),
+                "pre_promotion_ready": (
+                    1.0 if bool(pre_promotion_checklist.get("ready", False)) else 0.0
+                ),
+                "pre_promotion_failed_check_count": float(
+                    len(pre_promotion_checklist.get("failed_checks", []))
+                ),
+                "pre_promotion_failed_checks": list(
+                    pre_promotion_checklist.get("failed_checks", [])
+                ),
+                "pre_promotion_checklist": pre_promotion_checklist,
                 "registry_version_id": str(result.get("registry_version_id") or ""),
                 "model_name": str(result.get("model_name") or model_type),
                 "model_path": str(result.get("model_path") or ""),
@@ -11775,6 +12733,7 @@ def _persist_training_matrix_report(
     payload = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "rows": rows,
+        "comparison_summary": _build_training_comparison_summary(rows),
     }
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=True, sort_keys=True, default=str)
@@ -11782,7 +12741,15 @@ def _persist_training_matrix_report(
     flat_rows = []
     for row in rows:
         flat_row = {
-            k: v for k, v in row.items() if k not in {"deployment_plan", "validation_layers"}
+            k: v
+            for k, v in row.items()
+            if k
+            not in {
+                "deployment_plan",
+                "validation_layers",
+                "pre_promotion_checklist",
+                "pre_promotion_failed_checks",
+            }
         }
         flat_rows.append(flat_row)
     pd.DataFrame(flat_rows).to_csv(csv_path, index=False)
@@ -12273,6 +13240,18 @@ def run_training(args: argparse.Namespace) -> int:
                     "timeframe",
                     getattr(args, "timeframe", DEFAULT_TIMEFRAME),
                 ),
+                include_premarket=bool(
+                    _cfg_value(
+                        "include_premarket",
+                        getattr(args, "include_premarket", False),
+                    )
+                ),
+                include_postmarket=bool(
+                    _cfg_value(
+                        "include_postmarket",
+                        getattr(args, "include_postmarket", False),
+                    )
+                ),
                 timeframes=list(
                     _cfg_value(
                         "timeframes",
@@ -12292,6 +13271,18 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "n_jobs",
                         1 if (model_type == "random_forest" and os.name == "nt") else -1,
+                    )
+                ),
+                optuna_storage_dir=str(
+                    _cfg_value(
+                        "optuna_storage_dir",
+                        getattr(args, "optuna_storage_dir", "") or "",
+                    )
+                ).strip(),
+                optuna_resume_enabled=bool(
+                    _cfg_value(
+                        "optuna_resume_enabled",
+                        not bool(getattr(args, "disable_optuna_resume", False)),
                     )
                 ),
                 seed=int(_cfg_value("seed", getattr(args, "seed", global_seed))),
@@ -12897,6 +13888,16 @@ def run_training(args: argparse.Namespace) -> int:
                 "on" if config.compute_shap else "off",
             )
             logger.info(
+                "Optuna resume: %s (%s)",
+                "enabled" if config.optuna_resume_enabled else "disabled",
+                config.optuna_storage_dir or str(Path(config.output_dir) / "optuna_state"),
+            )
+            if config.optuna_resume_enabled:
+                logger.info(
+                    "Optuna resume procedure: rerun the same command with the same --name "
+                    "to reuse saved studies after interruption."
+                )
+            logger.info(
                 f"Nested CV: outer={config.nested_outer_splits}, inner={config.nested_inner_splits}"
             )
             logger.info(
@@ -12905,6 +13906,84 @@ def run_training(args: argparse.Namespace) -> int:
             )
             if replay_config:
                 logger.info("Replay source: manifest-driven configuration")
+            if (
+                config.training_profile == "promotion"
+                and config.strict_snapshot_replay
+                and config.dataset_snapshot_bundle_path
+                and not replay_config
+            ):
+                promotion_precheck = _evaluate_promotion_precheck(
+                    output_dir=Path(config.output_dir),
+                    model_type=config.model_type,
+                    primary_label_horizon=int(config.primary_label_horizon),
+                    dataset_snapshot_bundle_path=str(config.dataset_snapshot_bundle_path),
+                    bypass=bool(getattr(args, "force_promotion_precheck_bypass", False)),
+                )
+                if promotion_precheck.get("bypassed", False):
+                    logger.warning(
+                        "Promotion precheck bypassed by operator for strict snapshot replay: %s",
+                        config.dataset_snapshot_bundle_path,
+                    )
+                elif promotion_precheck.get("blocked", False):
+                    logger.error(
+                        "Promotion blocked before training: %s",
+                        promotion_precheck.get(
+                            "message",
+                            "Research candidate did not clear the pre-promotion checklist.",
+                        ),
+                    )
+                    if promotion_precheck.get("matrix_path"):
+                        logger.error(
+                            "Source training matrix: %s",
+                            promotion_precheck.get("matrix_path"),
+                        )
+                    checklist = promotion_precheck.get("checklist", {})
+                    failed_checks = (
+                        checklist.get("failed_checks", [])
+                        if isinstance(checklist, dict)
+                        else []
+                    )
+                    if failed_checks:
+                        logger.error("Failed checklist items: %s", ", ".join(failed_checks))
+                    candidate = promotion_precheck.get("candidate", {})
+                    if isinstance(candidate, dict) and candidate:
+                        logger.error(
+                            "Best matching research candidate: run_id=%s governance=%.2f pre_ready=%s",
+                            candidate.get("run_id", ""),
+                            float(candidate.get("governance_score", 0.0)),
+                            bool(candidate.get("pre_promotion_ready", 0.0)),
+                        )
+                    if requested_model == "all" or is_multi_run:
+                        results.append(
+                            (
+                                model_type,
+                                {
+                                    "success": False,
+                                    "model_type": config.model_type,
+                                    "model_name": config.model_name,
+                                    "model_path": None,
+                                    "training_duration_seconds": 0.0,
+                                    "training_metrics": {
+                                        "pre_promotion_checklist": checklist,
+                                        "pre_promotion_failed_checks": failed_checks,
+                                    },
+                                    "primary_label_horizon": int(config.primary_label_horizon),
+                                    "run_id": f"{config.model_type}_h{int(config.primary_label_horizon)}",
+                                    "error": "promotion_precheck_blocked",
+                                },
+                            )
+                        )
+                        overall_success = False
+                        continue
+                    return 1
+                else:
+                    candidate = promotion_precheck.get("candidate", {})
+                    if isinstance(candidate, dict) and candidate:
+                        logger.info(
+                            "Promotion precheck passed using research candidate %s (governance=%.2f)",
+                            candidate.get("run_id", ""),
+                            float(candidate.get("governance_score", 0.0)),
+                        )
 
             if audit_logger is not None:
                 audit_logger.log_model_training_started(
@@ -12982,7 +14061,7 @@ def run_training(args: argparse.Namespace) -> int:
             result.setdefault("model_type", config.model_type)
             result.setdefault("model_name", config.model_name)
             result["primary_label_horizon"] = int(config.primary_label_horizon)
-            result["run_id"] = f"{config.model_type}_h{int(config.primary_label_horizon)}"
+            result.setdefault("run_id", f"{config.model_type}_h{int(config.primary_label_horizon)}")
             metrics_payload = result.get("training_metrics")
             if isinstance(metrics_payload, dict):
                 metrics_payload.setdefault(
@@ -13106,6 +14185,15 @@ def run_training(args: argparse.Namespace) -> int:
                 logger.info(f"Mean Sharpe: {metrics.get('mean_sharpe', 0):.4f}")
                 if "deflated_sharpe" in metrics:
                     logger.info(f"Deflated Sharpe: {metrics['deflated_sharpe']:.4f}")
+                checklist = metrics.get("pre_promotion_checklist", {})
+                if isinstance(checklist, dict) and checklist:
+                    logger.info(
+                        "Pre-promotion checklist: %s",
+                        "PASSED" if checklist.get("ready", False) else "FAILED",
+                    )
+                    failed_checks = checklist.get("failed_checks", [])
+                    if isinstance(failed_checks, list) and failed_checks:
+                        logger.info("Blocked by: %s", ", ".join(str(item) for item in failed_checks))
             if result.get("promotion_package_path"):
                 logger.info(f"Promotion package: {result.get('promotion_package_path')}")
             if result.get("replay_manifest_path"):
@@ -13225,6 +14313,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", "--end-date", dest="end_date", type=str, default="")
     parser.add_argument("--timeframe", type=str, default=DEFAULT_TIMEFRAME)
     parser.add_argument(
+        "--include-premarket",
+        action="store_true",
+        help="Keep premarket bars in intraday training snapshots instead of filtering to regular session.",
+    )
+    parser.add_argument(
+        "--include-postmarket",
+        action="store_true",
+        help="Keep postmarket bars in intraday training snapshots instead of filtering to regular session.",
+    )
+    parser.add_argument(
         "--timeframes",
         nargs="+",
         default=[],
@@ -13238,6 +14336,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--embargo-pct", type=float, default=0.01)
     parser.add_argument("--n-trials", type=int, default=100)
+    parser.add_argument(
+        "--optuna-storage-dir",
+        type=Path,
+        default=None,
+        help="Directory for persistent Optuna SQLite studies used for resume-safe training.",
+    )
+    parser.add_argument(
+        "--disable-optuna-resume",
+        action="store_true",
+        help="Use fresh in-memory Optuna studies instead of resumable SQLite storage.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--nested-outer-splits", type=int, default=4)
     parser.add_argument("--nested-inner-splits", type=int, default=3)
@@ -13277,6 +14386,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-snapshot-replay",
         action="store_true",
         help="Fail instead of falling back when dataset snapshot replay bundle is missing.",
+    )
+    parser.add_argument(
+        "--force-promotion-precheck-bypass",
+        action="store_true",
+        help="Allow strict-snapshot promotion to start without a matching pre-promotion-ready research candidate.",
     )
     parser.add_argument(
         "--disable-auto-snapshot-reuse",

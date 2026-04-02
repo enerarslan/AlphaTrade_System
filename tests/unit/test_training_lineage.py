@@ -47,6 +47,32 @@ def test_build_data_quality_report_detects_missing_duplicate_and_outlier() -> No
     assert "missing_bars" in report["threshold_breaches"]
 
 
+def test_build_data_quality_report_includes_missing_gap_root_cause_summary() -> None:
+    data = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL", "AAPL", "MSFT", "MSFT", "MSFT"],
+            "timestamp": [
+                "2025-01-01T00:00:00Z",
+                "2025-01-01T00:15:00Z",
+                "2025-01-01T01:00:00Z",
+                "2025-01-01T00:00:00Z",
+                "2025-01-01T00:15:00Z",
+                "2025-01-01T00:30:00Z",
+            ],
+            "close": [100.0, 101.0, 102.0, 200.0, 200.5, 201.0],
+        }
+    )
+
+    report = build_data_quality_report(data)
+
+    assert report["summary"]["symbols_with_missing_bars"] == 1
+    assert report["top_missing_bar_symbols"][0]["symbol"] == "AAPL"
+    assert report["top_missing_bar_symbols"][0]["missing_bars_count"] >= 2
+    assert report["top_missing_bar_windows"][0]["symbol"] == "AAPL"
+    assert report["per_symbol"]["AAPL"]["missing_gap_window_count"] == 1
+    assert report["per_symbol"]["AAPL"]["missing_bar_windows_preview"][0]["gap_start"] is not None
+
+
 def test_estimate_missing_bars_count_ignores_daily_weekends() -> None:
     timestamps = pd.Series(
         pd.to_datetime(

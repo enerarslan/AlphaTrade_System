@@ -279,3 +279,46 @@ def test_data_manager_load_symbol_requires_database(monkeypatch):
     assert symbols == ["AAPL", "MSFT"]
     assert fake_loader.calls[0][0] == "AAPL"
     assert fake_loader.calls[0][3] == "15Min"
+
+
+def test_detect_gaps_ignores_sparse_premarket_to_open_boundary():
+    manager = data_script.DataManager(data_script.DataConfig(timeframe="15Min"))
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-16T13:00:00Z",
+                    "2024-01-16T14:30:00Z",
+                    "2024-01-16T14:45:00Z",
+                ],
+                utc=True,
+            )
+        }
+    )
+
+    issues = manager._detect_gaps(frame)
+
+    assert issues == []
+
+
+def test_detect_gaps_reports_true_intraday_missing_bar():
+    manager = data_script.DataManager(data_script.DataConfig(timeframe="15Min"))
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-16T13:00:00Z",
+                    "2024-01-16T14:30:00Z",
+                    "2024-01-16T14:45:00Z",
+                    "2024-01-16T15:15:00Z",
+                ],
+                utc=True,
+            )
+        }
+    )
+
+    issues = manager._detect_gaps(frame)
+
+    assert len(issues) == 1
+    assert "Missing bars detected after session filter" in issues[0]
+    assert "missing=1" in issues[0]

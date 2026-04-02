@@ -47,6 +47,9 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from quant_trading_system.data.data_access import filter_ohlcv_frame_to_market_session
+from quant_trading_system.models.training_lineage import summarize_missing_bar_windows
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -112,6 +115,8 @@ class DataConfig:
     start_date: str = ""
     end_date: str = ""
     timeframe: str = "15Min"  # 1Min, 5Min, 15Min, 1Hour, 1Day
+    include_premarket: bool = False
+    include_postmarket: bool = False
 
     # Validation settings
     validate_ohlcv: bool = True
@@ -462,36 +467,48 @@ class DataManager:
         """Detect gaps in time series."""
         if "timestamp" not in df.columns:
             return []
+        if hasattr(df, "sort") and not hasattr(df, "sort_values"):
+            timestamps = pd.Series(df.sort("timestamp")["timestamp"].to_list(), dtype="datetime64[ns, UTC]")
+        else:
+            timestamps = pd.Series(pd.to_datetime(df["timestamp"], utc=True, errors="coerce")).sort_values()
 
-        # Handle both pandas and polars DataFrames
-        try:
-            # Polars style
-            if hasattr(df, 'sort'):
-                df_sorted = df.sort("timestamp")
-                timestamps = df_sorted["timestamp"].to_list()
-                if len(timestamps) < 2:
-                    return []
-                time_diffs = [(timestamps[i] - timestamps[i-1]) for i in range(1, len(timestamps))]
-                # Convert timedelta to pandas Timedelta for comparison
-                max_gap = pd.Timedelta(hours=self.config.max_gap_hours)
-                large_gaps = [d for d in time_diffs if d > max_gap]
-                issues = []
-                if len(large_gaps) > 0:
-                    issues.append(f"Large time gaps detected: {len(large_gaps)} gaps > {self.config.max_gap_hours}h")
-                return issues
-            else:
-                # Pandas style
-                df_sorted = df.sort_values("timestamp")
-                time_diffs = df_sorted["timestamp"].diff()
-        except Exception:
-            df_sorted = df.sort_values("timestamp") if hasattr(df, 'sort_values') else df
-            time_diffs = df_sorted["timestamp"].diff() if hasattr(df_sorted["timestamp"], 'diff') else []
+        timestamp_frame = pd.DataFrame({"timestamp": timestamps.dropna().reset_index(drop=True)})
+        if timestamp_frame.empty:
+            return []
 
-        # Find large gaps (more than max_gap_hours)
+        filtered_frame, _session_meta = filter_ohlcv_frame_to_market_session(
+            timestamp_frame,
+            timeframe=getattr(self.config, "timeframe", "15Min"),
+            include_premarket=bool(getattr(self.config, "include_premarket", False)),
+            include_postmarket=bool(getattr(self.config, "include_postmarket", False)),
+        )
+
+        active_timestamps = filtered_frame["timestamp"] if not filtered_frame.empty else timestamp_frame["timestamp"]
+        missing_count, inferred_bar_seconds, gap_windows = summarize_missing_bar_windows(
+            active_timestamps
+        )
+
+        issues: list[str] = []
+        if gap_windows:
+            largest_window = max(
+                gap_windows,
+                key=lambda item: int(item.get("estimated_missing_bars", 0)),
+            )
+            inferred_minutes = (
+                float(inferred_bar_seconds) / 60.0 if inferred_bar_seconds is not None else float("nan")
+            )
+            issues.append(
+                "Missing bars detected after session filter: "
+                f"{int(missing_count)} estimated across {len(gap_windows)} gaps "
+                f"(largest {largest_window.get('gap_start')} -> {largest_window.get('gap_end')}, "
+                f"missing={int(largest_window.get('estimated_missing_bars', 0))}, "
+                f"inferred_bar_minutes={inferred_minutes:.2f})"
+            )
+            return issues
+
+        time_diffs = pd.Series(active_timestamps).diff().dropna()
         max_gap = pd.Timedelta(hours=self.config.max_gap_hours)
         large_gaps = time_diffs[time_diffs > max_gap]
-
-        issues = []
         if len(large_gaps) > 0:
             issues.append(f"Large time gaps detected: {len(large_gaps)} gaps > {self.config.max_gap_hours}h")
 
@@ -1269,6 +1286,8 @@ def cmd_download(args: argparse.Namespace) -> int:
         start_date=start_arg,
         end_date=end_arg,
         timeframe=getattr(args, "timeframe", "15Min"),
+        include_premarket=bool(getattr(args, "include_premarket", False)),
+        include_postmarket=bool(getattr(args, "include_postmarket", False)),
         raw_data_dir=str(getattr(args, "output_dir", "data/raw")),
         use_database=bool(getattr(args, "sync_db", False)),
     )
@@ -1412,6 +1431,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     config = DataConfig(
         raw_data_dir=getattr(args, "path", "data/raw"),
+        timeframe=getattr(args, "timeframe", "15Min"),
+        include_premarket=bool(getattr(args, "include_premarket", False)),
+        include_postmarket=bool(getattr(args, "include_postmarket", False)),
     )
 
     manager = DataManager(config)
@@ -1881,6 +1903,8 @@ if __name__ == "__main__":
         help="Load symbols from a newline/comma separated text file or JSON payload.",
     )
     download_parser.add_argument("--timeframe", type=str, default="15Min")
+    download_parser.add_argument("--include-premarket", action="store_true")
+    download_parser.add_argument("--include-postmarket", action="store_true")
     download_parser.add_argument("--output-dir", type=Path, default=Path("data/raw"))
     download_parser.add_argument("--sync-db", action="store_true")
     download_parser.add_argument("--incremental", action="store_true")
@@ -1898,6 +1922,8 @@ if __name__ == "__main__":
         help="Load symbols from a newline/comma separated text file or JSON payload.",
     )
     load_parser.add_argument("--timeframe", type=str, default="15Min")
+    load_parser.add_argument("--include-premarket", action="store_true")
+    load_parser.add_argument("--include-postmarket", action="store_true")
     load_parser.add_argument("--output-dir", type=Path, default=Path("data/raw"))
     load_parser.add_argument("--sync-db", action="store_true")
     load_parser.add_argument("--incremental", action="store_true")
@@ -1943,6 +1969,9 @@ if __name__ == "__main__":
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate data")
     validate_parser.add_argument("--path", type=str, default="data/raw")
+    validate_parser.add_argument("--timeframe", type=str, default="15Min")
+    validate_parser.add_argument("--include-premarket", action="store_true")
+    validate_parser.add_argument("--include-postmarket", action="store_true")
 
     # List command
     list_parser = subparsers.add_parser("list", help="List available symbols")

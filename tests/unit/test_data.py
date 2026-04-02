@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pandas as pd
 import polars as pl
 import pytest
 
@@ -618,6 +619,34 @@ class TestDataAligner:
         # Before market open
         early_time = datetime(2024, 1, 15, 8, 0)  # Monday
         assert aligner._is_trading_time(early_time) is False
+
+
+def test_filter_ohlcv_frame_to_market_session_removes_out_of_session_rows():
+    from quant_trading_system.data.data_access import filter_ohlcv_frame_to_market_session
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-16T13:00:00Z",
+                    "2024-01-16T14:30:00Z",
+                    "2024-01-16T20:45:00Z",
+                    "2024-01-16T21:00:00Z",
+                ],
+                utc=True,
+            ),
+            "close": [99.0, 100.0, 101.0, 102.0],
+        }
+    )
+
+    filtered, metadata = filter_ohlcv_frame_to_market_session(frame, timeframe="15Min")
+
+    assert filtered["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").tolist() == [
+        "2024-01-16T14:30:00Z",
+        "2024-01-16T20:45:00Z",
+    ]
+    assert metadata["applied"] is True
+    assert metadata["removed_rows"] == 2
 
 
 class TestFeatureStore:

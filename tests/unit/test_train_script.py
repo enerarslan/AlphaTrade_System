@@ -7,6 +7,7 @@ import logging
 import sys
 from argparse import Namespace
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -36,11 +37,15 @@ def _base_args(**overrides):
         "start_date": "",
         "end_date": "",
         "timeframe": "15Min",
+        "include_premarket": False,
+        "include_postmarket": False,
         "timeframes": [],
         "cv_method": "purged_kfold",
         "n_splits": 2,
         "embargo_pct": 0.01,
         "n_trials": 1,
+        "optuna_storage_dir": None,
+        "disable_optuna_resume": False,
         "epochs": 1,
         "batch_size": 8,
         "learning_rate": 0.001,
@@ -63,6 +68,7 @@ def _base_args(**overrides):
         "replay_manifest": None,
         "dataset_snapshot_bundle": None,
         "strict_snapshot_replay": False,
+        "force_promotion_precheck_bypass": False,
         "disable_auto_snapshot_reuse": False,
         "gpu": False,
         "use_gpu": False,
@@ -204,6 +210,17 @@ def test_training_config_normalizes_timeframes_and_modes():
 
     assert config.timeframes == ["15Min", "1Hour", "1Day"]
     assert config.training_bar_mode == "intrinsic"
+
+
+def test_training_config_normalizes_market_session_flags():
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        include_premarket=1,
+        include_postmarket="",
+    )
+
+    assert config.include_premarket is True
+    assert config.include_postmarket is False
 
 
 def test_training_config_requires_enabled_gpu_when_gpu_is_mandatory():
@@ -1071,6 +1088,121 @@ def test_run_training_promotion_profile_rejects_optional_governance_disables():
     assert train_script.run_training(_base_args(disable_meta_labeling=True)) == 1
 
 
+def test_run_training_blocks_strict_snapshot_promotion_without_ready_research_candidate(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    class DummyModelTrainer:
+        def __init__(self, _config):
+            raise AssertionError("promotion precheck should block before trainer construction")
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+
+    benchmark_dir = tmp_path / "benchmarks"
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    (benchmark_dir / "training_matrix_20260402T000000Z.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "model_type": "lightgbm_ranker",
+                        "model_name": "wave1_ranker_research_h12",
+                        "training_profile": "research",
+                        "run_id": "wave1_ranker_research_h12",
+                        "primary_label_horizon": 12,
+                        "snapshot_id": "snap_bad",
+                        "dataset_bundle_hash": "bundle_bad",
+                        "data_quality_report_hash": "dq_bad",
+                        "success": False,
+                        "mean_trade_count": 11.0,
+                        "mean_risk_adjusted_score": -2.0,
+                        "holdout_max_drawdown": 0.43,
+                        "holdout_symbol_sharpe_p25": -1.18,
+                        "pbo": 0.60,
+                        "white_reality_pvalue": 0.12,
+                        "expected_edge_policy_trained": 0.0,
+                        "symbol_quality_dropped_symbols": 1.0,
+                        "data_quality_report_passed": 0.0,
+                        "validation_results": {
+                            "layers": {
+                                "model_utility": {"passed": False},
+                                "execution_robustness": {"passed": False},
+                                "cross_symbol_robustness": {"passed": False},
+                            }
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle_dir = tmp_path / "snapshots" / "snap_bad"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = bundle_dir / "dataset_bundle.manifest.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "snapshot_id": "snap_bad",
+                "bundle_hash": "bundle_bad",
+                "snapshot_manifest": {"data_quality_report_hash": "dq_bad"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = _base_args(
+        model="lightgbm_ranker",
+        output_dir=str(tmp_path),
+        dataset_snapshot_bundle=str(bundle_path),
+        strict_snapshot_replay=True,
+        primary_horizon=12,
+    )
+
+    assert train_script.run_training(args) == 1
+
+
+def test_run_training_allows_bypassed_strict_snapshot_promotion_precheck(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    bundle_dir = tmp_path / "snapshots" / "snap_clean"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = bundle_dir / "dataset_bundle.manifest.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "snapshot_id": "snap_clean",
+                "bundle_hash": "bundle_clean",
+                "snapshot_manifest": {"data_quality_report_hash": "dq_clean"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = _base_args(
+        model="lightgbm_ranker",
+        output_dir=str(tmp_path),
+        dataset_snapshot_bundle=str(bundle_path),
+        strict_snapshot_replay=True,
+        force_promotion_precheck_bypass=True,
+    )
+
+    assert train_script.run_training(args) == 0
+    assert captured["config"].dataset_snapshot_bundle_path == str(bundle_path)
+
+
 def test_run_training_rejects_disable_nested_flag():
     args = _base_args(disable_nested_walk_forward=True)
     exit_code = train_script.run_training(args)
@@ -1306,6 +1438,66 @@ def test_run_training_can_disable_auto_snapshot_reuse(monkeypatch, tmp_path):
     assert captured["config"].dataset_snapshot_bundle_path == ""
 
 
+def test_run_training_passes_market_session_flags(monkeypatch):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    exit_code = train_script.run_training(
+        _base_args(
+            model="lightgbm",
+            training_profile="research",
+            include_premarket=True,
+            include_postmarket=True,
+        )
+    )
+
+    assert exit_code == 0
+    assert captured["config"].include_premarket is True
+    assert captured["config"].include_postmarket is True
+
+
+def test_run_training_passes_optuna_resume_settings(monkeypatch, tmp_path):
+    captured = {}
+
+    class DummyModelTrainer:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def run(self):
+            return {"success": True, "training_metrics": {}}
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+
+    args = _base_args(
+        model="lightgbm",
+        output_dir=str(tmp_path),
+        optuna_storage_dir=str(tmp_path / "optuna_state"),
+        disable_optuna_resume=True,
+        n_trials=100,
+        n_splits=5,
+        nested_outer_splits=4,
+        nested_inner_splits=3,
+        feature_selection_stability_iterations=16,
+    )
+    exit_code = train_script.run_training(args)
+
+    assert exit_code == 0
+    assert captured["config"].optuna_storage_dir == str(tmp_path / "optuna_state")
+    assert captured["config"].optuna_resume_enabled is False
+
+
 def test_get_cv_splitter_walk_forward_applies_purge_gap():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -1459,6 +1651,61 @@ def test_optuna_search_space_regularizes_xgboost_for_small_folds():
     assert trial.int_bounds["max_depth"][1] <= 6
     assert trial.float_bounds["learning_rate"][1] == pytest.approx(0.08)
     assert trial.float_bounds["scale_pos_weight"][1] <= 3.0
+
+
+def test_prepare_optuna_study_uses_sqlite_storage_for_resume(tmp_path):
+    captured: dict[str, object] = {}
+
+    trial_state = SimpleNamespace(
+        COMPLETE="complete",
+        PRUNED="pruned",
+        FAIL="fail",
+        RUNNING="running",
+        WAITING="waiting",
+    )
+
+    class DummyStudy:
+        def __init__(self):
+            self.trials = [
+                SimpleNamespace(state=trial_state.COMPLETE),
+                SimpleNamespace(state=trial_state.RUNNING),
+            ]
+
+    def _create_study(**kwargs):
+        captured.update(kwargs)
+        return DummyStudy()
+
+    fake_optuna = SimpleNamespace(
+        create_study=_create_study,
+        trial=SimpleNamespace(TrialState=trial_state),
+    )
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            model_name="resume_test",
+            output_dir=str(tmp_path),
+            n_trials=12,
+        )
+    )
+    trainer.snapshot_manifest = {"snapshot_id": "snap_123"}
+
+    _study, info = trainer._prepare_optuna_study(
+        fake_optuna,
+        namespace="nested_outer_01",
+        direction="maximize",
+        sampler=object(),
+        pruner=object(),
+    )
+
+    assert captured["load_if_exists"] is True
+    assert str(captured["storage"]).startswith("sqlite:///")
+    assert info["resume_enabled"] is True
+    assert info["resumed_from_storage"] is True
+    assert info["existing_trials"] == 2
+    assert info["finalized_trials"] == 1
+    assert info["remaining_trials"] == 11
+    assert Path(info["manifest_path"]).exists()
+    assert str(info["storage_path"]).endswith(".sqlite3")
 
 
 def test_fold_reliability_weight_penalizes_low_support():
@@ -1885,6 +2132,130 @@ def test_evaluate_holdout_performance_aligns_sequence_model_outputs(monkeypatch)
     assert trainer.training_metrics["holdout_rows_raw"] == pytest.approx(6.0)
     assert trainer.training_metrics["holdout_rows_aligned"] == pytest.approx(4.0)
     assert trainer.training_metrics["holdout_rows"] == pytest.approx(4.0)
+
+
+def test_evaluate_holdout_performance_records_tail_loss_contributors(monkeypatch):
+    class DummyModel:
+        def predict(self, X):
+            if len(X) == 60:
+                return np.concatenate(
+                    [np.ones(30, dtype=float), np.zeros(30, dtype=float)]
+                )
+            return np.zeros(len(X), dtype=float)
+
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    trainer.model = DummyModel()
+    trainer.features = pd.DataFrame(np.random.rand(80, 2), columns=["f1", "f2"])
+    trainer.labels = pd.Series(np.tile(np.array([0, 1], dtype=float), 40))
+    trainer.primary_forward_returns = np.zeros(80, dtype=float)
+    trainer.regimes = np.array(["trend"] * 80, dtype=object)
+    trainer.training_metrics = {}
+
+    rows = 60
+    trainer.holdout_features = pd.DataFrame(np.random.rand(rows, 2), columns=["f1", "f2"])
+    trainer.holdout_labels = pd.Series(
+        np.concatenate([np.ones(30, dtype=float), np.zeros(30, dtype=float)])
+    )
+    trainer.holdout_symbols = np.array((["AAPL"] * 30) + (["MSFT"] * 30), dtype=object)
+    trainer.holdout_regimes = np.array((["crash"] * 30) + (["trend"] * 30), dtype=object)
+    trainer.holdout_primary_forward_returns = np.concatenate(
+        [np.full(30, -0.01, dtype=float), np.full(30, 0.01, dtype=float)]
+    )
+    trainer.holdout_cost_aware_event_returns = trainer.holdout_primary_forward_returns.copy()
+    trainer.holdout_primary_event_directions = np.concatenate(
+        [np.ones(30, dtype=float), -np.ones(30, dtype=float)]
+    )
+    trainer.holdout_timestamps = np.array(
+        pd.date_range("2024-01-01", periods=rows, freq="h", tz="UTC"),
+        dtype="datetime64[ns]",
+    )
+
+    monkeypatch.setattr(
+        trainer,
+        "_get_predictions_proba",
+        lambda model, X: np.concatenate(
+            [np.full(30, 0.80, dtype=float), np.full(30, 0.20, dtype=float)]
+        )
+        if len(X) == rows
+        else np.linspace(0.4, 0.6, len(X), dtype=float),
+    )
+    monkeypatch.setattr(trainer, "_derive_signal_thresholds", lambda *args, **kwargs: (0.55, 0.45))
+
+    def _fake_calculate_fold_metrics(y_true, y_pred, y_proba, **kwargs):
+        symbols = np.asarray(kwargs.get("symbols"), dtype=object) if kwargs.get("symbols") is not None else None
+        if symbols is not None and len(set(symbols.tolist())) == 1:
+            group_name = str(symbols[0])
+            if group_name == "AAPL":
+                return {
+                    "accuracy": 0.25,
+                    "sharpe": -0.8,
+                    "max_drawdown": 0.30,
+                    "trade_count": 2.0,
+                    "win_rate": 0.20,
+                    "turnover": 0.10,
+                    "active_signal_rate": 0.50,
+                    "annual_return": -0.04,
+                    "calmar": -0.13,
+                    "pnl": -0.020,
+                    "loss_pnl": -0.030,
+                    "tail_loss_pnl": -0.018,
+                    "underwater_ratio": 0.75,
+                    "cvar_95": -0.025,
+                    "risk_adjusted_score": -0.20,
+                    "sharpe_observation_confidence": 0.80,
+                    "symbol_concentration_hhi": 1.0,
+                }
+            return {
+                "accuracy": 0.75,
+                "sharpe": 0.6,
+                "max_drawdown": 0.08,
+                "trade_count": 2.0,
+                "win_rate": 0.70,
+                "turnover": 0.08,
+                "active_signal_rate": 0.50,
+                "annual_return": 0.03,
+                "calmar": 0.37,
+                "pnl": 0.018,
+                "loss_pnl": -0.004,
+                "tail_loss_pnl": -0.001,
+                "underwater_ratio": 0.20,
+                "cvar_95": -0.010,
+                "risk_adjusted_score": 0.15,
+                "sharpe_observation_confidence": 0.85,
+                "symbol_concentration_hhi": 1.0,
+            }
+        return {
+            "accuracy": 0.5,
+            "sharpe": 0.1,
+            "max_drawdown": 0.10,
+            "trade_count": 4.0,
+            "win_rate": 0.5,
+            "turnover": 0.09,
+            "active_signal_rate": 0.50,
+            "annual_return": 0.0,
+            "calmar": 0.0,
+            "pnl": -0.002,
+            "loss_pnl": -0.034,
+            "tail_loss_pnl": -0.019,
+            "underwater_ratio": 0.40,
+            "cvar_95": -0.018,
+            "risk_adjusted_score": 0.02,
+            "sharpe_observation_confidence": 0.90,
+            "symbol_concentration_hhi": 0.5,
+        }
+
+    monkeypatch.setattr(trainer, "_calculate_fold_metrics", _fake_calculate_fold_metrics)
+
+    trainer._evaluate_holdout_performance()
+
+    assert trainer.training_metrics["holdout_symbol_metrics"]["AAPL"]["tail_loss_pnl"] == pytest.approx(
+        -0.018
+    )
+    assert trainer.training_metrics["holdout_symbol_metrics"]["AAPL"]["underwater_ratio"] == pytest.approx(
+        0.75
+    )
+    assert trainer.training_metrics["holdout_tail_loss_contributors_by_symbol"][0]["name"] == "AAPL"
+    assert trainer.training_metrics["holdout_tail_loss_contributors_by_regime"][0]["name"] == "crash"
 
 
 def test_calculate_fold_metrics_uses_active_trade_returns():
@@ -2940,7 +3311,11 @@ def test_build_parser_supports_training_profiles_and_snapshot_flags():
             "--dataset-snapshot-bundle",
             "models/snapshots/snap_123/dataset_bundle.manifest.json",
             "--strict-snapshot-replay",
+            "--force-promotion-precheck-bypass",
             "--disable-auto-snapshot-reuse",
+            "--optuna-storage-dir",
+            "models/optuna_state",
+            "--disable-optuna-resume",
             "--disable-meta-labeling",
             "--disable-feature-selection",
             "--feature-selection-stability-iterations",
@@ -2953,7 +3328,10 @@ def test_build_parser_supports_training_profiles_and_snapshot_flags():
     assert args.training_profile == "research"
     assert str(args.dataset_snapshot_bundle).endswith("dataset_bundle.manifest.json")
     assert args.strict_snapshot_replay is True
+    assert args.force_promotion_precheck_bypass is True
     assert args.disable_auto_snapshot_reuse is True
+    assert str(args.optuna_storage_dir).endswith("optuna_state")
+    assert args.disable_optuna_resume is True
     assert args.disable_meta_labeling is True
     assert args.disable_feature_selection is True
     assert args.feature_selection_stability_iterations == 6
@@ -3210,6 +3588,13 @@ def test_build_parser_supports_horizon_sweep_and_meta_threshold_flags():
     assert args.min_confidence_position_scale == pytest.approx(0.3)
 
 
+def test_build_parser_supports_market_session_flags():
+    parser = train_script.build_parser()
+    args = parser.parse_args(["--include-premarket", "--include-postmarket"])
+    assert args.include_premarket is True
+    assert args.include_postmarket is True
+
+
 def test_build_parser_supports_white_reality_gate_flags():
     parser = train_script.build_parser()
     args = parser.parse_args(
@@ -3270,6 +3655,89 @@ def test_build_training_matrix_ranks_by_governance_score():
     assert rows[0]["model_type"] == "xgboost"
     assert rows[0]["rank"] == 1
     assert rows[0]["governance_score"] > rows[1]["governance_score"]
+
+
+def test_build_pre_promotion_checklist_reports_failed_work_plan_checks():
+    checklist = train_script._build_pre_promotion_checklist(
+        {
+            "success": False,
+            "model_name": "ranker_h12",
+            "model_type": "lightgbm_ranker",
+            "snapshot_id": "snap_123",
+            "dataset_bundle_hash": "bundle_123",
+            "data_quality_report_hash": "dq_123",
+            "training_metrics": {
+                "training_profile": "research",
+                "data_quality_report_passed": False,
+                "mean_trade_count": 11.0,
+                "mean_risk_adjusted_score": -2.0,
+                "holdout_max_drawdown": 0.43,
+                "holdout_symbol_sharpe_p25": -1.18,
+                "pbo": 0.60,
+                "white_reality_pvalue": 0.12,
+                "expected_edge_policy_reason": "received 0 candidate trades",
+                "symbol_quality_dropped_symbols": 1.0,
+            },
+            "validation_results": {
+                "layers": {
+                    "model_utility": {"passed": False},
+                    "execution_robustness": {"passed": False},
+                    "cross_symbol_robustness": {"passed": False},
+                }
+            },
+        }
+    )
+
+    assert checklist["ready"] is False
+    assert "data_quality_passed" in checklist["failed_checks"]
+    assert "expected_edge_trained" in checklist["failed_checks"]
+    assert checklist["checks"]["expected_edge_trained"]["reason"] == "received 0 candidate trades"
+
+
+def test_build_training_matrix_captures_snapshot_identity_and_prepromotion_status():
+    rows = train_script._build_training_matrix(
+        [
+            (
+                "lightgbm_ranker",
+                {
+                    "success": True,
+                    "model_name": "ranker_h12_clean",
+                    "run_id": "wave1_ranker_h12_clean",
+                    "snapshot_id": "snap_clean",
+                    "dataset_bundle_hash": "bundle_clean",
+                    "data_quality_report_hash": "dq_clean",
+                    "data_quality_report_passed": True,
+                    "training_metrics": {
+                        "training_profile": "research",
+                        "mean_risk_adjusted_score": 0.45,
+                        "mean_trade_count": 155.0,
+                        "holdout_sharpe": 0.62,
+                        "holdout_max_drawdown": 0.22,
+                        "holdout_symbol_sharpe_p25": 0.04,
+                        "deflated_sharpe": 0.35,
+                        "pbo": 0.18,
+                        "white_reality_pvalue": 0.04,
+                        "expected_edge_policy_reason": "trained",
+                        "expected_edge_policy_enabled": 1.0,
+                        "symbol_quality_dropped_symbols": 0.0,
+                    },
+                    "validation_results": {
+                        "layers": {
+                            "model_utility": {"passed": True},
+                            "execution_robustness": {"passed": True},
+                            "cross_symbol_robustness": {"passed": True},
+                        }
+                    },
+                },
+            )
+        ]
+    )
+
+    assert rows[0]["snapshot_id"] == "snap_clean"
+    assert rows[0]["dataset_bundle_hash"] == "bundle_clean"
+    assert rows[0]["data_quality_report_hash"] == "dq_clean"
+    assert rows[0]["pre_promotion_ready"] == pytest.approx(1.0)
+    assert rows[0]["pre_promotion_failed_check_count"] == pytest.approx(0.0)
 
 
 def test_training_config_normalizes_limits_and_exports_cost_model():
@@ -4372,6 +4840,59 @@ def test_load_features_from_postgres_recomputes_when_feature_selection_signature
     monkeypatch.setattr(conn_module, "get_redis_manager", lambda: FakeRedis())
 
     assert trainer._load_features_from_postgres() is None
+
+
+def test_snapshot_training_scope_tracks_market_session_policy():
+    regular_scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(model_type="lightgbm")
+    )
+    extended_scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(model_type="lightgbm", include_premarket=True)
+    )
+
+    assert regular_scope["include_premarket"] is False
+    assert regular_scope["include_postmarket"] is False
+    assert extended_scope["include_premarket"] is True
+    assert regular_scope != extended_scope
+
+
+def test_apply_market_session_filter_removes_out_of_session_rows():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(model_type="lightgbm", timeframe="15Min")
+    )
+    frame = pd.DataFrame(
+        {
+            "symbol": ["AAPL"] * 5,
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-16T13:00:00Z",
+                    "2024-01-16T14:30:00Z",
+                    "2024-01-16T14:45:00Z",
+                    "2024-01-16T20:45:00Z",
+                    "2024-01-16T21:00:00Z",
+                ],
+                utc=True,
+            ),
+            "open": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "high": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "low": [98.0, 99.0, 100.0, 101.0, 102.0],
+            "close": [99.5, 100.5, 101.5, 102.5, 103.5],
+            "volume": [1000.0, 1100.0, 1200.0, 1300.0, 1400.0],
+        }
+    )
+    trainer.data = frame.copy()
+    trainer.ohlcv_panels_by_timeframe = {"15Min": frame.copy()}
+
+    trainer._apply_market_session_filter()
+
+    assert trainer.data["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").tolist() == [
+        "2024-01-16T14:30:00Z",
+        "2024-01-16T14:45:00Z",
+        "2024-01-16T20:45:00Z",
+    ]
+    assert trainer.training_metrics["market_session_filter_applied"] is True
+    assert trainer.training_metrics["market_session_rows_removed"] == pytest.approx(2.0)
+    assert len(trainer.ohlcv_panels_by_timeframe["15Min"]) == 3
 
 
 def test_validate_model_requires_nested_trace_for_promotion():

@@ -1,6 +1,7 @@
 # AlphaTrade Production-Ready Training Task List
 
 **Date:** 2026-04-02
+**Last Updated:** 2026-04-02
 **Purpose:** Convert the current diagnostic-grade LightGBM workflow into a production-ready training pipeline that can produce a promotable artifact, survive replay, and enter paper trading with traceable evidence.
 
 ## 1. Exit Criteria
@@ -14,381 +15,386 @@ This task list is complete only when all of the following are true:
 - replay passes on the promoted artifact
 - paper trading remains coherent for at least `2` weeks
 
-## 2. P0 Blockers
+## 2. Current Status
+
+### Completed
+
+- Task 2: Make Long-Running Training Durable
+- Task 3: Add Run Manifest Indexing
+- Task 4: Add Signal-Funnel Diagnostics
+- Task 5: Add Per-Symbol And Per-Regime Tail Diagnostics
+- Task 6: Make Feature Selection Auditable And Binding
+- Task 10: Add Candidate-Trade Floor Reporting For Expected-Edge
+- Task 11: Tighten Research Run Comparison Discipline
+- Task 12: Add A Pre-Promotion Checklist Gate
+
+### In Progress
+
+- Task 1: Repair Snapshot Data Quality
+
+### Pending
+
+- Task 7: Establish The Clean-Snapshot Ranker Baseline
+- Task 8: Build A Trade-Flow Challenger
+- Task 9: Build A Drawdown-Control Challenger
+- Task 13: Rerun Promotion On The Winner
+- Task 14: Replay Validation Across Three Windows
+- Task 15: Paper Trading Validation
+- Task 16: Canary Rollout Readiness Review
+
+### Deferred
+
+- Task 17: Reopen The TCN Branch Only After LightGBM Stabilizes
+
+## 3. Completed Work
+
+### Task 2: Make Long-Running Training Durable
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- WSL launcher flow now uses `tmux` through `scripts/wsl_tmux_launcher.sh`
+- `scripts/launch_wave1_wsl_run1.sh`, `scripts/launch_wave1_wsl_run2.sh`, and `scripts/launch_wave1_wsl_run3.sh` now launch through the durable wrapper
+- Optuna studies are persisted to SQLite and can be resumed with the same `--name`
+- work plan now documents the resume procedure
+
+Primary files touched:
+
+- `scripts/wsl_tmux_launcher.sh`
+- `scripts/launch_wave1_wsl_run1.sh`
+- `scripts/launch_wave1_wsl_run2.sh`
+- `scripts/launch_wave1_wsl_run3.sh`
+- `scripts/train.py`
+- `docs/LIGHTGBM_TCN_WORK_PLAN.md`
+
+Residual risk:
+
+- durable compute is fixed, but promotion still should not run until a valid research winner exists
+
+### Task 3: Add Run Manifest Indexing
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- append-only run event index added through `append_training_run_event(...)`
+- training now records `started`, `completed`, `failed`, and `interrupted` states
+- indexed payload includes run identity, snapshot, output paths, and top metrics
+
+Primary files touched:
+
+- `quant_trading_system/models/training_lineage.py`
+- `scripts/train.py`
+
+Residual risk:
+
+- run index is now durable, but the underlying candidate quality is still insufficient
+
+### Task 4: Add Signal-Funnel Diagnostics
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- expected-edge precheck funnel and full training funnel
+- holdout funnel metrics
+- symbol-level and regime-level funnel splits
+- candidate floor metrics before expected-edge fitting
+
+Primary files touched:
+
+- `scripts/train.py`
+
+Residual risk:
+
+- diagnostics exist, but we have not yet used them to build and validate the next challenger
+
+### Task 5: Add Per-Symbol And Per-Regime Tail Diagnostics
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- holdout symbol/regime payloads now include Sharpe, drawdown, trade count, hit rate, PnL, loss PnL, tail-loss PnL, underwater ratio, turnover, Calmar, and CVaR
+- tail-loss contributor leaderboards are written for both symbol and regime
+
+Primary files touched:
+
+- `scripts/train.py`
+
+Residual risk:
+
+- tail diagnostics identify bad contributors, but we still need to turn that evidence into a challenger policy
+
+### Task 6: Make Feature Selection Auditable And Binding
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- feature-selection audit now records input count, retained count, rejected count, rejected features, rejection reasons, family breakdown, and no-op detection
+- training warns when configured feature selection leaves the matrix effectively unchanged
+
+Primary files touched:
+
+- `scripts/train.py`
+
+Residual risk:
+
+- feature selection is now auditable, but it still needs to be made more aggressively useful in the drawdown-control challenger
+
+### Task 10: Add Candidate-Trade Floor Reporting For Expected-Edge
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- explicit candidate floor metrics are emitted before expected-edge fit
+- training records whether the candidate floor passes `min_samples` and `min_coverage`
+- skip reasons are visible without inferring them from downstream artifacts
+
+Primary files touched:
+
+- `scripts/train.py`
+
+Residual risk:
+
+- the pipeline now explains expected-edge starvation, but the research candidate still needs a real trade-flow fix
+
+### Task 11: Tighten Research Run Comparison Discipline
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- training matrix rows now carry snapshot identity fields including snapshot hash lineage
+- comparison summary now records baseline-vs-challenger diffs on the same snapshot identity
+- work plan already enforces one-thesis-at-a-time challenger policy
+
+Primary files touched:
+
+- `scripts/train.py`
+- `docs/LIGHTGBM_TCN_WORK_PLAN.md`
+
+Residual risk:
+
+- the comparison framework is ready, but it still needs new clean-snapshot runs to compare
+
+### Task 12: Add A Pre-Promotion Checklist Gate
+
+Status:
+
+- `completed`
+
+What was implemented:
+
+- research outputs now produce a machine-readable pre-promotion checklist
+- strict-snapshot promotion runs now preflight against the latest matching research matrix before training starts
+- blocked promotion attempts now explain why they are blocked
+- an explicit operator bypass exists for emergency/manual override
+
+Primary files touched:
+
+- `scripts/train.py`
+- `scripts/launch_wave1_wsl_run3.sh`
+- `docs/LIGHTGBM_TCN_WORK_PLAN.md`
+
+Residual risk:
+
+- the gate prevents wasted promotion compute, but it does not solve the underlying model-quality issues
+
+## 4. In-Progress Work
 
 ### Task 1: Repair Snapshot Data Quality
 
-Goal:
+Status:
 
-- remove the missing-bar failure that currently keeps the serious snapshot at diagnostic grade
+- `in_progress`
 
-Primary files:
+What was implemented so far:
+
+- PostgreSQL root-cause analysis showed most severe 15-minute "gaps" were sparse premarket-to-open / close-boundary rows being treated as missing regular-session bars
+- training now filters intraday OHLCV to regular session by default before symbol-quality scoring and snapshot quality reporting
+- snapshot auto-reuse scope now includes the market-session policy so old extended-hours snapshots cannot be silently reused
+- `scripts/data.py` gap diagnostics now use the same session-filtered missing-bar logic as training
+- data-quality reporting now includes root-cause style missing-bar summaries by symbol and date range
+- training logs now surface the top missing-bar symbols and the largest missing-bar window
+- quality-report lineage is already wired into training, snapshots, and benchmark comparisons
+
+Primary files touched so far:
 
 - `quant_trading_system/data/data_access.py`
+- `quant_trading_system/models/training_lineage.py`
 - `scripts/data.py`
 - `scripts/train.py`
-- `quant_trading_system/models/training_lineage.py`
-- `quant_trading_system/models/symbol_quality.py`
 
-Deliverables:
+What is still required:
 
-- root-cause summary for missing 15-minute bars by symbol and date range
-- repaired dataset or documented universe adjustment
-- new snapshot bundle with `quality_report_passed=true`
+- rerun serious snapshot generation and confirm the regular-session quality report now passes
+- verify whether any symbols still show true intraday gaps after the session-policy fix
+- decide whether remaining real gaps require:
+  - repairing data in-place
+  - backfilling missing windows
+  - explicitly retiring a broken symbol from the universe
+- regenerate a serious snapshot with `quality_report_passed=true`
+- make sure the dropped-symbol list is empty or explicitly approved
 
 Done when:
 
 - `models/snapshots/<new_snap>.quality.json` has no threshold breach
-- the dropped-symbol list is empty or explicitly approved in the plan
+- the next research run can use a clean snapshot without silent universe degradation
 
-### Task 2: Make Long-Running Training Durable
-
-Goal:
-
-- stop losing promotion runs to shell/session interruption
-
-Primary files:
-
-- `scripts/launch_wave1_wsl_run*.sh`
-- `scripts/train.py`
-
-Deliverables:
-
-- durable WSL launcher guidance using `tmux`, `screen`, or equivalent
-- persistent Optuna study or resumable training state for research and promotion profiles
-- explicit run-resume procedure in docs or scripts
-
-Done when:
-
-- a killed session can be resumed or safely restarted from auditable intermediate state
-- operators no longer rely on an attached foreground shell for multi-hour runs
-
-### Task 3: Add Run Manifest Indexing
-
-Goal:
-
-- make every serious run discoverable without digging through raw stdout logs
-
-Primary files:
-
-- `scripts/train.py`
-- `quant_trading_system/models/training_lineage.py`
-
-Deliverables:
-
-- append-only run index containing command, snapshot, timestamps, output paths, final status, and top metrics
-- explicit interrupted/failed/success states
-
-Done when:
-
-- the answer to "which run produced which artifact and why did it fail" is available from one machine-readable file
-
-### Task 4: Add Signal-Funnel Diagnostics
-
-Goal:
-
-- find where candidate trades are being suppressed
-
-Primary files:
-
-- `scripts/train.py`
-- `quant_trading_system/models/signal_policy.py`
-- `quant_trading_system/models/expected_edge_policy.py`
-
-Deliverables:
-
-- per-run artifact with counts at each stage:
-  - raw model predictions
-  - calibrated predictions
-  - side-policy admissions
-  - regime-policy admissions
-  - expected-edge candidates
-  - final selected trades
-- counts split by symbol, side, and regime
-
-Done when:
-
-- the team can point to the exact stage causing `mean_trade_count` collapse and `expected-edge` starvation
-
-### Task 5: Add Per-Symbol And Per-Regime Tail Diagnostics
-
-Goal:
-
-- identify why `holdout_symbol_sharpe_p25` is deeply negative while aggregate holdout Sharpe stays positive
-
-Primary files:
-
-- `scripts/train.py`
-- `quant_trading_system/models/training_lineage.py`
-
-Deliverables:
-
-- holdout table by symbol with Sharpe, drawdown, trade count, hit rate, PnL, and underwater ratio
-- holdout table by regime with the same metrics
-- top contributors to tail losses
-
-Done when:
-
-- the worst symbols and regimes are explicit and can be tied to concrete challenger ideas
-
-### Task 6: Make Feature Selection Auditable And Binding
-
-Goal:
-
-- stop treating feature selection as enabled when it effectively does nothing
-
-Primary files:
-
-- `scripts/train.py`
-
-Deliverables:
-
-- artifact fields for input feature count, retained feature count, rejected feature count, and rejection reasons
-- family-level breakdown for retained vs rejected features
-- warning when configured feature selection leaves the matrix unchanged
-
-Done when:
-
-- every run makes it obvious whether feature selection constrained the model or not
-
-## 3. P1 Training Improvements
+## 5. Remaining Work
 
 ### Task 7: Establish The Clean-Snapshot Ranker Baseline
 
-Goal:
+Status:
+
+- `pending`
+
+Blocked by:
+
+- Task 1
+
+Next action:
 
 - rerun `lightgbm_ranker h12` on the repaired snapshot with no hidden policy changes
 
-Primary files:
-
-- `scripts/launch_wave1_wsl_run1.sh`
-- `scripts/train.py`
-
-Deliverables:
-
-- baseline artifact package on the clean snapshot
-- updated training matrix and champion snapshot
-
 Done when:
 
-- the new baseline can be compared apples-to-apples against the old `h12` result
+- the clean-snapshot baseline can be compared directly against the old `h12` result
 
 ### Task 8: Build A Trade-Flow Challenger
 
-Goal:
+Status:
 
-- increase candidate trade flow enough for expected-edge training and `min_trades` without wrecking holdout quality
+- `pending`
 
-Primary files:
+Blocked by:
 
-- `scripts/train.py`
-- `quant_trading_system/models/signal_policy.py`
-- `quant_trading_system/models/expected_edge_policy.py`
+- Task 1
+- Task 7
 
-Allowed changes:
+Next action:
 
-- one admission-policy change at a time
-- one threshold-policy change at a time
-- no simultaneous feature-policy and label-policy rewrite in the same challenger
+- use the new funnel diagnostics to change one admission/threshold lever at a time and recover enough candidate trade flow for expected-edge training
 
 Done when:
 
-- `expected-edge` trains successfully and trade-count improvement is measured, not guessed
+- `expected-edge` trains successfully and trade-count improvement is measurable on the clean snapshot
 
 ### Task 9: Build A Drawdown-Control Challenger
 
-Goal:
+Status:
 
-- reduce drawdown, PBO, and weak statistical validity on the same snapshot
+- `pending`
 
-Primary files:
+Blocked by:
 
-- `scripts/train.py`
+- Task 1
+- Task 7
 
-Likely levers:
+Next action:
 
-- stronger feature pruning
-- stronger tail-risk and CVaR weights
-- stronger symbol-concentration penalties
-- stronger symbol-tail exclusions if diagnostics justify them
+- use the new tail diagnostics and feature-selection audit to tighten pruning, downside penalties, and symbol-tail protection without changing snapshots
 
 Done when:
 
-- at least one failed gate from `max_drawdown`, `risk_adjusted_positive`, `max_pbo`, or `max_white_reality_pvalue` materially improves without a hidden snapshot change
-
-### Task 10: Add Candidate-Trade Floor Reporting For Expected-Edge
-
-Goal:
-
-- make the expected-edge skip reason actionable instead of a late warning
-
-Primary files:
-
-- `quant_trading_system/models/expected_edge_policy.py`
-- `scripts/train.py`
-
-Deliverables:
-
-- explicit candidate-trade floor metric before expected-edge fitting
-- stage-by-stage reason codes for why candidates were filtered out
-
-Done when:
-
-- no one has to infer why expected-edge was skipped from downstream symptoms
-
-### Task 11: Tighten Research Run Comparison Discipline
-
-Goal:
-
-- make the next comparisons scientifically useful
-
-Primary files:
-
-- `scripts/train.py`
-- `docs/LIGHTGBM_TCN_WORK_PLAN.md`
-
-Deliverables:
-
-- one-variable-at-a-time challenger policy
-- snapshot hash recorded in every comparison summary
-- explicit baseline vs challenger diff report
-
-Done when:
-
-- each serious run has a single clear thesis and a measurable pass/fail result
-
-## 4. P1 Promotion Readiness Tasks
-
-### Task 12: Add A Pre-Promotion Checklist Gate
-
-Goal:
-
-- stop wasting promotion compute on obviously unready research candidates
-
-Primary files:
-
-- `scripts/train.py`
-- `scripts/launch_wave1_wsl_run3.sh`
-
-Deliverables:
-
-- lightweight pre-promotion checklist based on the work plan thresholds
-- operator-visible message explaining why promotion is blocked
-
-Done when:
-
-- promotion is only launched for a research winner that is plausibly promotable
+- at least one failed gate from drawdown/PBO/White-Reality materially improves on the same snapshot
 
 ### Task 13: Rerun Promotion On The Winner
 
-Goal:
+Status:
 
-- produce a real promotion artifact from the repaired pipeline
+- `pending`
 
-Primary files:
+Blocked by:
 
-- `scripts/launch_wave1_wsl_run3.sh`
-- `scripts/train.py`
+- Tasks 1, 7, 8, 9
 
-Deliverables:
+Next action:
 
-- complete promotion run
-- model artifact
-- promotion package
-- replay manifest
-- updated champion snapshot with an eligible candidate
+- promote only the clean-snapshot research winner that clears the pre-promotion checklist
 
 Done when:
 
-- `deployment_plan.ready_for_production=true`
-- the run finishes cleanly and is indexed as success
-
-## 5. P2 Deployment Validation Tasks
+- the promotion run finishes cleanly and produces model artifact, promotion package, replay manifest, and `deployment_plan.ready_for_production=true`
 
 ### Task 14: Replay Validation Across Three Windows
 
-Goal:
+Status:
 
-- prove that the promoted artifact survives multiple market regimes
+- `pending`
 
-Primary files:
+Blocked by:
 
-- `scripts/replay.py`
-- `quant_trading_system/backtest/replay.py`
+- Task 13
 
-Deliverables:
+Next action:
 
-- replay reports for the three required windows
-- execution SLO review including fills, slippage, turnover, concentration, and risk warnings
-
-Done when:
-
-- replay outcomes are coherent across all required windows and no regime-specific failure invalidates promotion
+- replay the promoted artifact across the three required windows and compare execution realism against promotion assumptions
 
 ### Task 15: Paper Trading Validation
 
-Goal:
+Status:
 
-- validate the promoted artifact under deployment-like behavior before any live canary expansion
+- `pending`
 
-Primary files:
+Blocked by:
 
-- `scripts/trade.py`
-- `quant_trading_system/trading/trading_engine.py`
-- `quant_trading_system/execution/order_manager.py`
+- Task 14
 
-Deliverables:
+Next action:
 
-- at least `2` weeks of artifact-driven paper trading
-- daily monitoring pack with PnL, turnover, slippage, symbol concentration, risk warnings, and expected-edge pass behavior
-
-Done when:
-
-- paper performance is operationally coherent and does not contradict replay or promotion assumptions
+- run at least `2` weeks of artifact-driven paper trading with daily monitoring packs
 
 ### Task 16: Canary Rollout Readiness Review
 
-Goal:
+Status:
 
-- confirm that the promoted model is fit for controlled capital exposure
+- `pending`
 
-Primary files:
+Blocked by:
 
-- promotion package artifacts
-- replay outputs
-- paper-trading logs
+- Tasks 14 and 15
 
-Deliverables:
+Next action:
 
-- explicit decision memo for `5% -> 15% -> 35% -> 100%` rollout phases
-- kill-switch and TCA guardrail review against the generated deployment plan
+- write the capital rollout memo and reconcile deployment guardrails against replay and paper evidence
 
-Done when:
-
-- the team can justify why the model deserves canary capital instead of more research work
-
-## 6. Deferred Tasks
+## 6. Deferred Work
 
 ### Task 17: Reopen The TCN Branch Only After LightGBM Stabilizes
 
-Goal:
+Status:
 
-- avoid turning model-family experimentation into a substitute for unresolved baseline issues
+- `deferred`
 
-Primary files:
+Rule:
 
-- `docs/LIGHTGBM_TCN_WORK_PLAN.md`
-- future TCN launcher scripts
+- TCN stays closed until LightGBM passes promotion, replay, and early paper validation
 
-Done when:
+## 7. Recommended Next Implementation Order
 
-- LightGBM has already passed promotion, replay, and early paper validation and the team still wants an incremental challenger
-
-## 7. Recommended Implementation Order
-
-1. Tasks 1-6
-2. Task 7
-3. Tasks 8-11
-4. Tasks 12-13
-5. Tasks 14-16
-6. Task 17 only after the baseline is stable
+1. Finish Task 1 by fixing the actual 15-minute gap source and generating a clean snapshot
+2. Run Task 7 to create the clean-snapshot `lightgbm_ranker h12` baseline
+3. Run Task 8 using the existing signal-funnel diagnostics
+4. Run Task 9 using the existing tail diagnostics and feature-selection audit
+5. Run Task 13 only after the research winner clears the checklist
+6. Run Tasks 14-16 in order
+7. Keep Task 17 deferred unless the LightGBM baseline is already operationally stable
