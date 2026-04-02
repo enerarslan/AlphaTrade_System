@@ -3395,6 +3395,11 @@ class ModelTrainer:
 
     def _persist_features_to_postgres_if_needed(self) -> None:
         """Persist only freshly materialized post-selection features."""
+        if self.config.snapshot_only:
+            self.logger.info(
+                "Skipping feature persistence because snapshot-only mode only needs bundle artifacts"
+            )
+            return
         if not self.config.persist_features_to_postgres:
             self.logger.info("Skipping feature persistence to PostgreSQL for this run")
             return
@@ -11964,10 +11969,17 @@ class ModelTrainer:
             },
         }
         failed_checks = [name for name, payload in checks.items() if not bool(payload["passed"])]
+        dataset_bundle_manifest_path = (
+            str(self.dataset_snapshot_bundle_manifest_path)
+            if self.dataset_snapshot_bundle_manifest_path is not None
+            else None
+        )
         return {
             "ready": len(failed_checks) == 0,
             "failed_checks": failed_checks,
             "checks": checks,
+            "data_quality_passed": data_quality_passed,
+            "no_silent_symbol_drop": len(dropped_symbols) == 0,
             "snapshot_id": (
                 str(self.snapshot_manifest.get("snapshot_id"))
                 if isinstance(self.snapshot_manifest, dict)
@@ -12015,11 +12027,8 @@ class ModelTrainer:
             "market_session_filter": self._json_safe(
                 self.training_metrics.get("market_session_filter_summary", {})
             ),
-            "dataset_snapshot_bundle_path": (
-                str(self.dataset_snapshot_bundle_manifest_path)
-                if self.dataset_snapshot_bundle_manifest_path is not None
-                else None
-            ),
+            "dataset_snapshot_bundle_path": dataset_bundle_manifest_path,
+            "dataset_bundle_manifest_path": dataset_bundle_manifest_path,
             "dataset_bundle_hash": (
                 str(self.dataset_snapshot_bundle_manifest.get("bundle_hash"))
                 if isinstance(self.dataset_snapshot_bundle_manifest, dict)
@@ -12107,11 +12116,11 @@ class ModelTrainer:
         if not review_stem:
             review_stem = "snapshot"
         self.snapshot_review_path = output_dir / f"{review_stem}.snapshot_review.json"
+        review_payload["snapshot_review_path"] = str(self.snapshot_review_path)
         self.snapshot_review_path.write_text(
             json.dumps(review_payload, indent=2, ensure_ascii=True, sort_keys=True, default=str),
             encoding="utf-8",
         )
-        review_payload["snapshot_review_path"] = str(self.snapshot_review_path)
         self.training_metrics["snapshot_review"] = review_payload
         self.training_metrics["snapshot_review_ready"] = bool(review_payload.get("ready", False))
         self.training_metrics["snapshot_review_failed_checks"] = list(
@@ -12143,11 +12152,11 @@ class ModelTrainer:
         review_payload = self._build_snapshot_review()
         review_payload["preflight_only"] = True
         self.snapshot_review_path = output_dir / f"{review_stem}.snapshot_review.json"
+        review_payload["snapshot_review_path"] = str(self.snapshot_review_path)
         self.snapshot_review_path.write_text(
             json.dumps(review_payload, indent=2, ensure_ascii=True, sort_keys=True, default=str),
             encoding="utf-8",
         )
-        review_payload["snapshot_review_path"] = str(self.snapshot_review_path)
         self.training_metrics["snapshot_review"] = review_payload
         self.training_metrics["snapshot_review_ready"] = bool(review_payload.get("ready", False))
         self.training_metrics["snapshot_review_failed_checks"] = list(

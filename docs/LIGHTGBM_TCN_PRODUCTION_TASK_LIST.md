@@ -240,9 +240,12 @@ What was implemented so far:
 - snapshot-only runs now emit `<model_name>.snapshot_review.json` with explicit `data_quality_passed` and `no_silent_symbol_drop` checks
 - snapshot-only preflight now fast-fails immediately after Phase 1 when the quality report fails or symbols drop from the effective universe, so Task 1 can be checked without paying feature-compute cost
 - market-session preflight filtering was vectorized in the package layer, so the same serious snapshot review now completes in seconds instead of stalling inside Phase 1
+- the Wave 1 universe is now explicit in `data/training/universes/wave1_clean_core11_20260402.json`, retiring `GLD` with recorded liquidity rationale instead of relying on silent drop
+- snapshot-only runs now skip post-selection PostgreSQL feature persistence; Task 1 only requires the frozen dataset bundle and review artifact, so the rebuild path no longer burns time in non-essential cache upserts
 
 Primary files touched so far:
 
+- `data/training/universes/wave1_clean_core11_20260402.json`
 - `quant_trading_system/data/data_access.py`
 - `quant_trading_system/models/training_lineage.py`
 - `scripts/data.py`
@@ -282,6 +285,7 @@ Blocked by:
 Next action:
 
 - rerun `lightgbm_ranker h12` on the repaired snapshot with no hidden policy changes
+- use `scripts/launch_wave1_wsl_runB_clean_ranker_h12.sh <dataset_bundle.manifest.json>` once Run A finishes, so the clean snapshot is replayed exactly under research settings
 
 Done when:
 

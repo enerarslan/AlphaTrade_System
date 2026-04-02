@@ -197,7 +197,9 @@ Rules:
 - same 15-minute scope unless the data audit proves that the universe must change
 - if the universe changes, document the exact reason and retire the old snapshot
 - the current preflight evidence points to `GLD` as the only dropped symbol, driven by `median_dollar_volume`, so the next Run A decision is whether to retire `GLD` explicitly or adjust the liquidity gate with written justification
+- Wave 1 now uses the explicit universe file `data/training/universes/wave1_clean_core11_20260402.json`, which retires `GLD` with a recorded reason instead of allowing silent symbol drop
 - first rebuild should run in `--snapshot-only` mode so `*.snapshot_review.json` captures the quality report and dropped-symbol list before the next research candidate is launched
+- snapshot-only runs now skip post-selection PostgreSQL feature persistence entirely; Run A only needs the dataset bundle and review package, and removing that write path avoids wasting time in non-essential cache materialization
 
 ### Run B: Clean-Snapshot Ranker Baseline
 
@@ -210,6 +212,7 @@ Rules:
 
 - no hidden policy changes
 - generate the new diagnostics artifacts described in this plan
+- launch the baseline with `scripts/launch_wave1_wsl_runB_clean_ranker_h12.sh <dataset_bundle.manifest.json>` so the exact Run A snapshot bundle is replayed under research settings
 
 ### Run C: Ranker Trade-Flow Challenger
 

@@ -2972,6 +2972,29 @@ def test_persist_features_to_postgres_if_needed_skips_reused_cache(monkeypatch):
     assert persist_calls["count"] == 0
 
 
+def test_persist_features_to_postgres_if_needed_skips_snapshot_only(monkeypatch):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            persist_features_to_postgres=True,
+            snapshot_only=True,
+        )
+    )
+    trainer.features_materialized_in_run = True
+    trainer.feature_cache_reused = False
+    trainer.snapshot_replay_loaded = False
+    persist_calls = {"count": 0}
+    monkeypatch.setattr(
+        trainer,
+        "_store_features_to_postgres",
+        lambda: persist_calls.__setitem__("count", persist_calls["count"] + 1),
+    )
+
+    trainer._persist_features_to_postgres_if_needed()
+
+    assert persist_calls["count"] == 0
+
+
 def test_persist_features_to_postgres_if_needed_persists_fresh_selected_features(monkeypatch):
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -3487,6 +3510,51 @@ def test_run_snapshot_only_fast_fails_after_phase1_quality_review(monkeypatch, t
     assert str(result["data_quality_report_path"]).endswith("wave1.preflight_quality.json")
     assert str(result["snapshot_review_path"]).endswith("wave1.snapshot_review.json")
     assert result["training_metrics"]["snapshot_review_ready"] is False
+
+
+def test_build_snapshot_review_includes_bundle_aliases_and_top_level_checks(tmp_path):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            output_dir=str(tmp_path),
+            snapshot_only=True,
+        )
+    )
+    trainer.snapshot_manifest = {"snapshot_id": "snap_task1", "dataset_bundle_hash": "bundle_hash_task1"}
+    trainer.data_quality_report = {
+        "passed": True,
+        "summary": {"symbol_count": 11},
+        "threshold_breaches": {},
+        "top_missing_bar_symbols": [],
+        "top_missing_bar_windows": [],
+    }
+    trainer.data_quality_report_hash = "dq_hash_task1"
+    trainer.training_metrics["symbol_quality_input_symbols"] = 11.0
+    trainer.training_metrics["symbol_quality_selected_symbols"] = 11.0
+    trainer.training_metrics["symbol_quality_dropped_symbols"] = 0.0
+    trainer.training_metrics["symbol_quality_universe"] = ["AAPL", "MSFT"]
+    trainer.training_metrics["symbol_quality_dropped_list"] = []
+    trainer.dataset_snapshot_bundle_manifest = {"bundle_hash": "bundle_hash_task1"}
+    trainer.dataset_snapshot_bundle_manifest_path = (
+        tmp_path / "snapshots" / "snap_task1" / "dataset_bundle.manifest.json"
+    )
+    trainer.dataset_snapshot_bundle_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    trainer.dataset_snapshot_bundle_manifest_path.write_text("{}", encoding="utf-8")
+
+    review = trainer._build_snapshot_review()
+
+    assert review["ready"] is True
+    assert review["data_quality_passed"] is True
+    assert review["no_silent_symbol_drop"] is True
+    assert (
+        review["dataset_snapshot_bundle_path"]
+        == str(trainer.dataset_snapshot_bundle_manifest_path)
+    )
+    assert (
+        review["dataset_bundle_manifest_path"]
+        == str(trainer.dataset_snapshot_bundle_manifest_path)
+    )
+    assert review["dataset_bundle_hash"] == "bundle_hash_task1"
 
 
 def test_build_parser_supports_institutional_failfast_flags_and_name():
