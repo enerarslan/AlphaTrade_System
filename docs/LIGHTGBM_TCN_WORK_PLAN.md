@@ -127,13 +127,14 @@ Before any live capital increase:
 Current blocker:
 
 - the active serious snapshot is diagnostic-grade, not promotion-grade, because the quality report failed on missing bars
+- latest Task 1 preflight (`wave1_snapshotonly_20260402_h12_preflight3`) now shows the regular-session quality report passes, but snapshot review still fails because `GLD` is silently dropped by the symbol-quality gate
 
 Required actions:
 
 - root-cause the 15-minute bar gaps in PostgreSQL and patch the ingestion/backfill path
 - regenerate the serious snapshot only after the quality report passes
 - make the quality report and dropped-symbol list mandatory review items before approving any promotion run
-- use `python main.py train ... --snapshot-only` to generate the snapshot bundle and a review artifact before spending research or promotion compute
+- use `python main.py train ... --snapshot-only` to generate the snapshot bundle and a review artifact before spending research or promotion compute; if Phase 1 already fails quality or drops symbols, the run now stops there instead of paying feature-compute cost
 - formally retire the current snapshot for promotion use if the gaps cannot be repaired cleanly
 
 ### 5.2 Training Diagnostics And Traceability
@@ -176,7 +177,7 @@ Required actions:
 
 Operational procedure:
 
-- launch serious WSL runs through `scripts/launch_wave1_wsl_run*.sh`; they now auto-start inside `tmux` when available
+- launch serious WSL runs through `scripts/launch_wave1_wsl_run*.sh`; `tmux` is now a hard requirement for durable WSL execution
 - the Wave 1 WSL launchers now pass through extra CLI flags, so operators can append `--snapshot-only` for preflight snapshot review without cloning a script
 - resume an interrupted search by rerunning the same launch script with the same `--name`; Optuna state is persisted under `models/optuna_state`
 - if the session is still alive, reattach with `tmux attach -t <session_name>` instead of starting a second foreground process
@@ -195,6 +196,7 @@ Rules:
 
 - same 15-minute scope unless the data audit proves that the universe must change
 - if the universe changes, document the exact reason and retire the old snapshot
+- the current preflight evidence points to `GLD` as the only dropped symbol, driven by `median_dollar_volume`, so the next Run A decision is whether to retire `GLD` explicitly or adjust the liquidity gate with written justification
 - first rebuild should run in `--snapshot-only` mode so `*.snapshot_review.json` captures the quality report and dropped-symbol list before the next research candidate is launched
 
 ### Run B: Clean-Snapshot Ranker Baseline

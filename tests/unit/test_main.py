@@ -255,6 +255,39 @@ class TestParseArgs:
             assert args.nested_inner_splits == 3
             assert args.seed == 7
 
+    def test_parse_train_delegates_full_training_parser_surface(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "main.py",
+                "--log-level",
+                "DEBUG",
+                "train",
+                "--symbols-file",
+                "data/training/universes/wave1_clean_core11_20260402.json",
+                "--optuna-storage-dir",
+                "models/optuna_state",
+                "--cv-method",
+                "purged_kfold",
+                "--execution-turnover-cap",
+                "0.7",
+                "--snapshot-only",
+            ],
+        ):
+            args = parse_args()
+            assert args.command == "train"
+            assert args.log_level == "DEBUG"
+            assert str(args.symbols_file).replace("\\", "/").endswith(
+                "data/training/universes/wave1_clean_core11_20260402.json"
+            )
+            assert str(args.optuna_storage_dir).replace("\\", "/").endswith(
+                "models/optuna_state"
+            )
+            assert args.cv_method == "purged_kfold"
+            assert args.execution_turnover_cap == pytest.approx(0.7)
+            assert args.snapshot_only is True
+
     def test_parse_train_advanced_risk_and_execution_flags(self):
         with patch.object(
             sys,

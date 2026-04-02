@@ -1392,6 +1392,25 @@ class ModelTrainer:
                 # Phase 1: Load Data
                 self._load_data()
 
+                if self.config.snapshot_only:
+                    preflight_review = self._build_snapshot_review()
+                    if not bool(preflight_review.get("ready", False)):
+                        failed_checks = list(preflight_review.get("failed_checks", []))
+                        self.logger.warning(
+                            "Snapshot-only preflight failed after Phase 1; "
+                            "skipping feature materialization. Failed checks: %s",
+                            ", ".join(failed_checks) if failed_checks else "unknown",
+                        )
+                        output_dir = Path(self.config.output_dir)
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        review_payload = self._persist_snapshot_review_only(output_dir)
+                        duration = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+                        results = self._build_snapshot_only_results(review_payload, duration)
+                        self._record_training_run_event("completed", results=results)
+                        self.logger.info("Snapshot-only preflight completed in %.1fs", duration)
+                        self.logger.info("Snapshot review readiness: FAILED")
+                        return results
+
                 # Phase 2: Compute Features
                 self._compute_features()
 
@@ -1415,75 +1434,9 @@ class ModelTrainer:
                 output_dir = Path(self.config.output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 review_payload = self._persist_snapshot_artifacts(output_dir)
-                snapshot_ready = bool(review_payload.get("ready", False))
                 duration = (datetime.now(timezone.utc) - self.start_time).total_seconds()
-                results = {
-                    "success": snapshot_ready,
-                    "snapshot_only": True,
-                    "run_id": self.run_id,
-                    "model_path": None,
-                    "model_type": self.config.model_type,
-                    "model_name": self.config.model_name,
-                    "training_duration_seconds": duration,
-                    "cv_results": [],
-                    "validation_results": {},
-                    "training_metrics": self.training_metrics,
-                    "passed_validation_gates": None,
-                    "snapshot_id": (
-                        str(self.snapshot_manifest.get("snapshot_id"))
-                        if isinstance(self.snapshot_manifest, dict)
-                        else None
-                    ),
-                    "snapshot_manifest_path": (
-                        str(self.snapshot_manifest_path)
-                        if self.snapshot_manifest_path is not None
-                        else None
-                    ),
-                    "data_quality_report_path": (
-                        str(self.data_quality_report_path)
-                        if self.data_quality_report_path is not None
-                        else None
-                    ),
-                    "data_quality_report_hash": self.data_quality_report_hash,
-                    "data_quality_report_passed": (
-                        bool(self.data_quality_report.get("passed", False))
-                        if isinstance(self.data_quality_report, dict)
-                        else None
-                    ),
-                    "dataset_snapshot_bundle_path": (
-                        str(self.dataset_snapshot_bundle_manifest_path)
-                        if self.dataset_snapshot_bundle_manifest_path is not None
-                        else None
-                    ),
-                    "dataset_bundle_hash": (
-                        str(self.dataset_snapshot_bundle_manifest.get("bundle_hash"))
-                        if isinstance(self.dataset_snapshot_bundle_manifest, dict)
-                        else (
-                            str(self.snapshot_manifest.get("dataset_bundle_hash"))
-                            if isinstance(self.snapshot_manifest, dict)
-                            else None
-                        )
-                    ),
-                    "snapshot_review_path": (
-                        str(self.snapshot_review_path)
-                        if self.snapshot_review_path is not None
-                        else None
-                    ),
-                    "snapshot_review": review_payload,
-                    "label_diagnostics": self.label_diagnostics,
-                    "nested_cv_trace": self.nested_cv_trace,
-                    "replay_manifest_path": None,
-                    "promotion_package_path": None,
-                    "artifacts_path": None,
-                    "run_event_index_path": (
-                        str(self.run_event_index_path)
-                        if self.run_event_index_path is not None
-                        else None
-                    ),
-                    "model_card": {},
-                    "deployment_plan": {},
-                    "pre_promotion_checklist": {},
-                }
+                results = self._build_snapshot_only_results(review_payload, duration)
+                snapshot_ready = bool(results.get("success", False))
                 self._record_training_run_event("completed", results=results)
                 self.logger.info("Snapshot-only pipeline completed in %.1fs", duration)
                 self.logger.info(
@@ -12165,6 +12118,116 @@ class ModelTrainer:
             review_payload.get("failed_checks", [])
         )
         return review_payload
+
+    def _persist_snapshot_review_only(self, output_dir: Path) -> dict[str, Any]:
+        """Persist a fast-fail Task 1 review artifact before feature materialization."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        review_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.config.model_name).strip("_")
+        if not review_stem:
+            review_stem = "snapshot"
+
+        if self.data_quality_report is not None:
+            preflight_quality_path = output_dir / f"{review_stem}.preflight_quality.json"
+            preflight_quality_path.write_text(
+                json.dumps(
+                    self.data_quality_report,
+                    indent=2,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+            self.data_quality_report_path = preflight_quality_path
+
+        review_payload = self._build_snapshot_review()
+        review_payload["preflight_only"] = True
+        self.snapshot_review_path = output_dir / f"{review_stem}.snapshot_review.json"
+        self.snapshot_review_path.write_text(
+            json.dumps(review_payload, indent=2, ensure_ascii=True, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        review_payload["snapshot_review_path"] = str(self.snapshot_review_path)
+        self.training_metrics["snapshot_review"] = review_payload
+        self.training_metrics["snapshot_review_ready"] = bool(review_payload.get("ready", False))
+        self.training_metrics["snapshot_review_failed_checks"] = list(
+            review_payload.get("failed_checks", [])
+        )
+        return review_payload
+
+    def _build_snapshot_only_results(
+        self,
+        review_payload: dict[str, Any],
+        duration: float,
+    ) -> dict[str, Any]:
+        """Build a stable result payload for snapshot-only execution paths."""
+        return {
+            "success": bool(review_payload.get("ready", False)),
+            "snapshot_only": True,
+            "preflight_only": bool(review_payload.get("preflight_only", False)),
+            "run_id": self.run_id,
+            "model_path": None,
+            "model_type": self.config.model_type,
+            "model_name": self.config.model_name,
+            "training_duration_seconds": duration,
+            "cv_results": [],
+            "validation_results": {},
+            "training_metrics": self.training_metrics,
+            "passed_validation_gates": None,
+            "snapshot_id": (
+                str(self.snapshot_manifest.get("snapshot_id"))
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "snapshot_manifest_path": (
+                str(self.snapshot_manifest_path) if self.snapshot_manifest_path is not None else None
+            ),
+            "data_quality_report_path": (
+                str(self.data_quality_report_path)
+                if self.data_quality_report_path is not None
+                else None
+            ),
+            "data_quality_report_hash": self.data_quality_report_hash,
+            "data_quality_report_passed": (
+                bool(self.data_quality_report.get("passed", False))
+                if isinstance(self.data_quality_report, dict)
+                else None
+            ),
+            "feature_schema_version": (
+                str(self.snapshot_manifest.get("feature_schema_version"))
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "dataset_snapshot_bundle_path": (
+                str(self.dataset_snapshot_bundle_manifest_path)
+                if self.dataset_snapshot_bundle_manifest_path is not None
+                else None
+            ),
+            "dataset_bundle_hash": (
+                str(self.dataset_snapshot_bundle_manifest.get("bundle_hash"))
+                if isinstance(self.dataset_snapshot_bundle_manifest, dict)
+                else (
+                    str(self.snapshot_manifest.get("dataset_bundle_hash"))
+                    if isinstance(self.snapshot_manifest, dict)
+                    else None
+                )
+            ),
+            "snapshot_review_path": (
+                str(self.snapshot_review_path) if self.snapshot_review_path is not None else None
+            ),
+            "snapshot_review": review_payload,
+            "label_diagnostics": self.label_diagnostics,
+            "nested_cv_trace": self.nested_cv_trace,
+            "replay_manifest_path": None,
+            "promotion_package_path": None,
+            "artifacts_path": None,
+            "run_event_index_path": (
+                str(self.run_event_index_path) if self.run_event_index_path is not None else None
+            ),
+            "model_card": {},
+            "deployment_plan": {},
+            "pre_promotion_checklist": {},
+        }
 
     def _save_model(self) -> str:
         """Phase 10: Save trained model and artifacts."""

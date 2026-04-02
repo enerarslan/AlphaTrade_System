@@ -3297,11 +3297,8 @@ def test_run_snapshot_only_persists_review_and_skips_model_fitting(monkeypatch, 
         return tmp_path / "run_index" / "training_runs.jsonl"
 
     monkeypatch.setattr(train_script, "append_training_run_event", _capture_event)
-    monkeypatch.setattr(trainer, "_load_data", lambda: None)
-    monkeypatch.setattr(trainer, "_compute_features", lambda: None)
 
-    def _fake_create_labels():
-        trainer.snapshot_manifest = {"snapshot_id": "snap_task1"}
+    def _fake_load_data():
         trainer.data_quality_report = {
             "passed": True,
             "summary": {"symbol_count": 12},
@@ -3315,6 +3312,12 @@ def test_run_snapshot_only_persists_review_and_skips_model_fitting(monkeypatch, 
         trainer.training_metrics["symbol_quality_dropped_symbols"] = 0.0
         trainer.training_metrics["symbol_quality_universe"] = ["AAPL", "MSFT"]
         trainer.training_metrics["symbol_quality_dropped_list"] = []
+
+    monkeypatch.setattr(trainer, "_load_data", _fake_load_data)
+    monkeypatch.setattr(trainer, "_compute_features", lambda: None)
+
+    def _fake_create_labels():
+        trainer.snapshot_manifest = {"snapshot_id": "snap_task1"}
 
     monkeypatch.setattr(trainer, "_create_labels", _fake_create_labels)
     monkeypatch.setattr(trainer, "_apply_feature_selection", lambda: None)
@@ -3368,6 +3371,122 @@ def test_run_snapshot_only_persists_review_and_skips_model_fitting(monkeypatch, 
     assert result["dataset_bundle_hash"] == "bundle_task1"
     assert str(result["snapshot_review_path"]).endswith("task1.snapshot_review.json")
     assert result["training_metrics"]["snapshot_review_ready"] is True
+
+
+def test_run_snapshot_only_fast_fails_after_phase1_quality_review(monkeypatch, tmp_path):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            output_dir=str(tmp_path),
+            save_artifacts=True,
+            snapshot_only=True,
+            optimize=True,
+        )
+    )
+    events: list[dict[str, object]] = []
+
+    def _capture_event(index_root, event):
+        events.append({"index_root": index_root, "event": dict(event)})
+        return tmp_path / "run_index" / "training_runs.jsonl"
+
+    monkeypatch.setattr(train_script, "append_training_run_event", _capture_event)
+
+    def _fake_load_data():
+        trainer.data_quality_report = {
+            "passed": False,
+            "summary": {"symbol_count": 12},
+            "threshold_breaches": {
+                "missing_bars_ratio_max": {"actual": 0.18, "threshold": 0.05}
+            },
+            "top_missing_bar_symbols": [{"symbol": "GLD", "missing_bars_count": 42}],
+            "top_missing_bar_windows": [],
+        }
+        trainer.data_quality_report_hash = "dq_bad_task1"
+        trainer.training_metrics["symbol_quality_input_symbols"] = 12.0
+        trainer.training_metrics["symbol_quality_selected_symbols"] = 11.0
+        trainer.training_metrics["symbol_quality_dropped_symbols"] = 1.0
+        trainer.training_metrics["symbol_quality_universe"] = ["AAPL", "MSFT"]
+        trainer.training_metrics["symbol_quality_dropped_list"] = ["GLD"]
+
+    monkeypatch.setattr(trainer, "_load_data", _fake_load_data)
+    monkeypatch.setattr(
+        trainer,
+        "_compute_features",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("preflight failure should skip feature materialization")
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_apply_feature_selection",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("preflight failure should skip feature selection")
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_persist_features_to_postgres_if_needed",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("preflight failure should skip feature cache persistence")
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_validate_no_future_leakage",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("preflight failure should skip leakage validation")
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_optimize_hyperparameters",
+        lambda: (_ for _ in ()).throw(AssertionError("preflight failure should skip optuna")),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_train_with_cv",
+        lambda: (_ for _ in ()).throw(AssertionError("preflight failure should skip CV")),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_save_model",
+        lambda: (_ for _ in ()).throw(AssertionError("preflight failure should skip save_model")),
+    )
+
+    def _fake_persist_snapshot_review_only(output_dir):
+        trainer.data_quality_report_path = output_dir / "wave1.preflight_quality.json"
+        trainer.data_quality_report_path.write_text("{}", encoding="utf-8")
+        trainer.snapshot_review_path = output_dir / "wave1.snapshot_review.json"
+        trainer.snapshot_review_path.write_text("{}", encoding="utf-8")
+        review_payload = trainer._build_snapshot_review()
+        review_payload["preflight_only"] = True
+        review_payload["snapshot_review_path"] = str(trainer.snapshot_review_path)
+        trainer.training_metrics["snapshot_review"] = review_payload
+        trainer.training_metrics["snapshot_review_ready"] = False
+        trainer.training_metrics["snapshot_review_failed_checks"] = list(
+            review_payload["failed_checks"]
+        )
+        return review_payload
+
+    monkeypatch.setattr(trainer, "_persist_snapshot_review_only", _fake_persist_snapshot_review_only)
+
+    result = trainer.run()
+
+    statuses = [entry["event"]["status"] for entry in events]
+    assert statuses == ["started", "completed"]
+    assert result["snapshot_only"] is True
+    assert result["preflight_only"] is True
+    assert result["success"] is False
+    assert result["model_path"] is None
+    assert result["snapshot_id"] is None
+    assert result["data_quality_report_passed"] is False
+    assert set(result["snapshot_review"]["failed_checks"]) == {
+        "data_quality_passed",
+        "no_silent_symbol_drop",
+    }
+    assert str(result["data_quality_report_path"]).endswith("wave1.preflight_quality.json")
+    assert str(result["snapshot_review_path"]).endswith("wave1.snapshot_review.json")
+    assert result["training_metrics"]["snapshot_review_ready"] is False
 
 
 def test_build_parser_supports_institutional_failfast_flags_and_name():

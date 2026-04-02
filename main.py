@@ -2264,14 +2264,52 @@ def setup_signal_handlers() -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments (compatibility wrapper used by tests)."""
-    parser = create_parser()
+    args, _parser = _parse_cli_args(argv)
+    return args
+
+
+def _parse_cli_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, argparse.ArgumentParser]:
+    """Parse CLI arguments, delegating train flags to the training script parser."""
     normalized_argv = list(argv) if argv is not None else sys.argv[1:]
+
+    global_parser = argparse.ArgumentParser(add_help=False)
+    global_parser.add_argument("--config", default=None)
+    global_parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+    )
+    global_parser.add_argument(
+        "--log-format",
+        choices=["console", "json", "structured", "text"],
+        default="console",
+    )
+    global_parser.add_argument("--quiet", action="store_true", default=False)
+    global_args, remaining_argv = global_parser.parse_known_args(normalized_argv)
+
+    if remaining_argv and remaining_argv[0] == "train":
+        from scripts.train import (
+            _attach_explicit_profile_overrides,
+            build_parser as build_train_parser,
+        )
+
+        train_parser = build_train_parser()
+        train_args = train_parser.parse_args(remaining_argv[1:])
+        _attach_explicit_profile_overrides(train_parser, train_args, remaining_argv[1:])
+
+        merged_args = vars(global_args)
+        merged_args.update(vars(train_args))
+        merged_args["command"] = "train"
+        merged_args["func"] = cmd_train
+        return argparse.Namespace(**merged_args), train_parser
+
+    parser = create_parser()
     args = parser.parse_args(normalized_argv)
     if getattr(args, "command", None) == "train":
         from scripts.train import _attach_explicit_profile_overrides
 
         _attach_explicit_profile_overrides(parser, args, normalized_argv)
-    return args
+    return args, parser
 
 
 class TradingSystemApp:
@@ -2321,13 +2359,7 @@ class TradingSystemApp:
 def main() -> int:
     """Main entry point for the AlphaTrade CLI."""
 
-    parser = create_parser()
-    raw_argv = sys.argv[1:]
-    args = parser.parse_args(raw_argv)
-    if getattr(args, "command", None) == "train":
-        from scripts.train import _attach_explicit_profile_overrides
-
-        _attach_explicit_profile_overrides(parser, args, raw_argv)
+    args, parser = _parse_cli_args()
 
     # Setup logging
     setup_logging(

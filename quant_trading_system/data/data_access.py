@@ -107,9 +107,24 @@ def filter_ohlcv_frame_to_market_session(
 
     eastern_ts = timestamps_utc.loc[valid_mask].dt.tz_convert("America/New_York")
     trading_day_mask = eastern_ts.dt.dayofweek < 5
-    trading_dates = eastern_ts.loc[trading_day_mask].dt.normalize().drop_duplicates().tolist()
+    trading_eastern = eastern_ts.loc[trading_day_mask]
+    trading_dates = trading_eastern.dt.normalize()
+    unique_trading_dates = pd.Index(trading_dates.unique()).sort_values()
+    if len(unique_trading_dates) == 0:
+        filtered = working.loc[session_mask].copy()
+        return filtered.reset_index(drop=True), {
+            "applied": True,
+            "reason": "no_trading_days",
+            "input_rows": int(len(frame)),
+            "output_rows": 0,
+            "removed_rows": int(len(frame)),
+            "include_premarket": bool(include_premarket),
+            "include_postmarket": bool(include_postmarket),
+        }
 
-    for trading_date in trading_dates:
+    session_open_map: dict[pd.Timestamp, pd.Timestamp] = {}
+    session_close_map: dict[pd.Timestamp, pd.Timestamp] = {}
+    for trading_date in unique_trading_dates:
         session_open, session_close = get_market_session_bounds(
             pd.Timestamp(trading_date).to_pydatetime()
         )
@@ -117,10 +132,14 @@ def filter_ohlcv_frame_to_market_session(
             session_open = session_open.replace(hour=4, minute=0, second=0, microsecond=0)
         if include_postmarket:
             session_close = session_close.replace(hour=20, minute=0, second=0, microsecond=0)
+        trading_date_key = pd.Timestamp(trading_date)
+        session_open_map[trading_date_key] = pd.Timestamp(session_open)
+        session_close_map[trading_date_key] = pd.Timestamp(session_close)
 
-        date_mask = eastern_ts.dt.normalize() == trading_date
-        in_window = date_mask & (eastern_ts >= session_open) & (eastern_ts < session_close)
-        session_mask.loc[eastern_ts.index[in_window]] = True
+    session_open_by_row = trading_dates.map(session_open_map)
+    session_close_by_row = trading_dates.map(session_close_map)
+    in_window = (trading_eastern >= session_open_by_row) & (trading_eastern < session_close_by_row)
+    session_mask.loc[trading_eastern.index[in_window.to_numpy()]] = True
 
     filtered = working.loc[session_mask].copy().reset_index(drop=True)
     return filtered, {
@@ -132,6 +151,7 @@ def filter_ohlcv_frame_to_market_session(
         "include_premarket": bool(include_premarket),
         "include_postmarket": bool(include_postmarket),
         "timeframe": str(timeframe or DEFAULT_TIMEFRAME),
+        "session_days_evaluated": int(len(unique_trading_dates)),
     }
 
 

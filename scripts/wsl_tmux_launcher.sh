@@ -23,9 +23,8 @@ if [[ "${ALPHATRADE_FORCE_FOREGROUND:-0}" == "1" ]] || [[ -n "${TMUX:-}" ]]; the
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux not found; running in foreground." >&2
-  run_logged_command "$@"
-  exit $?
+  echo "tmux is required for durable WSL launches. Install tmux or set ALPHATRADE_FORCE_FOREGROUND=1 intentionally." >&2
+  exit 1
 fi
 
 if tmux has-session -t "$session_name" 2>/dev/null; then
@@ -38,9 +37,17 @@ fi
 printf -v cwd_text '%q' "$PWD"
 printf -v command_text '%q ' "$@"
 printf -v log_text '%q' "$log_file"
-tmux_payload="set -euo pipefail; cd ${cwd_text}; ${command_text}2>&1 | tee ${log_text}; exit \${PIPESTATUS[0]}"
+launch_script="$(mktemp "${TMPDIR:-/tmp}/alphatrade-${session_name}.XXXXXX.sh")"
+cat > "$launch_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd ${cwd_text}
+${command_text}2>&1 | tee ${log_text}
+exit \${PIPESTATUS[0]}
+EOF
+chmod +x "$launch_script"
 
-tmux new-session -d -s "$session_name" "bash -lc $(printf '%q' "$tmux_payload")"
+tmux new-session -d -s "$session_name" "bash $(printf '%q' "$launch_script")"
 
 echo "Started tmux session: $session_name"
 echo "Log file: $log_file"

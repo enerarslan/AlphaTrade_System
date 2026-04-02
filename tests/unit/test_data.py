@@ -649,6 +649,45 @@ def test_filter_ohlcv_frame_to_market_session_removes_out_of_session_rows():
     assert metadata["removed_rows"] == 2
 
 
+def test_filter_ohlcv_frame_to_market_session_evaluates_unique_trading_days_once(
+    monkeypatch,
+):
+    from quant_trading_system.data import data_access
+
+    observed_dates: list[str] = []
+    original_get_market_session_bounds = data_access.get_market_session_bounds
+
+    def _capture_bounds(session_date):
+        observed_dates.append(pd.Timestamp(session_date).strftime("%Y-%m-%d"))
+        return original_get_market_session_bounds(session_date)
+
+    monkeypatch.setattr(data_access, "get_market_session_bounds", _capture_bounds)
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-16T14:30:00Z",
+                    "2024-01-16T15:00:00Z",
+                    "2024-01-17T14:30:00Z",
+                    "2024-01-17T20:45:00Z",
+                ],
+                utc=True,
+            ),
+            "close": [100.0, 101.0, 102.0, 103.0],
+        }
+    )
+
+    filtered, metadata = data_access.filter_ohlcv_frame_to_market_session(
+        frame,
+        timeframe="15Min",
+    )
+
+    assert len(filtered) == 4
+    assert observed_dates == ["2024-01-16", "2024-01-17"]
+    assert metadata["session_days_evaluated"] == 2
+
+
 class TestFeatureStore:
     """Tests for FeatureStore class."""
 

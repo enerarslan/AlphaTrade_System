@@ -57,6 +57,7 @@ Status:
 What was implemented:
 
 - WSL launcher flow now uses `tmux` through `scripts/wsl_tmux_launcher.sh`
+- durable WSL launchers now require real `tmux`; there is no automatic fallback path
 - `scripts/launch_wave1_wsl_run1.sh`, `scripts/launch_wave1_wsl_run2.sh`, and `scripts/launch_wave1_wsl_run3.sh` now launch through the durable wrapper
 - Optuna studies are persisted to SQLite and can be resumed with the same `--name`
 - work plan now documents the resume procedure
@@ -237,6 +238,8 @@ What was implemented so far:
 - quality-report lineage is already wired into training, snapshots, and benchmark comparisons
 - training now supports `--snapshot-only` so operators can materialize the dataset snapshot bundle, quality report, and dropped-symbol review artifact before any Optuna/model run
 - snapshot-only runs now emit `<model_name>.snapshot_review.json` with explicit `data_quality_passed` and `no_silent_symbol_drop` checks
+- snapshot-only preflight now fast-fails immediately after Phase 1 when the quality report fails or symbols drop from the effective universe, so Task 1 can be checked without paying feature-compute cost
+- market-session preflight filtering was vectorized in the package layer, so the same serious snapshot review now completes in seconds instead of stalling inside Phase 1
 
 Primary files touched so far:
 
@@ -250,10 +253,12 @@ What is still required:
 - rerun serious snapshot generation and confirm the regular-session quality report now passes
 - use `python main.py train ... --snapshot-only --disable-auto-snapshot-reuse` for the first post-fix rebuild so the snapshot review package is produced before any research rerun
 - verify whether any symbols still show true intraday gaps after the session-policy fix
+- latest preflight evidence: `wave1_snapshotonly_20260402_h12_preflight3` finished in `18.6s`, `data_quality_passed=true`, but snapshot review still failed because `GLD` was dropped by the symbol-quality gate for `median_dollar_volume`
 - decide whether remaining real gaps require:
   - repairing data in-place
   - backfilling missing windows
   - explicitly retiring a broken symbol from the universe
+- decide whether `GLD` should be explicitly retired from the Wave 1 universe or whether the liquidity threshold should be changed with written justification
 - regenerate a serious snapshot with `quality_report_passed=true`
 - make sure the dropped-symbol list is empty or explicitly approved
 

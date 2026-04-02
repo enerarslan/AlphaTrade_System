@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <dataset-snapshot-bundle> [extra train args...]" >&2
+  exit 1
+fi
+
+snapshot_bundle="$1"
+shift
+
 cd ~/AlphaTrade_wsl
 
 export OMP_NUM_THREADS=1
@@ -9,9 +17,9 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONFAULTHANDLER=1
 
-log_file="logs/train_wave1_ranker_research_wsl_run1_clean_core11_h12.stdout.log"
-model_name="wave1_ranker_research_20260402_wsl_run1_clean_core11_h12"
-session_name="alphatrade_wave1_run1_clean_core11_h12"
+log_file="logs/train_wave1_ranker_research_runB_clean_core11_h12.stdout.log"
+model_name="wave1_ranker_research_20260402_runB_clean_core11_h12"
+session_name="alphatrade_wave1_runB_clean_core11_h12"
 launcher_script="$(dirname "$0")/wsl_tmux_launcher.sh"
 symbols_file="data/training/universes/wave1_clean_core11_20260402.json"
 
@@ -24,6 +32,8 @@ command=(
   --model lightgbm_ranker
   --name "$model_name"
   --training-profile research
+  --dataset-snapshot-bundle "$snapshot_bundle"
+  --strict-snapshot-replay
   --symbols-file "$symbols_file"
   --timeframe 15Min
   --cv-method purged_kfold
@@ -55,7 +65,6 @@ command=(
   --probability-calibration-method isotonic
   --require-gpu
   --max-cross-sectional-rows 500000
-  --disable-auto-snapshot-reuse
   "$@"
 )
 
