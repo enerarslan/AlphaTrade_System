@@ -235,6 +235,8 @@ What was implemented so far:
 - data-quality reporting now includes root-cause style missing-bar summaries by symbol and date range
 - training logs now surface the top missing-bar symbols and the largest missing-bar window
 - quality-report lineage is already wired into training, snapshots, and benchmark comparisons
+- training now supports `--snapshot-only` so operators can materialize the dataset snapshot bundle, quality report, and dropped-symbol review artifact before any Optuna/model run
+- snapshot-only runs now emit `<model_name>.snapshot_review.json` with explicit `data_quality_passed` and `no_silent_symbol_drop` checks
 
 Primary files touched so far:
 
@@ -246,6 +248,7 @@ Primary files touched so far:
 What is still required:
 
 - rerun serious snapshot generation and confirm the regular-session quality report now passes
+- use `python main.py train ... --snapshot-only --disable-auto-snapshot-reuse` for the first post-fix rebuild so the snapshot review package is produced before any research rerun
 - verify whether any symbols still show true intraday gaps after the session-policy fix
 - decide whether remaining real gaps require:
   - repairing data in-place

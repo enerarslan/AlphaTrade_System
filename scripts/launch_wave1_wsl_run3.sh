@@ -57,6 +57,7 @@ command=(
   --probability-calibration-method isotonic
   --meta-label-min-confidence 0.55
   --require-gpu
+  "$@"
 )
 
 if [[ "${ALPHATRADE_FORCE_PROMOTION_PRECHECK_BYPASS:-0}" == "1" ]]; then

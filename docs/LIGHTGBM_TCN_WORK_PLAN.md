@@ -133,6 +133,7 @@ Required actions:
 - root-cause the 15-minute bar gaps in PostgreSQL and patch the ingestion/backfill path
 - regenerate the serious snapshot only after the quality report passes
 - make the quality report and dropped-symbol list mandatory review items before approving any promotion run
+- use `python main.py train ... --snapshot-only` to generate the snapshot bundle and a review artifact before spending research or promotion compute
 - formally retire the current snapshot for promotion use if the gaps cannot be repaired cleanly
 
 ### 5.2 Training Diagnostics And Traceability
@@ -176,6 +177,7 @@ Required actions:
 Operational procedure:
 
 - launch serious WSL runs through `scripts/launch_wave1_wsl_run*.sh`; they now auto-start inside `tmux` when available
+- the Wave 1 WSL launchers now pass through extra CLI flags, so operators can append `--snapshot-only` for preflight snapshot review without cloning a script
 - resume an interrupted search by rerunning the same launch script with the same `--name`; Optuna state is persisted under `models/optuna_state`
 - if the session is still alive, reattach with `tmux attach -t <session_name>` instead of starting a second foreground process
 - strict-snapshot promotion runs now enforce a pre-promotion checklist against the latest matching research matrix before training starts
@@ -193,6 +195,7 @@ Rules:
 
 - same 15-minute scope unless the data audit proves that the universe must change
 - if the universe changes, document the exact reason and retire the old snapshot
+- first rebuild should run in `--snapshot-only` mode so `*.snapshot_review.json` captures the quality report and dropped-symbol list before the next research candidate is launched
 
 ### Run B: Clean-Snapshot Ranker Baseline
 

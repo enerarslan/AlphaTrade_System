@@ -1024,6 +1024,14 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Force live dataset rebuild even when a matching local dataset snapshot bundle exists",
     )
     train_parser.add_argument(
+        "--snapshot-only",
+        action="store_true",
+        help=(
+            "Stop after persisting the dataset snapshot bundle, data-quality report, "
+            "and dropped-symbol review artifact"
+        ),
+    )
+    train_parser.add_argument(
         "--gpu",
         action="store_true",
         help="Deprecated: training auto-detects GPU acceleration",

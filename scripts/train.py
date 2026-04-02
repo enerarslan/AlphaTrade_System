@@ -1019,6 +1019,7 @@ class TrainingConfig:
     # Output
     output_dir: str = "models"
     save_artifacts: bool = True
+    snapshot_only: bool = False
     dataset_snapshot_bundle_path: str = ""
     strict_snapshot_replay: bool = False
     auto_snapshot_reuse_enabled: bool = True
@@ -1109,6 +1110,7 @@ class TrainingConfig:
             raise ValueError("require_gpu=True requires use_gpu=True.")
         self.cross_sectional_user_locked = bool(self.cross_sectional_user_locked)
         self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
+        self.snapshot_only = bool(self.snapshot_only)
         self.dataset_snapshot_bundle_path = str(self.dataset_snapshot_bundle_path or "").strip()
         self.strict_snapshot_replay = bool(self.strict_snapshot_replay)
         self.auto_snapshot_reuse_enabled = bool(self.auto_snapshot_reuse_enabled)
@@ -1348,6 +1350,7 @@ class ModelTrainer:
         self.cached_cv_splits: list[tuple[np.ndarray, np.ndarray]] = []
         self.snapshot_replay_loaded: bool = False
         self.nested_cv_trace: list[dict[str, Any]] = []
+        self.snapshot_review_path: Path | None = None
         self.replay_manifest_path: Path | None = None
         self.promotion_package_path: Path | None = None
         self.artifacts_path: Path | None = None
@@ -1362,6 +1365,7 @@ class ModelTrainer:
         self.training_metrics: dict = {
             "training_profile": self.config.training_profile,
             "run_id": self.run_id,
+            "snapshot_only": bool(self.config.snapshot_only),
         }
         self.start_time: datetime | None = None
         self.feature_pipeline_fingerprint = _compute_feature_pipeline_fingerprint()
@@ -1402,6 +1406,91 @@ class ModelTrainer:
 
             # Phase 3.5: Enforce future-leak validation gates
             self._validate_no_future_leakage()
+
+            if self.config.snapshot_only:
+                self.logger.info(
+                    "Snapshot-only mode: persisting dataset bundle and review artifacts "
+                    "without optimization or model fitting."
+                )
+                output_dir = Path(self.config.output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                review_payload = self._persist_snapshot_artifacts(output_dir)
+                snapshot_ready = bool(review_payload.get("ready", False))
+                duration = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+                results = {
+                    "success": snapshot_ready,
+                    "snapshot_only": True,
+                    "run_id": self.run_id,
+                    "model_path": None,
+                    "model_type": self.config.model_type,
+                    "model_name": self.config.model_name,
+                    "training_duration_seconds": duration,
+                    "cv_results": [],
+                    "validation_results": {},
+                    "training_metrics": self.training_metrics,
+                    "passed_validation_gates": None,
+                    "snapshot_id": (
+                        str(self.snapshot_manifest.get("snapshot_id"))
+                        if isinstance(self.snapshot_manifest, dict)
+                        else None
+                    ),
+                    "snapshot_manifest_path": (
+                        str(self.snapshot_manifest_path)
+                        if self.snapshot_manifest_path is not None
+                        else None
+                    ),
+                    "data_quality_report_path": (
+                        str(self.data_quality_report_path)
+                        if self.data_quality_report_path is not None
+                        else None
+                    ),
+                    "data_quality_report_hash": self.data_quality_report_hash,
+                    "data_quality_report_passed": (
+                        bool(self.data_quality_report.get("passed", False))
+                        if isinstance(self.data_quality_report, dict)
+                        else None
+                    ),
+                    "dataset_snapshot_bundle_path": (
+                        str(self.dataset_snapshot_bundle_manifest_path)
+                        if self.dataset_snapshot_bundle_manifest_path is not None
+                        else None
+                    ),
+                    "dataset_bundle_hash": (
+                        str(self.dataset_snapshot_bundle_manifest.get("bundle_hash"))
+                        if isinstance(self.dataset_snapshot_bundle_manifest, dict)
+                        else (
+                            str(self.snapshot_manifest.get("dataset_bundle_hash"))
+                            if isinstance(self.snapshot_manifest, dict)
+                            else None
+                        )
+                    ),
+                    "snapshot_review_path": (
+                        str(self.snapshot_review_path)
+                        if self.snapshot_review_path is not None
+                        else None
+                    ),
+                    "snapshot_review": review_payload,
+                    "label_diagnostics": self.label_diagnostics,
+                    "nested_cv_trace": self.nested_cv_trace,
+                    "replay_manifest_path": None,
+                    "promotion_package_path": None,
+                    "artifacts_path": None,
+                    "run_event_index_path": (
+                        str(self.run_event_index_path)
+                        if self.run_event_index_path is not None
+                        else None
+                    ),
+                    "model_card": {},
+                    "deployment_plan": {},
+                    "pre_promotion_checklist": {},
+                }
+                self._record_training_run_event("completed", results=results)
+                self.logger.info("Snapshot-only pipeline completed in %.1fs", duration)
+                self.logger.info(
+                    "Snapshot review readiness: %s",
+                    "PASSED" if snapshot_ready else "FAILED",
+                )
+                return results
 
             # Phase 4: Hyperparameter Optimization (if enabled)
             if self.config.optimize:
@@ -1507,6 +1596,9 @@ class ModelTrainer:
                 ),
                 "artifacts_path": (
                     str(self.artifacts_path) if self.artifacts_path is not None else None
+                ),
+                "snapshot_review_path": (
+                    str(self.snapshot_review_path) if self.snapshot_review_path is not None else None
                 ),
                 "run_event_index_path": (
                     str(self.run_event_index_path)
@@ -11888,6 +11980,192 @@ class ModelTrainer:
             self.cached_cv_splits = []
         return self.cached_cv_splits
 
+    def _build_snapshot_review(self) -> dict[str, Any]:
+        """Build a review payload for Task 1 snapshot-quality sign-off."""
+        data_quality_passed = bool(
+            isinstance(self.data_quality_report, dict)
+            and self.data_quality_report.get("passed", False)
+        )
+        dropped_symbols = [
+            str(symbol)
+            for symbol in self.training_metrics.get("symbol_quality_dropped_list", [])
+            if str(symbol).strip()
+        ]
+        selected_symbols = [
+            str(symbol)
+            for symbol in self.training_metrics.get("symbol_quality_universe", [])
+            if str(symbol).strip()
+        ]
+        checks = {
+            "data_quality_passed": {
+                "passed": data_quality_passed,
+                "actual": data_quality_passed,
+                "threshold": True,
+                "comparator": "is",
+            },
+            "no_silent_symbol_drop": {
+                "passed": len(dropped_symbols) == 0,
+                "actual": len(dropped_symbols),
+                "threshold": 0,
+                "comparator": "<=",
+            },
+        }
+        failed_checks = [name for name, payload in checks.items() if not bool(payload["passed"])]
+        return {
+            "ready": len(failed_checks) == 0,
+            "failed_checks": failed_checks,
+            "checks": checks,
+            "snapshot_id": (
+                str(self.snapshot_manifest.get("snapshot_id"))
+                if isinstance(self.snapshot_manifest, dict)
+                else None
+            ),
+            "run_id": self.run_id,
+            "model_type": self.config.model_type,
+            "model_name": self.config.model_name,
+            "training_profile": self.config.training_profile,
+            "data_quality_report_hash": self.data_quality_report_hash,
+            "data_quality_summary": self._json_safe(
+                self.data_quality_report.get("summary", {})
+                if isinstance(self.data_quality_report, dict)
+                else {}
+            ),
+            "data_quality_threshold_breaches": self._json_safe(
+                self.data_quality_report.get("threshold_breaches", {})
+                if isinstance(self.data_quality_report, dict)
+                else {}
+            ),
+            "top_missing_bar_symbols": self._json_safe(
+                self.data_quality_report.get("top_missing_bar_symbols", [])
+                if isinstance(self.data_quality_report, dict)
+                else []
+            ),
+            "top_missing_bar_windows": self._json_safe(
+                self.data_quality_report.get("top_missing_bar_windows", [])
+                if isinstance(self.data_quality_report, dict)
+                else []
+            ),
+            "symbol_quality": {
+                "input_symbols": int(
+                    round(float(self.training_metrics.get("symbol_quality_input_symbols", 0.0)))
+                ),
+                "selected_symbols": int(
+                    round(float(self.training_metrics.get("symbol_quality_selected_symbols", 0.0)))
+                ),
+                "dropped_symbols": int(
+                    round(float(self.training_metrics.get("symbol_quality_dropped_symbols", 0.0)))
+                ),
+                "selected_universe": selected_symbols,
+                "dropped_list": dropped_symbols,
+                "report": self._json_safe(self.training_metrics.get("symbol_quality_report", {})),
+            },
+            "market_session_filter": self._json_safe(
+                self.training_metrics.get("market_session_filter_summary", {})
+            ),
+            "dataset_snapshot_bundle_path": (
+                str(self.dataset_snapshot_bundle_manifest_path)
+                if self.dataset_snapshot_bundle_manifest_path is not None
+                else None
+            ),
+            "dataset_bundle_hash": (
+                str(self.dataset_snapshot_bundle_manifest.get("bundle_hash"))
+                if isinstance(self.dataset_snapshot_bundle_manifest, dict)
+                else (
+                    str(self.snapshot_manifest.get("dataset_bundle_hash"))
+                    if isinstance(self.snapshot_manifest, dict)
+                    else None
+                )
+            ),
+            "snapshot_manifest_path": (
+                str(self.snapshot_manifest_path) if self.snapshot_manifest_path is not None else None
+            ),
+            "data_quality_report_path": (
+                str(self.data_quality_report_path)
+                if self.data_quality_report_path is not None
+                else None
+            ),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _persist_snapshot_artifacts(self, output_dir: Path) -> dict[str, Any]:
+        """Persist snapshot lineage artifacts without requiring a trained model."""
+        if self.snapshot_manifest is None:
+            raise RuntimeError(
+                "Snapshot manifest missing at artifact stage. Institutional mode requires snapshot lineage."
+            )
+        if self.data_quality_report is None:
+            raise RuntimeError(
+                "Data quality report missing at artifact stage. Institutional mode requires quality review."
+            )
+
+        manifest_path, quality_path = persist_snapshot_bundle(
+            output_dir=output_dir,
+            manifest=self.snapshot_manifest,
+            quality_report=self.data_quality_report,
+        )
+        self.snapshot_manifest_path = manifest_path
+        self.data_quality_report_path = quality_path
+        self.snapshot_manifest["manifest_path"] = str(manifest_path)
+        self.snapshot_manifest["quality_report_path"] = str(quality_path)
+        if self.dataset_snapshot_bundle_manifest_path is None:
+            bundle_manifest_path, bundle_manifest = persist_dataset_snapshot_bundle(
+                output_dir=output_dir,
+                snapshot_manifest=self.snapshot_manifest,
+                raw_ohlcv_data=self.data,
+                development_frame=(
+                    self.development_frame if self.development_frame is not None else self.features
+                ),
+                holdout_frame=self.holdout_frame,
+                feature_names=self.feature_names,
+                training_scope=_build_snapshot_training_scope(self.config),
+                data_quality_report=self.data_quality_report,
+                development_sample_weights=self.sample_weights,
+                holdout_sample_weights=self.holdout_sample_weights,
+                cv_splits=self._snapshot_bundle_cv_splits(),
+                label_diagnostics=self.label_diagnostics,
+            )
+            self.dataset_snapshot_bundle_manifest_path = bundle_manifest_path
+            self.dataset_snapshot_bundle_manifest = bundle_manifest
+        if isinstance(self.snapshot_manifest, dict):
+            self.snapshot_manifest["dataset_bundle_manifest_path"] = (
+                str(self.dataset_snapshot_bundle_manifest_path)
+                if self.dataset_snapshot_bundle_manifest_path
+                else None
+            )
+            self.snapshot_manifest["dataset_bundle_hash"] = (
+                self.dataset_snapshot_bundle_manifest.get("bundle_hash")
+                if isinstance(self.dataset_snapshot_bundle_manifest, dict)
+                else None
+            )
+        if self.snapshot_manifest_path is not None and isinstance(self.snapshot_manifest, dict):
+            self.snapshot_manifest_path.write_text(
+                json.dumps(
+                    self.snapshot_manifest,
+                    indent=2,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+
+        review_payload = self._build_snapshot_review()
+        review_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.config.model_name).strip("_")
+        if not review_stem:
+            review_stem = "snapshot"
+        self.snapshot_review_path = output_dir / f"{review_stem}.snapshot_review.json"
+        self.snapshot_review_path.write_text(
+            json.dumps(review_payload, indent=2, ensure_ascii=True, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        review_payload["snapshot_review_path"] = str(self.snapshot_review_path)
+        self.training_metrics["snapshot_review"] = review_payload
+        self.training_metrics["snapshot_review_ready"] = bool(review_payload.get("ready", False))
+        self.training_metrics["snapshot_review_failed_checks"] = list(
+            review_payload.get("failed_checks", [])
+        )
+        return review_payload
+
     def _save_model(self) -> str:
         """Phase 10: Save trained model and artifacts."""
         self.logger.info("Phase 10: Saving model...")
@@ -11916,69 +12194,7 @@ class ModelTrainer:
         self.logger.info(f"Model saved to: {model_path}")
 
         if self.config.save_artifacts:
-            if self.snapshot_manifest is None:
-                raise RuntimeError(
-                    "Snapshot manifest missing at save stage. "
-                    "Institutional mode requires snapshot lineage."
-                )
-            if self.data_quality_report is None:
-                raise RuntimeError(
-                    "Data quality report missing at save stage. "
-                    "Institutional mode requires quality report archival."
-                )
-
-            manifest_path, quality_path = persist_snapshot_bundle(
-                output_dir=output_dir,
-                manifest=self.snapshot_manifest,
-                quality_report=self.data_quality_report,
-            )
-            self.snapshot_manifest_path = manifest_path
-            self.data_quality_report_path = quality_path
-            self.snapshot_manifest["manifest_path"] = str(manifest_path)
-            self.snapshot_manifest["quality_report_path"] = str(quality_path)
-            if self.dataset_snapshot_bundle_manifest_path is None:
-                bundle_manifest_path, bundle_manifest = persist_dataset_snapshot_bundle(
-                    output_dir=output_dir,
-                    snapshot_manifest=self.snapshot_manifest,
-                    raw_ohlcv_data=self.data,
-                    development_frame=(
-                        self.development_frame
-                        if self.development_frame is not None
-                        else self.features
-                    ),
-                    holdout_frame=self.holdout_frame,
-                    feature_names=self.feature_names,
-                    training_scope=_build_snapshot_training_scope(self.config),
-                    data_quality_report=self.data_quality_report,
-                    development_sample_weights=self.sample_weights,
-                    holdout_sample_weights=self.holdout_sample_weights,
-                    cv_splits=self._snapshot_bundle_cv_splits(),
-                    label_diagnostics=self.label_diagnostics,
-                )
-                self.dataset_snapshot_bundle_manifest_path = bundle_manifest_path
-                self.dataset_snapshot_bundle_manifest = bundle_manifest
-            if isinstance(self.snapshot_manifest, dict):
-                self.snapshot_manifest["dataset_bundle_manifest_path"] = (
-                    str(self.dataset_snapshot_bundle_manifest_path)
-                    if self.dataset_snapshot_bundle_manifest_path
-                    else None
-                )
-                self.snapshot_manifest["dataset_bundle_hash"] = (
-                    self.dataset_snapshot_bundle_manifest.get("bundle_hash")
-                    if isinstance(self.dataset_snapshot_bundle_manifest, dict)
-                    else None
-                )
-            if self.snapshot_manifest_path is not None and isinstance(self.snapshot_manifest, dict):
-                self.snapshot_manifest_path.write_text(
-                    json.dumps(
-                        self.snapshot_manifest,
-                        indent=2,
-                        ensure_ascii=True,
-                        sort_keys=True,
-                        default=str,
-                    ),
-                    encoding="utf-8",
-                )
+            self._persist_snapshot_artifacts(output_dir)
             self.replay_manifest_path = self._write_replay_manifest(output_dir, model_path)
             self.promotion_package_path = self._write_promotion_package(
                 output_dir=output_dir,
@@ -13850,6 +14066,12 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_auto_snapshot_reuse", False)),
                     )
                 ),
+                snapshot_only=bool(
+                    _cfg_value(
+                        "snapshot_only",
+                        bool(getattr(args, "snapshot_only", False)),
+                    )
+                ),
                 model_params=model_params,
             )
             if (
@@ -13877,6 +14099,8 @@ def run_training(args: argparse.Namespace) -> int:
             logger.info("Redis cache: enabled (mandatory)")
             if config.dataset_snapshot_bundle_path:
                 logger.info(f"Dataset snapshot bundle: {config.dataset_snapshot_bundle_path}")
+            if config.snapshot_only:
+                logger.info("Snapshot-only mode: enabled")
             logger.info(f"CV method: {config.cv_method} ({config.n_splits} splits)")
             logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
             logger.info(f"GPU acceleration enabled: {config.use_gpu}")
@@ -14174,26 +14398,47 @@ def run_training(args: argparse.Namespace) -> int:
         logger.info("=" * 80)
         logger.info("TRAINING COMPLETE")
         logger.info("=" * 80)
+        snapshot_only_mode_only = bool(results) and all(
+            bool(result.get("snapshot_only", False)) for _, result in results
+        )
         for model_type, result in results:
             logger.info("-" * 80)
             logger.info(f"{model_type.upper()} RESULT")
-            logger.info(f"Model saved to: {result.get('model_path', 'N/A')}")
+            if result.get("snapshot_only", False):
+                logger.info("Snapshot-only run: yes")
+                logger.info(f"Snapshot review: {result.get('snapshot_review_path', 'N/A')}")
+                logger.info(
+                    "Snapshot readiness: %s",
+                    "PASSED" if bool(result.get("success", False)) else "FAILED",
+                )
+            else:
+                logger.info(f"Model saved to: {result.get('model_path', 'N/A')}")
             logger.info(f"Training duration: {result.get('training_duration_seconds', 0):.1f}s")
             metrics = result.get("training_metrics", {})
             if metrics:
-                logger.info(f"Mean accuracy: {metrics.get('mean_accuracy', 0):.4f}")
-                logger.info(f"Mean Sharpe: {metrics.get('mean_sharpe', 0):.4f}")
-                if "deflated_sharpe" in metrics:
-                    logger.info(f"Deflated Sharpe: {metrics['deflated_sharpe']:.4f}")
-                checklist = metrics.get("pre_promotion_checklist", {})
-                if isinstance(checklist, dict) and checklist:
-                    logger.info(
-                        "Pre-promotion checklist: %s",
-                        "PASSED" if checklist.get("ready", False) else "FAILED",
-                    )
-                    failed_checks = checklist.get("failed_checks", [])
-                    if isinstance(failed_checks, list) and failed_checks:
-                        logger.info("Blocked by: %s", ", ".join(str(item) for item in failed_checks))
+                if result.get("snapshot_only", False):
+                    review_payload = metrics.get("snapshot_review", {})
+                    if isinstance(review_payload, dict) and review_payload:
+                        failed_checks = review_payload.get("failed_checks", [])
+                        if isinstance(failed_checks, list) and failed_checks:
+                            logger.info(
+                                "Snapshot blocked by: %s",
+                                ", ".join(str(item) for item in failed_checks),
+                            )
+                else:
+                    logger.info(f"Mean accuracy: {metrics.get('mean_accuracy', 0):.4f}")
+                    logger.info(f"Mean Sharpe: {metrics.get('mean_sharpe', 0):.4f}")
+                    if "deflated_sharpe" in metrics:
+                        logger.info(f"Deflated Sharpe: {metrics['deflated_sharpe']:.4f}")
+                    checklist = metrics.get("pre_promotion_checklist", {})
+                    if isinstance(checklist, dict) and checklist:
+                        logger.info(
+                            "Pre-promotion checklist: %s",
+                            "PASSED" if checklist.get("ready", False) else "FAILED",
+                        )
+                        failed_checks = checklist.get("failed_checks", [])
+                        if isinstance(failed_checks, list) and failed_checks:
+                            logger.info("Blocked by: %s", ", ".join(str(item) for item in failed_checks))
             if result.get("promotion_package_path"):
                 logger.info(f"Promotion package: {result.get('promotion_package_path')}")
             if result.get("replay_manifest_path"):
@@ -14214,11 +14459,18 @@ def run_training(args: argparse.Namespace) -> int:
                     )
 
         if overall_success:
-            logger.info("Validation gates: PASSED")
+            if snapshot_only_mode_only:
+                logger.info("Snapshot preparation gates: PASSED")
+            else:
+                logger.info("Validation gates: PASSED")
             return 0
 
-        logger.warning("Validation gates: FAILED for one or more models")
-        logger.warning("Some models may not meet production requirements")
+        if snapshot_only_mode_only:
+            logger.warning("Snapshot preparation gates: FAILED for one or more runs")
+            logger.warning("Review the snapshot review artifact before launching research training")
+        else:
+            logger.warning("Validation gates: FAILED for one or more models")
+            logger.warning("Some models may not meet production requirements")
         return 1
 
     except KeyboardInterrupt:
@@ -14396,6 +14648,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-auto-snapshot-reuse",
         action="store_true",
         help="Force live dataset rebuild even when a matching local dataset snapshot bundle exists.",
+    )
+    parser.add_argument(
+        "--snapshot-only",
+        action="store_true",
+        help=(
+            "Stop after persisting the dataset snapshot bundle, data-quality report, "
+            "and dropped-symbol review artifact."
+        ),
     )
     parser.add_argument(
         "--min-accuracy",

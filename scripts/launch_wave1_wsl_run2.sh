@@ -56,6 +56,7 @@ command=(
   --min-confidence-position-scale 0.20
   --probability-calibration-method isotonic
   --require-gpu
+  "$@"
 )
 
 "$launcher_script" "$session_name" "$log_file" "${command[@]}"

@@ -55,6 +55,7 @@ command=(
   --require-gpu
   --max-cross-sectional-rows 500000
   --disable-auto-snapshot-reuse
+  "$@"
 )
 
 "$launcher_script" "$session_name" "$log_file" "${command[@]}"

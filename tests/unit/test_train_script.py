@@ -3280,6 +3280,96 @@ def test_run_records_training_run_events(monkeypatch, tmp_path):
     assert str(events[-1]["index_root"]).endswith("run_index")
 
 
+def test_run_snapshot_only_persists_review_and_skips_model_fitting(monkeypatch, tmp_path):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            output_dir=str(tmp_path),
+            save_artifacts=True,
+            snapshot_only=True,
+            optimize=True,
+        )
+    )
+    events: list[dict[str, object]] = []
+
+    def _capture_event(index_root, event):
+        events.append({"index_root": index_root, "event": dict(event)})
+        return tmp_path / "run_index" / "training_runs.jsonl"
+
+    monkeypatch.setattr(train_script, "append_training_run_event", _capture_event)
+    monkeypatch.setattr(trainer, "_load_data", lambda: None)
+    monkeypatch.setattr(trainer, "_compute_features", lambda: None)
+
+    def _fake_create_labels():
+        trainer.snapshot_manifest = {"snapshot_id": "snap_task1"}
+        trainer.data_quality_report = {
+            "passed": True,
+            "summary": {"symbol_count": 12},
+            "threshold_breaches": {},
+            "top_missing_bar_symbols": [],
+            "top_missing_bar_windows": [],
+        }
+        trainer.data_quality_report_hash = "dq_task1"
+        trainer.training_metrics["symbol_quality_input_symbols"] = 12.0
+        trainer.training_metrics["symbol_quality_selected_symbols"] = 12.0
+        trainer.training_metrics["symbol_quality_dropped_symbols"] = 0.0
+        trainer.training_metrics["symbol_quality_universe"] = ["AAPL", "MSFT"]
+        trainer.training_metrics["symbol_quality_dropped_list"] = []
+
+    monkeypatch.setattr(trainer, "_create_labels", _fake_create_labels)
+    monkeypatch.setattr(trainer, "_apply_feature_selection", lambda: None)
+    monkeypatch.setattr(trainer, "_persist_features_to_postgres_if_needed", lambda: None)
+    monkeypatch.setattr(trainer, "_validate_no_future_leakage", lambda: None)
+
+    def _fake_persist_snapshot_artifacts(output_dir):
+        trainer.snapshot_manifest_path = output_dir / "snap_task1.manifest.json"
+        trainer.snapshot_manifest_path.write_text("{}", encoding="utf-8")
+        trainer.data_quality_report_path = output_dir / "snap_task1.quality.json"
+        trainer.data_quality_report_path.write_text("{}", encoding="utf-8")
+        bundle_dir = output_dir / "snapshots" / "snap_task1"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        trainer.dataset_snapshot_bundle_manifest = {"bundle_hash": "bundle_task1"}
+        trainer.dataset_snapshot_bundle_manifest_path = bundle_dir / "dataset_bundle.manifest.json"
+        trainer.dataset_snapshot_bundle_manifest_path.write_text("{}", encoding="utf-8")
+        trainer.snapshot_review_path = output_dir / "task1.snapshot_review.json"
+        trainer.snapshot_review_path.write_text("{}", encoding="utf-8")
+        review_payload = trainer._build_snapshot_review()
+        review_payload["snapshot_review_path"] = str(trainer.snapshot_review_path)
+        trainer.training_metrics["snapshot_review"] = review_payload
+        trainer.training_metrics["snapshot_review_ready"] = True
+        trainer.training_metrics["snapshot_review_failed_checks"] = []
+        return review_payload
+
+    monkeypatch.setattr(trainer, "_persist_snapshot_artifacts", _fake_persist_snapshot_artifacts)
+    monkeypatch.setattr(
+        trainer,
+        "_optimize_hyperparameters",
+        lambda: (_ for _ in ()).throw(AssertionError("snapshot-only should skip optuna")),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_train_with_cv",
+        lambda: (_ for _ in ()).throw(AssertionError("snapshot-only should skip CV")),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_save_model",
+        lambda: (_ for _ in ()).throw(AssertionError("snapshot-only should skip save_model")),
+    )
+
+    result = trainer.run()
+
+    statuses = [entry["event"]["status"] for entry in events]
+    assert statuses == ["started", "completed"]
+    assert result["snapshot_only"] is True
+    assert result["success"] is True
+    assert result["model_path"] is None
+    assert result["snapshot_id"] == "snap_task1"
+    assert result["dataset_bundle_hash"] == "bundle_task1"
+    assert str(result["snapshot_review_path"]).endswith("task1.snapshot_review.json")
+    assert result["training_metrics"]["snapshot_review_ready"] is True
+
+
 def test_build_parser_supports_institutional_failfast_flags_and_name():
     parser = train_script.build_parser()
     args = parser.parse_args(
@@ -3313,6 +3403,7 @@ def test_build_parser_supports_training_profiles_and_snapshot_flags():
             "--strict-snapshot-replay",
             "--force-promotion-precheck-bypass",
             "--disable-auto-snapshot-reuse",
+            "--snapshot-only",
             "--optuna-storage-dir",
             "models/optuna_state",
             "--disable-optuna-resume",
@@ -3330,6 +3421,7 @@ def test_build_parser_supports_training_profiles_and_snapshot_flags():
     assert args.strict_snapshot_replay is True
     assert args.force_promotion_precheck_bypass is True
     assert args.disable_auto_snapshot_reuse is True
+    assert args.snapshot_only is True
     assert str(args.optuna_storage_dir).endswith("optuna_state")
     assert args.disable_optuna_resume is True
     assert args.disable_meta_labeling is True

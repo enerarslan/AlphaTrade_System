@@ -235,6 +235,7 @@ class TestParseArgs:
                 "models/snapshots/snap_123/dataset_bundle.manifest.json",
                 "--strict-snapshot-replay",
                 "--disable-auto-snapshot-reuse",
+                "--snapshot-only",
                 "--nested-outer-splits",
                 "5",
                 "--nested-inner-splits",
@@ -249,6 +250,7 @@ class TestParseArgs:
             assert str(args.dataset_snapshot_bundle).endswith("dataset_bundle.manifest.json")
             assert args.strict_snapshot_replay is True
             assert args.disable_auto_snapshot_reuse is True
+            assert args.snapshot_only is True
             assert args.nested_outer_splits == 5
             assert args.nested_inner_splits == 3
             assert args.seed == 7
