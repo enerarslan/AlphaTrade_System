@@ -392,6 +392,39 @@ class TestLightGBMModel:
 
         assert "monotone_constraints" not in captured["params"]
 
+    def test_fit_uses_cuda_device_when_gpu_enabled(
+        self,
+        monkeypatch,
+        sample_regression_data,
+    ):
+        """Wrapper should request the CUDA backend when GPU training is enabled."""
+        X, y = sample_regression_data
+        captured: dict[str, dict[str, object]] = {}
+
+        class DummyRegressor:
+            def __init__(self, **params):
+                captured["params"] = dict(params)
+                self.feature_importances_ = np.zeros(X.shape[1], dtype=float)
+
+            def fit(self, X_fit, y_fit, **fit_params):
+                captured["fit_params"] = dict(fit_params)
+                return self
+
+            def predict(self, X_pred):
+                return np.zeros(len(X_pred), dtype=float)
+
+        fake_lgb = SimpleNamespace(
+            LGBMClassifier=DummyRegressor,
+            LGBMRegressor=DummyRegressor,
+            early_stopping=lambda *args, **kwargs: None,
+        )
+        monkeypatch.setitem(sys.modules, "lightgbm", fake_lgb)
+
+        model = LightGBMModel(n_estimators=10, use_gpu=True)
+        model.fit(X, y)
+
+        assert captured["params"]["device"] == "cuda"
+
 
 class TestCatBoostModel:
     """Tests for CatBoost model."""

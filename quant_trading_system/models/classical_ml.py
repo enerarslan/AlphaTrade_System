@@ -360,7 +360,7 @@ class LightGBMModel(TradingModel):
                 params.pop("monotone_constraints", None)
 
         if self._params.get("use_gpu"):
-            params["device_type"] = "gpu"
+            params["device"] = "cuda"
         params.setdefault(
             "objective",
             "binary" if self._model_type == ModelType.CLASSIFIER else "regression",

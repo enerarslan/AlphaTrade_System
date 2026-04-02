@@ -1,696 +1,510 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white" />
-  <img src="https://img.shields.io/badge/TypeScript-5.9-3178C6?style=for-the-badge&logo=typescript&logoColor=white" />
-  <img src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=black" />
-  <img src="https://img.shields.io/badge/FastAPI-0.104+-009688?style=for-the-badge&logo=fastapi&logoColor=white" />
-  <img src="https://img.shields.io/badge/PyTorch-2.1+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white" />
-  <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" />
-  <img src="https://img.shields.io/badge/Kubernetes-Multi--Region-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white" />
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" />
-</p>
+# AlphaTrade
 
-<h1 align="center">⚡ AlphaTrade System</h1>
+AlphaTrade is a production-oriented quantitative trading platform designed to take a model from research to deployment without changing the decision contract on the way.
 
-<p align="center">
-  <strong>Institutional-Grade Quantitative Trading Platform</strong><br/>
-  <em>End-to-end algorithmic trading infrastructure — from raw market data to execution, with ML/DL-driven alpha generation, institutional risk controls, and real-time monitoring.</em>
-</p>
+At a high level, the system is built around:
 
-<p align="center">
-  <code>110+ Python Modules</code> · <code>~80,000 Lines of Backend Code</code> · <code>12 Domain Subpackages</code> · <code>React 19 Dashboard</code> · <code>Full Docker/K8s Stack</code>
-</p>
+`data -> features -> models -> alpha -> signal -> portfolio -> risk -> execution -> audit`
 
----
+The repository currently contains:
 
-## Table of Contents
+- `135` Python modules under [`quant_trading_system/`](quant_trading_system/)
+- `49` test files under [`tests/`](tests/)
+- a unified operator CLI in [`main.py`](main.py)
+- standalone scripts in [`scripts/`](scripts/)
+- an optional frontend in [`dashboard_ui/`](dashboard_ui/)
 
-- [Why This Project](#why-this-project)
-- [System Architecture](#system-architecture)
-- [Core Modules Deep Dive](#core-modules-deep-dive)
-  - [Alpha Generation Engine](#1-alpha-generation-engine-alpha)
-  - [Feature Engineering Pipeline](#2-feature-engineering-pipeline-features)
-  - [Model Lifecycle Manager](#3-model-lifecycle-manager-models)
-  - [Risk Governance Framework](#4-risk-governance-framework-risk)
-  - [Execution Intelligence Layer](#5-execution-intelligence-layer-execution)
-  - [Trading Orchestration](#6-trading-orchestration-trading)
-  - [Backtesting & Research](#7-backtesting--research-backtest)
-  - [Data Fabric](#8-data-fabric-data)
-  - [Core Infrastructure](#9-core-infrastructure-core)
-  - [Monitoring & Observability](#10-monitoring--observability-monitoring)
-  - [Database & Persistence](#11-database--persistence-database)
-  - [Configuration Management](#12-configuration-management-config)
-- [Real-Time Dashboard](#real-time-dashboard)
-- [Infrastructure & DevOps](#infrastructure--devops)
-- [Technology Stack](#technology-stack)
-- [Unified CLI Surface](#unified-cli-surface)
-- [Data Universe](#data-universe)
-- [Testing & Quality](#testing--quality)
-- [Reviewer Fast-Track](#reviewer-fast-track)
-- [Getting Started](#getting-started)
+This is not a notebook-only research project. It is structured as a real trading system with explicit runtime boundaries, artifact contracts, risk controls, replay validation, and paper/live deployment paths.
 
----
+## Why This Project Matters
 
-## Why This Project
+AlphaTrade is meant to demonstrate end-to-end quantitative trading engineering, not just model training. It combines:
 
-This is not a tutorial project, a Jupyter notebook demo, or a toy strategy backtester.
+- database-first market data infrastructure
+- feature engineering across technical, statistical, cross-sectional, reference, and flow layers
+- ML and DL model training with leakage-aware validation
+- artifact-backed backtesting, replay, and paper trading
+- explicit risk, execution, audit, and monitoring layers
 
-**AlphaTrade** is a production-designed, full-stack quantitative trading system that mirrors the architecture of institutional trading desks. It was built from scratch to demonstrate deep expertise across:
+From a CV and portfolio perspective, the interesting part is not just that it trains models. The interesting part is that it tries to solve the full production problem:
 
-| Domain | What It Proves |
-|--------|---------------|
-| **System Design** | Event-driven, domain-driven modular architecture with CQRS, circuit breakers, and lazy-loading |
-| **Financial ML/DL** | Leakage-aware pipelines (purged CV, embargo), model governance, ensemble learning, reinforcement learning |
-| **Risk Engineering** | Pre-trade checks, kill switch, drawdown protection, VaR/stress testing, correlation monitoring |
-| **Execution Quality** | Smart order routing, TWAP/VWAP algos, market impact modeling, transaction cost analysis |
-| **Observability** | Prometheus metrics, Grafana dashboards, structured logging, distributed tracing, tamper-evident audit |
-| **Infrastructure** | Docker Compose, Kubernetes multi-region, TimescaleDB, Redis, CI/CD pipeline readiness |
-| **Full-Stack** | React 19 + TypeScript real-time dashboard with WebSocket feeds, Zustand state management, Framer Motion |
+- how data is versioned
+- how models are validated
+- how predictions are converted into economically sensible trades
+- how risk controls remain intact in live execution paths
+- how the same model contract survives the jump from training to backtest to paper trading
 
----
+## What It Demonstrates
 
-## System Architecture
+| Area | What AlphaTrade Shows |
+|---|---|
+| System design | Modular package architecture with clear runtime layers and operator entrypoints |
+| Quant research | Purged CV, embargo-aware evaluation, snapshot-based experiments, artifact lineage |
+| Financial ML | LightGBM, XGBoost, deep learning models, calibration, meta-labeling, policy layers |
+| Runtime discipline | Promotion package contract reused by backtest, replay, and paper/live trading |
+| Risk engineering | Pre-trade checks, kill switch logic, drawdown monitoring, exposure controls |
+| Execution | OMS lifecycle, broker boundary, execution-mode simulation, slippage and commission handling |
+| Observability | Structured logging, health checks, monitoring hooks, audit-oriented design |
+| Data engineering | PostgreSQL / TimescaleDB-first ingestion, export, validation, and training workflows |
 
-```mermaid
-flowchart TB
-    subgraph DataLayer["📊 Data Layer"]
-        MD[Market Data Feeds] --> DI[Data Ingestion]
-        DI --> FS[Feature Store]
-        DI --> DB[(TimescaleDB)]
-    end
+## Core Idea: Promotion Packages
 
-    subgraph AlphaEngine["🧠 Alpha & ML Engine"]
-        FS --> FP[Feature Pipeline<br/>200+ Indicators]
-        FP --> AG[Alpha Generation<br/>Momentum · Mean-Rev · ML]
-        FP --> RD[Regime Detection<br/>HMM · Markov · Composite]
-        AG --> ME[Model Ensemble<br/>XGBoost · LGBM · LSTM · Transformer]
-        ME --> VG[Validation Gates<br/>Purged CV · Meta-Labeling]
-    end
+The central runtime contract in the current project is the promotion package.
 
-    subgraph TradingCore["⚡ Trading Core"]
-        VG --> SG[Signal Generator]
-        SG --> PM[Portfolio Manager]
-        PM --> TE[Trading Engine]
-        RD --> PS[Regime-Aware<br/>Position Sizing]
-        PS --> TE
-    end
+A serious training run can produce:
 
-    subgraph RiskLayer["🛡️ Risk Governance"]
-        TE --> PRC[Pre-Trade Risk Checks]
-        PRC --> KS{Kill Switch}
-        KS -->|Pass| OM[Order Manager]
-        KS -->|Reject| HALT[Strategy Halt]
-        DM[Drawdown Monitor] --> KS
-        CM[Correlation Monitor] --> PRC
-        VS[VaR & Stress Testing] --> PRC
-    end
+- a model artifact
+- an artifacts JSON file
+- a replay manifest
+- a promotion package JSON file
 
-    subgraph ExecutionLayer["🔄 Execution Layer"]
-        OM --> EA[Execution Algos<br/>TWAP · VWAP · Iceberg]
-        EA --> BC[Broker Client<br/>Alpaca API]
-        BC --> MI[Market Impact Model]
-        BC --> TCA[Transaction Cost<br/>Analysis]
-        PT[Position Tracker] --> OM
-    end
+That promotion package is the object reused by:
 
-    subgraph Monitoring["📡 Monitoring & Ops"]
-        PROM[Prometheus] --> GRAF[Grafana]
-        AL[Alertmanager] --> NOTIF[Notifications]
-        AUDIT[Audit Trail<br/>Hash-Chain Integrity]
-        HEALTH[Health Diagnostics]
-        TRACE[Distributed Tracing]
-    end
+- historical backtests
+- deterministic replay
+- paper trading
+- live trading entrypoints
 
-    subgraph Dashboard["🖥️ Dashboard UI"]
-        REACT[React 19 + TypeScript]
-        WS[WebSocket Real-Time]
-        PAGES[9 Interactive Pages]
-    end
+This matters because it keeps the same settings and policy layer across environments, including:
 
-    TE --> Monitoring
-    BC --> Monitoring
-    PRC --> Monitoring
-    PROM --> Dashboard
-    BC --> DB
+- thresholds
+- sizing rules
+- probability calibration
+- meta-labeling
+- expected-edge gating
+- regime-conditioned policy
+- asymmetric side controls
+- universe quality gating
 
-    style DataLayer fill:#1a1a2e,stroke:#e94560,color:#fff
-    style AlphaEngine fill:#16213e,stroke:#0f3460,color:#fff
-    style TradingCore fill:#0f3460,stroke:#533483,color:#fff
-    style RiskLayer fill:#533483,stroke:#e94560,color:#fff
-    style ExecutionLayer fill:#1a1a2e,stroke:#e94560,color:#fff
-    style Monitoring fill:#16213e,stroke:#0f3460,color:#fff
-    style Dashboard fill:#0f3460,stroke:#533483,color:#fff
+In other words, the project is not trying to compare a training-time model to a hand-waved runtime implementation. It tries to carry the actual decision policy forward.
+
+## Current Modeling Stack
+
+The current Wave 1 stack is post-hardening and goes beyond raw probability prediction.
+
+Key pieces now in the model-to-trade path:
+
+- purged CV and leakage-aware training
+- frozen dataset snapshots and replayable bundles
+- out-of-fold probability calibration
+- meta-labeling
+- OOF expected-edge policy layer
+- regime-conditioned policy adjustments
+- asymmetric long/short side policy
+- universe quality gate
+- minimum confidence position scaling
+- replay and early paper-trading validation before deployment
+
+The active work plan is tracked in [`docs/LIGHTGBM_TCN_WORK_PLAN.md`](docs/LIGHTGBM_TCN_WORK_PLAN.md).
+
+## Architecture Overview
+
+### 1. Data Layer
+
+The platform is database-first. Historical and runtime paths are designed around PostgreSQL / TimescaleDB, not loose CSV workflows.
+
+Relevant areas:
+
+- [`quant_trading_system/data/`](quant_trading_system/data/)
+- [`quant_trading_system/database/`](quant_trading_system/database/)
+- [`quant_trading_system/models/training_lineage.py`](quant_trading_system/models/training_lineage.py)
+
+Capabilities include:
+
+- historical data loading
+- multi-source bootstrap flows
+- DB migration and export paths
+- data quality reporting
+- snapshot manifest generation
+- deterministic dataset bundle hashing and reuse
+
+### 2. Feature Layer
+
+Feature engineering spans multiple families and is intentionally broader than classic indicator-only pipelines.
+
+Current feature families include:
+
+- technical features
+- statistical features
+- cross-sectional features
+- reference features from multi-layer data
+- quote / trade / flow-derived features where coverage exists
+
+Relevant areas:
+
+- [`quant_trading_system/features/`](quant_trading_system/features/)
+- [`quant_trading_system/features/reference.py`](quant_trading_system/features/reference.py)
+- [`quant_trading_system/features/tick_microstructure.py`](quant_trading_system/features/tick_microstructure.py)
+- [`quant_trading_system/features/multi_timeframe.py`](quant_trading_system/features/multi_timeframe.py)
+
+The current stack explicitly supports multi-timeframe feature fusion and runtime-compatible feature regeneration for promotion-package inference.
+
+### 3. Model Layer
+
+The model layer is not limited to fitting a base learner. It also covers validation, policy, lineage, and deployment-oriented logic.
+
+Relevant areas:
+
+- [`quant_trading_system/models/classical_ml.py`](quant_trading_system/models/classical_ml.py)
+- [`quant_trading_system/models/deep_learning.py`](quant_trading_system/models/deep_learning.py)
+- [`quant_trading_system/models/purged_cv.py`](quant_trading_system/models/purged_cv.py)
+- [`quant_trading_system/models/meta_labeling.py`](quant_trading_system/models/meta_labeling.py)
+- [`quant_trading_system/models/expected_edge_policy.py`](quant_trading_system/models/expected_edge_policy.py)
+- [`quant_trading_system/models/target_engineering.py`](quant_trading_system/models/target_engineering.py)
+- [`quant_trading_system/models/training_lineage.py`](quant_trading_system/models/training_lineage.py)
+
+Supported training families from the CLI include:
+
+- `xgboost`
+- `lightgbm`
+- `lightgbm_ranker`
+- `xgboost_regressor`
+- `lightgbm_regressor`
+- `random_forest`
+- `elastic_net`
+- `lstm`
+- `transformer`
+- `tcn`
+- `ensemble`
+
+### 4. Trading Runtime
+
+The production-critical runtime path is built inside [`quant_trading_system/trading/`](quant_trading_system/trading/).
+
+Key components:
+
+- [`quant_trading_system/trading/trading_engine.py`](quant_trading_system/trading/trading_engine.py)
+- [`quant_trading_system/trading/signal_generator.py`](quant_trading_system/trading/signal_generator.py)
+- [`quant_trading_system/trading/portfolio_manager.py`](quant_trading_system/trading/portfolio_manager.py)
+
+This layer is responsible for:
+
+- market-session lifecycle
+- signal routing
+- portfolio targeting
+- integrating external signal sources
+- coordinating risk and execution boundaries
+
+### 5. Risk Layer
+
+Risk controls are not optional wrappers. They are part of the runtime contract.
+
+Key files:
+
+- [`quant_trading_system/risk/limits.py`](quant_trading_system/risk/limits.py)
+- [`quant_trading_system/risk/drawdown_monitor.py`](quant_trading_system/risk/drawdown_monitor.py)
+
+Core behavior includes:
+
+- pre-trade checks
+- buying power and exposure controls
+- concentration limits
+- kill switch logic
+- drawdown-based trading halts
+- explicit reason-coded failures
+
+### 6. Execution Layer
+
+Execution is modeled as its own boundary rather than a direct broker API call from strategy code.
+
+Key files:
+
+- [`quant_trading_system/execution/order_manager.py`](quant_trading_system/execution/order_manager.py)
+- [`quant_trading_system/execution/alpaca_client.py`](quant_trading_system/execution/alpaca_client.py)
+- [`quant_trading_system/execution/position_tracker.py`](quant_trading_system/execution/position_tracker.py)
+
+Responsibilities include:
+
+- order lifecycle management
+- submission and cancellation
+- partial fill handling
+- broker integration
+- position reconciliation
+- execution-quality-aware simulation settings
+
+### 7. Backtest, Replay, And Promotion
+
+Backtest and replay are first-class parts of the system, not afterthoughts.
+
+Key areas:
+
+- [`quant_trading_system/backtest/`](quant_trading_system/backtest/)
+- [`quant_trading_system/backtest/promotion.py`](quant_trading_system/backtest/promotion.py)
+- [`scripts/backtest.py`](scripts/backtest.py)
+- [`scripts/replay.py`](scripts/replay.py)
+
+The important design choice here is that replay and paper trading can consume the same promotion package that came out of training.
+
+That means:
+
+- the same model family
+- the same thresholds
+- the same policy layer
+- the same runtime assumptions
+
+are reused across environments instead of being reimplemented manually.
+
+## Repository Layout
+
+```text
+quant_trading_system/
+  alpha/        Alpha generation and regime-aware combination
+  backtest/     Historical simulation, replay, promotion adapters
+  config/       Runtime settings and environment loading
+  core/         Events, system integration, shared contracts
+  data/         Market data access, live feeds, timeframe utilities
+  database/     PostgreSQL and TimescaleDB integration
+  execution/    Order manager, broker boundary, execution analytics
+  features/     Technical, statistical, cross-sectional, reference, flow features
+  models/       Training, validation, calibration, policy, lineage
+  monitoring/   Structured logging, audit trail, health telemetry
+  risk/         Limits, drawdown monitoring, sizing, portfolio controls
+  trading/      Trading engine, signal generation, portfolio manager
+
+scripts/
+  train.py      Standalone model training CLI
+  backtest.py   Historical backtest CLI
+  replay.py     Deterministic replay CLI
+  trade.py      Paper/live trading CLI
+
+docs/
+  LIGHTGBM_TCN_WORK_PLAN.md
+
+dashboard_ui/
+  Optional dashboard frontend
 ```
 
----
+## Unified CLI
 
-## Core Modules Deep Dive
+The main operator surface is [`main.py`](main.py).
 
-### 1. Alpha Generation Engine (`alpha/`)
-
-The signal discovery layer implementing multiple alpha strategy families with dynamic combination.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `alpha_base.py` | ~700 | Abstract alpha interface, lifecycle management, signal normalization |
-| `momentum_alphas.py` | ~600 | Cross-sectional & time-series momentum, breakout detection |
-| `mean_reversion_alphas.py` | ~650 | Statistical arbitrage signals, Ornstein-Uhlenbeck, z-score reversals |
-| `ml_alphas.py` | ~640 | ML-driven alpha factors, feature importance-weighted signals |
-| `alpha_combiner.py` | ~1,100 | Weighted alpha blending, regime-conditional mixing, turnover control |
-| `alpha_metrics.py` | ~960 | IC/IR analysis, decay profiling, alpha orthogonality testing |
-| `regime_detection.py` | ~1,350 | HMM-based regime classification, Markov switching, composite detector |
-
-**Key Design Decisions:**
-- Alpha signals are **regime-conditioned** — the combiner dynamically reweights alphas based on detected market regime (trending, mean-reverting, volatile, calm)
-- Built-in **alpha decay analysis** tracks signal half-life to prevent stale signal usage
-- All alphas implement a common interface enabling hot-swappable strategy modules
-
----
-
-### 2. Feature Engineering Pipeline (`features/`)
-
-Production feature computation with 200+ indicators across multiple feature categories, with GPU acceleration support.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `technical.py` | ~2,000 | Complete technical indicator suite (RSI, MACD, Bollinger, Ichimoku, etc.) |
-| `technical_extended.py` | ~1,500 | Advanced indicators (Heikin-Ashi, Renko, Keltner, Donchian, etc.) |
-| `statistical.py` | ~1,250 | Returns distributions, rolling volatility, VaR, Hurst exponent, entropy |
-| `microstructure.py` | ~1,450 | Bid-ask bounce, Kyle lambda, volume clock, order flow toxicity (VPIN) |
-| `cross_sectional.py` | ~1,000 | Relative strength, sector momentum, dispersion, rank-based features |
-| `feature_pipeline.py` | ~1,250 | Orchestration, caching, dependency graph, parallel computation |
-| `optimized_pipeline.py` | ~1,050 | RAPIDS/cuDF GPU acceleration, Numba JIT fallback, memory optimization |
-
-**Key Design Decisions:**
-- Feature pipeline uses a **DAG-based dependency graph** to compute features in optimal order
-- Supports **GPU-accelerated computation** via RAPIDS cuDF with automatic CPU fallback
-- **Feature quality gates** prevent downstream usage of features with excessive NaN rates or zero variance
-
----
-
-### 3. Model Lifecycle Manager (`models/`)
-
-Institutional-grade ML/DL model management — from training through validation to deployment governance.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `classical_ml.py` | ~1,050 | XGBoost, LightGBM, CatBoost, Random Forest, ElasticNet wrappers |
-| `deep_learning.py` | ~1,700 | LSTM, Transformer, TCN architectures with PyTorch Lightning |
-| `reinforcement.py` | ~1,250 | PPO-based RL agent for adaptive position sizing |
-| `rl_meta_learning.py` | ~870 | Meta-learning across market regimes, few-shot adaptation |
-| `ensemble.py` | ~970 | Voting, Stacking, Adaptive ensemble with regime-aware weighting |
-| `meta_labeling.py` | ~690 | Marcos López de Prado's meta-labeling for bet sizing |
-| `purged_cv.py` | ~1,030 | Purged K-Fold, Embargo, Combinatorial Purged CV |
-| `validation_gates.py` | ~500 | Multi-gate validation (performance, stability, overfitting, risk) |
-| `model_manager.py` | ~1,770 | Full lifecycle: versioning, promotion, rollback, A/B testing |
-| `ab_testing.py` | ~1,090 | Statistical A/B framework for model comparison in production |
-| `explainability.py` | ~930 | SHAP, LIME, permutation importance, partial dependence |
-| `inference_batcher.py` | ~600 | Batch inference optimization, latency monitoring |
-| `staleness_detector.py` | ~550 | Model drift detection, automatic retraining triggers |
-| `training_lineage.py` | ~540 | Full lineage tracking: data → features → model → predictions |
-| `target_engineering.py` | ~350 | Triple-barrier labeling, volatility-normalized returns |
-| `statistical_validation.py` | ~180 | Walk-forward analysis, combinatorial symmetry validation |
-| `base.py` | ~680 | Abstract model interface, serialization, device management |
-
-**Key Design Decisions:**
-- **Purged cross-validation with embargo** prevents look-ahead bias — a critical differentiator from naive ML approaches
-- Model promotion requires passing through **4 independent validation gates** (performance, stability, overfitting, risk-adjusted)
-- Built-in **A/B testing framework** with statistical significance testing for safe model rollout
-- **Training lineage** creates a full audit trail from raw data through feature engineering to final predictions
-
----
-
-### 4. Risk Governance Framework (`risk/`)
-
-Multi-layered risk management implementing institutional controls that go far beyond simple stop-losses.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `limits.py` | ~1,550 | Pre-trade risk checks, position limits, exposure constraints, kill switch |
-| `drawdown_monitor.py` | ~710 | Real-time drawdown tracking, strategy halt thresholds, recovery detection |
-| `position_sizer.py` | ~770 | Kelly criterion, volatility targeting, risk parity, fixed fractional |
-| `regime_position_sizer.py` | ~520 | Regime-conditional position sizing adjustments |
-| `portfolio_optimizer.py` | ~850 | Mean-variance, risk parity, Black-Litterman, hierarchical risk parity |
-| `risk_monitor.py` | ~710 | Aggregate risk dashboard, PnL attribution, limit utilization tracking |
-| `var_stress_testing.py` | ~660 | Historical VaR, Monte Carlo VaR, parametric VaR, stress scenarios |
-| `correlation_monitor.py` | ~850 | Dynamic correlation tracking, concentration risk, diversification score |
-| `sector_rebalancer.py` | ~830 | Sector exposure management, drift detection, rebalancing triggers |
-
-**Key Design Decisions:**
-- **Kill switch** with explicit reason codes and configurable cooldown prevents runaway strategies
-- **Consecutive-loss circuit breaker** automatically halts trading after N sequential losses
-- Pre-trade checks validate orders against **21 different risk dimensions** before submission
-- Risk parameters are **YAML-configured** and can be adjusted without code changes
-
----
-
-### 5. Execution Intelligence Layer (`execution/`)
-
-Smart order management with execution quality analytics that connect model alpha to realized PnL.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `order_manager.py` | ~1,350 | Full order lifecycle, state machine, fill tracking, partial fills |
-| `alpaca_client.py` | ~1,280 | Production Alpaca broker integration with circuit breaker patterns |
-| `execution_algo.py` | ~990 | TWAP, VWAP, Iceberg, Implementation Shortfall algorithms |
-| `tca.py` | ~790 | Transaction cost decomposition, benchmark analysis, execution scoring |
-| `market_impact.py` | ~650 | Almgren-Chriss impact model, temporary/permanent impact estimation |
-| `position_tracker.py` | ~760 | Real-time position reconciliation, P&L tracking, exposure calculation |
-
-**Key Design Decisions:**
-- Execution algorithms use **Almgren-Chriss market impact** model for optimal trade scheduling
-- TCA provides **4 benchmark types** (arrival price, VWAP, TWAP, interval VWAP) for execution quality scoring
-- Cost decomposition breaks fills into spread, market impact, timing cost, and commission components
-- Broker client implements **circuit breaker pattern** with exponential backoff for API resilience
-
----
-
-### 6. Trading Orchestration (`trading/`)
-
-The core strategy coordination layer that ties alpha, risk, and execution together.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `trading_engine.py` | ~1,470 | Main orchestration loop, event processing, lifecycle management |
-| `signal_generator.py` | ~710 | Alpha aggregation, signal filtering, conviction scoring |
-| `portfolio_manager.py` | ~850 | Target portfolio construction, rebalancing, cash management |
-| `strategy.py` | ~750 | Strategy abstraction, parameter management, warmup logic |
-
----
-
-### 7. Backtesting & Research (`backtest/`)
-
-Historical simulation with realistic execution assumptions.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `engine.py` | ~1,800 | Event-driven backtest engine with configurable execution realism |
-| `analyzer.py` | ~1,220 | Performance metrics (Sharpe, Sortino, Calmar, max drawdown, etc.) |
-| `simulator.py` | ~990 | Execution simulation with slippage, partial fills, market impact |
-| `optimizer.py` | ~880 | Walk-forward optimization, parameter sensitivity analysis |
-| `performance_attribution.py` | ~970 | Brinson-Fachler attribution, factor attribution, regime attribution |
-
-**Key Design Decisions:**
-- Backtest engine supports **3 execution realism modes** (simple, realistic, pessimistic)
-- **Monte Carlo simulation** generates confidence intervals for strategy performance
-- **Brinson-Fachler attribution** decomposes returns into allocation, selection, and interaction effects
-- Walk-forward optimization prevents in-sample overfitting
-
----
-
-### 8. Data Fabric (`data/`)
-
-Multi-source data ingestion with quality control and lineage tracking.
-
-- Historical and live data loading from Alpaca Markets API
-- Intrinsic bar generation (dollar bars, volume bars, tick bars)
-- Data quality validation with gap detection and outlier handling
-- Feature store bridge for ML pipeline integration
-- Data lineage tracking for regulatory compliance
-
----
-
-### 9. Core Infrastructure (`core/`)
-
-Shared architectural primitives that enable the system's modularity and resilience.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `events.py` | ~690 | Typed event taxonomy, async event bus, priority routing, dead-letter queue |
-| `circuit_breaker.py` | ~530 | Multi-state circuit breaker with half-open recovery and metrics |
-| `cqrs.py` | ~450 | Command/Query Responsibility Segregation pattern |
-| `data_types.py` | ~670 | Domain models: Order, Position, Signal, MarketData (all Pydantic v2) |
-| `exceptions.py` | ~650 | Hierarchical exception taxonomy with context propagation |
-| `registry.py` | ~400 | Dynamic component registry for plugin-style extensibility |
-| `system_integrator.py` | ~780 | Cross-module orchestration, dependency injection, boot sequence |
-| `lazy_loader.py` | ~430 | Module lazy loading for <1s cold start |
-| `redis_bridge.py` | ~190 | Redis pub/sub abstraction for inter-process communication |
-| `utils.py` | ~1,150 | Shared utilities, retry logic, rate limiting, credential masking |
-| `reproducibility.py` | ~40 | Global seed management for deterministic experiments |
-
----
-
-### 10. Monitoring & Observability (`monitoring/`)
-
-Production-grade observability stack for diagnosing and operating a live trading system.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `dashboard.py` | ~5,600 | FastAPI backend with 40+ REST endpoints + WebSocket real-time feed |
-| `alerting.py` | ~2,070 | Multi-channel alerting (email, Slack, PagerDuty), escalation policies |
-| `audit.py` | ~1,050 | Tamper-evident audit trail with hash-chain integrity verification |
-| `metrics.py` | ~1,000 | Prometheus metric collection, custom trading metrics, histograms |
-| `health.py` | ~820 | System health diagnostics, dependency checks, degradation detection |
-| `logger.py` | ~680 | Structured logging with structlog, context propagation, credential masking |
-| `tracing.py` | ~460 | Distributed tracing integration, span management, performance profiling |
-
-**Key Design Decisions:**
-- Audit trail uses **cryptographic hash chaining** for tamper evidence — critical for regulatory compliance
-- Dashboard exposes **40+ API endpoints** covering every subsystem's operational state
-- Alert system supports **escalation policies** — if an alert isn't acknowledged within a configurable window, it escalates
-
----
-
-### 11. Database & Persistence (`database/`)
-
-SQLAlchemy 2.0-based persistence with Alembic migrations and TimescaleDB integration.
-
-- Multi-table schema: trades, orders, positions, signals, model artifacts, audit events
-- Repository pattern for clean data access abstraction
-- Connection pooling with health-check aware lifecycle
-- Alembic migrations for schema evolution
-
----
-
-### 12. Configuration Management (`config/`)
-
-Type-safe, multi-source configuration system.
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `settings.py` | ~890 | Pydantic Settings with environment variable binding, validation |
-| `feature_flags.py` | ~770 | Runtime feature flag system with gradual rollout support |
-| `secure_config.py` | ~550 | Secrets management, credential rotation, vault integration |
-| `regional.py` | ~390 | Multi-region deployment configuration (US, EU, APAC) |
-| `risk_params.yaml` | — | Externalized risk limits and thresholds |
-| `model_configs.yaml` | — | Model hyperparameter presets |
-| `symbols.yaml` | — | Trading universe definition |
-| `alpaca_config.yaml` | — | Broker-specific configuration |
-
----
-
-## Real-Time Dashboard
-
-A modern, full-featured trading terminal built with **React 19**, **TypeScript 5.9**, **Vite 7**, and **Framer Motion** animations.
-
-### Dashboard Pages
-
-| Page | Description |
-|------|-------------|
-| **Overview** | Real-time P&L, portfolio summary, position heatmap, market regime indicator |
-| **Trading** | Live order blotter, execution timeline, fill analysis |
-| **Risk** | Risk limit utilization, drawdown chart, VaR exposure, kill switch status |
-| **Models** | Model performance tracking, validation gate status, A/B test results |
-| **System Status** | Infrastructure health, API latency, database connections, Redis status |
-| **Alerts** | Active alerts, escalation status, alert history, acknowledgment flow |
-| **Platform** | System configuration, feature flags, deployment info |
-| **Settings** | User preferences, notification configuration, theme customization |
-| **Login** | Authentication with session management |
-
-### Frontend Stack
-
-- **React 19** with TypeScript for type-safe component development
-- **Zustand** for lightweight, scalable state management
-- **Framer Motion** for fluid micro-animations and page transitions
-- **Recharts** for interactive financial data visualization
-- **Radix UI** primitives for accessible component foundations
-- **TailwindCSS 3** for utility-first responsive design
-- **Axios** + **WebSocket** for real-time data streaming from FastAPI backend
-- **React Router 7** for client-side navigation
-
----
-
-## Infrastructure & DevOps
-
-### Docker Compose Stack
-
-```yaml
-Services:
-  trading_app      →  Main application (4GB RAM, 2 CPU)
-  postgres         →  TimescaleDB (time-series optimized PostgreSQL)
-  redis            →  Cache + message queue (512MB, LRU eviction)
-  prometheus       →  Metrics collection (30-day retention)
-  grafana          →  Visualization dashboards
-  alertmanager     →  Alert routing & notification
+```bash
+python main.py --help
 ```
 
-### Production Deployment
+Top-level commands:
 
-- **Production Docker Compose** with optimized resource limits and security hardening
-- **Kubernetes multi-region manifest** for US_EAST, US_WEST, EU_WEST, ASIA_PACIFIC deployments
-- Network isolation: separate `trading_network` and `monitoring_network`
-- Health checks with configurable intervals, timeouts, and retry policies
-- Volume management for persistent data, logs, and model artifacts
+- `trade`: execute paper, live, or dry-run trading
+- `backtest`: historical simulation
+- `replay`: deterministic replay with execution/risk SLO checks
+- `train`: model training and promotion artifact generation
+- `data`: load, bootstrap, validate, migrate, export data
+- `features`: compute or validate feature sets
+- `health`: diagnostics and health checks
+- `deploy`: deployment and setup helpers
+- `dashboard`: run the monitoring dashboard
 
-### Infrastructure Diagram
+## Common Workflows
 
-```mermaid
-graph LR
-    subgraph K8s["Kubernetes Cluster"]
-        subgraph US_EAST["US East"]
-            APP1[Trading Pod]
-            DB1[(TimescaleDB)]
-        end
-        subgraph EU_WEST["EU West"]
-            APP2[Trading Pod]
-            DB2[(TimescaleDB)]
-        end
-    end
+### Health Check
 
-    subgraph Monitoring["Monitoring Stack"]
-        PROM[Prometheus]
-        GRAF[Grafana]
-        AM[Alertmanager]
-    end
-
-    subgraph Cache["Cache Layer"]
-        REDIS[Redis Cluster]
-    end
-
-    APP1 --> DB1
-    APP2 --> DB2
-    APP1 --> REDIS
-    APP2 --> REDIS
-    APP1 --> PROM
-    APP2 --> PROM
-    PROM --> GRAF
-    PROM --> AM
-
-    style K8s fill:#1a1a2e,stroke:#e94560,color:#fff
-    style Monitoring fill:#16213e,stroke:#0f3460,color:#fff
-    style Cache fill:#0f3460,stroke:#533483,color:#fff
+```bash
+python main.py health check --full
 ```
 
----
+### Check Database Status
+
+```bash
+python main.py data db-status
+```
+
+### Train A Serious Candidate
+
+Example promotion-style LightGBM run:
+
+```bash
+python main.py train \
+  --model lightgbm_ranker \
+  --training-profile promotion \
+  --dataset-snapshot-bundle <PATH_TO_DATASET_BUNDLE_MANIFEST> \
+  --strict-snapshot-replay \
+  --timeframe 15Min \
+  --timeframes 15Min 1Hour \
+  --n-splits 5 \
+  --n-trials 120 \
+  --min-confidence-position-scale 0.20
+```
+
+### Backtest From A Promotion Package
+
+```bash
+python main.py backtest \
+  --start 2025-01-01 \
+  --end 2025-03-31 \
+  --symbols AAPL MSFT NVDA \
+  --promotion-package models/<model>.promotion_package.json \
+  --timeframe 15Min
+```
+
+### Replay The Same Artifact
+
+```bash
+python main.py replay \
+  --start 2025-01-01 \
+  --end 2025-01-10 \
+  --symbols AAPL MSFT NVDA \
+  --promotion-package models/<model>.promotion_package.json \
+  --timeframe 15Min
+```
+
+### Paper Trade The Same Artifact
+
+```bash
+python main.py trade \
+  --mode paper \
+  --promotion-package models/<model>.promotion_package.json \
+  --max-positions 6 \
+  --kill-switch-drawdown 0.08
+```
+
+The intended operator contract is:
+
+1. Train on a frozen snapshot.
+2. Inspect artifacts and validation gates.
+3. Replay the promoted artifact.
+4. Paper trade the exact same artifact.
+5. Only then consider live rollout.
+
+## Environment And Setup
+
+Baseline requirements:
+
+- Python `3.11+`
+- PostgreSQL / TimescaleDB
+- Redis
+- Alpaca credentials for broker integration
+
+Local install:
+
+```bash
+python -m venv .venv
+. .venv/Scripts/activate
+pip install -e ".[dev]"
+```
+
+Configuration:
+
+- copy [`.env.example`](.env.example) to `.env`
+- review [`quant_trading_system/config/settings.py`](quant_trading_system/config/settings.py)
+- keep PostgreSQL as the primary runtime source of truth
+
+Operational note:
+
+- serious training runs should be executed from the Linux filesystem inside WSL
+- use the `~/AlphaTrade` copy for heavy training instead of `/mnt/c/...`
 
 ## Technology Stack
 
-### Backend & Core
+Main technologies currently in the repo:
 
-| Technology | Version | Purpose |
-|-----------|---------|---------|
-| Python | 3.11+ | Core platform language |
-| Pydantic v2 | 2.5+ | Data validation, settings, domain models |
-| FastAPI | 0.104+ | REST API + WebSocket server |
-| SQLAlchemy 2 | 2.0+ | ORM, repository pattern |
-| Alembic | 1.12+ | Database migrations |
-| Redis | 5.0+ | Caching, pub/sub messaging |
-| structlog | 23.2+ | Structured logging |
-| Prometheus Client | 0.19+ | Metrics instrumentation |
+- Python `3.11+`
+- PostgreSQL / TimescaleDB
+- Redis
+- pandas, Polars, NumPy, PyArrow
+- scikit-learn
+- XGBoost
+- LightGBM
+- PyTorch and PyTorch Lightning
+- FastAPI and WebSocket-related runtime components
+- Alpaca broker integration
+- pytest, mypy, black, isort, ruff
 
-### Machine Learning & Data Science
+## Validation And Quality
 
-| Technology | Version | Purpose |
-|-----------|---------|---------|
-| PyTorch | 2.1+ | Deep learning (LSTM, Transformer, TCN) |
-| PyTorch Lightning | 2.1+ | Training framework, experiment management |
-| XGBoost | 2.0+ | Gradient boosting models |
-| LightGBM | 4.1+ | Light gradient boosting |
-| CatBoost | 1.2+ | Categorical boosting |
-| scikit-learn | 1.3+ | Classical ML, preprocessing, metrics |
-| Optuna | 3.4+ | Bayesian hyperparameter optimization |
-| Polars | 0.19+ | High-performance DataFrames |
-| Pandas | 2.1+ | Data manipulation |
-| NumPy | 1.26+ | Numerical computing |
-| PyArrow | 14.0+ | Columnar data format |
+The project is designed around targeted validation, not just "it runs once."
 
-### Frontend
+Typical validation surfaces include:
 
-| Technology | Version | Purpose |
-|-----------|---------|---------|
-| React | 19 | UI framework |
-| TypeScript | 5.9 | Type-safe development |
-| Vite | 7 | Build tooling, HMR |
-| Zustand | 5.0 | State management |
-| Framer Motion | 12 | Animations |
-| Recharts | 3.6 | Data visualization |
-| TailwindCSS | 3.4 | Styling |
-| Radix UI | Latest | Accessible primitives |
+- unit tests
+- integration tests
+- deterministic replay
+- runtime health checks
+- training validation gates
 
-### Infrastructure
-
-| Technology | Purpose |
-|-----------|---------|
-| Docker + Docker Compose | Containerization & orchestration |
-| Kubernetes | Multi-region production deployment |
-| TimescaleDB (PostgreSQL 15) | Time-series optimized persistence |
-| Redis 7 | Caching & message queue |
-| Prometheus | Metrics collection |
-| Grafana | Monitoring dashboards |
-| Alertmanager | Alert routing |
-
-### Code Quality
-
-| Tool | Purpose |
-|------|---------|
-| pytest | Testing framework (unit + integration) |
-| Black | Code formatting |
-| isort | Import sorting |
-| Ruff | Fast linting |
-| mypy (strict) | Static type checking |
-| pre-commit | Git hook automation |
-
----
-
-## Unified CLI Surface
-
-Single entry point with comprehensive command groups:
-
-```
-python main.py <command> [options]
-
-Commands:
-  trade       Live/paper/dry-run trading with full risk controls
-  backtest    Historical simulation with configurable execution realism
-  train       ML model training with institutional validation pipeline
-  data        Data ingestion, validation, export, and migration
-  features    Feature computation with GPU acceleration support
-  health      System diagnostics, connectivity, and metrics
-  deploy      Infrastructure setup, migrations, and environment config
-  dashboard   Launch monitoring dashboard and WebSocket server
-```
-
-### Example Workflows
+Examples:
 
 ```bash
-# Paper trading with risk controls
-python main.py trade --mode paper --symbols AAPL MSFT GOOGL --risk-check full
-
-# Backtest with realistic execution
-python main.py backtest --start 2024-01-01 --end 2024-06-30 \
-  --symbols AAPL MSFT --execution-mode realistic
-
-# Train XGBoost with purged cross-validation
-python main.py train --model xgboost --symbols AAPL MSFT \
-  --validation purged-cv --optuna-trials 100
-
-# Full system health check
+pytest tests/unit/test_settings.py -v
+pytest tests/unit/test_trading.py tests/unit/test_risk.py tests/unit/test_execution.py -v
+pytest tests/unit/test_backtest.py tests/unit/test_backtest_replay.py -v
+pytest tests/unit/test_features.py tests/unit/test_models.py tests/unit/test_purged_cv.py -v
 python main.py health check --full
-
-# Launch monitoring dashboard
-python main.py dashboard --host 0.0.0.0 --port 8000
 ```
 
----
-
-## Data Universe
-
-| Metric | Value |
-|--------|-------|
-| Symbols | 46 US equities |
-| Data Files | 92 CSV files (daily + 15-min bars) |
-| History Depth | ~5 years |
-| Bar Types | Standard OHLCV, dollar bars, volume bars |
-| Data Source | Alpaca Markets API |
-
----
-
-## Testing & Quality
-
-```
-tests/
-├── conftest.py              # Shared fixtures, mock factories
-├── unit/                    # 29 unit test files
-│   ├── test_alpha_*.py      # Alpha signal validation
-│   ├── test_risk_*.py       # Risk control verification
-│   ├── test_model_*.py      # ML pipeline testing
-│   ├── test_execution_*.py  # Order management tests
-│   ├── test_features_*.py   # Feature computation tests
-│   └── ...
-└── integration/             # 3 integration test files
-    ├── test_pipeline_*.py   # End-to-end pipeline tests
-    └── ...
-```
+When working on the current model stack, the most common targeted suites are:
 
 ```bash
-# Run all tests
-pytest tests/ -v
-
-# Run with coverage
-pytest tests/ --cov=quant_trading_system --cov-report=html
-
-# Run only unit tests
-pytest tests/ -m unit
-
-# Run only integration tests
-pytest tests/ -m integration
+pytest tests/unit/test_train_script.py tests/unit/test_backtest_script.py tests/unit/test_trade_script.py -v
+pytest tests/unit/test_backtest_replay.py tests/unit/test_target_engineering.py -v
 ```
 
----
+## Key Design Decisions
 
-## Reviewer Fast-Track
+There are a few choices that define the project:
 
-> **For interviewers, recruiters, or technical reviewers** — inspect these files to quickly evaluate the quality and depth of this system:
+### Snapshot-First Training
 
-| Priority | File | What It Demonstrates |
-|----------|------|---------------------|
-| 1 | `quant_trading_system/core/events.py` | Event-driven architecture, async patterns, typed event taxonomy |
-| 2 | `quant_trading_system/risk/limits.py` | Institutional risk controls, kill switch, pre-trade validation |
-| 3 | `quant_trading_system/models/purged_cv.py` | Financial ML rigor, leakage prevention, embargo logic |
-| 4 | `quant_trading_system/models/validation_gates.py` | Model governance, multi-gate promotion workflow |
-| 5 | `quant_trading_system/models/deep_learning.py` | PyTorch architectures (LSTM, Transformer, TCN) |
-| 6 | `quant_trading_system/execution/tca.py` | Execution quality analysis, cost decomposition |
-| 7 | `quant_trading_system/monitoring/audit.py` | Tamper-evident audit, hash-chain integrity |
-| 8 | `quant_trading_system/alpha/regime_detection.py` | HMM regime classification, market state modeling |
-| 9 | `main.py` | Unified CLI, command orchestration, system bootstrap |
-| 10 | `dashboard_ui/src/pages/overview.tsx` | React 19 real-time dashboard, data visualization |
+The system prefers frozen dataset bundles and replayable manifests instead of loosely defined experiments.
 
----
+### Artifact-Backed Deployment
 
-## Getting Started
+Training output is expected to survive into backtest, replay, and paper/live trading through the promotion package contract.
 
-### Prerequisites
+### Policy Layer Above Base Predictions
 
-- Python 3.11+
-- Node.js 18+ (for dashboard)
-- Docker & Docker Compose (for infrastructure)
-- Alpaca Markets API credentials
+The runtime decision is not just a raw class probability. It can also include:
 
-### Quick Start
+- calibration
+- meta-labeling
+- expected-edge gating
+- regime-aware policy adjustments
+- side-specific controls
+- universe eligibility rules
 
-```bash
-# 1. Clone and setup
-git clone <repo-url> && cd AlphaTrade_System
-pip install -e ".[dev]"
+### Explicit Live Guardrails
 
-# 2. Configure environment
-cp .env.example .env
-# Edit .env with your Alpaca API credentials
+Live behavior is expected to preserve:
 
-# 3. Start infrastructure
-docker-compose -f docker/docker-compose.yml up -d
+- pre-trade checks
+- drawdown halts
+- kill switch logic
+- structured logging
+- auditability
 
-# 4. Run database migrations
-python main.py deploy migrate
+## Files To Read First
 
-# 5. Load historical data
-python main.py data load --source alpaca --symbols AAPL MSFT GOOGL
+If you are trying to understand the production-critical path, start with:
 
-# 6. Verify system health
-python main.py health check --full
+- [`quant_trading_system/config/settings.py`](quant_trading_system/config/settings.py)
+- [`quant_trading_system/core/events.py`](quant_trading_system/core/events.py)
+- [`quant_trading_system/core/system_integrator.py`](quant_trading_system/core/system_integrator.py)
+- [`quant_trading_system/trading/trading_engine.py`](quant_trading_system/trading/trading_engine.py)
+- [`quant_trading_system/trading/signal_generator.py`](quant_trading_system/trading/signal_generator.py)
+- [`quant_trading_system/risk/limits.py`](quant_trading_system/risk/limits.py)
+- [`quant_trading_system/risk/drawdown_monitor.py`](quant_trading_system/risk/drawdown_monitor.py)
+- [`quant_trading_system/execution/order_manager.py`](quant_trading_system/execution/order_manager.py)
+- [`quant_trading_system/execution/alpaca_client.py`](quant_trading_system/execution/alpaca_client.py)
+- [`quant_trading_system/data/live_feed.py`](quant_trading_system/data/live_feed.py)
+- [`quant_trading_system/data/data_access.py`](quant_trading_system/data/data_access.py)
+- [`quant_trading_system/monitoring/audit.py`](quant_trading_system/monitoring/audit.py)
+- [`quant_trading_system/monitoring/logger.py`](quant_trading_system/monitoring/logger.py)
 
-# 7. Start the dashboard
-cd dashboard_ui && npm install && npm run dev
+## Related Documentation
 
-# 8. Run paper trading
-python main.py trade --mode paper --symbols AAPL MSFT GOOGL
-```
+- Work plan: [`docs/LIGHTGBM_TCN_WORK_PLAN.md`](docs/LIGHTGBM_TCN_WORK_PLAN.md)
+- Agent instructions: [`AGENTS.md`](AGENTS.md)
+- Project configuration and toolchain: [`pyproject.toml`](pyproject.toml)
 
----
+## Current Status
 
-<p align="center">
-  <strong>Built with precision. Engineered for production. Designed to impress.</strong>
-</p>
+The current focus of the repository is:
 
-<p align="center">
-  <sub>This repository is for engineering demonstration purposes. Not financial advice.</sub>
-</p>
+- build a serious LightGBM baseline on a frozen snapshot
+- validate it through replay and early paper trading
+- compare TCN only after the LightGBM baseline is stable
+
+If you want the fastest way to understand the project:
+
+1. read the work plan
+2. inspect [`quant_trading_system/`](quant_trading_system/)
+3. run `python main.py --help`

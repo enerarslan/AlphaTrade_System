@@ -338,6 +338,29 @@ class TestStatisticalFeatures:
         valid_values = result["rolling_skew_60"][~np.isnan(result["rolling_skew_60"])]
         assert np.all(np.isfinite(valid_values))
 
+    def test_rolling_kurtosis(self, sample_ohlcv_df):
+        """Test rolling kurtosis."""
+        from quant_trading_system.features.statistical import RollingKurtosis
+
+        kurt = RollingKurtosis(windows=[60])
+        result = kurt.compute(sample_ohlcv_df)
+
+        assert isinstance(result, dict)
+        assert "rolling_kurt_60" in result
+
+        valid_values = result["rolling_kurt_60"][~np.isnan(result["rolling_kurt_60"])]
+        assert np.all(np.isfinite(valid_values))
+
+    def test_adaptive_sampling_step_scales_large_datasets(self):
+        """Large rolling jobs should switch to coarser sampled evaluation."""
+        from quant_trading_system.features.statistical import _adaptive_sampling_step
+
+        assert _adaptive_sampling_step(500, 1) == 1
+        assert _adaptive_sampling_step(12_000, 1) == 6
+        assert _adaptive_sampling_step(25_000, 1) == 12
+        assert _adaptive_sampling_step(55_000, 1) == 24
+        assert _adaptive_sampling_step(125_000, 1) == 40
+
     def test_rolling_var(self, sample_ohlcv_df):
         """Test rolling VaR."""
         from quant_trading_system.features.statistical import RollingVaR
@@ -384,6 +407,43 @@ class TestStatisticalFeatures:
         if len(valid_values) > 0:
             # Autocorrelation should be bounded [-1, 1]
             assert np.all(valid_values >= -1) and np.all(valid_values <= 1)
+
+    def test_partial_autocorrelation_large_dataset_forward_fills_sampled_values(self):
+        """Adaptive PACF sampling should still provide a dense terminal series."""
+        from quant_trading_system.features.statistical import PartialAutocorrelation
+
+        n = 20_050
+        close = 100.0 * np.exp(np.cumsum(np.random.default_rng(42).normal(0.0002, 0.01, n)))
+        df = pl.DataFrame({"close": close})
+
+        pacf = PartialAutocorrelation(window=60, lags=[2], compute_step=1)
+        result = pacf.compute(df)
+
+        values = result["pacf_lag2_60"]
+        warmup = 60 + 2 - 1
+        populated = np.count_nonzero(~np.isnan(values[warmup:]))
+
+        assert np.isfinite(values[-1])
+        assert populated > 0.95 * (n - warmup)
+
+    def test_r_squared_large_dataset_forward_fills_sampled_values(self):
+        """Adaptive regression features should remain dense on large datasets."""
+        from quant_trading_system.features.statistical import RSquared
+
+        n = 20_050
+        close = 100.0 + np.linspace(0.0, 50.0, n) + np.sin(np.linspace(0.0, 20.0, n))
+        df = pl.DataFrame({"close": close})
+
+        r_squared = RSquared(windows=[50], compute_step=1)
+        result = r_squared.compute(df)
+
+        values = result["r_squared_50"]
+        warmup = 50 - 1
+        populated = np.count_nonzero(~np.isnan(values[warmup:]))
+
+        assert np.isfinite(values[-1])
+        assert populated > 0.95 * (n - warmup)
+        assert np.all(values[~np.isnan(values)] <= 1.0)
 
     def test_statistical_calculator(self, sample_ohlcv_df):
         """Test StatisticalFeatureCalculator."""

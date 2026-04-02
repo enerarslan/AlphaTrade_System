@@ -91,6 +91,84 @@ def _forward_fill_nan(arr: np.ndarray) -> np.ndarray:
     return out
 
 
+def _unbiased_excess_kurtosis(values: np.ndarray) -> float:
+    """Return Fisher excess kurtosis with bias correction.
+
+    SciPy's kurtosis path has been observed to abort the Python process on long
+    rolling loops in the WSL training environment. Keep this implementation
+    NumPy-only so large live-training datasets stay deterministic and stable.
+    """
+    sample = np.asarray(values, dtype=np.float64)
+    sample = sample[np.isfinite(sample)]
+    n = int(sample.size)
+    if n < 4:
+        return float("nan")
+
+    centered = sample - float(np.mean(sample))
+    second_moment = float(np.mean(centered**2))
+    if not np.isfinite(second_moment) or second_moment <= 1e-18:
+        return 0.0
+
+    fourth_moment = float(np.mean(centered**4))
+    excess = fourth_moment / (second_moment**2) - 3.0
+    correction = ((n - 1) / ((n - 2) * (n - 3))) * ((n + 1) * excess + 6.0)
+    return float(correction)
+
+
+def _unbiased_skewness(values: np.ndarray) -> float:
+    """Return adjusted Fisher-Pearson sample skewness."""
+    sample = np.asarray(values, dtype=np.float64)
+    sample = sample[np.isfinite(sample)]
+    n = int(sample.size)
+    if n < 3:
+        return float("nan")
+
+    centered = sample - float(np.mean(sample))
+    second_moment = float(np.mean(centered**2))
+    if not np.isfinite(second_moment) or second_moment <= 1e-18:
+        return 0.0
+
+    third_moment = float(np.mean(centered**3))
+    skew = third_moment / (second_moment ** 1.5)
+    correction = np.sqrt(n * (n - 1)) / (n - 2)
+    return float(correction * skew)
+
+
+def _linear_regression_diagnostics(
+    values: np.ndarray,
+) -> tuple[float, float, float, np.ndarray, float] | None:
+    """Return slope, intercept, r-squared, residuals, and standard error."""
+    y = np.asarray(values, dtype=np.float64)
+    if y.ndim != 1 or y.size < 2 or not np.all(np.isfinite(y)):
+        return None
+
+    x = np.arange(y.size, dtype=np.float64)
+    x_mean = float(np.mean(x))
+    y_mean = float(np.mean(y))
+    x_centered = x - x_mean
+    y_centered = y - y_mean
+
+    denom = float(np.sum(x_centered**2))
+    if denom <= 1e-18:
+        return None
+
+    slope = float(np.sum(x_centered * y_centered) / denom)
+    intercept = float(y_mean - slope * x_mean)
+    predicted = slope * x + intercept
+    residuals = y - predicted
+
+    ss_tot = float(np.sum(y_centered**2))
+    ss_res = float(np.sum(residuals**2))
+    if ss_tot <= 1e-18:
+        r_squared = 0.0
+    else:
+        r_squared = float(np.clip(1.0 - (ss_res / ss_tot), 0.0, 1.0))
+
+    dof = max(1, y.size - 2)
+    stderr = float(np.sqrt(ss_res / dof))
+    return slope, intercept, r_squared, residuals, stderr
+
+
 # =============================================================================
 # RETURNS & DISTRIBUTIONS
 # =============================================================================
@@ -281,23 +359,27 @@ class RollingVar(StatisticalFeature):
 class RollingSkewness(StatisticalFeature):
     """Rolling skewness of returns."""
 
-    def __init__(self, windows: list[int] | None = None):
+    def __init__(self, windows: list[int] | None = None, compute_step: int = 1):
         super().__init__("RollingSkewness")
         self.windows = windows or [20, 60, 120]
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
         close = df["close"].to_numpy().astype(np.float64)
         returns = np.diff(np.log(close), prepend=np.nan)
         results = {}
+        step = _adaptive_sampling_step(len(close), self.compute_step)
 
         for window in self.windows:
             roll_skew = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
+            for i in _sample_indices(window - 1, len(close), step):
                 data = returns[i - window + 1 : i + 1]
                 valid_data = data[~np.isnan(data)]
                 if len(valid_data) >= 3:
-                    roll_skew[i] = stats.skew(valid_data, bias=False)
+                    roll_skew[i] = _unbiased_skewness(valid_data)
+            if step > 1:
+                roll_skew = _forward_fill_nan(roll_skew)
             results[f"rolling_skew_{window}"] = roll_skew
 
         return results
@@ -322,7 +404,7 @@ class RollingKurtosis(StatisticalFeature):
                 data = returns[i - window + 1 : i + 1]
                 valid_data = data[~np.isnan(data)]
                 if len(valid_data) >= 4:
-                    roll_kurt[i] = stats.kurtosis(valid_data, bias=False)
+                    roll_kurt[i] = _unbiased_excess_kurtosis(valid_data)
             results[f"rolling_kurt_{window}"] = roll_kurt
 
         return results
@@ -518,10 +600,16 @@ class Autocorrelation(StatisticalFeature):
 class PartialAutocorrelation(StatisticalFeature):
     """Partial autocorrelation (PACF) at various lags."""
 
-    def __init__(self, window: int = 60, lags: list[int] | None = None):
+    def __init__(
+        self,
+        window: int = 60,
+        lags: list[int] | None = None,
+        compute_step: int = 1,
+    ):
         super().__init__("PACF")
         self.window = window
         self.lags = lags or [1, 2, 3, 5]
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
@@ -530,13 +618,16 @@ class PartialAutocorrelation(StatisticalFeature):
         results = {}
 
         max_lag = max(self.lags)
+        step = _adaptive_sampling_step(len(close), self.compute_step)
         for lag in self.lags:
             pacf = np.full(len(close), np.nan)
-            for i in range(self.window + max_lag - 1, len(close)):
+            for i in _sample_indices(self.window + max_lag - 1, len(close), step):
                 data = returns[i - self.window - max_lag + 1 : i + 1]
                 valid_data = data[~np.isnan(data)]
                 if len(valid_data) >= self.window:
                     pacf[i] = self._pacf(valid_data, lag)
+            if step > 1:
+                pacf = _forward_fill_nan(pacf)
             results[f"pacf_lag{lag}_{self.window}"] = pacf
 
         return results
@@ -550,8 +641,11 @@ class PartialAutocorrelation(StatisticalFeature):
 
         # Yule-Walker approach for PACF
         acf_values = [Autocorrelation._autocorr(x, i) for i in range(lag + 1)]
-        r = np.array(acf_values[1:])
-        R = np.zeros((lag, lag))
+        if not np.all(np.isfinite(acf_values)):
+            return np.nan
+
+        r = np.asarray(acf_values[1:], dtype=np.float64)
+        R = np.zeros((lag, lag), dtype=np.float64)
         for i in range(lag):
             for j in range(lag):
                 R[i, j] = acf_values[abs(i - j)]
@@ -1117,24 +1211,26 @@ class MeanReversionStrength(StatisticalFeature):
 class LinearRegressionSlope(StatisticalFeature):
     """Rolling linear regression slope."""
 
-    def __init__(self, windows: list[int] | None = None):
+    def __init__(self, windows: list[int] | None = None, compute_step: int = 1):
         super().__init__("LinRegSlope")
         self.windows = windows or [10, 20, 50]
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
         close = df["close"].to_numpy().astype(np.float64)
         results = {}
+        step = _adaptive_sampling_step(len(close), self.compute_step)
 
         for window in self.windows:
             slope = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
+            for i in _sample_indices(window - 1, len(close), step):
                 data = close[i - window + 1 : i + 1]
-                x = np.arange(window)
-                try:
-                    slope[i], _ = np.polyfit(x, data, 1)
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+                diagnostics = _linear_regression_diagnostics(data)
+                if diagnostics is not None:
+                    slope[i] = diagnostics[0]
+            if step > 1:
+                slope = _forward_fill_nan(slope)
             results[f"linreg_slope_{window}"] = slope
 
         return results
@@ -1143,25 +1239,26 @@ class LinearRegressionSlope(StatisticalFeature):
 class RSquared(StatisticalFeature):
     """Rolling R-squared of linear regression."""
 
-    def __init__(self, windows: list[int] | None = None):
+    def __init__(self, windows: list[int] | None = None, compute_step: int = 1):
         super().__init__("RSquared")
         self.windows = windows or [10, 20, 50]
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
         close = df["close"].to_numpy().astype(np.float64)
         results = {}
+        step = _adaptive_sampling_step(len(close), self.compute_step)
 
         for window in self.windows:
             r2 = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
+            for i in _sample_indices(window - 1, len(close), step):
                 data = close[i - window + 1 : i + 1]
-                x = np.arange(window)
-                try:
-                    _, _, r_value, _, _ = stats.linregress(x, data)
-                    r2[i] = r_value**2
-                except (ValueError, RuntimeWarning):
-                    pass
+                diagnostics = _linear_regression_diagnostics(data)
+                if diagnostics is not None:
+                    r2[i] = diagnostics[2]
+            if step > 1:
+                r2 = _forward_fill_nan(r2)
             results[f"r_squared_{window}"] = r2
 
         return results
@@ -1170,26 +1267,28 @@ class RSquared(StatisticalFeature):
 class LinearRegressionResiduals(StatisticalFeature):
     """Residuals from linear regression (deviation from trend)."""
 
-    def __init__(self, windows: list[int] | None = None):
+    def __init__(self, windows: list[int] | None = None, compute_step: int = 1):
         super().__init__("LinRegResid")
         self.windows = windows or [20, 50]
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
         close = df["close"].to_numpy().astype(np.float64)
         results = {}
+        step = _adaptive_sampling_step(len(close), self.compute_step)
 
         for window in self.windows:
             residual = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
+            for i in _sample_indices(window - 1, len(close), step):
                 data = close[i - window + 1 : i + 1]
-                x = np.arange(window)
-                try:
-                    slope, intercept = np.polyfit(x, data, 1)
+                diagnostics = _linear_regression_diagnostics(data)
+                if diagnostics is not None:
+                    slope, intercept = diagnostics[0], diagnostics[1]
                     predicted = slope * (window - 1) + intercept
                     residual[i] = close[i] - predicted
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+            if step > 1:
+                residual = _forward_fill_nan(residual)
             results[f"linreg_residual_{window}"] = residual
 
         return results
@@ -1198,27 +1297,26 @@ class LinearRegressionResiduals(StatisticalFeature):
 class StandardError(StatisticalFeature):
     """Rolling standard error of linear regression."""
 
-    def __init__(self, windows: list[int] | None = None):
+    def __init__(self, windows: list[int] | None = None, compute_step: int = 1):
         super().__init__("StdError")
         self.windows = windows or [20, 50]
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
         close = df["close"].to_numpy().astype(np.float64)
         results = {}
+        step = _adaptive_sampling_step(len(close), self.compute_step)
 
         for window in self.windows:
             stderr = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
+            for i in _sample_indices(window - 1, len(close), step):
                 data = close[i - window + 1 : i + 1]
-                x = np.arange(window)
-                try:
-                    slope, intercept = np.polyfit(x, data, 1)
-                    predicted = slope * x + intercept
-                    residuals = data - predicted
-                    stderr[i] = np.std(residuals, ddof=2)
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+                diagnostics = _linear_regression_diagnostics(data)
+                if diagnostics is not None:
+                    stderr[i] = diagnostics[4]
+            if step > 1:
+                stderr = _forward_fill_nan(stderr)
             results[f"std_error_{window}"] = stderr
 
         return results
@@ -1227,25 +1325,29 @@ class StandardError(StatisticalFeature):
 class Curvature(StatisticalFeature):
     """Curvature measure from quadratic fit."""
 
-    def __init__(self, windows: list[int] | None = None):
+    def __init__(self, windows: list[int] | None = None, compute_step: int = 1):
         super().__init__("Curvature")
         self.windows = windows or [20, 50]
+        self.compute_step = compute_step
 
     def compute(self, df: pl.DataFrame) -> dict[str, np.ndarray]:
         self.validate_input(df, ["close"])
         close = df["close"].to_numpy().astype(np.float64)
         results = {}
+        step = _adaptive_sampling_step(len(close), self.compute_step)
 
         for window in self.windows:
             curvature = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
+            for i in _sample_indices(window - 1, len(close), step):
                 data = close[i - window + 1 : i + 1]
-                x = np.arange(window)
+                x = np.arange(window, dtype=np.float64)
                 try:
                     coeffs = np.polyfit(x, data, 2)
                     curvature[i] = 2 * coeffs[0]  # Second derivative
                 except (np.linalg.LinAlgError, ValueError):
                     pass
+            if step > 1:
+                curvature = _forward_fill_nan(curvature)
             results[f"curvature_{window}"] = curvature
 
         return results

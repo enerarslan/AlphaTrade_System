@@ -653,7 +653,7 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
         params["tree_method"] = "hist"
         params["device"] = "cuda"
     elif model_type in LIGHTGBM_FAMILY_MODELS and use_gpu:
-        params["device_type"] = "gpu"
+        params["device"] = "cuda"
 
     # Harmonize YAML keys with model constructor names.
     if model_type == "lstm":
@@ -826,8 +826,11 @@ def _verify_gpu_stack(model_list: list[str]) -> bool:
             )
             probe.fit(X, y)
             gpu_backend_available = True
-        except Exception:
-            logger.warning("XGBoost GPU backend unavailable; falling back to CPU parameters.")
+        except Exception as exc:
+            logger.warning(
+                "XGBoost GPU backend unavailable; falling back to CPU parameters: %s",
+                exc,
+            )
             return False
 
     if {"lightgbm", "lightgbm_ranker", "lightgbm_regressor", "ensemble"}.intersection(model_list):
@@ -839,13 +842,16 @@ def _verify_gpu_stack(model_list: list[str]) -> bool:
             probe = lgb.LGBMClassifier(
                 n_estimators=2,
                 max_depth=3,
-                device_type="gpu",
+                device="cuda",
                 verbosity=-1,
             )
             probe.fit(X, y)
             gpu_backend_available = True
-        except Exception:
-            logger.warning("LightGBM GPU backend unavailable; falling back to CPU parameters.")
+        except Exception as exc:
+            logger.warning(
+                "LightGBM GPU backend unavailable; falling back to CPU parameters: %s",
+                exc,
+            )
             return False
 
     if requires_torch:
@@ -982,6 +988,7 @@ class TrainingConfig:
 
     # GPU acceleration
     use_gpu: bool = True
+    require_gpu: bool = False
     gpu_device: int = 0
 
     # Database integration
@@ -1028,7 +1035,7 @@ class TrainingConfig:
     enable_cross_sectional: bool = True
     cross_sectional_user_locked: bool = False
     max_cross_sectional_symbols: int = 20
-    max_cross_sectional_rows: int = 250000
+    max_cross_sectional_rows: int = 500000
     allow_feature_group_fallback: bool = False
     feature_materialization_batch_rows: int = 5000
     feature_reuse_min_coverage: float = 0.20
@@ -1075,6 +1082,10 @@ class TrainingConfig:
         )
         self.timeframe = normalize_timeframe(self.timeframe)
         self.timeframes = normalize_timeframes(self.timeframe, self.timeframes)
+        self.use_gpu = bool(self.use_gpu)
+        self.require_gpu = bool(self.require_gpu)
+        if self.require_gpu and not self.use_gpu:
+            raise ValueError("require_gpu=True requires use_gpu=True.")
         self.cross_sectional_user_locked = bool(self.cross_sectional_user_locked)
         self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
         self.dataset_snapshot_bundle_path = str(self.dataset_snapshot_bundle_path or "").strip()
@@ -2932,13 +2943,41 @@ class ModelTrainer:
             cleaned.append(col)
         return cleaned
 
+    @staticmethod
+    def _downcast_feature_payload(
+        matrix: pd.DataFrame,
+        *,
+        preserve_columns: set[str] | None = None,
+    ) -> pd.DataFrame:
+        """Reduce feature-matrix memory footprint before wide-frame operations.
+
+        Training feature matrices are numerically tolerant to float32 precision.
+        Keeping feature payloads in float64 causes WSL OOM kills once symbol-level
+        frames, augmented matrices, and finalize-time intermediates coexist.
+        """
+        if matrix is None or matrix.empty:
+            return matrix
+
+        preserve = set(preserve_columns or set())
+        numeric_cols = [
+            column
+            for column in matrix.select_dtypes(include=[np.number]).columns
+            if column not in preserve
+        ]
+        for column in numeric_cols:
+            series = pd.to_numeric(matrix[column], errors="coerce")
+            if pd.api.types.is_float_dtype(series) or series.isna().any():
+                matrix[column] = series.astype(np.float32)
+            else:
+                matrix[column] = pd.to_numeric(series, downcast="integer")
+        return matrix
+
     def _finalize_feature_matrix(self, matrix: pd.DataFrame) -> pd.DataFrame:
         """Finalize computed feature matrix with coverage-aware cleaning."""
         if matrix is None or matrix.empty:
             raise RuntimeError("Feature matrix is empty after feature computation.")
 
-        working = matrix.copy()
-        working = working.replace([np.inf, -np.inf], np.nan)
+        working = matrix
         working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
         working = working.dropna(
             subset=["symbol", "timestamp", "open", "high", "low", "close", "volume"]
@@ -2950,6 +2989,12 @@ class ModelTrainer:
         feature_cols = self._sanitize_feature_columns(feature_cols)
         if not feature_cols:
             raise RuntimeError("No usable feature columns were produced by feature pipeline.")
+
+        working.loc[:, feature_cols] = working[feature_cols].replace([np.inf, -np.inf], np.nan)
+        working = self._downcast_feature_payload(
+            working,
+            preserve_columns=set(BASE_MARKET_COLUMNS),
+        )
 
         min_col_coverage = float(np.clip(self.config.feature_reuse_min_coverage * 0.50, 0.02, 0.35))
         col_coverage = working[feature_cols].notna().mean(axis=0)
@@ -2971,7 +3016,7 @@ class ModelTrainer:
         min_row_coverage = float(np.clip(self.config.feature_reuse_min_coverage * 0.75, 0.05, 0.50))
         row_coverage = working[kept_feature_cols].notna().mean(axis=1)
         input_rows = len(working)
-        working = working.loc[row_coverage >= min_row_coverage].copy()
+        working = working.loc[row_coverage >= min_row_coverage]
         if working.empty:
             raise RuntimeError(
                 "Feature matrix lost all rows after coverage filtering. "
@@ -2987,7 +3032,7 @@ class ModelTrainer:
 
         final_matrix = working[
             ["symbol", "timestamp", "open", "high", "low", "close", "volume", *kept_feature_cols]
-        ].copy()
+        ]
         self.logger.info(
             "Feature matrix finalized: rows=%d->%d, features=%d->%d, row_coverage_floor=%.2f%%",
             input_rows,
@@ -3242,7 +3287,13 @@ class ModelTrainer:
         if not combined_features:
             raise RuntimeError(f"No features computed for symbol {symbol}")
 
-        feature_df = pd.DataFrame(combined_features, index=df.index)
+        feature_df = pd.DataFrame(
+            {
+                name: np.asarray(values, dtype=np.float32)
+                for name, values in combined_features.items()
+            },
+            index=df.index,
+        )
         features_df = pd.concat([df, feature_df], axis=1)
         features_df["symbol"] = symbol
         return features_df
@@ -3506,16 +3557,36 @@ class ModelTrainer:
             self.logger.info("  %s: %d features computed", symbol, feature_count)
 
         if features_list:
+            symbol_frame_count = len(features_list)
             raw_features = pd.concat(features_list, ignore_index=True)
+            features_list.clear()
+            del features_list
+            gc.collect()
+            raw_features = self._downcast_feature_payload(
+                raw_features,
+                preserve_columns=set(BASE_MARKET_COLUMNS),
+            )
             if self.config.enable_reference_features:
                 raw_features = self._augment_reference_features(raw_features)
+                raw_features = self._downcast_feature_payload(
+                    raw_features,
+                    preserve_columns=set(BASE_MARKET_COLUMNS),
+                )
+                gc.collect()
             if self.config.enable_tick_microstructure_features:
                 raw_features = self._augment_tick_microstructure_features(raw_features)
+                raw_features = self._downcast_feature_payload(
+                    raw_features,
+                    preserve_columns=set(BASE_MARKET_COLUMNS),
+                )
+                gc.collect()
             self.features = self._finalize_feature_matrix(raw_features)
+            del raw_features
+            gc.collect()
             self.training_metrics["multi_timeframe_enabled"] = bool(multi_timeframe_enabled)
             self.training_metrics["multi_timeframe_scopes"] = list(self.config.timeframes)
             self.logger.info(
-                f"Total: {len(self.features.columns)} columns for {len(features_list)} symbols"
+                f"Total: {len(self.features.columns)} columns for {symbol_frame_count} symbols"
             )
 
     def _load_features_from_postgres(self) -> pd.DataFrame | None:
@@ -6922,7 +6993,7 @@ class ModelTrainer:
 
             params.setdefault("verbose", -1)
             if self.config.use_gpu:
-                params.setdefault("device_type", "gpu")
+                params.setdefault("device", "cuda")
             return LGBMClassifier(**params)
 
         elif self.config.model_type == "lightgbm_ranker":
@@ -6932,7 +7003,7 @@ class ModelTrainer:
             params.setdefault("objective", "lambdarank")
             params.setdefault("metric", "ndcg")
             if self.config.use_gpu:
-                params.setdefault("device_type", "gpu")
+                params.setdefault("device", "cuda")
             return LGBMRanker(**params)
 
         elif self.config.model_type == "lightgbm_regressor":
@@ -6940,7 +7011,7 @@ class ModelTrainer:
 
             params.setdefault("verbose", -1)
             if self.config.use_gpu:
-                params.setdefault("device_type", "gpu")
+                params.setdefault("device", "cuda")
             return LGBMRegressor(**params)
 
         elif self.config.model_type == "random_forest":
@@ -7017,7 +7088,7 @@ class ModelTrainer:
                 model_params.setdefault("objective", "lambdarank")
                 model_params.setdefault("metric", "ndcg")
                 if self.config.use_gpu:
-                    model_params.setdefault("device_type", "gpu")
+                    model_params.setdefault("device", "cuda")
                 return LGBMRanker(**model_params)
 
             elif self.config.model_type == "random_forest":
@@ -11328,7 +11399,7 @@ def run_training(args: argparse.Namespace) -> int:
 
     try:
         if getattr(args, "gpu", False) or getattr(args, "use_gpu", False):
-            logger.warning("`--gpu/--use-gpu` is deprecated; GPU acceleration is auto-detected.")
+            logger.warning("`--gpu/--use-gpu` is deprecated; use `--require-gpu` instead.")
         if getattr(args, "no_database", False) or getattr(args, "no_redis_cache", False):
             raise ValueError("Institutional mode does not allow disabling PostgreSQL or Redis.")
         if getattr(args, "disable_nested_walk_forward", False):
@@ -11398,7 +11469,17 @@ def run_training(args: argparse.Namespace) -> int:
         global_seed = int(replay_config.get("seed", getattr(args, "seed", 42)))
         set_global_seed(global_seed)
 
+        require_gpu_requested = bool(
+            replay_config.get("require_gpu", False)
+            or getattr(args, "require_gpu", False)
+            or getattr(args, "gpu", False)
+            or getattr(args, "use_gpu", False)
+        )
         resolved_use_gpu = _verify_gpu_stack(model_list)
+        if require_gpu_requested and not resolved_use_gpu:
+            raise RuntimeError(
+                "GPU acceleration was required, but the requested training stack is not GPU-ready."
+            )
 
         audit_logger = None
         try:
@@ -11777,6 +11858,7 @@ def run_training(args: argparse.Namespace) -> int:
                 apply_multiple_testing=True,
                 correction_method="deflated_sharpe",
                 use_gpu=resolved_use_gpu,
+                require_gpu=require_gpu_requested,
                 use_database=True,
                 use_redis_cache=True,
                 compute_shap=compute_shap,
@@ -12065,7 +12147,7 @@ def run_training(args: argparse.Namespace) -> int:
                 max_cross_sectional_rows=int(
                     _cfg_value(
                         "max_cross_sectional_rows",
-                        getattr(args, "max_cross_sectional_rows", 250000),
+                        getattr(args, "max_cross_sectional_rows", 500000),
                     )
                 ),
                 allow_feature_group_fallback=bool(
@@ -12259,6 +12341,7 @@ def run_training(args: argparse.Namespace) -> int:
             logger.info(f"CV method: {config.cv_method} ({config.n_splits} splits)")
             logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
             logger.info(f"GPU acceleration enabled: {config.use_gpu}")
+            logger.info(f"GPU acceleration required: {config.require_gpu}")
             logger.info(
                 "Training stack: Nested Walk-Forward + Optuna + Meta-Labeling=%s + "
                 "Multiple-Testing + SHAP=%s + Leak-Validation",
@@ -12286,6 +12369,7 @@ def run_training(args: argparse.Namespace) -> int:
                         "embargo_pct": config.embargo_pct,
                         "n_trials": config.n_trials,
                         "use_gpu": config.use_gpu,
+                        "require_gpu": config.require_gpu,
                         "use_meta_labeling": config.use_meta_labeling,
                         "compute_shap": config.compute_shap,
                         "holdout_pct": config.holdout_pct,
@@ -12682,7 +12766,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu",
         action="store_true",
-        help="Deprecated: training auto-detects GPU acceleration.",
+        help="Deprecated alias for --require-gpu.",
+    )
+    parser.add_argument(
+        "--require-gpu",
+        action="store_true",
+        help="Fail fast unless the requested model stack can run on GPU.",
     )
     parser.add_argument(
         "--no-database",
@@ -12854,8 +12943,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-cross-sectional-rows",
         type=int,
-        default=250000,
-        help="Adaptive guardrail: disable cross-sectional when dataset rows exceed this value.",
+        default=500000,
+        help=(
+            "Adaptive guardrail: disable cross-sectional when dataset rows exceed this value. "
+            "Default 500000 keeps the Wave 1 multi-symbol 15Min scope on the full feature stack."
+        ),
     )
     parser.add_argument(
         "--feature-materialization-batch-rows",

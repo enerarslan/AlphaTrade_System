@@ -1034,6 +1034,11 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Deprecated: training auto-detects GPU acceleration",
     )
     train_parser.add_argument(
+        "--require-gpu",
+        action="store_true",
+        help="Fail fast unless the requested training stack can run on GPU",
+    )
+    train_parser.add_argument(
         "--no-database",
         action="store_true",
         help="Forbidden in institutional mode; kept for explicit fail-fast validation",

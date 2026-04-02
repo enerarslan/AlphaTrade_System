@@ -66,6 +66,7 @@ def _base_args(**overrides):
         "disable_auto_snapshot_reuse": False,
         "gpu": False,
         "use_gpu": False,
+        "require_gpu": False,
         "no_database": False,
         "no_redis_cache": False,
         "no_shap": False,
@@ -114,7 +115,7 @@ def _base_args(**overrides):
         "strict_feature_groups": False,
         "allow_partial_feature_fallback": False,
         "max_cross_sectional_symbols": 20,
-        "max_cross_sectional_rows": 250000,
+        "max_cross_sectional_rows": 500000,
         "feature_materialization_batch_rows": 5000,
         "feature_reuse_min_coverage": 0.20,
         "skip_feature_persist": False,
@@ -163,7 +164,7 @@ def test_verify_gpu_stack_allows_tree_gpu_without_torch_cuda(monkeypatch):
 
     class _FakeLGBMClassifier:
         def __init__(self, **kwargs):
-            assert kwargs["device_type"] == "gpu"
+            assert kwargs["device"] == "cuda"
 
         def fit(self, X, y):
             assert len(X) == 128
@@ -203,6 +204,15 @@ def test_training_config_normalizes_timeframes_and_modes():
 
     assert config.timeframes == ["15Min", "1Hour", "1Day"]
     assert config.training_bar_mode == "intrinsic"
+
+
+def test_training_config_requires_enabled_gpu_when_gpu_is_mandatory():
+    with pytest.raises(ValueError, match="require_gpu=True requires use_gpu=True"):
+        train_script.TrainingConfig(
+            model_type="lightgbm",
+            use_gpu=False,
+            require_gpu=True,
+        )
 
 
 def test_training_config_normalizes_universe_reference_symbols():
@@ -1694,6 +1704,11 @@ def test_load_model_defaults_random_forest_windows_forces_single_job(monkeypatch
     assert defaults.get("n_jobs") == 1
 
 
+def test_load_model_defaults_lightgbm_uses_cuda_when_gpu_enabled():
+    defaults = train_script._load_model_defaults("lightgbm", use_gpu=True)
+    assert defaults.get("device") == "cuda"
+
+
 def test_augment_params_random_forest_windows_forces_single_job(monkeypatch):
     monkeypatch.setattr(train_script.os, "name", "nt", raising=False)
     trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="random_forest"))
@@ -2413,6 +2428,57 @@ def test_compute_features_windows_allows_partial_fallback_when_enabled(monkeypat
 
     trainer._compute_features()
     assert fallback_called["value"] is True
+
+
+def test_compute_features_full_pipeline_allows_wave1_cross_sectional_row_budget(monkeypatch):
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            feature_groups=["cross_sectional"],
+            enable_reference_features=False,
+            enable_tick_microstructure_features=False,
+            persist_features_to_postgres=False,
+            max_cross_sectional_rows=500000,
+        )
+    )
+    row_count = 260000
+    timestamps = pd.date_range("2024-01-01", periods=row_count // 2, freq="15min", tz="UTC")
+    trainer.data = pd.DataFrame(
+        {
+            "symbol": np.repeat(["AAPL", "MSFT"], len(timestamps)),
+            "timestamp": np.tile(timestamps.to_numpy(), 2),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 100.0,
+        }
+    )
+
+    monkeypatch.setattr(train_script.os, "name", "posix", raising=False)
+
+    def _fake_symbol_features(**kwargs):
+        df = kwargs["df"]
+        return df.loc[:, ["symbol", "timestamp", "open", "high", "low", "close", "volume"]].assign(
+            alpha=1.0
+        )
+
+    monkeypatch.setattr(trainer, "_compute_symbol_feature_frame", _fake_symbol_features)
+    monkeypatch.setattr(trainer, "_augment_reference_features", lambda frame: frame)
+    monkeypatch.setattr(trainer, "_augment_tick_microstructure_features", lambda frame: frame)
+    monkeypatch.setattr(trainer, "_finalize_feature_matrix", lambda frame: frame)
+
+    trainer._compute_features_full_pipeline()
+
+    assert trainer.features is not None
+    assert "alpha" in trainer.features.columns
+    assert len(trainer.features) == row_count
+
+
+def test_training_config_defaults_cross_sectional_row_budget_to_wave1_scope():
+    config = train_script.TrainingConfig(model_type="xgboost")
+
+    assert config.max_cross_sectional_rows == 500000
 
 
 def test_compute_features_defers_postgres_persistence_until_after_selection(monkeypatch):
@@ -3880,6 +3946,18 @@ def test_run_training_replay_manifest_overrides_cli(monkeypatch, tmp_path):
     assert captured["config"].start_date == "2023-01-01"
     assert captured["config"].end_date == "2023-12-31"
     assert captured["config"].model_name.startswith("prod_candidate_replay_")
+
+
+def test_run_training_require_gpu_fails_when_gpu_stack_unavailable(monkeypatch, caplog):
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: False)
+
+    args = _base_args(model="lightgbm", require_gpu=True)
+    with caplog.at_level(logging.ERROR):
+        exit_code = train_script.run_training(args)
+
+    assert exit_code == 1
+    assert "GPU acceleration was required" in caplog.text
 
 
 def test_run_training_replay_manifest_passes_dataset_snapshot_bundle(monkeypatch, tmp_path):
