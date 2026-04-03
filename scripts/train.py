@@ -341,6 +341,7 @@ def _build_snapshot_training_scope(config: "TrainingConfig") -> dict[str, Any]:
         "intrinsic_bar_threshold": float(config.intrinsic_bar_threshold),
         "intrinsic_target_bars_per_day": int(config.intrinsic_target_bars_per_day),
         "enable_reference_features": bool(config.enable_reference_features),
+        "reference_feature_sources": list(config.reference_feature_sources),
         "enable_tick_microstructure_features": bool(config.enable_tick_microstructure_features),
         "enable_cross_sectional": bool(config.enable_cross_sectional),
         "enable_symbol_quality_filter": bool(config.enable_symbol_quality_filter),
@@ -504,6 +505,16 @@ REFERENCE_TRAINING_SCHEMA_CONTRACT: dict[str, set[str]] = {
     },
     "fails_to_deliver": {"symbol", "settlement_date", "quantity", "price", "ftd_metadata"},
 }
+REFERENCE_SOURCE_SCHEMA_TABLES: dict[str, tuple[str, ...]] = {
+    "macro": ("macro_observations", "macro_vintage_observations"),
+    "short_sale": ("short_sale_volumes",),
+    "news": ("news_articles",),
+    "sec_filings": ("sec_filings",),
+    "fundamentals": ("fundamental_snapshots",),
+    "earnings": ("earnings_events",),
+    "ftd": ("fails_to_deliver",),
+    "corporate_actions": ("corporate_actions",),
+}
 
 
 def _required_training_schema_contract(
@@ -519,9 +530,13 @@ def _required_training_schema_contract(
         required["corporate_actions"] = set(REFERENCE_TRAINING_SCHEMA_CONTRACT["corporate_actions"])
 
     if bool(config.enable_reference_features):
-        reference_contract = {
-            table: set(columns) for table, columns in REFERENCE_TRAINING_SCHEMA_CONTRACT.items()
-        }
+        active_sources = list(
+            config.reference_feature_sources or REFERENCE_SOURCE_SCHEMA_TABLES.keys()
+        )
+        reference_contract: dict[str, set[str]] = {}
+        for source_name in active_sources:
+            for table_name in REFERENCE_SOURCE_SCHEMA_TABLES.get(str(source_name), ()):
+                reference_contract[table_name] = set(REFERENCE_TRAINING_SCHEMA_CONTRACT[table_name])
         if bool(config.allow_feature_group_fallback):
             optional.update(reference_contract)
         else:
@@ -654,7 +669,9 @@ def _load_model_defaults(model_type: str, use_gpu: bool = False) -> dict[str, An
         section = all_cfg.get(model_type, {})
         if not section and model_type == "lightgbm_ranker":
             legacy_section = all_cfg.get("lightgbm", {})
-            legacy_ranker = legacy_section.get("ranker", {}) if isinstance(legacy_section, dict) else {}
+            legacy_ranker = (
+                legacy_section.get("ranker", {}) if isinstance(legacy_section, dict) else {}
+            )
             section = {"ranker": legacy_ranker} if legacy_ranker else {}
         if not section and model_type == "xgboost_regressor":
             section = all_cfg.get("xgboost", {})
@@ -1076,6 +1093,7 @@ class TrainingConfig:
     intrinsic_bar_threshold: float = 0.0
     intrinsic_target_bars_per_day: int = 100
     enable_reference_features: bool = True
+    reference_feature_sources: list[str] = field(default_factory=list)
     adjust_prices_for_corporate_actions: bool = True
     enable_tick_microstructure_features: bool = True
     enable_cross_sectional: bool = True
@@ -1113,6 +1131,7 @@ class TrainingConfig:
 
     def __post_init__(self):
         from quant_trading_system.features.multi_timeframe import normalize_timeframes
+        from quant_trading_system.features.reference import normalize_reference_feature_sources
 
         if not self.model_name:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1291,6 +1310,14 @@ class TrainingConfig:
         if not self.feature_groups:
             self.feature_groups = ["technical", "statistical", "microstructure", "cross_sectional"]
         self.enable_reference_features = bool(self.enable_reference_features)
+        normalized_reference_sources = normalize_reference_feature_sources(
+            self.reference_feature_sources
+            if self.reference_feature_sources
+            else (["all"] if self.enable_reference_features else [])
+        )
+        self.reference_feature_sources = (
+            list(normalized_reference_sources) if self.enable_reference_features else []
+        )
         self.enable_tick_microstructure_features = bool(self.enable_tick_microstructure_features)
         self.adjust_prices_for_corporate_actions = bool(self.adjust_prices_for_corporate_actions)
         self.enable_feature_selection = bool(self.enable_feature_selection)
@@ -3304,10 +3331,7 @@ class ModelTrainer:
         normalized_universe = sorted(set(symbol_universe))
         if float(self.training_metrics.get("symbol_quality_input_symbols", 0.0) or 0.0) <= 0.0:
             self.training_metrics["symbol_quality_input_symbols"] = float(len(normalized_universe))
-        if (
-            float(self.training_metrics.get("symbol_quality_selected_symbols", 0.0) or 0.0)
-            <= 0.0
-        ):
+        if float(self.training_metrics.get("symbol_quality_selected_symbols", 0.0) or 0.0) <= 0.0:
             self.training_metrics["symbol_quality_selected_symbols"] = float(
                 len(normalized_universe)
             )
@@ -4013,6 +4037,7 @@ class ModelTrainer:
         groups_part = ",".join(sorted(self.config.feature_groups))
         cross_sectional_part = "1" if self.config.enable_cross_sectional else "0"
         reference_part = "1" if self.config.enable_reference_features else "0"
+        reference_sources_part = ",".join(self.config.reference_feature_sources or ["all"])
         tick_part = "1" if self.config.enable_tick_microstructure_features else "0"
         timeframes_part = ",".join(self.config.timeframes)
         start_part = start_date.isoformat() if start_date is not None else "none"
@@ -4021,7 +4046,8 @@ class ModelTrainer:
             "train:features:schema:v3:"
             f"{symbol_part}:{start_part}:{end_part}:"
             f"{self.config.timeframe}:{feature_set_id}:{groups_part}:"
-            f"{cross_sectional_part}:{reference_part}:{tick_part}:{timeframes_part}:"
+            f"{cross_sectional_part}:{reference_part}:{reference_sources_part}:"
+            f"{tick_part}:{timeframes_part}:"
             f"{self.config.training_bar_mode}:{self.config.intrinsic_bar_type}:"
             f"{self.feature_pipeline_fingerprint}"
         )
@@ -4055,6 +4081,7 @@ class ModelTrainer:
             "feature_groups": sorted(str(name) for name in self.config.feature_groups),
             "enable_cross_sectional": bool(self.config.enable_cross_sectional),
             "enable_reference_features": bool(self.config.enable_reference_features),
+            "reference_feature_sources": list(self.config.reference_feature_sources),
             "enable_tick_microstructure_features": bool(
                 self.config.enable_tick_microstructure_features
             ),
@@ -4100,6 +4127,7 @@ class ModelTrainer:
                 "groups": sorted(self.config.feature_groups),
                 "cross_sectional": bool(self.config.enable_cross_sectional),
                 "reference_features": bool(self.config.enable_reference_features),
+                "reference_feature_sources": list(self.config.reference_feature_sources),
                 "tick_microstructure_features": bool(
                     self.config.enable_tick_microstructure_features
                 ),
@@ -4115,18 +4143,28 @@ class ModelTrainer:
 
     def _augment_reference_features(self, matrix: pd.DataFrame) -> pd.DataFrame:
         """Augment computed market features with point-in-time reference/event layers."""
-        from quant_trading_system.features.reference import ReferenceFeatureBuilder
+        from quant_trading_system.features.reference import (
+            ReferenceFeatureBuilder,
+            build_reference_feature_config,
+        )
 
         if matrix is None or matrix.empty:
             return matrix
 
         try:
-            builder = ReferenceFeatureBuilder(logger_=self.logger)
+            builder = ReferenceFeatureBuilder(
+                config=build_reference_feature_config(
+                    enabled=self.config.enable_reference_features,
+                    selected_sources=self.config.reference_feature_sources,
+                ),
+                logger_=self.logger,
+            )
             enriched = builder.augment(matrix)
             added_cols = [column for column in enriched.columns if column not in matrix.columns]
             self.logger.info(
-                "Reference feature augmentation added %d columns",
+                "Reference feature augmentation added %d columns from sources=%s",
                 len(added_cols),
+                ",".join(self.config.reference_feature_sources),
             )
             return enriched
         except Exception as exc:
@@ -4662,6 +4700,11 @@ class ModelTrainer:
             return None
         if schema_payload.get("intrinsic_bar_type") != self.config.intrinsic_bar_type:
             self.logger.info("Feature cache intrinsic bar type changed; recomputing features.")
+            return None
+        if list(schema_payload.get("reference_feature_sources", [])) != list(
+            self.config.reference_feature_sources
+        ):
+            self.logger.info("Feature cache reference source scope changed; recomputing features.")
             return None
         if bool(schema_payload.get("enable_tick_microstructure_features", False)) != bool(
             self.config.enable_tick_microstructure_features
@@ -10123,9 +10166,7 @@ class ModelTrainer:
             "meets_min_samples": bool(
                 np.count_nonzero(candidate_mask) >= int(self.config.expected_edge_min_samples)
             ),
-            "meets_min_coverage": bool(
-                candidate_rate >= float(effective_min_coverage)
-            ),
+            "meets_min_coverage": bool(candidate_rate >= float(effective_min_coverage)),
             "long_candidate_count": int(np.count_nonzero(candidate_mask & (signal_values > 0.0))),
             "short_candidate_count": int(np.count_nonzero(candidate_mask & (signal_values < 0.0))),
         }
@@ -10735,7 +10776,9 @@ class ModelTrainer:
         ):
             return summary
 
-        unique_symbols = sorted({str(value).strip() for value in aligned_symbols if str(value).strip()})
+        unique_symbols = sorted(
+            {str(value).strip() for value in aligned_symbols if str(value).strip()}
+        )
         if not unique_symbols:
             return summary
 
@@ -13900,6 +13943,7 @@ class ModelTrainer:
                 "feature_groups": sorted(str(group) for group in self.config.feature_groups),
                 "enable_cross_sectional": bool(self.config.enable_cross_sectional),
                 "enable_reference_features": bool(self.config.enable_reference_features),
+                "reference_feature_sources": list(self.config.reference_feature_sources),
                 "enable_tick_microstructure_features": bool(
                     self.config.enable_tick_microstructure_features
                 ),
@@ -16130,6 +16174,13 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_reference_features", False)),
                     )
                 ),
+                reference_feature_sources=list(
+                    _cfg_value(
+                        "reference_feature_sources",
+                        getattr(args, "reference_feature_sources", []),
+                    )
+                    or []
+                ),
                 enable_tick_microstructure_features=bool(
                     _cfg_value(
                         "enable_tick_microstructure_features",
@@ -17084,6 +17135,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-reference-features",
         action="store_true",
         help="Disable point-in-time reference/event feature augmentation.",
+    )
+    parser.add_argument(
+        "--reference-feature-sources",
+        nargs="+",
+        default=[],
+        help=(
+            "Optional reference feature source allowlist. Supported values: "
+            "macro short_sale news sec_filings fundamentals earnings ftd corporate_actions"
+        ),
     )
     parser.add_argument(
         "--disable-tick-microstructure-features",

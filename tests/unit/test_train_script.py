@@ -728,6 +728,63 @@ def test_run_training_uses_start_end_alias(monkeypatch):
     assert captured["config"].use_gpu is True
 
 
+def test_training_config_normalizes_reference_feature_sources():
+    config = train_script.TrainingConfig(
+        model_type="xgboost",
+        enable_reference_features=True,
+        reference_feature_sources=["sec", "macro", "actions", "sec_filings"],
+    )
+
+    assert config.reference_feature_sources == ["sec_filings", "macro", "corporate_actions"]
+
+
+def test_augment_reference_features_uses_selected_reference_sources(monkeypatch):
+    import quant_trading_system.features.reference as reference_module
+
+    captured = {}
+
+    class FakeReferenceFeatureBuilder:
+        def __init__(self, db_manager=None, config=None, logger_=None):
+            del db_manager, logger_
+            captured["config"] = config
+
+        def augment(self, feature_matrix):
+            enriched = feature_matrix.copy()
+            enriched["ref_stub"] = 1.0
+            return enriched
+
+    monkeypatch.setattr(reference_module, "ReferenceFeatureBuilder", FakeReferenceFeatureBuilder)
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            enable_reference_features=True,
+            reference_feature_sources=["macro", "sec", "news"],
+        )
+    )
+    frame = pd.DataFrame(
+        {
+            "symbol": ["AAPL"],
+            "timestamp": pd.to_datetime(["2025-01-02T10:00:00Z"], utc=True),
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1000.0],
+        }
+    )
+
+    enriched = trainer._augment_reference_features(frame)
+
+    assert "ref_stub" in enriched.columns
+    assert captured["config"].enable_macro_features is True
+    assert captured["config"].enable_sec_filing_features is True
+    assert captured["config"].enable_news_features is True
+    assert captured["config"].enable_fundamental_features is False
+    assert captured["config"].enable_earnings_features is False
+    assert captured["config"].enable_ftd_features is False
+
+
 def test_run_training_maps_feature_pipeline_flags(monkeypatch):
     captured = {}
 
@@ -3748,7 +3805,9 @@ def test_train_expected_edge_policy_uses_effective_coverage_for_large_selective_
             "macro_regime_score": [0.2, 0.1, -0.1, -0.2, 0.0, 0.0],
         }
     )
-    trainer.holdout_symbols = np.array(["AAPL", "AAPL", "MSFT", "MSFT", "AAPL", "MSFT"], dtype=object)
+    trainer.holdout_symbols = np.array(
+        ["AAPL", "AAPL", "MSFT", "MSFT", "AAPL", "MSFT"], dtype=object
+    )
     trainer.holdout_regimes = np.array(
         ["trend_up", "trend_up", "high_vol", "high_vol", "trend_up", "high_vol"],
         dtype=object,
@@ -3772,12 +3831,12 @@ def test_train_expected_edge_policy_uses_effective_coverage_for_large_selective_
     assert candidate_floor["effective_min_coverage"] == pytest.approx(0.20)
     assert candidate_floor["candidate_rate"] < candidate_floor["configured_min_coverage"]
     assert candidate_floor["meets_min_coverage"] is True
-    assert trainer.training_metrics["expected_edge_training_effective_min_coverage"] == pytest.approx(
-        0.20
-    )
-    assert trainer.training_metrics["expected_edge_training_configured_min_coverage"] == pytest.approx(
-        0.55
-    )
+    assert trainer.training_metrics[
+        "expected_edge_training_effective_min_coverage"
+    ] == pytest.approx(0.20)
+    assert trainer.training_metrics[
+        "expected_edge_training_configured_min_coverage"
+    ] == pytest.approx(0.55)
 
 
 def test_run_records_training_run_events(monkeypatch, tmp_path):

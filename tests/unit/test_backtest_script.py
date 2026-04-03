@@ -842,6 +842,33 @@ def test_load_promotion_package_defaults_ranker_runtime_contract(tmp_path: Path)
     assert package.ranker_requires_cross_sectional_panel is True
 
 
+def test_load_promotion_package_restores_reference_feature_sources(tmp_path: Path):
+    model_path = tmp_path / "ref_model.pkl"
+    package_path = tmp_path / "ref_model.promotion_package.json"
+
+    with model_path.open("wb") as handle:
+        pickle.dump(DummyProbabilityModel(), handle)
+
+    package_payload = {
+        "schema_version": "1.0.0",
+        "model_name": "ref_model",
+        "model_type": "lightgbm",
+        "model_path": str(model_path),
+        "feature_contract": {
+            "selected_features": ["feat_a"],
+            "enable_reference_features": True,
+            "reference_feature_sources": ["macro", "sec", "actions"],
+        },
+        "training_config": {"symbols": ["AAPL"], "timeframe": "15Min"},
+    }
+    package_path.write_text(json.dumps(package_payload), encoding="utf-8")
+
+    package = load_promotion_package(package_path)
+
+    assert package.enable_reference_features is True
+    assert package.reference_feature_sources == ("macro", "sec_filings", "corporate_actions")
+
+
 def test_backtest_runner_generates_signals_from_promotion_package(tmp_path: Path):
     model_path = tmp_path / "pkg_model.pkl"
     meta_model_path = tmp_path / "pkg_model_meta.pkl"

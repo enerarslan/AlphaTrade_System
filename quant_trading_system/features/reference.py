@@ -56,6 +56,104 @@ class ReferenceFeatureConfig:
     enable_corporate_action_features: bool = True
 
 
+REFERENCE_FEATURE_SOURCES: tuple[str, ...] = (
+    "macro",
+    "short_sale",
+    "news",
+    "sec_filings",
+    "fundamentals",
+    "earnings",
+    "ftd",
+    "corporate_actions",
+)
+REFERENCE_FEATURE_SOURCE_ALIASES: dict[str, str] = {
+    "macro": "macro",
+    "macros": "macro",
+    "short": "short_sale",
+    "short_sale": "short_sale",
+    "short-sale": "short_sale",
+    "short_sale_volumes": "short_sale",
+    "news": "news",
+    "sec": "sec_filings",
+    "filings": "sec_filings",
+    "sec_filing": "sec_filings",
+    "sec-filings": "sec_filings",
+    "sec_filings": "sec_filings",
+    "fundamental": "fundamentals",
+    "fundamentals": "fundamentals",
+    "earning": "earnings",
+    "earnings": "earnings",
+    "ftd": "ftd",
+    "fails_to_deliver": "ftd",
+    "fails-to-deliver": "ftd",
+    "corporate_action": "corporate_actions",
+    "corporate-action": "corporate_actions",
+    "corporate_actions": "corporate_actions",
+    "corporate-actions": "corporate_actions",
+    "actions": "corporate_actions",
+    "all": "all",
+}
+
+
+def normalize_reference_feature_sources(values: Any) -> list[str]:
+    """Normalize reference feature source selectors into canonical names."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        raw_values = [values]
+    else:
+        raw_values = list(values)
+
+    normalized: list[str] = []
+    for raw_value in raw_values:
+        token = str(raw_value or "").strip().lower()
+        if not token:
+            continue
+        canonical = REFERENCE_FEATURE_SOURCE_ALIASES.get(token)
+        if canonical is None:
+            supported = ", ".join(REFERENCE_FEATURE_SOURCES)
+            raise ValueError(
+                f"Unknown reference feature source '{raw_value}'. Expected one of: {supported}"
+            )
+        if canonical == "all":
+            return list(REFERENCE_FEATURE_SOURCES)
+        if canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
+
+
+def build_reference_feature_config(
+    *,
+    enabled: bool,
+    selected_sources: Any = None,
+) -> ReferenceFeatureConfig:
+    """Build a granular reference-feature config from a canonical source list."""
+    if not enabled:
+        return ReferenceFeatureConfig(
+            enable_macro_features=False,
+            enable_short_sale_features=False,
+            enable_news_features=False,
+            enable_sec_filing_features=False,
+            enable_fundamental_features=False,
+            enable_earnings_features=False,
+            enable_ftd_features=False,
+            enable_corporate_action_features=False,
+        )
+
+    normalized = normalize_reference_feature_sources(selected_sources)
+    active_sources = set(normalized or REFERENCE_FEATURE_SOURCES)
+    return ReferenceFeatureConfig(
+        enable_macro_features="macro" in active_sources,
+        enable_short_sale_features="short_sale" in active_sources,
+        enable_news_features="news" in active_sources,
+        enable_sec_filing_features="sec_filings" in active_sources,
+        enable_fundamental_features="fundamentals" in active_sources,
+        enable_earnings_features="earnings" in active_sources,
+        enable_ftd_features="ftd" in active_sources,
+        enable_corporate_action_features="corporate_actions" in active_sources,
+    )
+
+
 def _coerce_utc_timestamp(values: Any) -> pd.Series:
     timestamps = pd.to_datetime(values, utc=True, errors="coerce")
     if isinstance(timestamps, pd.Series):
@@ -730,12 +828,8 @@ class ReferenceFeatureBuilder:
             valid_sentiment = np.isfinite(sentiment_values).astype(float)
             sentiment_filled = np.nan_to_num(sentiment_values, nan=0.0)
             absolute_sentiment = np.abs(sentiment_filled)
-            positive_events = (
-                sentiment_filled > _NEWS_SENTIMENT_NEUTRAL_TOLERANCE
-            ).astype(float)
-            negative_events = (
-                sentiment_filled < -_NEWS_SENTIMENT_NEUTRAL_TOLERANCE
-            ).astype(float)
+            positive_events = (sentiment_filled > _NEWS_SENTIMENT_NEUTRAL_TOLERANCE).astype(float)
+            negative_events = (sentiment_filled < -_NEWS_SENTIMENT_NEUTRAL_TOLERANCE).astype(float)
             positive_prefix = np.concatenate(([0.0], np.cumsum(positive_events, dtype=float)))
             negative_prefix = np.concatenate(([0.0], np.cumsum(negative_events, dtype=float)))
 
@@ -801,9 +895,7 @@ class ReferenceFeatureBuilder:
             recency_weighted = np.zeros(len(bar_ns), dtype=float)
             valid_age = age_days < _EVENT_AGE_FILL
             if np.any(valid_age):
-                decay = np.exp(
-                    -np.log(2.0) * (age_days[valid_age] / _NEWS_RECENCY_HALF_LIFE_DAYS)
-                )
+                decay = np.exp(-np.log(2.0) * (age_days[valid_age] / _NEWS_RECENCY_HALF_LIFE_DAYS))
                 recency_weighted[valid_age] = last_sentiment[valid_age] * decay
 
             base.loc[row_index, "ref_news_count_6h"] = counts["6h"]

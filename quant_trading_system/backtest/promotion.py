@@ -188,6 +188,7 @@ class PromotionPackageContract:
     feature_schema_version: str | None
     enable_cross_sectional: bool
     enable_reference_features: bool
+    reference_feature_sources: tuple[str, ...]
     enable_tick_microstructure_features: bool
     long_threshold: float
     short_threshold: float
@@ -297,6 +298,17 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
             feature_contract.get("enable_reference_features"),
             training_config.get("enable_reference_features"),
             False,
+        )
+    )
+    from quant_trading_system.features.reference import normalize_reference_feature_sources
+
+    reference_feature_sources = tuple(
+        normalize_reference_feature_sources(
+            _coalesce(
+                feature_contract.get("reference_feature_sources"),
+                training_config.get("reference_feature_sources"),
+                ["all"] if enable_reference_features else [],
+            )
         )
     )
     enable_tick_microstructure_features = bool(
@@ -515,6 +527,7 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         feature_schema_version=feature_schema_version,
         enable_cross_sectional=enable_cross_sectional,
         enable_reference_features=enable_reference_features,
+        reference_feature_sources=reference_feature_sources,
         enable_tick_microstructure_features=enable_tick_microstructure_features,
         long_threshold=long_threshold,
         short_threshold=short_threshold,
@@ -1014,9 +1027,18 @@ class PromotionSignalAdapter:
         merged = pd.concat(feature_frames.values(), ignore_index=True)
         if self.contract.enable_reference_features:
             try:
-                from quant_trading_system.features.reference import ReferenceFeatureBuilder
+                from quant_trading_system.features.reference import (
+                    ReferenceFeatureBuilder,
+                    build_reference_feature_config,
+                )
 
-                merged = ReferenceFeatureBuilder(logger_=self.logger).augment(merged)
+                merged = ReferenceFeatureBuilder(
+                    config=build_reference_feature_config(
+                        enabled=self.contract.enable_reference_features,
+                        selected_sources=getattr(self.contract, "reference_feature_sources", ()),
+                    ),
+                    logger_=self.logger,
+                ).augment(merged)
             except Exception as exc:
                 self.logger.warning("Promotion reference feature augmentation skipped: %s", exc)
         if self.contract.enable_tick_microstructure_features:

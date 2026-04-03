@@ -52,8 +52,8 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONFAULTHANDLER=1
 
-log_file="logs/train_wave1_ranker_research_${run_suffix}.stdout.log"
-model_name="wave1_ranker_research_20260402_${run_suffix}"
+log_file="logs/train_wave1_elastic_research_${run_suffix}.stdout.log"
+model_name="wave1_elastic_research_20260403_${run_suffix}"
 session_name="alphatrade_${run_suffix}"
 launcher_script="$(dirname "$0")/wsl_tmux_launcher.sh"
 
@@ -63,7 +63,7 @@ command=(
   .venv/bin/python
   main.py
   train
-  --model lightgbm_ranker
+  --model elastic_net
   --name "$model_name"
   --training-profile research
   --dataset-snapshot-bundle "$snapshot_bundle"
@@ -98,7 +98,6 @@ command=(
   --execution-turnover-cap 0.60
   --min-confidence-position-scale 0.20
   --probability-calibration-method isotonic
-  --require-gpu
   --max-cross-sectional-rows 500000
   "$@"
 )
