@@ -6003,6 +6003,12 @@ def test_load_training_dataset_snapshot_restores_state(tmp_path):
             "f_beta": [0.8],
         }
     )
+    training_scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            primary_label_horizon=5,
+        )
+    )
     bundle_path, _ = persist_dataset_snapshot_bundle(
         output_dir=tmp_path,
         snapshot_manifest=snapshot_manifest,
@@ -6010,6 +6016,7 @@ def test_load_training_dataset_snapshot_restores_state(tmp_path):
         development_frame=dev_frame,
         holdout_frame=holdout_frame,
         feature_names=["f_alpha", "f_beta"],
+        training_scope=training_scope,
         data_quality_report=quality_report,
         development_sample_weights=np.array([1.0, 0.8]),
         holdout_sample_weights=np.array([0.9]),
@@ -6038,6 +6045,232 @@ def test_load_training_dataset_snapshot_restores_state(tmp_path):
     assert trainer.training_metrics["symbol_quality_selected_symbols"] == pytest.approx(1.0)
     assert trainer.training_metrics["symbol_quality_universe"] == ["AAPL"]
     assert trainer.training_metrics["symbol_quality_report"]["AAPL"]["passes"] is True
+
+
+def test_load_training_dataset_snapshot_strict_rejects_scope_mismatch(tmp_path):
+    raw = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1100.0],
+        }
+    )
+    quality_report = build_data_quality_report(raw.loc[:, ["symbol", "timestamp", "close"]])
+    quality_hash = compute_data_quality_hash(quality_report)
+    snapshot_manifest = build_snapshot_manifest(
+        ohlcv_data=raw,
+        feature_names=["f_alpha", "ref_filing_count_7d"],
+        data_quality_report_hash=quality_hash,
+    )
+    dev_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-01-01T00:00:00Z"], utc=True),
+            "symbol": ["AAPL"],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1000.0],
+            "label": [1],
+            "regime": ["trend_up"],
+            "forward_return_h5": [0.01],
+            "triple_barrier_net_return": [0.008],
+            "f_alpha": [0.1],
+            "ref_filing_count_7d": [1.0],
+        }
+    )
+    holdout_frame = dev_frame.copy()
+
+    bundle_scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            primary_label_horizon=5,
+            enable_reference_features=True,
+            reference_feature_sources=["sec_filings"],
+        )
+    )
+    bundle_path, _ = persist_dataset_snapshot_bundle(
+        output_dir=tmp_path,
+        snapshot_manifest=snapshot_manifest,
+        raw_ohlcv_data=raw,
+        development_frame=dev_frame,
+        holdout_frame=holdout_frame,
+        feature_names=["f_alpha", "ref_filing_count_7d"],
+        training_scope=bundle_scope,
+        data_quality_report=quality_report,
+        label_diagnostics={"positive_rate": 1.0},
+    )
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            dataset_snapshot_bundle_path=str(bundle_path),
+            strict_snapshot_replay=True,
+            primary_label_horizon=5,
+            enable_reference_features=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="training scope"):
+        trainer._load_training_dataset_snapshot()
+
+
+def test_load_training_dataset_snapshot_non_strict_falls_back_on_scope_mismatch(tmp_path):
+    raw = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1100.0],
+        }
+    )
+    quality_report = build_data_quality_report(raw.loc[:, ["symbol", "timestamp", "close"]])
+    quality_hash = compute_data_quality_hash(quality_report)
+    snapshot_manifest = build_snapshot_manifest(
+        ohlcv_data=raw,
+        feature_names=["f_alpha", "ref_filing_count_7d"],
+        data_quality_report_hash=quality_hash,
+    )
+    dev_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-01-01T00:00:00Z"], utc=True),
+            "symbol": ["AAPL"],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1000.0],
+            "label": [1],
+            "regime": ["trend_up"],
+            "forward_return_h5": [0.01],
+            "triple_barrier_net_return": [0.008],
+            "f_alpha": [0.1],
+            "ref_filing_count_7d": [1.0],
+        }
+    )
+    holdout_frame = dev_frame.copy()
+
+    bundle_scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            primary_label_horizon=5,
+            enable_reference_features=True,
+            reference_feature_sources=["sec_filings"],
+        )
+    )
+    bundle_path, _ = persist_dataset_snapshot_bundle(
+        output_dir=tmp_path,
+        snapshot_manifest=snapshot_manifest,
+        raw_ohlcv_data=raw,
+        development_frame=dev_frame,
+        holdout_frame=holdout_frame,
+        feature_names=["f_alpha", "ref_filing_count_7d"],
+        training_scope=bundle_scope,
+        data_quality_report=quality_report,
+        label_diagnostics={"positive_rate": 1.0},
+    )
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            dataset_snapshot_bundle_path=str(bundle_path),
+            strict_snapshot_replay=False,
+            primary_label_horizon=5,
+            enable_reference_features=False,
+        )
+    )
+
+    assert trainer._load_training_dataset_snapshot() is False
+    assert trainer.snapshot_replay_loaded is False
+    assert trainer.training_metrics["snapshot_bundle_scope_validated"] is False
+    assert trainer.training_metrics["snapshot_bundle_scope_issues"]
+
+
+def test_load_training_dataset_snapshot_strict_rejects_dirty_feature_list(tmp_path):
+    raw = pd.DataFrame(
+        {
+            "symbol": ["AAPL", "AAPL"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1000.0, 1100.0],
+        }
+    )
+    quality_report = build_data_quality_report(raw.loc[:, ["symbol", "timestamp", "close"]])
+    quality_hash = compute_data_quality_hash(quality_report)
+    snapshot_manifest = build_snapshot_manifest(
+        ohlcv_data=raw,
+        feature_names=["f_alpha", "ref_filing_count_7d"],
+        data_quality_report_hash=quality_hash,
+    )
+    dev_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-01-01T00:00:00Z"], utc=True),
+            "symbol": ["AAPL"],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1000.0],
+            "label": [1],
+            "regime": ["trend_up"],
+            "forward_return_h5": [0.01],
+            "triple_barrier_net_return": [0.008],
+            "f_alpha": [0.1],
+            "ref_filing_count_7d": [1.0],
+        }
+    )
+    holdout_frame = dev_frame.copy()
+
+    clean_scope = train_script._build_snapshot_training_scope(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            primary_label_horizon=5,
+            enable_reference_features=False,
+        )
+    )
+    bundle_path, _ = persist_dataset_snapshot_bundle(
+        output_dir=tmp_path,
+        snapshot_manifest=snapshot_manifest,
+        raw_ohlcv_data=raw,
+        development_frame=dev_frame,
+        holdout_frame=holdout_frame,
+        feature_names=["f_alpha", "ref_filing_count_7d"],
+        training_scope=clean_scope,
+        data_quality_report=quality_report,
+        label_diagnostics={"positive_rate": 1.0},
+    )
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            dataset_snapshot_bundle_path=str(bundle_path),
+            strict_snapshot_replay=True,
+            primary_label_horizon=5,
+            enable_reference_features=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="reference features present"):
+        trainer._load_training_dataset_snapshot()
 
 
 def test_load_features_from_postgres_recomputes_when_ohlcv_hash_changes(monkeypatch):

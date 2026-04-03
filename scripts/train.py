@@ -393,6 +393,168 @@ def _build_snapshot_training_scope(config: "TrainingConfig") -> dict[str, Any]:
     }
 
 
+_SNAPSHOT_SCOPE_SEQUENCE_KEYS = {
+    "symbols",
+    "feature_groups",
+    "timeframes",
+    "universe_reference_symbols",
+    "label_horizons",
+    "reference_feature_sources",
+}
+_SNAPSHOT_SCOPE_UPPER_KEYS = {"symbols", "universe_reference_symbols"}
+_SNAPSHOT_SCOPE_LOWER_KEYS = {"feature_groups"}
+_REFERENCE_FEATURE_EXACT_SOURCE_MAP: dict[str, tuple[str, ...]] = {
+    "ref_days_since_dividend": ("corporate_actions",),
+    "ref_days_since_split": ("corporate_actions",),
+    "ref_last_dividend_amount": ("corporate_actions",),
+    "ref_last_split_ratio": ("corporate_actions",),
+    "ref_pe_ratio": ("fundamentals",),
+    "ref_price_to_book": ("fundamentals",),
+    "ref_dividend_per_share": ("fundamentals",),
+    "ref_dividend_yield": ("fundamentals",),
+    "ref_operating_margin_ttm": ("fundamentals",),
+    "ref_profit_margin": ("fundamentals",),
+    "ref_beta": ("fundamentals",),
+    "ref_analyst_target_upside": ("fundamentals",),
+    "ref_price_to_52w_high": ("fundamentals",),
+    "ref_price_to_52w_low": ("fundamentals",),
+    "ref_fundamental_days_since_snapshot": ("fundamentals",),
+    "ref_days_since_earnings": ("earnings",),
+    "ref_news_filing_sentiment_pressure": ("news", "sec_filings"),
+    "ref_earnings_short_pressure": ("earnings", "short_sale"),
+    "ref_ftd_short_pressure": ("ftd", "short_sale"),
+    "ref_news_analyst_alignment": ("news", "fundamentals"),
+    "ref_macro_news_stress": ("macro", "news"),
+}
+_REFERENCE_FEATURE_PREFIX_SOURCE_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("macro_", ("macro",)),
+    ("ref_news_", ("news",)),
+    ("ref_filing_", ("sec_filings",)),
+    ("ref_short_", ("short_sale",)),
+    ("ref_market_cap_", ("fundamentals",)),
+    ("ref_shares_outstanding_", ("fundamentals",)),
+    ("ref_revenue_ttm_", ("fundamentals",)),
+    ("ref_earnings_", ("earnings",)),
+    ("ref_ftd_", ("ftd",)),
+    ("ref_corporate_action_", ("corporate_actions",)),
+    ("ref_dividend_", ("corporate_actions",)),
+    ("ref_split_", ("corporate_actions",)),
+)
+
+
+def _normalize_snapshot_scope_value(key: str, value: Any) -> Any:
+    """Normalize snapshot scope values for bundle compatibility checks."""
+    if key == "reference_feature_sources":
+        from quant_trading_system.features.reference import normalize_reference_feature_sources
+
+        try:
+            return normalize_reference_feature_sources(value)
+        except Exception:
+            pass
+
+    if key in _SNAPSHOT_SCOPE_SEQUENCE_KEYS:
+        if value is None:
+            return []
+        raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+        normalized_values: list[Any] = []
+        for raw_value in raw_values:
+            if raw_value is None:
+                continue
+            if key == "label_horizons":
+                try:
+                    normalized_values.append(int(raw_value))
+                except (TypeError, ValueError):
+                    normalized_values.append(str(raw_value).strip())
+                continue
+            token = str(raw_value).strip()
+            if not token:
+                continue
+            if key in _SNAPSHOT_SCOPE_UPPER_KEYS:
+                token = token.upper()
+            elif key in _SNAPSHOT_SCOPE_LOWER_KEYS:
+                token = token.lower()
+            normalized_values.append(token)
+        return sorted(normalized_values)
+    return value
+
+
+def _infer_reference_feature_sources_from_names(
+    feature_names: list[str] | tuple[str, ...] | None,
+) -> tuple[set[str], list[str]]:
+    """Infer reference-data sources from a bundle feature list."""
+    inferred_sources: set[str] = set()
+    unknown_reference_features: list[str] = []
+    for raw_name in feature_names or []:
+        feature_name = str(raw_name).strip()
+        if not feature_name:
+            continue
+        normalized_name = feature_name.lower()
+        mapped_sources = _REFERENCE_FEATURE_EXACT_SOURCE_MAP.get(normalized_name)
+        if mapped_sources is not None:
+            inferred_sources.update(mapped_sources)
+            continue
+
+        matched = False
+        for prefix, sources in _REFERENCE_FEATURE_PREFIX_SOURCE_MAP:
+            if normalized_name.startswith(prefix):
+                inferred_sources.update(sources)
+                matched = True
+                break
+        if matched:
+            continue
+
+        if normalized_name.startswith("macro_") or normalized_name.startswith("ref_"):
+            unknown_reference_features.append(feature_name)
+    return inferred_sources, sorted(set(unknown_reference_features))
+
+
+def _validate_snapshot_bundle_manifest_scope(
+    bundle_manifest: dict[str, Any],
+    config: "TrainingConfig",
+) -> list[str]:
+    """Return auditable scope-mismatch reasons for a snapshot bundle manifest."""
+    expected_scope = _build_snapshot_training_scope(config)
+    actual_scope = bundle_manifest.get("training_scope", {})
+    issues: list[str] = []
+
+    if not isinstance(actual_scope, dict) or not actual_scope:
+        issues.append("bundle manifest is missing a compatible training_scope block")
+    else:
+        for key in sorted(set(expected_scope).union(actual_scope)):
+            expected_value = _normalize_snapshot_scope_value(key, expected_scope.get(key))
+            actual_value = _normalize_snapshot_scope_value(key, actual_scope.get(key))
+            if expected_value != actual_value:
+                issues.append(f"{key}: expected={expected_value!r} actual={actual_value!r}")
+
+    bundle_feature_names = bundle_manifest.get("feature_names", [])
+    if isinstance(bundle_feature_names, list):
+        bundle_sources, unknown_reference_features = _infer_reference_feature_sources_from_names(
+            bundle_feature_names
+        )
+        if not bool(config.enable_reference_features):
+            if bundle_sources or unknown_reference_features:
+                preview = sorted(bundle_sources)[:4] or unknown_reference_features[:4]
+                issues.append(
+                    "reference features present while enable_reference_features=False "
+                    f"(examples={preview!r})"
+                )
+        elif config.reference_feature_sources:
+            allowed_sources = set(config.reference_feature_sources)
+            unexpected_sources = sorted(bundle_sources.difference(allowed_sources))
+            if unexpected_sources:
+                issues.append(
+                    "bundle feature list contains disallowed reference sources "
+                    f"(unexpected={unexpected_sources!r})"
+                )
+            if unknown_reference_features:
+                issues.append(
+                    "bundle feature list contains unmapped reference features under a "
+                    f"source-selective policy (examples={unknown_reference_features[:4]!r})"
+                )
+
+    return issues
+
+
 def _find_reusable_snapshot_bundle(config: "TrainingConfig") -> Path | None:
     """Discover the newest dataset snapshot bundle that matches the current training scope."""
     snapshots_root = Path(config.output_dir) / "snapshots"
@@ -409,6 +571,8 @@ def _find_reusable_snapshot_bundle(config: "TrainingConfig") -> Path | None:
         if not isinstance(payload, dict):
             continue
         if payload.get("training_scope") != expected_scope:
+            continue
+        if _validate_snapshot_bundle_manifest_scope(payload, config):
             continue
         created_at = str(payload.get("created_at") or "")
         candidates.append((created_at, manifest_path))
@@ -3357,6 +3521,46 @@ class ModelTrainer:
             )
             return False
 
+        try:
+            bundle_manifest = json.loads(bundle_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            if self.config.strict_snapshot_replay:
+                raise ValueError(
+                    f"Failed to parse dataset snapshot bundle manifest {bundle_path}: {exc}"
+                ) from exc
+            self.logger.warning(
+                "Failed to parse dataset snapshot bundle manifest (%s); falling back to live data load.",
+                bundle_path,
+            )
+            self.training_metrics["snapshot_bundle_scope_validated"] = False
+            self.training_metrics["snapshot_bundle_scope_issues"] = [
+                f"manifest_parse_error: {exc}"
+            ]
+            return False
+
+        bundle_scope_issues = (
+            _validate_snapshot_bundle_manifest_scope(bundle_manifest, self.config)
+            if isinstance(bundle_manifest, dict)
+            else ["bundle manifest is not a JSON object"]
+        )
+        if bundle_scope_issues:
+            summary = "; ".join(bundle_scope_issues[:6])
+            message = (
+                "Dataset snapshot bundle does not match the requested training scope "
+                f"({bundle_path}): {summary}"
+            )
+            self.training_metrics["snapshot_bundle_scope_validated"] = False
+            self.training_metrics["snapshot_bundle_scope_issues"] = list(bundle_scope_issues)
+            if self.config.strict_snapshot_replay:
+                raise ValueError(
+                    message
+                    + ". Rebuild a scope-matched bundle with --snapshot-only and rerun."
+                )
+            self.logger.warning("%s; rebuilding from live data instead.", message)
+            return False
+
+        self.training_metrics["snapshot_bundle_scope_validated"] = True
+        self.training_metrics["snapshot_bundle_scope_issues"] = []
         bundle = load_dataset_snapshot_bundle(bundle_path)
         development_frame = bundle.get("development_frame")
         if development_frame is None or development_frame.empty:
