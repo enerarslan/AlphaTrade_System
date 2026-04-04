@@ -67,6 +67,28 @@ def _normalize_regime_values(
     return normalized.to_numpy(dtype=object)
 
 
+def _normalize_symbol_values(
+    symbols: np.ndarray | list[str] | pd.Series | None,
+    *,
+    length: int,
+) -> np.ndarray:
+    """Normalize arbitrary symbol labels into stable uppercase keys."""
+    if length <= 0:
+        return np.array([], dtype=object)
+    if symbols is None:
+        return np.full(length, "__UNKNOWN__", dtype=object)
+    arr = np.asarray(symbols, dtype=object).reshape(-1)
+    if arr.size < length:
+        aligned = np.full(length, "__UNKNOWN__", dtype=object)
+        aligned[-arr.size :] = arr.astype(object)
+        arr = aligned
+    elif arr.size > length:
+        arr = arr[-length:]
+    normalized = pd.Series(arr, dtype="object").fillna("__UNKNOWN__").astype(str).str.strip().str.upper()
+    normalized = normalized.where(normalized != "", "__UNKNOWN__")
+    return normalized.to_numpy(dtype=object)
+
+
 def _neutral_regime_policy() -> dict[str, Any]:
     """Return a no-op regime policy block."""
     return {
@@ -341,6 +363,8 @@ def build_expected_edge_feature_frame(
     signal_values: np.ndarray | list[float] | None = None,
     confidence: np.ndarray | list[float] | None = None,
     context_features: list[str] | tuple[str, ...] | None = None,
+    symbols: np.ndarray | list[str] | pd.Series | None = None,
+    symbol_priors: dict[str, dict[str, float]] | None = None,
 ) -> pd.DataFrame:
     """Build the deterministic feature frame consumed by the edge policy model."""
     numeric_frame = _safe_numeric_frame(feature_frame.reset_index(drop=True))
@@ -387,6 +411,33 @@ def build_expected_edge_feature_frame(
     selected_context = [name for name in list(context_features or []) if name in numeric_frame.columns]
     if selected_context:
         frame = pd.concat([frame, numeric_frame.loc[:, selected_context]], axis=1)
+
+    resolved_symbol_priors = symbol_priors if isinstance(symbol_priors, dict) else {}
+    if resolved_symbol_priors:
+        normalized_symbols = _normalize_symbol_values(symbols, length=length)
+        default_prior = resolved_symbol_priors.get("__GLOBAL__", {})
+
+        def _prior_series(key: str, fallback: float) -> np.ndarray:
+            values: list[float] = []
+            for symbol in normalized_symbols.tolist():
+                prior_block = resolved_symbol_priors.get(str(symbol), default_prior)
+                raw_value = prior_block.get(key, default_prior.get(key, fallback))
+                values.append(float(raw_value))
+            return np.asarray(values, dtype=float)
+
+        frame["policy_symbol_edge_prior"] = _prior_series("edge_prior", 0.0)
+        frame["policy_symbol_pass_prior"] = np.clip(_prior_series("pass_prior", 0.5), 0.0, 1.0)
+        frame["policy_symbol_tail_prior"] = _prior_series("tail_prior", 0.0)
+        frame["policy_symbol_downside_prior"] = np.clip(
+            _prior_series("downside_prior", 0.5),
+            0.0,
+            1.0,
+        )
+        frame["policy_symbol_sample_confidence"] = np.clip(
+            _prior_series("sample_confidence", 0.0),
+            0.0,
+            1.0,
+        )
     return frame.replace([np.inf, -np.inf], np.nan)
 
 
@@ -414,6 +465,7 @@ class ExpectedEdgePolicyModel:
         self.feature_scores_: dict[str, float] = {}
         self.edge_reference_: float = 0.001
         self.training_summary_: dict[str, Any] = {}
+        self.symbol_priors_: dict[str, dict[str, float]] = {}
         self._edge_model: Any | None = None
         self._pass_model: Any | None = None
 
@@ -503,6 +555,55 @@ class ExpectedEdgePolicyModel:
         reference = float(np.quantile(positive, 0.65)) if positive.size else 0.001
         return float(max(reference, 1e-4))
 
+    def _build_symbol_priors(
+        self,
+        *,
+        symbols: np.ndarray,
+        trade_returns: np.ndarray,
+        candidate_mask: np.ndarray,
+    ) -> dict[str, dict[str, float]]:
+        """Build shrinkage-based symbol priors for selector alignment."""
+        candidate_returns = trade_returns[candidate_mask]
+        global_mean = float(np.mean(candidate_returns)) if candidate_returns.size else 0.0
+        global_pass = float(np.mean(candidate_returns > 0.0)) if candidate_returns.size else 0.5
+        global_tail = float(np.quantile(candidate_returns, 0.25)) if candidate_returns.size else 0.0
+        global_downside = float(np.mean(candidate_returns <= 0.0)) if candidate_returns.size else 0.5
+        global_prior = {
+            "edge_prior": global_mean,
+            "pass_prior": global_pass,
+            "tail_prior": global_tail,
+            "downside_prior": global_downside,
+            "sample_confidence": 0.0,
+            "candidate_count": 0.0,
+        }
+        priors: dict[str, dict[str, float]] = {"__GLOBAL__": dict(global_prior)}
+        if candidate_returns.size == 0:
+            return priors
+
+        prior_strength = max(12.0, float(self.config.min_samples) * 0.35)
+        for symbol_name in sorted({str(value) for value in symbols[candidate_mask].tolist()}):
+            symbol_mask = candidate_mask & (symbols == symbol_name)
+            symbol_returns = trade_returns[symbol_mask]
+            count = int(symbol_returns.size)
+            if count <= 0:
+                continue
+            shrink = float(count / (count + prior_strength))
+            sym_mean = float(np.mean(symbol_returns))
+            sym_pass = float(np.mean(symbol_returns > 0.0))
+            sym_tail = float(np.quantile(symbol_returns, 0.25))
+            sym_downside = float(np.mean(symbol_returns <= 0.0))
+            priors[str(symbol_name)] = {
+                "edge_prior": float((shrink * sym_mean) + ((1.0 - shrink) * global_mean)),
+                "pass_prior": float((shrink * sym_pass) + ((1.0 - shrink) * global_pass)),
+                "tail_prior": float((shrink * sym_tail) + ((1.0 - shrink) * global_tail)),
+                "downside_prior": float(
+                    (shrink * sym_downside) + ((1.0 - shrink) * global_downside)
+                ),
+                "sample_confidence": float(np.clip(shrink, 0.0, 1.0)),
+                "candidate_count": float(count),
+            }
+        return priors
+
     def fit(
         self,
         feature_frame: pd.DataFrame,
@@ -515,6 +616,7 @@ class ExpectedEdgePolicyModel:
         signal_values: np.ndarray | list[float] | None = None,
         confidence: np.ndarray | list[float] | None = None,
         sample_weights: np.ndarray | pd.Series | None = None,
+        symbols: np.ndarray | list[str] | pd.Series | None = None,
     ) -> dict[str, Any]:
         """Fit the expected-edge admission/sizing policy on candidate trades only."""
         trade_return_values = np.asarray(trade_returns, dtype=float).reshape(-1)
@@ -523,6 +625,22 @@ class ExpectedEdgePolicyModel:
             raise ValueError("Expected-edge policy feature/target length mismatch.")
 
         selected_context = self._select_context_features(numeric_frame, trade_return_values)
+        resolved_signal = (
+            _normalize_vector(signal_values, len(numeric_frame), fill_value=0.0)
+            if signal_values is not None
+            else derive_base_signal(
+                probabilities,
+                long_threshold=float(long_threshold),
+                short_threshold=float(short_threshold),
+            )
+        )
+        normalized_symbols = _normalize_symbol_values(symbols, length=len(numeric_frame))
+        candidate_mask = np.isfinite(trade_return_values) & (np.abs(resolved_signal) > 1e-8)
+        self.symbol_priors_ = self._build_symbol_priors(
+            symbols=normalized_symbols,
+            trade_returns=trade_return_values,
+            candidate_mask=candidate_mask,
+        )
         policy_frame = build_expected_edge_feature_frame(
             numeric_frame,
             probabilities=probabilities,
@@ -532,6 +650,8 @@ class ExpectedEdgePolicyModel:
             signal_values=signal_values,
             confidence=confidence,
             context_features=selected_context,
+            symbols=normalized_symbols,
+            symbol_priors=self.symbol_priors_,
         )
 
         signal = policy_frame["policy_signal_direction"].to_numpy(dtype=float)
@@ -602,6 +722,7 @@ class ExpectedEdgePolicyModel:
             raw_predictions=raw_predictions,
             signal_values=signal_values,
             confidence=confidence,
+            symbols=normalized_symbols,
         )
         selected_mask = training_policy["edge_policy_pass"].to_numpy(dtype=bool)
         selected_edge = trade_return_values[selected_mask & np.isfinite(trade_return_values)]
@@ -618,6 +739,7 @@ class ExpectedEdgePolicyModel:
             "selected_win_rate": float(np.mean(selected_edge > 0.0)) if selected_edge.size else 0.0,
             "edge_reference": float(self.edge_reference_),
             "selected_context_features": list(self.selected_context_features_),
+            "symbol_prior_summary": dict(self.symbol_priors_),
         }
         return dict(self.training_summary_)
 
@@ -644,6 +766,7 @@ class ExpectedEdgePolicyModel:
         raw_predictions: np.ndarray | list[float] | None = None,
         signal_values: np.ndarray | list[float] | None = None,
         confidence: np.ndarray | list[float] | None = None,
+        symbols: np.ndarray | list[str] | pd.Series | None = None,
         regimes: np.ndarray | list[str] | pd.Series | None = None,
         regime_policy: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
@@ -652,6 +775,7 @@ class ExpectedEdgePolicyModel:
             raise RuntimeError("Expected-edge policy model has not been fitted.")
 
         numeric_frame = _safe_numeric_frame(feature_frame.reset_index(drop=True))
+        symbol_priors = getattr(self, "symbol_priors_", {})
         policy_frame = build_expected_edge_feature_frame(
             numeric_frame,
             probabilities=probabilities,
@@ -661,6 +785,8 @@ class ExpectedEdgePolicyModel:
             signal_values=signal_values,
             confidence=confidence,
             context_features=self.selected_context_features_,
+            symbols=symbols,
+            symbol_priors=symbol_priors,
         )
         for column in self.policy_feature_names_:
             if column not in policy_frame.columns:

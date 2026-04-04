@@ -62,10 +62,11 @@ class DummyExpectedEdgeModel:
         raw_predictions=None,
         signal_values=None,
         confidence=None,
+        symbols=None,
         regimes=None,
         regime_policy=None,
     ):
-        del feature_frame, long_threshold, short_threshold, raw_predictions, confidence
+        del feature_frame, long_threshold, short_threshold, raw_predictions, confidence, symbols
         probabilities = np.asarray(probabilities, dtype=float).reshape(-1)
         signal_values = np.asarray(signal_values, dtype=float).reshape(-1)
         runtime_regimes = (

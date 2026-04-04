@@ -1513,6 +1513,7 @@ class PromotionSignalAdapter:
                     raw_predictions=raw_prediction,
                     signal_values=edge_signal_values,
                     confidence=edge_confidence,
+                    symbols=np.full(len(X_df), str(symbol), dtype=object),
                     regimes=runtime_regimes,
                     regime_policy=regime_policy_payload,
                 )

@@ -61,6 +61,52 @@ Bu nedenle siradaki dogru sira:
 3. `xgboost` challenger
 4. ancak bundan sonra tighter ranker hardening
 
+## 1.2 2026-04-04 Execution Guncellemesi
+
+Bu plan uzerinde bugune kadar yapilan ana execution adimlari ve fiili sonuclar:
+
+- Snapshot hijyeni duzeltildi. Scope-safe clean launcher eklendi ve
+  `scripts/train.py` icinde snapshot bundle scope validation sikilastirildi.
+  Boylece `price-only` ve `sec+corp` ablation'lari eski kirli bundle'lari
+  sessizce reuse etmez hale geldi.
+- Clean ranker ablation block tamamlandi: `D0`, `D1`, `D2`, `D3`
+- Challenger block kismen tamamlandi: `E0 xgboost` tamamlandi,
+  `E1 elastic_net` Optuna tamamlandiktan sonra final asamada asiri uzun sure
+  takildigi icin karsilastirma disi birakildi
+- Symbol-level teshiis notu hazirlandi:
+  `docs/WAVE1_D1_SYMBOL_DIAGNOSIS_20260404.md`
+- Reduced-universe deneyleri tamamlandi: `D1b core8`, `D1c stable5`
+
+Su anki fiili durum:
+
+- Hicbir run production promotion gate'lerini gecmedi
+- En guclu benchmark hala `D1 sec+corp core11`
+- `D1b` ve `D1c`, symbol-tail problemini belirgin sekilde duzeltti ama
+  utility/PBO/regime robustness tarafini bozdu
+- Bu da sorunun yalnizca "kotu sembolleri at" seviyesinde olmadigini,
+  symbol-aware activity / selector handoff katmaninda oldugunu gosterdi
+
+Gerceklesen run ozeti:
+
+| Run | Scope | Sonuc | Ana metrikler | Not |
+|---|---|---|---|---|
+| `D0` | clean `price-only` ranker | basarisiz | `mean_sharpe=0.3408`, `risk_adj=-2.9218`, `p25=-0.7741`, `pbo_gate=0.8778` | price-only yeterli edge tasimadi |
+| `D1` | clean `sec_filings + corporate_actions` ranker | en iyi benchmark | `mean_sharpe=1.5240`, `risk_adj=0.8678`, `holdout_sharpe=2.7308`, `worst_regime=1.8815`, `p25=-0.6197`, `pbo_gate=0.5219` | utility en iyi ama `p25` ve `pbo` fail |
+| `D2` | config-only hardening | gerileme | `mean_sharpe=1.0771`, `risk_adj=0.8511`, `worst_regime=-0.7756`, `p25=-0.9230`, `pbo_gate=0.5797` | harder config tek basina ise yaramadi |
+| `D3` | objective/search patch | kismi duzelme, kullanilamaz | `p25=+0.8439`, `underwater=18.18%`, ama `risk_adj=-0.7851`, `policy_sharpe=-0.3732` | cross-symbol duzeldi, expected-edge handoff bozuldu |
+| `E0` | `xgboost` challenger | basarisiz | `mean_sharpe=0.8918`, `risk_adj=0.6487`, `p25=-0.1454`, `worst_regime=-0.4966`, `pbo_gate=0.5487` | challenger sorunu cozmedi |
+| `E1` | `elastic_net` baseline | iptal edildi | Optuna `30/30` tamamlandi ama final asama takildi | karsilastirma disi |
+| `D1b` | reduced `core8` no `META/JPM/MSFT` | symbol-tail duzeldi, utility bozuldu | `mean_sharpe=0.5584`, `risk_adj=-1.6940`, `holdout_sharpe=3.2297`, `p25=+0.0716`, `pbo_gate=0.5899`, `white_p=0.1256` | tail fix tek basina yeterli olmadi |
+| `D1c` | stable `5` symbol ranker | symbol-tail cok iyi, utility yine bozuk | `mean_sharpe=0.4378`, `risk_adj=-2.0649`, `holdout_sharpe=2.4732`, `worst_regime=-0.3457`, `p25=+1.3546`, `pbo_gate=0.5201` | kucuk evren de production adayi olmadi |
+
+Bugun icin en onemli cikarim:
+
+- `D1` tam core evrende en iyi benchmark olarak kaldi
+- `D1b/D1c` deneyi, `p25` probleminin sembol kaynakli oldugunu dogruladi
+- Ancak utility ve PBO ayni anda toparlanmadigi icin sonraki is,
+  daha fazla universe kucultme degil, symbol-aware gating / selector uyumu
+  tarafina odaklanmak olacaktir
+
 ## 2. Veri Kullanim Politikasi
 
 ### 2.1 Su anda primer egitim verisi
@@ -392,6 +438,25 @@ Her blok arasinda karar kurali:
 - Once ayni blokta duzelt, sonra sonraki asamaya gec
 - Eger `price-only` `p25` ve `pbo`'yu iyilestirirse, reference katmanlarini agresif kullanma
 - Eger `sec+corp` `price-only`'dan iyi cikarsa, production adayi reference subset'i bu iki kaynak olacak
+
+### 7.1 2026-04-04 Fiili Durum
+
+Bu run sirasinin su ana kadar gerceklesen kismi:
+
+1. `D0` tamamlandi
+2. `D1` tamamlandi
+3. `D1` benchmark olarak `D0`'in onune gecti
+4. `E0` tamamlandi
+5. `E1` baslatildi ama final asamada takildigi icin karsilastirma disi birakildi
+6. Plan disi ama gerekli iki arastirma kolu daha kosuldu:
+   - `D1b`: reduced `core8`
+   - `D1c`: stable `5`
+
+Bu fiili execution sonunda:
+
+- challenger block, `E0` ile yeterli sinyal verdi
+- reduced-universe branch, `p25` probleminin gercekten symbol-driven oldugunu dogruladi
+- ama henuz replay/backtest/paper hattina gecis icin uygun production candidate cikmadi
 
 ## 8. Hangi Komut Tiplerini Kullanacagiz
 

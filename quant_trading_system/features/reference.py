@@ -736,6 +736,7 @@ class ReferenceFeatureBuilder:
                 NewsArticle.symbols,
                 NewsArticle.sentiment,
                 NewsArticle.source,
+                NewsArticle.url,
             ).where(
                 NewsArticle.created_at_source
                 >= (min_timestamp - pd.Timedelta(days=8)).to_pydatetime(),
@@ -749,7 +750,7 @@ class ReferenceFeatureBuilder:
 
         news_df = pd.DataFrame(
             rows,
-            columns=["article_id", "created_at_source", "symbols", "sentiment", "source"],
+            columns=["article_id", "created_at_source", "symbols", "sentiment", "source", "url"],
         )
         news_df["event_timestamp"] = _coerce_utc_timestamp(news_df["created_at_source"])
         news_df["symbols"] = news_df["symbols"].map(_normalize_symbol_list)
@@ -763,6 +764,17 @@ class ReferenceFeatureBuilder:
         news_df["symbol"] = news_df["symbol"].astype(str).str.upper().str.strip()
         news_df["sentiment"] = _series_to_float(news_df["sentiment"])
         news_df["source"] = news_df["source"].astype(str).str.strip()
+        news_df["url"] = news_df["url"].fillna("").astype(str).str.strip()
+        news_df["_has_sentiment"] = news_df["sentiment"].notna().astype(int)
+        news_df["_source_priority"] = (news_df["source"].str.lower() == "alpha_vantage").astype(int)
+        with_url = news_df[news_df["url"] != ""].copy()
+        without_url = news_df[news_df["url"] == ""].copy()
+        if not with_url.empty:
+            with_url = with_url.sort_values(
+                by=["symbol", "url", "_has_sentiment", "_source_priority", "event_timestamp"],
+                ascending=[True, True, False, False, False],
+            ).drop_duplicates(subset=["symbol", "url"], keep="first")
+        news_df = pd.concat([with_url, without_url], ignore_index=True, sort=False)
         return news_df[["article_id", "event_timestamp", "symbol", "sentiment", "source"]].copy()
 
     def _augment_news_features(

@@ -1389,6 +1389,43 @@ def cmd_bootstrap_free(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill_news_sentiment(args: argparse.Namespace) -> int:
+    """Backfill historical symbol-specific news sentiment from Alpha Vantage."""
+    logger.info("=" * 80)
+    logger.info("ALPHA VANTAGE NEWS SENTIMENT BACKFILL")
+    logger.info("=" * 80)
+
+    from quant_trading_system.data.institutional_bootstrap import (
+        InstitutionalBootstrapConfig,
+        InstitutionalDataBootstrapper,
+    )
+
+    today = date.today()
+    config = InstitutionalBootstrapConfig(
+        output_root=Path(getattr(args, "output_root", "data")),
+        sync_db=not bool(getattr(args, "no_sync_db", False)),
+        news_start=today - timedelta(days=int(getattr(args, "news_days", 365))),
+        alpha_vantage_news_window_days=int(getattr(args, "window_days", 120)),
+        include_news=True,
+        include_sec=False,
+        include_macro=False,
+        include_corporate_actions=False,
+        include_fundamentals=False,
+        include_daily_bars=False,
+        include_intraday_bars=False,
+    )
+    bootstrapper = InstitutionalDataBootstrapper(config)
+    symbols = _resolve_cli_symbols(args)
+    manifest = bootstrapper.backfill_alpha_vantage_news_sentiment(symbols or None)
+    logger.info(
+        "Alpha Vantage sentiment backfill complete: %s rows for %s symbols, manifest written to %s",
+        manifest.get("rows", 0),
+        manifest.get("symbol_count", 0),
+        Path(config.output_root) / "export" / "alpha_vantage_news_manifest.json",
+    )
+    return 0
+
+
 def cmd_bootstrap_gap_free(args: argparse.Namespace) -> int:
     """Bootstrap the highest-value missing free data layers."""
     logger.info("=" * 80)
@@ -1865,6 +1902,7 @@ def run_data_command(args: argparse.Namespace) -> int:
         "load": cmd_download,
         "download": cmd_download,
         "bootstrap-free": cmd_bootstrap_free,
+        "backfill-news-sentiment": cmd_backfill_news_sentiment,
         "bootstrap-gap-free": cmd_bootstrap_gap_free,
         "validate": cmd_validate,
         "preprocess": cmd_preprocess,
@@ -1949,6 +1987,22 @@ if __name__ == "__main__":
     bootstrap_parser.add_argument("--no-fundamentals", action="store_true")
     bootstrap_parser.add_argument("--no-daily", action="store_true")
     bootstrap_parser.add_argument("--no-intraday", action="store_true")
+
+    news_backfill_parser = subparsers.add_parser(
+        "backfill-news-sentiment",
+        help="Backfill symbol-specific news sentiment from Alpha Vantage into news_articles",
+    )
+    news_backfill_parser.add_argument("--symbols", nargs="+", default=[])
+    news_backfill_parser.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
+    news_backfill_parser.add_argument("--news-days", type=int, default=365)
+    news_backfill_parser.add_argument("--window-days", type=int, default=120)
+    news_backfill_parser.add_argument("--output-root", type=Path, default=Path("data"))
+    news_backfill_parser.add_argument("--no-sync-db", action="store_true")
 
     gap_bootstrap_parser = subparsers.add_parser(
         "bootstrap-gap-free",

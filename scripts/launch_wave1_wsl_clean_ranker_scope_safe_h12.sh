@@ -9,7 +9,7 @@ fi
 run_suffix="$1"
 shift
 
-symbols_file="data/training/universes/wave1_clean_core11_20260402.json"
+symbols_file="${ALPHATRADE_SYMBOLS_FILE:-data/training/universes/wave1_clean_core11_20260402.json}"
 blocked_overrides=(
   "--dataset-snapshot-bundle"
   "--symbols"

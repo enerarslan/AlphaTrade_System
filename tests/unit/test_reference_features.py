@@ -107,6 +107,45 @@ def test_news_features_respect_event_timestamps(monkeypatch: pytest.MonkeyPatch)
     assert result.loc[2, "ref_news_sentiment_momentum"] == pytest.approx(-0.3)
 
 
+def test_load_news_articles_dedupes_same_url_preferring_sentiment_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _builder()
+
+    monkeypatch.setattr(
+        builder,
+        "_read_rows",
+        lambda statement: [
+            (
+                "alp-1",
+                datetime(2025, 1, 2, 15, 0, tzinfo=UTC),
+                ["AAPL"],
+                None,
+                "alpaca",
+                "https://example.com/story",
+            ),
+            (
+                "av-1",
+                datetime(2025, 1, 2, 15, 0, tzinfo=UTC),
+                ["AAPL"],
+                0.55,
+                "alpha_vantage",
+                "https://example.com/story",
+            ),
+        ],
+    )
+
+    result = builder._load_news_articles(
+        min_timestamp=pd.Timestamp("2025-01-02T00:00:00Z"),
+        max_timestamp=pd.Timestamp("2025-01-03T00:00:00Z"),
+    )
+
+    assert len(result) == 1
+    assert result.loc[0, "article_id"] == "av-1"
+    assert result.loc[0, "sentiment"] == pytest.approx(0.55)
+    assert result.loc[0, "source"] == "alpha_vantage"
+
+
 def test_reference_interaction_features_capture_cross_source_pressure() -> None:
     builder = _builder()
     base = _base_frame(["2025-01-03T21:00:00Z"])

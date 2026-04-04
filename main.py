@@ -1761,7 +1761,7 @@ For more information, visit: https://github.com/alphatrade/docs
         "--news-days",
         type=int,
         default=365,
-        help="Days of Alpaca news history to fetch (default: 365)",
+        help="Days of news history to fetch (default: 365)",
     )
     data_bootstrap.add_argument(
         "--output-root",
@@ -1781,6 +1781,46 @@ For more information, visit: https://github.com/alphatrade/docs
     data_bootstrap.add_argument("--no-fundamentals", action="store_true", help="Skip Finnhub fundamentals/earnings")
     data_bootstrap.add_argument("--no-daily", action="store_true", help="Skip broad-universe daily bars")
     data_bootstrap.add_argument("--no-intraday", action="store_true", help="Skip core-universe intraday bars")
+
+    data_news_backfill = data_subparsers.add_parser(
+        "backfill-news-sentiment",
+        help="Backfill symbol-specific news sentiment from Alpha Vantage into news_articles",
+    )
+    data_news_backfill.add_argument(
+        "--symbols",
+        nargs="+",
+        default=[],
+        help="Optional explicit symbol list; defaults to the configured core universe",
+    )
+    data_news_backfill.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Load symbols from a newline/comma separated text file or JSON payload.",
+    )
+    data_news_backfill.add_argument(
+        "--news-days",
+        type=int,
+        default=365,
+        help="Days of Alpha Vantage news history to fetch (default: 365)",
+    )
+    data_news_backfill.add_argument(
+        "--window-days",
+        type=int,
+        default=120,
+        help="Per-request Alpha Vantage time window in days (default: 120)",
+    )
+    data_news_backfill.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("data"),
+        help="Root directory for manifest/export outputs (default: data)",
+    )
+    data_news_backfill.add_argument(
+        "--no-sync-db",
+        action="store_true",
+        help="Skip writing backfilled sentiment rows to PostgreSQL",
+    )
 
     data_gap_bootstrap = data_subparsers.add_parser(
         "bootstrap-gap-free",

@@ -10216,6 +10216,7 @@ class ModelTrainer:
             short_threshold=float(short_threshold),
             signal_values=holdout_signal,
             confidence=holdout_confidence,
+            symbols=holdout_symbols,
             regimes=holdout_regimes,
             regime_policy=regime_policy,
         )
@@ -10421,6 +10422,7 @@ class ModelTrainer:
                 signal_values=signal_values,
                 confidence=signal_confidence,
                 sample_weights=sample_weights,
+                symbols=aligned_symbols,
             )
         except ValueError as exc:
             self.training_metrics["expected_edge_policy_reason"] = str(exc)
@@ -10450,6 +10452,7 @@ class ModelTrainer:
             short_threshold=float(short_threshold),
             signal_values=signal_values,
             confidence=signal_confidence,
+            symbols=aligned_symbols,
         )
         training_funnel_summary, training_funnel_by_symbol, training_funnel_by_regime = (
             self._build_signal_funnel_summary(

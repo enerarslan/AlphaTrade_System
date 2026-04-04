@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -175,6 +176,32 @@ def _parse_decimal(value: Any, multiplier: Decimal | None = None) -> Decimal | N
         return None
 
 
+def _parse_float(value: Any) -> float | None:
+    if value in (None, "", "None", "null", "NaN"):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(number):
+        return None
+    return number
+
+
+def _parse_env_key_list(*values: str) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        if not raw_value:
+            continue
+        for part in str(raw_value).replace("\n", ",").replace(";", ",").split(","):
+            key = str(part).strip()
+            if key and key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
+
+
 def _coerce_scalar(value: Any) -> Any:
     if isinstance(value, pd.Timestamp):
         if pd.isna(value):
@@ -301,6 +328,7 @@ class InstitutionalBootstrapConfig:
     intraday_15m_start: date = field(default_factory=lambda: date.today() - timedelta(days=365 * 5))
     intraday_1m_start: date = field(default_factory=lambda: date.today() - timedelta(days=365 * 2))
     news_start: date = field(default_factory=lambda: date.today() - timedelta(days=365))
+    alpha_vantage_news_window_days: int = 120
     core_universe_path: Path = Path("quant_trading_system/config/symbols.yaml")
     include_news: bool = True
     include_sec: bool = True
@@ -364,7 +392,12 @@ class InstitutionalDataBootstrapper:
             "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", ""),
         }
         self.finnhub_token = os.getenv("FINNHUB_API_KEY", "").strip()
-        self.alpha_vantage_key = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
+        self.alpha_vantage_keys = _parse_env_key_list(
+            os.getenv("ALPHA_VANTAGE_API_KEYS", ""),
+            os.getenv("ALPHA_VANTAGE_API_KEY", "").strip(),
+        )
+        self.alpha_vantage_key = self.alpha_vantage_keys[0] if self.alpha_vantage_keys else ""
+        self._alpha_vantage_key_cursor = 0
 
         self.provider_gate = _ProviderGate()
         self.db_loader = get_db_loader() if self.config.sync_db else None
@@ -390,9 +423,23 @@ class InstitutionalDataBootstrapper:
         provider: str,
         timeout: int = 60,
     ) -> Any:
-        for attempt in range(5):
+        attempts = 5
+        alpha_vantage_keys: list[str] = []
+        if provider == "alpha_vantage":
+            explicit_key = str((params or {}).get("apikey") or "").strip()
+            alpha_vantage_keys = _parse_env_key_list(
+                ",".join(self.alpha_vantage_keys),
+                explicit_key,
+            )
+            attempts = max(attempts, len(alpha_vantage_keys) * 2) if alpha_vantage_keys else attempts
+
+        for attempt in range(attempts):
+            request_params = dict(params or {})
+            if provider == "alpha_vantage" and alpha_vantage_keys:
+                key_index = (self._alpha_vantage_key_cursor + attempt) % len(alpha_vantage_keys)
+                request_params["apikey"] = alpha_vantage_keys[key_index]
             self.provider_gate.wait(provider)
-            response = self.session.get(url, params=params, headers=headers, timeout=timeout)
+            response = self.session.get(url, params=request_params, headers=headers, timeout=timeout)
             if response.status_code == 429:
                 time.sleep(min(2**attempt, 15))
                 continue
@@ -400,9 +447,19 @@ class InstitutionalDataBootstrapper:
             data = response.json()
             if provider == "alpha_vantage" and isinstance(data, dict):
                 message = str(data.get("Note") or data.get("Information") or "")
-                if "rate limit" in message.lower():
-                    time.sleep(max(10.0, 2**attempt))
+                lower_message = message.lower()
+                if (
+                    "rate limit" in lower_message
+                    or "requests per day" in lower_message
+                    or "premium plans" in lower_message
+                ):
+                    if len(alpha_vantage_keys) <= 1:
+                        time.sleep(max(10.0, 2**attempt))
                     continue
+                if alpha_vantage_keys:
+                    self._alpha_vantage_key_cursor = (
+                        (self._alpha_vantage_key_cursor + attempt + 1) % len(alpha_vantage_keys)
+                    )
             return data
         raise RuntimeError(f"{provider} request failed after retries: {url}")
 
@@ -478,13 +535,58 @@ class InstitutionalDataBootstrapper:
             self._save_table_export("macro_observations", macro)
 
         if self.config.include_news:
-            news_records = self.download_alpaca_news(core_symbols)
+            alpaca_news_records = self.download_alpaca_news(core_symbols)
+            alpha_vantage_news_records = self.download_alpha_vantage_news(core_symbols)
+            news_records = alpaca_news_records + alpha_vantage_news_records
             self._upsert_records(NewsArticle, news_records)
             self._save_table_export("news_articles", news_records)
+            self._record_dataset(
+                "news_articles",
+                rows=len(news_records),
+                providers={
+                    "alpaca": len(alpaca_news_records),
+                    "alpha_vantage": len(alpha_vantage_news_records),
+                },
+            )
 
         self.manifest["generated_at"] = _now_utc().isoformat()
         self.manifest_path.write_text(json.dumps(self.manifest, indent=2), encoding="utf-8")
         return self.manifest
+
+    def backfill_alpha_vantage_news_sentiment(
+        self,
+        symbols: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Backfill symbol-specific news sentiment into ``news_articles`` from Alpha Vantage."""
+        if self.config.sync_db and self.db_manager is not None:
+            run_database_migrations(
+                database_url=self.db_manager.engine.url.render_as_string(hide_password=False)
+            )
+
+        resolved_symbols = [
+            normalized
+            for normalized in (
+                _safe_symbol(symbol) for symbol in (symbols or self._load_core_symbols())
+            )
+            if normalized
+        ]
+        deduped_symbols = list(dict.fromkeys(resolved_symbols))
+        news_records = self.download_alpha_vantage_news(deduped_symbols)
+        self._upsert_records(NewsArticle, news_records)
+        self._save_table_export("news_articles_alpha_vantage", news_records)
+
+        manifest = {
+            "generated_at": _now_utc().isoformat(),
+            "news_start": self.config.news_start.isoformat(),
+            "symbol_count": len(deduped_symbols),
+            "symbols": deduped_symbols,
+            "rows": len(news_records),
+            "window_days": int(self.config.alpha_vantage_news_window_days),
+        }
+        manifest_path = self.output_root / "export" / "alpha_vantage_news_manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return manifest
 
     def _load_core_symbols(self) -> list[str]:
         data = yaml.safe_load(self.config.core_universe_path.read_text(encoding="utf-8"))
@@ -1297,6 +1399,165 @@ class InstitutionalDataBootstrapper:
                     break
 
         self._record_dataset("news_articles", rows=len(records))
+        return records
+
+    def download_alpha_vantage_news(self, symbols: Sequence[str]) -> list[dict[str, Any]]:
+        """Download symbol-specific news sentiment from Alpha Vantage."""
+        if not self.alpha_vantage_key:
+            logger.info("Skipping Alpha Vantage news sentiment download: ALPHA_VANTAGE_API_KEY missing")
+            self._record_dataset("news_articles_alpha_vantage", rows=0, skipped=True)
+            return []
+
+        unique_symbols = list(dict.fromkeys(_safe_symbol(symbol) for symbol in symbols if symbol))
+        if not unique_symbols:
+            self._record_dataset("news_articles_alpha_vantage", rows=0, skipped=True)
+            return []
+
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        now = _now_utc()
+        window_days = max(int(self.config.alpha_vantage_news_window_days), 1)
+        end_dt = _now_utc()
+        window_start = datetime.combine(self.config.news_start, datetime.min.time(), tzinfo=timezone.utc)
+
+        while window_start < end_dt:
+            window_end = min(window_start + timedelta(days=window_days), end_dt)
+            time_from = window_start.strftime("%Y%m%dT%H%M")
+            time_to = window_end.strftime("%Y%m%dT%H%M")
+
+            for symbol in unique_symbols:
+                try:
+                    data = self._get_json(
+                        "https://www.alphavantage.co/query",
+                        params={
+                            "function": "NEWS_SENTIMENT",
+                            "tickers": symbol,
+                            "time_from": time_from,
+                            "time_to": time_to,
+                            "sort": "EARLIEST",
+                            "limit": 1000,
+                            "apikey": self.alpha_vantage_key,
+                        },
+                        provider="alpha_vantage",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Alpha Vantage news sentiment failed for %s [%s -> %s]: %s",
+                        symbol,
+                        time_from,
+                        time_to,
+                        exc,
+                    )
+                    continue
+
+                articles = data.get("feed", []) if isinstance(data, dict) else []
+                if not isinstance(articles, list):
+                    continue
+                if len(articles) >= 1000:
+                    logger.warning(
+                        "Alpha Vantage news window hit the 1000-article cap for %s [%s -> %s]; "
+                        "consider reducing alpha_vantage_news_window_days for fuller coverage.",
+                        symbol,
+                        time_from,
+                        time_to,
+                    )
+
+                for article in articles:
+                    if not isinstance(article, dict):
+                        continue
+
+                    published_at = _parse_datetime_utc(article.get("time_published"))
+                    if published_at is None:
+                        continue
+
+                    ticker_sentiment = None
+                    for payload in article.get("ticker_sentiment") or []:
+                        if not isinstance(payload, dict):
+                            continue
+                        if _safe_symbol(payload.get("ticker")) == symbol:
+                            ticker_sentiment = payload
+                            break
+
+                    sentiment_score = _parse_float(
+                        (ticker_sentiment or {}).get("ticker_sentiment_score")
+                    )
+                    if sentiment_score is None:
+                        sentiment_score = _parse_float(article.get("overall_sentiment_score"))
+                    if sentiment_score is None:
+                        continue
+
+                    title = str(article.get("title") or "").strip()
+                    summary = article.get("summary")
+                    url = article.get("url")
+                    article_key = hashlib.sha1(
+                        "|".join(
+                            [
+                                symbol,
+                                str(url or ""),
+                                published_at.isoformat(),
+                                title,
+                            ]
+                        ).encode("utf-8", errors="ignore")
+                    ).hexdigest()[:24]
+                    article_id = f"av::{symbol}::{article_key}"
+                    if article_id in seen:
+                        continue
+                    seen.add(article_id)
+
+                    authors = article.get("authors") or []
+                    if isinstance(authors, list):
+                        author_value = ", ".join(
+                            str(author).strip() for author in authors if str(author).strip()
+                        )
+                    else:
+                        author_value = str(authors).strip()
+
+                    records.append(
+                        {
+                            "article_id": article_id,
+                            "source": "alpha_vantage",
+                            "headline": title or None,
+                            "author": (author_value[:255] if author_value else None),
+                            "created_at_source": published_at,
+                            "updated_at_source": published_at,
+                            "summary": summary,
+                            "url": url,
+                            "symbols": [symbol],
+                            "sentiment": sentiment_score,
+                            "news_metadata": {
+                                "source": article.get("source"),
+                                "source_domain": article.get("source_domain"),
+                                "category_within_source": article.get("category_within_source"),
+                                "overall_sentiment_score": _parse_float(
+                                    article.get("overall_sentiment_score")
+                                ),
+                                "overall_sentiment_label": article.get("overall_sentiment_label"),
+                                "ticker_sentiment_score": _parse_float(
+                                    (ticker_sentiment or {}).get("ticker_sentiment_score")
+                                ),
+                                "ticker_sentiment_label": (ticker_sentiment or {}).get(
+                                    "ticker_sentiment_label"
+                                ),
+                                "relevance_score": _parse_float(
+                                    (ticker_sentiment or {}).get("relevance_score")
+                                ),
+                                "topics": article.get("topics"),
+                                "banner_image": article.get("banner_image"),
+                                "article_key": article_key,
+                            },
+                            "created_at": now,
+                            "updated_at": now,
+                        }
+                    )
+
+            window_start = window_end
+
+        self._record_dataset(
+            "news_articles_alpha_vantage",
+            rows=len(records),
+            symbol_count=len(unique_symbols),
+            window_days=window_days,
+        )
         return records
 
     def _save_bar_frame(self, frame: pd.DataFrame, path: Path) -> None:
