@@ -1822,6 +1822,46 @@ For more information, visit: https://github.com/alphatrade/docs
         help="Skip writing backfilled sentiment rows to PostgreSQL",
     )
 
+    data_local_news_backfill = data_subparsers.add_parser(
+        "backfill-local-news-sentiment",
+        help="Backfill article sentiment locally with FinBERT-style transformer inference",
+    )
+    data_local_news_backfill.add_argument(
+        "--model-name",
+        type=str,
+        default="ProsusAI/finbert",
+        help="Hugging Face sentiment model id (default: ProsusAI/finbert)",
+    )
+    data_local_news_backfill.add_argument(
+        "--source",
+        type=str,
+        default="alpaca",
+        help="Restrict backfill to one news source (default: alpaca)",
+    )
+    data_local_news_backfill.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        help="Sentiment backend: auto, transformers, or vader (default: auto)",
+    )
+    data_local_news_backfill.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Inference batch size (default: 32)",
+    )
+    data_local_news_backfill.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional maximum article count to score",
+    )
+    data_local_news_backfill.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Recompute sentiment even when a row already has a score",
+    )
+
     data_gap_bootstrap = data_subparsers.add_parser(
         "bootstrap-gap-free",
         help="Bootstrap missing institutional-style free data layers",

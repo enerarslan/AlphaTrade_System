@@ -1426,6 +1426,35 @@ def cmd_backfill_news_sentiment(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill_local_news_sentiment(args: argparse.Namespace) -> int:
+    """Backfill historical article sentiment with a local FinBERT-style model."""
+    logger.info("=" * 80)
+    logger.info("LOCAL NEWS SENTIMENT BACKFILL")
+    logger.info("=" * 80)
+
+    from quant_trading_system.data.news_sentiment import (
+        LocalNewsSentimentBackfiller,
+        LocalNewsSentimentConfig,
+    )
+
+    config = LocalNewsSentimentConfig(
+        model_name=str(getattr(args, "model_name", "ProsusAI/finbert")),
+        batch_size=int(getattr(args, "batch_size", 32)),
+        source=getattr(args, "source", "alpaca"),
+        only_null_sentiment=not bool(getattr(args, "overwrite", False)),
+        limit=(int(getattr(args, "limit")) if getattr(args, "limit", None) else None),
+        backend=str(getattr(args, "backend", "auto")),
+    )
+    result = LocalNewsSentimentBackfiller(config, logger_=logger).run()
+    logger.info(
+        "Local sentiment backfill complete: %s rows updated from %s using %s",
+        result.get("updated_rows", 0),
+        result.get("source"),
+        result.get("model_name"),
+    )
+    return 0
+
+
 def cmd_bootstrap_gap_free(args: argparse.Namespace) -> int:
     """Bootstrap the highest-value missing free data layers."""
     logger.info("=" * 80)
@@ -1903,6 +1932,7 @@ def run_data_command(args: argparse.Namespace) -> int:
         "download": cmd_download,
         "bootstrap-free": cmd_bootstrap_free,
         "backfill-news-sentiment": cmd_backfill_news_sentiment,
+        "backfill-local-news-sentiment": cmd_backfill_local_news_sentiment,
         "bootstrap-gap-free": cmd_bootstrap_gap_free,
         "validate": cmd_validate,
         "preprocess": cmd_preprocess,
@@ -2003,6 +2033,17 @@ if __name__ == "__main__":
     news_backfill_parser.add_argument("--window-days", type=int, default=120)
     news_backfill_parser.add_argument("--output-root", type=Path, default=Path("data"))
     news_backfill_parser.add_argument("--no-sync-db", action="store_true")
+
+    local_news_backfill_parser = subparsers.add_parser(
+        "backfill-local-news-sentiment",
+        help="Backfill article sentiment locally with FinBERT-style transformer inference",
+    )
+    local_news_backfill_parser.add_argument("--model-name", type=str, default="ProsusAI/finbert")
+    local_news_backfill_parser.add_argument("--source", type=str, default="alpaca")
+    local_news_backfill_parser.add_argument("--backend", type=str, default="auto")
+    local_news_backfill_parser.add_argument("--batch-size", type=int, default=32)
+    local_news_backfill_parser.add_argument("--limit", type=int, default=None)
+    local_news_backfill_parser.add_argument("--overwrite", action="store_true")
 
     gap_bootstrap_parser = subparsers.add_parser(
         "bootstrap-gap-free",

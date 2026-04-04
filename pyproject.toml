@@ -116,6 +116,9 @@ altdata = [
     "aiohttp>=3.9.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
+    "transformers>=4.40.0",
+    "safetensors>=0.4.0",
+    "vaderSentiment>=3.3.2",
 ]
 # Full installation with all optional features
 full = [
@@ -124,6 +127,9 @@ full = [
     "aiohttp>=3.9.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
+    "transformers>=4.40.0",
+    "safetensors>=0.4.0",
+    "vaderSentiment>=3.3.2",
     "shap>=0.43.0",  # Model explainability
     "lime>=0.2.0",   # Model explainability
 ]
