@@ -7367,23 +7367,11 @@ class ModelTrainer:
             max_depth = float(p.get("max_depth", 5))
             learning_rate = float(p.get("learning_rate", 0.03))
             min_leaf = float(p.get("min_data_in_leaf", 40))
-            feature_fraction = float(p.get("feature_fraction", 0.82))
-            bagging_fraction = float(p.get("bagging_fraction", 0.84))
-            bagging_freq = float(p.get("bagging_freq", 1))
-            lambda_l1 = float(p.get("lambda_l1", 0.20))
-            lambda_l2 = float(p.get("lambda_l2", 2.0))
-            min_gain_to_split = float(p.get("min_gain_to_split", 0.10))
 
             penalty += 0.06 * max(0.0, (num_leaves - 36.0) / 12.0)
             penalty += 0.05 * max(0.0, max_depth - 5.0)
             penalty += 0.06 * max(0.0, (learning_rate - 0.040) / 0.015)
             penalty += 0.04 * max(0.0, (35.0 - min_leaf) / 10.0)
-            penalty += 0.04 * max(0.0, (feature_fraction - 0.86) / 0.04)
-            penalty += 0.04 * max(0.0, (bagging_fraction - 0.88) / 0.04)
-            penalty += 0.03 * max(0.0, (bagging_freq - 2.0) / 1.0)
-            penalty += 0.03 * max(0.0, (0.15 - lambda_l1) / 0.10)
-            penalty += 0.04 * max(0.0, (1.50 - lambda_l2) / 0.50)
-            penalty += 0.04 * max(0.0, (0.10 - min_gain_to_split) / 0.04)
             return float(max(0.0, penalty))
 
         return 0.0
@@ -11084,14 +11072,8 @@ class ModelTrainer:
         if symbol_sharpe_p25 is not None:
             tail_shortfall = max(0.0, symbol_tail_floor - float(symbol_sharpe_p25))
             tail_scale = max(0.25, abs(symbol_tail_floor) + 0.10)
-            normalized_tail_shortfall = float(tail_shortfall / tail_scale)
             symbol_tail_penalty = float(
-                -self.config.objective_weight_tail_risk
-                * (
-                    min(1.0, normalized_tail_shortfall)
-                    + (0.90 * min(1.0, max(0.0, normalized_tail_shortfall - 1.0)))
-                    + (0.60 * min(2.0, max(0.0, normalized_tail_shortfall - 2.0)))
-                )
+                -self.config.objective_weight_tail_risk * min(2.0, tail_shortfall / tail_scale)
             )
         skew_penalty = float(-self.config.objective_weight_skew * max(0.0, -float(skew)))
         equity_break_penalty = float(-2.0 * max(0.0, float(equity_break)))
