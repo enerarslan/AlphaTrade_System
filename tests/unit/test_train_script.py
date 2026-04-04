@@ -2122,6 +2122,42 @@ def test_parameter_robustness_penalty_penalizes_extreme_xgboost_params():
     assert moderate >= 0.0
 
 
+def test_parameter_robustness_penalty_penalizes_extreme_lightgbm_params():
+    extreme = train_script.ModelTrainer._parameter_robustness_penalty(
+        "lightgbm_ranker",
+        {
+            "num_leaves": 96,
+            "max_depth": 6,
+            "learning_rate": 0.05,
+            "min_data_in_leaf": 24,
+            "feature_fraction": 0.90,
+            "bagging_fraction": 0.92,
+            "bagging_freq": 4,
+            "lambda_l1": 0.05,
+            "lambda_l2": 0.50,
+            "min_gain_to_split": 0.03,
+        },
+    )
+    moderate = train_script.ModelTrainer._parameter_robustness_penalty(
+        "lightgbm_ranker",
+        {
+            "num_leaves": 32,
+            "max_depth": 4,
+            "learning_rate": 0.03,
+            "min_data_in_leaf": 48,
+            "feature_fraction": 0.82,
+            "bagging_fraction": 0.84,
+            "bagging_freq": 1,
+            "lambda_l1": 0.30,
+            "lambda_l2": 2.0,
+            "min_gain_to_split": 0.12,
+        },
+    )
+
+    assert extreme > moderate
+    assert moderate >= 0.0
+
+
 def test_compute_objective_components_adds_tail_risk_penalty():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
@@ -2216,6 +2252,49 @@ def test_compute_objective_components_penalizes_negative_symbol_tail():
     assert stressed["objective_symbol_tail_floor"] == pytest.approx(-0.10)
     assert stressed["objective_symbol_tail_penalty"] < -1.0
     assert stressed["risk_adjusted_score"] < baseline["risk_adjusted_score"]
+
+
+def test_compute_objective_components_scales_symbol_tail_penalty_for_severe_shortfall():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            objective_weight_tail_risk=0.45,
+            min_holdout_symbol_p25_sharpe=-0.10,
+        )
+    )
+
+    moderate = trainer._compute_objective_components(
+        sharpe=0.3,
+        max_drawdown=0.05,
+        turnover=0.1,
+        brier_score=0.2,
+        trade_count=15,
+        cvar=-0.02,
+        skew=0.1,
+        expected_shortfall=0.04,
+        symbol_concentration_hhi=0.20,
+        equity_break=0.0,
+        evaluation_size=120,
+        symbol_sharpe_p25=-0.45,
+    )
+    severe = trainer._compute_objective_components(
+        sharpe=0.3,
+        max_drawdown=0.05,
+        turnover=0.1,
+        brier_score=0.2,
+        trade_count=15,
+        cvar=-0.02,
+        skew=0.1,
+        expected_shortfall=0.04,
+        symbol_concentration_hhi=0.20,
+        equity_break=0.0,
+        evaluation_size=120,
+        symbol_sharpe_p25=-0.95,
+    )
+
+    assert moderate["objective_symbol_tail_penalty"] < 0.0
+    assert severe["objective_symbol_tail_penalty"] < moderate["objective_symbol_tail_penalty"]
+    assert severe["risk_adjusted_score"] < moderate["risk_adjusted_score"]
 
 
 def test_load_model_defaults_random_forest_windows_forces_single_job(monkeypatch):
