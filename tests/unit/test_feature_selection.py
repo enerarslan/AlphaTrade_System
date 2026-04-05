@@ -104,3 +104,41 @@ def test_compute_information_coefficients_supports_group_aware_rank_ic() -> None
 
     assert scores.index[0] == "signal_feature"
     assert float(scores["signal_feature"]) > float(scores["noise_feature"])
+
+
+def test_select_training_features_emits_progress_callbacks() -> None:
+    rng = np.random.default_rng(21)
+    n = 180
+    signal = rng.normal(size=n)
+    features = pd.DataFrame(
+        {
+            "signal_feature": signal,
+            "signal_feature_2": signal * 0.8 + rng.normal(scale=0.1, size=n),
+            "noise_feature": rng.normal(size=n),
+        }
+    )
+    target = (signal > 0.0).astype(float)
+    events: list[str] = []
+
+    result = select_training_features(
+        features,
+        target,
+        FeatureSelectionConfig(
+            min_information_coefficient=0.01,
+            max_correlation=0.999,
+            max_features=3,
+            stability_iterations=3,
+            min_stability_support=0.0,
+        ),
+        progress_callback=lambda stage, payload: events.append(stage),
+    )
+
+    assert result.selected_features
+    assert "information_coefficient_start" in events
+    assert "information_coefficient_progress" in events
+    assert "information_coefficient_screen_complete" in events
+    assert "correlation_prune_complete" in events
+    assert "stability_selection_start" in events
+    assert "stability_selection_progress" in events
+    assert "stability_selection_complete" in events
+    assert "selection_complete" in events

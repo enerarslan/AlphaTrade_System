@@ -2153,7 +2153,7 @@ def test_feature_selection_reapplies_lightgbm_monotonic_constraints(monkeypatch)
     monkeypatch.setattr(
         feature_selection_module,
         "select_training_features",
-        lambda features, labels, config: SimpleNamespace(
+        lambda features, labels, config, **kwargs: SimpleNamespace(
             selected_features=["momentum_10", "rsi_14"],
             diagnostics={
                 "initial_feature_count": 3,
@@ -2189,7 +2189,7 @@ def test_apply_feature_selection_records_detailed_audit(monkeypatch):
     monkeypatch.setattr(
         feature_selection_module,
         "select_training_features",
-        lambda features, labels, config: SimpleNamespace(
+        lambda features, labels, config, **kwargs: SimpleNamespace(
             selected_features=["momentum_10", "rsi_14"],
             diagnostics={
                 "initial_feature_count": 4,
@@ -2249,7 +2249,7 @@ def test_apply_feature_selection_preserves_upstream_snapshot_binding(monkeypatch
     monkeypatch.setattr(
         feature_selection_module,
         "select_training_features",
-        lambda features, labels, config: SimpleNamespace(
+        lambda features, labels, config, **kwargs: SimpleNamespace(
             selected_features=list(features.columns),
             diagnostics={
                 "initial_feature_count": len(features.columns),

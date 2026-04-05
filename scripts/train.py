@@ -5047,6 +5047,75 @@ class ModelTrainer:
         selection_kwargs: dict[str, Any] = {}
         if selection_groups is not None:
             selection_kwargs["groups"] = selection_groups
+
+        self.logger.info(
+            "Feature selection started: rows=%d features=%d target_mode=%s group_aware_ic=%s",
+            len(self.features),
+            len(old_feature_names),
+            feature_selection_target_mode,
+            group_aware_ic,
+        )
+
+        def _feature_selection_progress(stage: str, payload: dict[str, Any]) -> None:
+            if stage == "information_coefficient_start":
+                self.logger.info(
+                    "Feature selection IC scoring started: %d features",
+                    int(payload.get("feature_count", len(old_feature_names))),
+                )
+                return
+            if stage == "information_coefficient_progress":
+                self.logger.info(
+                    "Feature selection IC scoring progress: %d/%d features",
+                    int(payload.get("processed_features", 0)),
+                    int(payload.get("total_features", len(old_feature_names))),
+                )
+                return
+            if stage == "information_coefficient_screen_complete":
+                self.logger.info(
+                    "Feature selection IC screening complete: ranked=%d screened=%d min_ic=%.4f",
+                    int(payload.get("ranked_feature_count", len(old_feature_names))),
+                    int(payload.get("screened_feature_count", 0)),
+                    float(payload.get("min_information_coefficient", 0.0)),
+                )
+                return
+            if stage == "correlation_prune_complete":
+                self.logger.info(
+                    "Feature selection correlation pruning complete: candidates=%d pruned=%d",
+                    int(payload.get("candidate_feature_count", 0)),
+                    int(payload.get("pruned_feature_count", 0)),
+                )
+                return
+            if stage == "stability_selection_start":
+                self.logger.info(
+                    "Feature selection stability selection started: features=%d iterations=%d sample_size=%d",
+                    int(payload.get("feature_count", 0)),
+                    int(payload.get("total_iterations", 0)),
+                    int(payload.get("sample_size", 0)),
+                )
+                return
+            if stage == "stability_selection_progress":
+                self.logger.info(
+                    "Feature selection stability progress: %d/%d iterations (%d successful)",
+                    int(payload.get("completed_iterations", 0)),
+                    int(payload.get("total_iterations", 0)),
+                    int(payload.get("successful_iterations", 0)),
+                )
+                return
+            if stage == "stability_selection_complete":
+                self.logger.info(
+                    "Feature selection stability selection complete: successful_iterations=%d/%d",
+                    int(payload.get("successful_iterations", 0)),
+                    int(payload.get("total_iterations", 0)),
+                )
+                return
+            if stage == "selection_complete":
+                self.logger.info(
+                    "Feature selection candidate reduction complete: screened=%d candidates=%d selected=%d",
+                    int(payload.get("screened_feature_count", 0)),
+                    int(payload.get("candidate_feature_count", 0)),
+                    int(payload.get("selected_feature_count", 0)),
+                )
+
         selection_result = select_training_features(
             self.features,
             selection_target,
@@ -5060,6 +5129,7 @@ class ModelTrainer:
                 min_group_size=3,
                 random_state=self.config.seed,
             ),
+            progress_callback=_feature_selection_progress,
             **selection_kwargs,
         )
         selected_features = [

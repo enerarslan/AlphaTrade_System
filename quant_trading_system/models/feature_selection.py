@@ -4,7 +4,9 @@ Training-time feature selection for institutional model governance.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -31,6 +33,9 @@ class FeatureSelectionResult:
     correlation_pruned_features: list[str]
     stability_scores: dict[str, float]
     diagnostics: dict[str, float | int]
+
+
+FeatureSelectionProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 def _finite_feature_matrix(
@@ -92,6 +97,7 @@ def compute_information_coefficients(
     *,
     groups: pd.Series | np.ndarray | None = None,
     min_group_size: int = 3,
+    progress_callback: FeatureSelectionProgressCallback | None = None,
 ) -> pd.Series:
     numeric = _finite_feature_matrix(features)
     label = pd.Series(pd.to_numeric(target, errors="coerce"), index=numeric.index)
@@ -99,31 +105,67 @@ def compute_information_coefficients(
         pd.Series(groups, index=numeric.index, dtype="object") if groups is not None else None
     )
     scores: dict[str, float] = {}
-    for column in numeric.columns:
+    total_features = int(len(numeric.columns))
+    progress_step = max(1, total_features // 6) if total_features > 0 else 1
+    if progress_callback is not None:
+        progress_callback(
+            "information_coefficient_start",
+            {
+                "feature_count": total_features,
+                "group_aware": bool(group_series is not None),
+            },
+        )
+    for idx, column in enumerate(numeric.columns, start=1):
         values = numeric[column]
         valid = values.notna() & label.notna()
         if group_series is not None:
             valid = valid & group_series.notna()
         if int(valid.sum()) < 20:
             scores[column] = 0.0
-            continue
-        if group_series is not None:
-            ic_value = _groupwise_information_coefficient(
-                values.loc[valid],
-                label.loc[valid],
-                group_series.loc[valid],
-                min_group_size=min_group_size,
-            )
         else:
-            feature_values = values.loc[valid].to_numpy(dtype=float)
-            label_values = label.loc[valid].to_numpy(dtype=float)
-            if _is_effectively_constant(feature_values) or _is_effectively_constant(label_values):
-                scores[column] = 0.0
-                continue
-            ic = stats.spearmanr(feature_values, label_values, nan_policy="omit")[0]
-            ic_value = float(abs(ic)) if np.isfinite(ic) else 0.0
-        scores[column] = float(ic_value)
-    return pd.Series(scores, dtype=float).sort_values(ascending=False)
+            if group_series is not None:
+                ic_value = _groupwise_information_coefficient(
+                    values.loc[valid],
+                    label.loc[valid],
+                    group_series.loc[valid],
+                    min_group_size=min_group_size,
+                )
+            else:
+                feature_values = values.loc[valid].to_numpy(dtype=float)
+                label_values = label.loc[valid].to_numpy(dtype=float)
+                if _is_effectively_constant(feature_values) or _is_effectively_constant(label_values):
+                    scores[column] = 0.0
+                    if progress_callback is not None and (
+                        idx == total_features or idx % progress_step == 0
+                    ):
+                        progress_callback(
+                            "information_coefficient_progress",
+                            {
+                                "processed_features": idx,
+                                "total_features": total_features,
+                            },
+                        )
+                    continue
+                ic = stats.spearmanr(feature_values, label_values, nan_policy="omit")[0]
+                ic_value = float(abs(ic)) if np.isfinite(ic) else 0.0
+            scores[column] = float(ic_value)
+        if progress_callback is not None and (idx == total_features or idx % progress_step == 0):
+            progress_callback(
+                "information_coefficient_progress",
+                {
+                    "processed_features": idx,
+                    "total_features": total_features,
+                },
+            )
+    ranked = pd.Series(scores, dtype=float).sort_values(ascending=False)
+    if progress_callback is not None:
+        progress_callback(
+            "information_coefficient_complete",
+            {
+                "ranked_feature_count": int(len(ranked)),
+            },
+        )
+    return ranked
 
 
 def _prune_correlated_features(
@@ -161,8 +203,18 @@ def _stability_selection_scores(
     target: pd.Series | np.ndarray,
     *,
     config: FeatureSelectionConfig,
+    progress_callback: FeatureSelectionProgressCallback | None = None,
 ) -> dict[str, float]:
     if features.empty:
+        if progress_callback is not None:
+            progress_callback(
+                "stability_selection_complete",
+                {
+                    "successful_iterations": 0,
+                    "total_iterations": 0,
+                    "skipped": True,
+                },
+            )
         return {}
 
     from sklearn.linear_model import LogisticRegression
@@ -177,13 +229,38 @@ def _stability_selection_scores(
         median = float(label.median()) if len(label) else 0.0
         label = (label > median).astype(float)
 
+    total_iterations = max(1, int(config.stability_iterations))
+    if progress_callback is not None:
+        progress_callback(
+            "stability_selection_start",
+            {
+                "feature_count": int(numeric.shape[1]),
+                "sample_size": (
+                    int(max(50, int(round(len(numeric) * config.stability_subsample_ratio))))
+                    if len(numeric) > 0
+                    else 0
+                ),
+                "total_iterations": total_iterations,
+            },
+        )
+
     if numeric.shape[0] < 100 or numeric.shape[1] <= 1:
+        if progress_callback is not None:
+            progress_callback(
+                "stability_selection_complete",
+                {
+                    "successful_iterations": 0,
+                    "total_iterations": int(total_iterations),
+                    "skipped": True,
+                },
+            )
         return {column: 1.0 for column in numeric.columns}
 
     rng = np.random.default_rng(config.random_state)
     sample_size = max(50, int(round(len(numeric) * config.stability_subsample_ratio)))
     active_counts = dict.fromkeys(numeric.columns.tolist(), 0)
     successful_iterations = 0
+    progress_step = max(1, total_iterations // 4)
 
     model = Pipeline(
         steps=[
@@ -201,11 +278,22 @@ def _stability_selection_scores(
         ]
     )
 
-    for _ in range(max(1, int(config.stability_iterations))):
+    for iteration in range(1, total_iterations + 1):
         sample_idx = rng.choice(len(numeric), size=sample_size, replace=False)
         X_sample = numeric.iloc[sample_idx]
         y_sample = label.iloc[sample_idx]
         if y_sample.nunique(dropna=True) < 2:
+            if progress_callback is not None and (
+                iteration == total_iterations or iteration % progress_step == 0
+            ):
+                progress_callback(
+                    "stability_selection_progress",
+                    {
+                        "completed_iterations": int(iteration),
+                        "successful_iterations": int(successful_iterations),
+                        "total_iterations": int(total_iterations),
+                    },
+                )
             continue
         model.fit(X_sample, y_sample)
         coefs = np.asarray(model.named_steps["selector"].coef_).reshape(-1)
@@ -213,14 +301,42 @@ def _stability_selection_scores(
         for column, coef in zip(numeric.columns, coefs, strict=False):
             if abs(float(coef)) > 1e-8:
                 active_counts[column] = int(active_counts[column]) + 1
+        if progress_callback is not None and (
+            iteration == total_iterations or iteration % progress_step == 0
+        ):
+            progress_callback(
+                "stability_selection_progress",
+                {
+                    "completed_iterations": int(iteration),
+                    "successful_iterations": int(successful_iterations),
+                    "total_iterations": int(total_iterations),
+                },
+            )
 
     if successful_iterations <= 0:
+        if progress_callback is not None:
+            progress_callback(
+                "stability_selection_complete",
+                {
+                    "successful_iterations": 0,
+                    "total_iterations": int(total_iterations),
+                },
+            )
         return {column: 1.0 for column in numeric.columns}
 
-    return {
+    scores = {
         column: float(int(active_counts[column]) / successful_iterations)
         for column in numeric.columns
     }
+    if progress_callback is not None:
+        progress_callback(
+            "stability_selection_complete",
+            {
+                "successful_iterations": int(successful_iterations),
+                "total_iterations": int(total_iterations),
+            },
+        )
+    return scores
 
 
 def select_training_features(
@@ -229,6 +345,7 @@ def select_training_features(
     config: FeatureSelectionConfig,
     *,
     groups: pd.Series | np.ndarray | None = None,
+    progress_callback: FeatureSelectionProgressCallback | None = None,
 ) -> FeatureSelectionResult:
     use_group_aware_ic = bool(config.group_aware_ic and groups is not None)
     ranked = compute_information_coefficients(
@@ -236,8 +353,18 @@ def select_training_features(
         target,
         groups=(groups if use_group_aware_ic else None),
         min_group_size=int(config.min_group_size),
+        progress_callback=progress_callback,
     )
     screened = ranked[ranked >= float(config.min_information_coefficient)]
+    if progress_callback is not None:
+        progress_callback(
+            "information_coefficient_screen_complete",
+            {
+                "ranked_feature_count": int(len(ranked)),
+                "screened_feature_count": int(len(screened)),
+                "min_information_coefficient": float(config.min_information_coefficient),
+            },
+        )
     if screened.empty:
         screened = ranked.head(min(int(config.max_features), len(ranked)))
     if screened.empty:
@@ -263,10 +390,21 @@ def select_training_features(
     if len(corr_selected) > int(config.max_features):
         corr_selected = corr_selected[: int(config.max_features)]
 
+    if progress_callback is not None:
+        progress_callback(
+            "correlation_prune_complete",
+            {
+                "candidate_feature_count": int(len(corr_selected)),
+                "pruned_feature_count": int(len(corr_pruned)),
+                "max_features": int(config.max_features),
+            },
+        )
+
     stability_scores = _stability_selection_scores(
         features[corr_selected],
         target,
         config=config,
+        progress_callback=progress_callback,
     )
     stable_selected = [
         column
@@ -278,7 +416,7 @@ def select_training_features(
     else:
         final_selected = corr_selected[: int(config.max_features)]
 
-    return FeatureSelectionResult(
+    result = FeatureSelectionResult(
         selected_features=final_selected,
         information_coefficients={key: float(value) for key, value in screened.items()},
         correlation_pruned_features=corr_pruned,
@@ -292,3 +430,13 @@ def select_training_features(
             "group_aware_ic_enabled": float(use_group_aware_ic),
         },
     )
+    if progress_callback is not None:
+        progress_callback(
+            "selection_complete",
+            {
+                "selected_feature_count": int(len(final_selected)),
+                "screened_feature_count": int(len(screened)),
+                "candidate_feature_count": int(len(corr_selected)),
+            },
+        )
+    return result
