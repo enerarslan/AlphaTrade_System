@@ -17,7 +17,6 @@ from typing import Any
 
 import numpy as np
 import polars as pl
-from scipy import stats
 
 
 @dataclass
@@ -89,6 +88,291 @@ def _forward_fill_nan(arr: np.ndarray) -> np.ndarray:
     np.maximum.accumulate(idx, out=idx)
     out[mask] = out[idx[mask]]
     return out
+
+
+def _rolling_sum_count(arr: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return rolling finite-value sums and counts aligned to the trailing window."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    if window <= 0 or window > values.size:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.int64)
+
+    finite = np.isfinite(values)
+    safe = np.where(finite, values, 0.0)
+    sums = np.cumsum(safe, dtype=np.float64)
+    counts = np.cumsum(finite.astype(np.int64), dtype=np.int64)
+
+    window_sums = sums[window - 1 :].copy()
+    window_counts = counts[window - 1 :].copy()
+    if window < values.size:
+        window_sums[1:] -= sums[: -window]
+        window_counts[1:] -= counts[: -window]
+    return window_sums, window_counts
+
+
+def _rolling_nanmean(arr: np.ndarray, window: int) -> np.ndarray:
+    """Compute rolling NaN-aware means."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    window_sums, window_counts = _rolling_sum_count(values, int(window))
+    if window_sums.size == 0:
+        return result
+    out = np.full(window_sums.size, np.nan, dtype=np.float64)
+    valid = window_counts > 0
+    out[valid] = window_sums[valid] / window_counts[valid]
+    result[int(window) - 1 :] = out
+    return result
+
+
+def _rolling_nanvar(arr: np.ndarray, window: int, ddof: int = 1) -> np.ndarray:
+    """Compute rolling NaN-aware variance."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    window_sums, window_counts = _rolling_sum_count(values, int(window))
+    if window_sums.size == 0:
+        return result
+
+    safe_squared = np.where(np.isfinite(values), values * values, 0.0)
+    squared_sums = np.cumsum(safe_squared, dtype=np.float64)
+    window_squared_sums = squared_sums[int(window) - 1 :].copy()
+    if int(window) < values.size:
+        window_squared_sums[1:] -= squared_sums[: -int(window)]
+
+    out = np.full(window_sums.size, np.nan, dtype=np.float64)
+    valid = window_counts > int(ddof)
+    if np.any(valid):
+        counts = window_counts[valid].astype(np.float64)
+        numerator = window_squared_sums[valid] - (window_sums[valid] ** 2) / counts
+        numerator = np.maximum(numerator, 0.0)
+        out[valid] = numerator / np.maximum(counts - float(ddof), 1.0)
+    result[int(window) - 1 :] = out
+    return result
+
+
+def _rolling_nanstd(arr: np.ndarray, window: int, ddof: int = 1) -> np.ndarray:
+    """Compute rolling NaN-aware standard deviation."""
+    variance = _rolling_nanvar(arr, window, ddof=ddof)
+    return np.sqrt(variance)
+
+
+def _sampled_rolling_moment_windows(
+    arr: np.ndarray,
+    window: int,
+    sample_positions: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return sampled sliding windows plus aligned output positions."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    if window <= 0 or window > values.size or not sample_positions:
+        return np.empty((0, 0), dtype=np.float64), np.array([], dtype=np.int64)
+
+    windows = np.lib.stride_tricks.sliding_window_view(values, window_shape=int(window))
+    row_positions = np.asarray(sample_positions, dtype=np.int64) - (int(window) - 1)
+    valid = (row_positions >= 0) & (row_positions < windows.shape[0])
+    if not np.any(valid):
+        return np.empty((0, int(window)), dtype=np.float64), np.array([], dtype=np.int64)
+    row_positions = row_positions[valid]
+    return windows[row_positions], row_positions + (int(window) - 1)
+
+
+def _rolling_sampled_skewness(
+    arr: np.ndarray,
+    window: int,
+    sample_positions: list[int],
+) -> np.ndarray:
+    """Compute sampled rolling skewness using vectorized central moments."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    windows, target_positions = _sampled_rolling_moment_windows(values, window, sample_positions)
+    if windows.size == 0:
+        return result
+
+    finite = np.isfinite(windows)
+    counts = finite.sum(axis=1).astype(np.float64)
+    safe = np.where(finite, windows, 0.0)
+    means = safe.sum(axis=1) / np.where(counts > 0.0, counts, 1.0)
+    centered = np.where(finite, safe - means[:, None], 0.0)
+    second = (centered**2).sum(axis=1) / np.where(counts > 0.0, counts, 1.0)
+    third = (centered**3).sum(axis=1) / np.where(counts > 0.0, counts, 1.0)
+
+    skew_values = np.full(target_positions.size, np.nan, dtype=np.float64)
+    valid = (counts >= 3.0) & (second > 1e-18)
+    if np.any(valid):
+        base = third[valid] / np.power(second[valid], 1.5)
+        correction = np.sqrt(counts[valid] * (counts[valid] - 1.0)) / (counts[valid] - 2.0)
+        skew_values[valid] = correction * base
+
+    result[target_positions] = skew_values
+    return result
+
+
+def _rolling_sampled_kurtosis(
+    arr: np.ndarray,
+    window: int,
+    sample_positions: list[int],
+) -> np.ndarray:
+    """Compute sampled rolling excess kurtosis using vectorized central moments."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    windows, target_positions = _sampled_rolling_moment_windows(values, window, sample_positions)
+    if windows.size == 0:
+        return result
+
+    finite = np.isfinite(windows)
+    counts = finite.sum(axis=1).astype(np.float64)
+    safe = np.where(finite, windows, 0.0)
+    means = safe.sum(axis=1) / np.where(counts > 0.0, counts, 1.0)
+    centered = np.where(finite, safe - means[:, None], 0.0)
+    second = (centered**2).sum(axis=1) / np.where(counts > 0.0, counts, 1.0)
+    fourth = (centered**4).sum(axis=1) / np.where(counts > 0.0, counts, 1.0)
+
+    kurt_values = np.full(target_positions.size, np.nan, dtype=np.float64)
+    valid = (counts >= 4.0) & (second > 1e-18)
+    if np.any(valid):
+        excess = (fourth[valid] / np.power(second[valid], 2.0)) - 3.0
+        correction = ((counts[valid] - 1.0) / ((counts[valid] - 2.0) * (counts[valid] - 3.0))) * (
+            ((counts[valid] + 1.0) * excess) + 6.0
+        )
+        kurt_values[valid] = correction
+
+    result[target_positions] = kurt_values
+    return result
+
+
+def _rolling_nanquantile(arr: np.ndarray, window: int, quantile: float) -> np.ndarray:
+    """Compute rolling NaN-aware quantiles."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    if window <= 0 or window > values.size:
+        return result
+
+    windows = np.lib.stride_tricks.sliding_window_view(values, window_shape=int(window))
+    valid = np.isfinite(windows).sum(axis=1) > 0
+    out = np.full(windows.shape[0], np.nan, dtype=np.float64)
+    if np.any(valid):
+        out[valid] = np.nanquantile(windows[valid], float(quantile), axis=1)
+    result[int(window) - 1 :] = out
+    return result
+
+
+def _rolling_nanquantiles(
+    arr: np.ndarray,
+    window: int,
+    quantiles: list[float] | np.ndarray,
+) -> dict[float, np.ndarray]:
+    """Compute multiple rolling NaN-aware quantiles from a single window view."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    quantile_array = np.asarray(list(quantiles), dtype=np.float64)
+    outputs = {
+        float(quantile): np.full(values.size, np.nan, dtype=np.float64)
+        for quantile in quantile_array
+    }
+    if window <= 0 or window > values.size or quantile_array.size == 0:
+        return outputs
+
+    windows = np.lib.stride_tricks.sliding_window_view(values, window_shape=int(window))
+    valid_rows = np.isfinite(windows).sum(axis=1) > 0
+    if not np.any(valid_rows):
+        return outputs
+
+    computed = np.nanquantile(windows[valid_rows], quantile_array, axis=1)
+    if computed.ndim == 1:
+        computed = computed[np.newaxis, :]
+
+    for index, quantile in enumerate(quantile_array):
+        out = np.full(windows.shape[0], np.nan, dtype=np.float64)
+        out[valid_rows] = computed[index]
+        outputs[float(quantile)][int(window) - 1 :] = out
+    return outputs
+
+
+def _rolling_tail_mean(arr: np.ndarray, window: int, quantile: float) -> np.ndarray:
+    """Compute rolling lower-tail mean using a quantile threshold per window."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    if window <= 0 or window > values.size:
+        return result
+
+    windows = np.lib.stride_tricks.sliding_window_view(values, window_shape=int(window))
+    finite = np.isfinite(windows)
+    valid_rows = finite.sum(axis=1) > 0
+    if not np.any(valid_rows):
+        return result
+
+    thresholds = np.nanquantile(windows[valid_rows], float(quantile), axis=1)
+    valid_windows = windows[valid_rows]
+    valid_finite = finite[valid_rows]
+    tail_mask = valid_finite & (valid_windows <= thresholds[:, None])
+    tail_counts = tail_mask.sum(axis=1)
+    tail_sums = np.where(tail_mask, valid_windows, 0.0).sum(axis=1)
+
+    out = np.full(windows.shape[0], np.nan, dtype=np.float64)
+    valid_tail = tail_counts > 0
+    if np.any(valid_tail):
+        out_positions = np.flatnonzero(valid_rows)
+        out[out_positions[valid_tail]] = tail_sums[valid_tail] / tail_counts[valid_tail]
+    result[int(window) - 1 :] = out
+    return result
+
+
+def _rolling_pairwise_correlation(
+    x: np.ndarray,
+    y: np.ndarray,
+    window: int,
+) -> np.ndarray:
+    """Compute rolling correlation for two aligned 1D arrays with NaN handling."""
+    x_values = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_values = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = min(x_values.size, y_values.size)
+    result = np.full(n, np.nan, dtype=np.float64)
+    if window <= 0 or window > n:
+        return result
+
+    x_values = x_values[:n]
+    y_values = y_values[:n]
+    valid = np.isfinite(x_values) & np.isfinite(y_values)
+    x_safe = np.where(valid, x_values, 0.0)
+    y_safe = np.where(valid, y_values, 0.0)
+    xy_safe = x_safe * y_safe
+    x2_safe = x_safe * x_safe
+    y2_safe = y_safe * y_safe
+
+    counts = np.cumsum(valid.astype(np.int64), dtype=np.int64)
+    sum_x = np.cumsum(x_safe, dtype=np.float64)
+    sum_y = np.cumsum(y_safe, dtype=np.float64)
+    sum_xy = np.cumsum(xy_safe, dtype=np.float64)
+    sum_x2 = np.cumsum(x2_safe, dtype=np.float64)
+    sum_y2 = np.cumsum(y2_safe, dtype=np.float64)
+
+    counts_w = counts[int(window) - 1 :].copy()
+    sum_x_w = sum_x[int(window) - 1 :].copy()
+    sum_y_w = sum_y[int(window) - 1 :].copy()
+    sum_xy_w = sum_xy[int(window) - 1 :].copy()
+    sum_x2_w = sum_x2[int(window) - 1 :].copy()
+    sum_y2_w = sum_y2[int(window) - 1 :].copy()
+
+    if int(window) < n:
+        counts_w[1:] -= counts[: -int(window)]
+        sum_x_w[1:] -= sum_x[: -int(window)]
+        sum_y_w[1:] -= sum_y[: -int(window)]
+        sum_xy_w[1:] -= sum_xy[: -int(window)]
+        sum_x2_w[1:] -= sum_x2[: -int(window)]
+        sum_y2_w[1:] -= sum_y2[: -int(window)]
+
+    out = np.full(sum_x_w.size, np.nan, dtype=np.float64)
+    valid_rows = counts_w > 2
+    if np.any(valid_rows):
+        row_counts = counts_w[valid_rows].astype(np.float64)
+        cov_num = sum_xy_w[valid_rows] - ((sum_x_w[valid_rows] * sum_y_w[valid_rows]) / row_counts)
+        var_x_num = sum_x2_w[valid_rows] - ((sum_x_w[valid_rows] ** 2) / row_counts)
+        var_y_num = sum_y2_w[valid_rows] - ((sum_y_w[valid_rows] ** 2) / row_counts)
+        denom = np.sqrt(np.maximum(var_x_num, 0.0) * np.maximum(var_y_num, 0.0))
+        corr = np.full(row_counts.size, np.nan, dtype=np.float64)
+        valid_denom = denom > 1e-18
+        if np.any(valid_denom):
+            corr[valid_denom] = cov_num[valid_denom] / denom[valid_denom]
+            corr[valid_denom] = np.clip(corr[valid_denom], -1.0, 1.0)
+        out[valid_rows] = corr
+    result[int(window) - 1 :] = out
+    return result
 
 
 def _unbiased_excess_kurtosis(values: np.ndarray) -> float:
@@ -279,10 +563,7 @@ class RiskAdjustedReturns(StatisticalFeature):
     @staticmethod
     def _rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
         """Compute rolling standard deviation."""
-        result = np.full(len(arr), np.nan)
-        for i in range(window - 1, len(arr)):
-            result[i] = np.nanstd(arr[i - window + 1 : i + 1], ddof=1)
-        return result
+        return _rolling_nanstd(arr, window, ddof=1)
 
 
 # =============================================================================
@@ -304,10 +585,7 @@ class RollingMean(StatisticalFeature):
         results = {}
 
         for window in self.windows:
-            roll_mean = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
-                roll_mean[i] = np.nanmean(returns[i - window + 1 : i + 1])
-            results[f"rolling_mean_{window}"] = roll_mean
+            results[f"rolling_mean_{window}"] = _rolling_nanmean(returns, window)
 
         return results
 
@@ -326,10 +604,7 @@ class RollingStd(StatisticalFeature):
         results = {}
 
         for window in self.windows:
-            roll_std = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
-                roll_std[i] = np.nanstd(returns[i - window + 1 : i + 1], ddof=1)
-            results[f"rolling_std_{window}"] = roll_std
+            results[f"rolling_std_{window}"] = _rolling_nanstd(returns, window, ddof=1)
 
         return results
 
@@ -348,10 +623,7 @@ class RollingVar(StatisticalFeature):
         results = {}
 
         for window in self.windows:
-            roll_var = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
-                roll_var[i] = np.nanvar(returns[i - window + 1 : i + 1], ddof=1)
-            results[f"rolling_var_{window}"] = roll_var
+            results[f"rolling_var_{window}"] = _rolling_nanvar(returns, window, ddof=1)
 
         return results
 
@@ -372,12 +644,11 @@ class RollingSkewness(StatisticalFeature):
         step = _adaptive_sampling_step(len(close), self.compute_step)
 
         for window in self.windows:
-            roll_skew = np.full(len(close), np.nan)
-            for i in _sample_indices(window - 1, len(close), step):
-                data = returns[i - window + 1 : i + 1]
-                valid_data = data[~np.isnan(data)]
-                if len(valid_data) >= 3:
-                    roll_skew[i] = _unbiased_skewness(valid_data)
+            roll_skew = _rolling_sampled_skewness(
+                returns,
+                window,
+                _sample_indices(window - 1, len(close), step),
+            )
             if step > 1:
                 roll_skew = _forward_fill_nan(roll_skew)
             results[f"rolling_skew_{window}"] = roll_skew
@@ -397,14 +668,16 @@ class RollingKurtosis(StatisticalFeature):
         close = df["close"].to_numpy().astype(np.float64)
         returns = np.diff(np.log(close), prepend=np.nan)
         results = {}
+        step = _adaptive_sampling_step(len(close), 1)
 
         for window in self.windows:
-            roll_kurt = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
-                data = returns[i - window + 1 : i + 1]
-                valid_data = data[~np.isnan(data)]
-                if len(valid_data) >= 4:
-                    roll_kurt[i] = _unbiased_excess_kurtosis(valid_data)
+            roll_kurt = _rolling_sampled_kurtosis(
+                returns,
+                window,
+                _sample_indices(window - 1, len(close), step),
+            )
+            if step > 1:
+                roll_kurt = _forward_fill_nan(roll_kurt)
             results[f"rolling_kurt_{window}"] = roll_kurt
 
         return results
@@ -424,15 +697,10 @@ class RollingQuantiles(StatisticalFeature):
         returns = np.diff(np.log(close), prepend=np.nan)
         results = {}
 
+        quantile_results = _rolling_nanquantiles(returns, self.window, self.quantiles)
         for q in self.quantiles:
-            roll_q = np.full(len(close), np.nan)
-            for i in range(self.window - 1, len(close)):
-                data = returns[i - self.window + 1 : i + 1]
-                valid_data = data[~np.isnan(data)]
-                if len(valid_data) > 0:
-                    roll_q[i] = np.quantile(valid_data, q)
             q_name = int(q * 100)
-            results[f"rolling_q{q_name}_{self.window}"] = roll_q
+            results[f"rolling_q{q_name}_{self.window}"] = quantile_results[float(q)]
 
         return results
 
@@ -451,12 +719,10 @@ class ZScore(StatisticalFeature):
 
         for window in self.windows:
             zscore = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
-                data = close[i - window + 1 : i + 1]
-                mean = np.mean(data)
-                std = np.std(data, ddof=1)
-                if std > 0:
-                    zscore[i] = (close[i] - mean) / std
+            mean = _rolling_nanmean(close, window)
+            std = _rolling_nanstd(close, window, ddof=1)
+            valid = np.isfinite(close) & np.isfinite(mean) & (std > 1e-12)
+            zscore[valid] = (close[valid] - mean[valid]) / std[valid]
             results[f"zscore_{window}"] = zscore
 
         return results
@@ -481,15 +747,11 @@ class RollingVaR(StatisticalFeature):
         returns = np.diff(np.log(close), prepend=np.nan)
         results = {}
 
+        quantile_levels = [1.0 - float(conf) for conf in self.confidence_levels]
+        quantile_results = _rolling_nanquantiles(returns, self.window, quantile_levels)
         for conf in self.confidence_levels:
-            var_arr = np.full(len(close), np.nan)
-            for i in range(self.window - 1, len(close)):
-                data = returns[i - self.window + 1 : i + 1]
-                valid_data = data[~np.isnan(data)]
-                if len(valid_data) > 0:
-                    var_arr[i] = np.quantile(valid_data, 1 - conf)
             conf_name = int(conf * 100)
-            results[f"var_{conf_name}_{self.window}"] = var_arr
+            results[f"var_{conf_name}_{self.window}"] = quantile_results[1.0 - float(conf)]
 
         return results
 
@@ -508,15 +770,7 @@ class RollingCVaR(StatisticalFeature):
         returns = np.diff(np.log(close), prepend=np.nan)
         results = {}
 
-        cvar_arr = np.full(len(close), np.nan)
-        for i in range(self.window - 1, len(close)):
-            data = returns[i - self.window + 1 : i + 1]
-            valid_data = data[~np.isnan(data)]
-            if len(valid_data) > 0:
-                var_threshold = np.quantile(valid_data, 1 - self.confidence_level)
-                tail_losses = valid_data[valid_data <= var_threshold]
-                if len(tail_losses) > 0:
-                    cvar_arr[i] = np.mean(tail_losses)
+        cvar_arr = _rolling_tail_mean(returns, self.window, 1.0 - float(self.confidence_level))
 
         conf_name = int(self.confidence_level * 100)
         results[f"cvar_{conf_name}_{self.window}"] = cvar_arr
@@ -539,14 +793,16 @@ class TailRatio(StatisticalFeature):
         results = {}
 
         tail_ratio = np.full(len(close), np.nan)
-        for i in range(self.window - 1, len(close)):
-            data = returns[i - self.window + 1 : i + 1]
-            valid_data = data[~np.isnan(data)]
-            if len(valid_data) > 0:
-                upper_tail = np.quantile(valid_data, 1 - self.percentile)
-                lower_tail = np.quantile(valid_data, self.percentile)
-                if lower_tail != 0:
-                    tail_ratio[i] = abs(upper_tail / lower_tail)
+        quantiles = _rolling_nanquantiles(
+            returns,
+            self.window,
+            [float(self.percentile), 1.0 - float(self.percentile)],
+        )
+        lower_tail = quantiles[float(self.percentile)]
+        upper_tail = quantiles[1.0 - float(self.percentile)]
+        valid = np.isfinite(lower_tail) & np.isfinite(upper_tail) & (np.abs(lower_tail) > 1e-18)
+        if np.any(valid):
+            tail_ratio[valid] = np.abs(upper_tail[valid] / lower_tail[valid])
 
         results[f"tail_ratio_{self.window}"] = tail_ratio
 
@@ -574,11 +830,8 @@ class Autocorrelation(StatisticalFeature):
 
         for lag in self.lags:
             acf = np.full(len(close), np.nan)
-            for i in range(self.window + lag - 1, len(close)):
-                data = returns[i - self.window - lag + 1 : i + 1]
-                valid_data = data[~np.isnan(data)]
-                if len(valid_data) >= self.window:
-                    acf[i] = self._autocorr(valid_data, lag)
+            if lag < len(returns):
+                acf[lag:] = _rolling_pairwise_correlation(returns[lag:], returns[:-lag], self.window)
             results[f"acf_lag{lag}_{self.window}"] = acf
 
         return results
@@ -691,42 +944,35 @@ class HurstExponent(StatisticalFeature):
         return results
 
     def _compute_hurst(self, ts: np.ndarray) -> float:
-        """Compute Hurst exponent using R/S analysis."""
+        """Compute Hurst exponent using a variance-of-increments approximation."""
         if len(ts) < self.max_lag * 2:
             return np.nan
 
-        lags = range(self.min_lag, self.max_lag)
-        rs = []
+        sample = np.asarray(ts, dtype=np.float64)
+        lags = np.arange(self.min_lag, self.max_lag, dtype=np.int64)
+        tau = np.full(lags.shape[0], np.nan, dtype=np.float64)
 
-        for lag in lags:
-            rs_values = []
-            for start in range(0, len(ts) - lag, lag):
-                subset = ts[start : start + lag]
-                if len(subset) < lag:
-                    continue
-                mean = np.mean(subset)
-                deviations = np.cumsum(subset - mean)
-                R = np.max(deviations) - np.min(deviations)
-                S = np.std(subset, ddof=1)
-                if S > 0:
-                    rs_values.append(R / S)
-            if rs_values:
-                rs.append(np.mean(rs_values))
-            else:
-                rs.append(np.nan)
+        for index, lag in enumerate(lags):
+            diffs = sample[int(lag) :] - sample[: -int(lag)]
+            diffs = diffs[np.isfinite(diffs)]
+            if diffs.size < 2:
+                continue
+            sigma = float(np.std(diffs, ddof=1))
+            if sigma > 1e-18:
+                tau[index] = sigma
 
-        valid_idx = ~np.isnan(rs)
+        valid_idx = np.isfinite(tau)
         if np.sum(valid_idx) < 2:
             return np.nan
 
-        log_lags = np.log(list(lags))[valid_idx]
-        log_rs = np.log(np.array(rs)[valid_idx])
-
-        try:
-            slope, _, _, _, _ = stats.linregress(log_lags, log_rs)
-            return slope
-        except ValueError:
+        log_lags = np.log(lags[valid_idx].astype(np.float64))
+        log_tau = np.log(tau[valid_idx])
+        x_centered = log_lags - np.mean(log_lags)
+        denom = float(np.sum(x_centered**2))
+        if denom <= 1e-18:
             return np.nan
+        slope = float(np.sum(x_centered * (log_tau - np.mean(log_tau))) / denom)
+        return float(np.clip(slope * 2.0, 0.0, 1.5))
 
 
 class ADFStatistic(StatisticalFeature):

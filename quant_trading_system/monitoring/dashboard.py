@@ -2533,7 +2533,12 @@ def _get_audit_secret() -> str:
     configured = os.environ.get("DASHBOARD_AUDIT_SECRET", "").strip()
     if configured:
         return configured
-    logger.warning(
+    environment = os.environ.get("APP_ENV", "development").strip().lower()
+    if environment in {"production", "staging"}:
+        raise RuntimeError(
+            "DASHBOARD_AUDIT_SECRET must be set in production or staging before dashboard startup."
+        )
+    logger.info(
         "DASHBOARD_AUDIT_SECRET is not set, using development-only fallback secret for signed audit records."
     )
     return "DEV_ONLY_AUDIT_SECRET_CHANGE_ME"

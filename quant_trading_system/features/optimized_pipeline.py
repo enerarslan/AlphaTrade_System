@@ -34,6 +34,15 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+_GPU_FALLBACK_LOGGED = False
+
+
+def _log_gpu_fallback_once(message: str) -> None:
+    global _GPU_FALLBACK_LOGGED
+    if _GPU_FALLBACK_LOGGED:
+        return
+    logger.info(message)
+    _GPU_FALLBACK_LOGGED = True
 
 
 # Try to import optional dependencies
@@ -910,7 +919,9 @@ class OptimizedFeaturePipeline:
             if CUDF_AVAILABLE:
                 result = self._compute_gpu(data, symbol, feature_names, data_hash, use_cache)
             else:
-                logger.warning("GPU mode requested but cuDF not available, falling back to parallel")
+                _log_gpu_fallback_once(
+                    "GPU mode requested for optimized features but cuDF is unavailable; falling back to parallel CPU."
+                )
                 result = self._compute_parallel(data, symbol, feature_names, data_hash, use_cache)
         elif self.config.compute_mode == ComputeMode.PARALLEL:
             result = self._compute_parallel(data, symbol, feature_names, data_hash, use_cache)
@@ -1094,7 +1105,9 @@ class OptimizedFeaturePipeline:
             DataFrame with computed features
         """
         if not CUDF_AVAILABLE:
-            logger.warning("cuDF not available, falling back to CPU computation")
+            _log_gpu_fallback_once(
+                "cuDF is unavailable for optimized features; falling back to CPU computation."
+            )
             return self._compute_parallel(data, symbol, feature_names, data_hash, use_cache)
 
         try:

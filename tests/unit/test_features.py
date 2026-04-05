@@ -8,6 +8,7 @@ cross-sectional features, and the feature pipeline.
 import numpy as np
 import polars as pl
 import pytest
+import warnings
 from datetime import datetime, timedelta
 
 
@@ -459,6 +460,30 @@ class TestStatisticalFeatures:
         assert any("return" in k for k in result.keys())
         assert any("zscore" in k for k in result.keys())
 
+    def test_volume_indicators_handle_flat_high_low_ranges_without_runtime_warning(self):
+        """Flat candles should not trigger invalid divide warnings."""
+        from quant_trading_system.features.technical import AccumulationDistribution, ChaikinMoneyFlow
+
+        n = 64
+        flat_price = np.full(n, 100.0)
+        df = pl.DataFrame(
+            {
+                "high": flat_price,
+                "low": flat_price,
+                "close": flat_price,
+                "volume": np.full(n, 1_000.0),
+            }
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            ad = AccumulationDistribution().compute(df)
+            cmf = ChaikinMoneyFlow(period=20).compute(df)
+
+        assert np.all(np.isfinite(ad["ad_line"]))
+        assert np.all(np.isnan(cmf["cmf_20"][:19]))
+        assert np.all(np.isfinite(cmf["cmf_20"][19:]))
+
 
 class TestMicrostructureFeatures:
     """Tests for microstructure features."""
@@ -521,6 +546,36 @@ class TestMicrostructureFeatures:
 
         assert isinstance(result, dict)
         assert len(result) > 0
+
+    def test_microstructure_fallbacks_handle_flat_ranges_without_runtime_warning(self):
+        """OHLCV fallback microstructure features should stay stable on flat bars."""
+        from quant_trading_system.features.microstructure import (
+            BuySellVolumeImbalance,
+            OrderBookImbalance,
+            OrderFlowToxicity,
+        )
+
+        n = 80
+        flat_price = np.full(n, 50.0)
+        df = pl.DataFrame(
+            {
+                "high": flat_price,
+                "low": flat_price,
+                "close": flat_price,
+                "volume": np.full(n, 5_000.0),
+            }
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            obi = OrderBookImbalance(windows=[5]).compute(df)
+            imbalance = BuySellVolumeImbalance(windows=[5]).compute(df)
+            toxicity = OrderFlowToxicity(window=10, persistence_window=3).compute(df)
+
+        assert np.all(np.isfinite(obi["obi_approx"]))
+        assert np.all(np.isfinite(imbalance["volume_imbalance_raw"]))
+        valid_toxicity = toxicity["flow_toxicity_10"][~np.isnan(toxicity["flow_toxicity_10"])]
+        assert np.all(np.isfinite(valid_toxicity))
 
 
 class TestCrossSectionalFeatures:
@@ -664,6 +719,40 @@ class TestCrossSectionalFeatures:
         assert np.isnan(centrality[4])
         assert np.isfinite(centrality).sum() > 0
 
+    def test_percentile_rank_excludes_current_symbol_duplicate_from_universe(self):
+        """PercentileRank should not double-count the current symbol when universe_data includes it."""
+        from quant_trading_system.features.cross_sectional import PercentileRank
+
+        base_ts = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(4)]
+        base_df = pl.DataFrame(
+            {
+                "timestamp": base_ts,
+                "symbol": ["BASE"] * 4,
+                "close": [100.0, 101.0, 102.0, 103.0],
+            }
+        )
+        lower_df = pl.DataFrame(
+            {
+                "timestamp": base_ts,
+                "symbol": ["LOW"] * 4,
+                "close": [100.0, 100.5, 101.0, 101.5],
+            }
+        )
+        higher_df = pl.DataFrame(
+            {
+                "timestamp": base_ts,
+                "symbol": ["HIGH"] * 4,
+                "close": [100.0, 101.5, 103.0, 104.5],
+            }
+        )
+
+        feature = PercentileRank(windows=[1])
+        result = feature.compute(base_df, {"BASE": base_df, "LOW": lower_df, "HIGH": higher_df})
+        valid = result["return_percentile_1"][np.isfinite(result["return_percentile_1"])]
+
+        assert valid.size > 0
+        assert valid[-1] == pytest.approx(2.0 / 3.0)
+
     def test_cross_sectional_calculator_preserves_bounded_percentile_features(self):
         """Robust normalization should not distort naturally bounded [0,1] features."""
         from quant_trading_system.features.cross_sectional import (
@@ -750,6 +839,30 @@ class TestFeaturePipeline:
         # Result is a FeatureSet object
         assert result is not None
         assert result.num_features > 0
+
+    def test_non_technical_pipeline_does_not_inject_optimized_technical_features(
+        self,
+        sample_ohlcv_df,
+    ):
+        """Optimized technical features must not leak into non-technical group runs."""
+        from quant_trading_system.features.feature_pipeline import (
+            FeatureConfig,
+            FeatureGroup,
+            FeaturePipeline,
+        )
+
+        pipeline = FeaturePipeline(
+            FeatureConfig(
+                groups=[FeatureGroup.STATISTICAL],
+                use_optimized_pipeline=True,
+            )
+        )
+
+        result = pipeline.compute(sample_ohlcv_df)
+
+        assert "ema_26" not in result.features
+        assert "rsi_14" not in result.features
+        assert "volatility_20" not in result.features
 
     def test_cache_key_deterministic_for_equivalent_configs(self, sample_ohlcv_df):
         """Test cache key is deterministic for equivalent output configs."""

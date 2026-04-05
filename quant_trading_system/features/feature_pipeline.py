@@ -46,6 +46,15 @@ from .optimized_pipeline import (
 )
 
 logger = logging.getLogger(__name__)
+_GPU_FALLBACK_LOGGED = False
+
+
+def _log_gpu_fallback_once(message: str) -> None:
+    global _GPU_FALLBACK_LOGGED
+    if _GPU_FALLBACK_LOGGED:
+        return
+    logger.info(message)
+    _GPU_FALLBACK_LOGGED = True
 
 
 # =============================================================================
@@ -216,6 +225,121 @@ class FeatureGroup(str, Enum):
     MICROSTRUCTURE = "microstructure"
     CROSS_SECTIONAL = "cross_sectional"
     ALL = "all"
+
+
+_FULLY_GPU_READY_GROUPS: frozenset[FeatureGroup] = frozenset()
+_PARTIALLY_GPU_ACCELERATED_GROUPS: frozenset[FeatureGroup] = frozenset(
+    {FeatureGroup.TECHNICAL}
+)
+_CPU_OPTIMIZED_GROUPS: frozenset[FeatureGroup] = frozenset(
+    {
+        FeatureGroup.TECHNICAL,
+        FeatureGroup.STATISTICAL,
+        FeatureGroup.MICROSTRUCTURE,
+        FeatureGroup.CROSS_SECTIONAL,
+    }
+)
+_PARTIAL_GPU_TECHNICAL_FEATURES: tuple[str, ...] = (
+    "sma_20",
+    "sma_50",
+    "ema_12",
+    "ema_26",
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_middle",
+    "bb_upper",
+    "bb_lower",
+    "bb_width",
+    "returns",
+    "log_returns",
+    "volatility_20",
+    "z_score_20",
+)
+
+
+def describe_feature_gpu_readiness(
+    groups: list[FeatureGroup | str],
+    *,
+    use_gpu: bool,
+    use_optimized_pipeline: bool,
+    disable_optimized_technical: bool = False,
+) -> dict[str, Any]:
+    """Describe current feature-family GPU coverage precisely.
+
+    Today the package has:
+    - model-side GPU support
+    - a partial cuDF-accelerated technical fast path
+    - CPU-optimized implementations for all requested feature families
+
+    It does not yet have complete CUDA-family ports for the full technical,
+    statistical, microstructure, or cross-sectional calculators. This helper
+    keeps training artifacts and launchers honest about that contract.
+    """
+
+    normalized_groups: list[FeatureGroup] = []
+    for group in groups:
+        try:
+            normalized_group = (
+                group if isinstance(group, FeatureGroup) else FeatureGroup(str(group))
+            )
+        except ValueError:
+            continue
+        if normalized_group == FeatureGroup.ALL:
+            continue
+        if normalized_group not in normalized_groups:
+            normalized_groups.append(normalized_group)
+
+    requested_groups = [group.value for group in normalized_groups]
+    fully_gpu_ready_groups = [
+        group.value
+        for group in normalized_groups
+        if bool(use_gpu and CUDF_AVAILABLE and group in _FULLY_GPU_READY_GROUPS)
+    ]
+
+    partially_gpu_accelerated_groups: list[str] = []
+    partial_gpu_feature_names: dict[str, list[str]] = {}
+    if (
+        use_gpu
+        and CUDF_AVAILABLE
+        and use_optimized_pipeline
+        and not disable_optimized_technical
+        and FeatureGroup.TECHNICAL in normalized_groups
+        and FeatureGroup.TECHNICAL in _PARTIALLY_GPU_ACCELERATED_GROUPS
+    ):
+        partially_gpu_accelerated_groups.append(FeatureGroup.TECHNICAL.value)
+        partial_gpu_feature_names[FeatureGroup.TECHNICAL.value] = list(
+            _PARTIAL_GPU_TECHNICAL_FEATURES
+        )
+
+    cpu_materialized_groups = [
+        group.value
+        for group in normalized_groups
+        if group.value not in fully_gpu_ready_groups
+    ]
+    cpu_optimized_groups = [
+        group.value for group in normalized_groups if group in _CPU_OPTIMIZED_GROUPS
+    ]
+    fully_gpu_ready = bool(requested_groups) and len(cpu_materialized_groups) == 0
+
+    acceleration_mode = "cpu_only"
+    if partially_gpu_accelerated_groups:
+        acceleration_mode = "partial_gpu_acceleration"
+    if fully_gpu_ready:
+        acceleration_mode = "full_gpu"
+
+    return {
+        "cudf_available": bool(CUDF_AVAILABLE),
+        "requested_groups": requested_groups,
+        "fully_gpu_ready_groups": fully_gpu_ready_groups,
+        "partially_gpu_accelerated_groups": partially_gpu_accelerated_groups,
+        "partial_gpu_feature_names": partial_gpu_feature_names,
+        "cpu_materialized_groups": cpu_materialized_groups,
+        "cpu_optimized_groups": cpu_optimized_groups,
+        "fully_gpu_ready": bool(fully_gpu_ready),
+        "acceleration_mode": acceleration_mode,
+    }
 
 
 class NormalizationMethod(str, Enum):
@@ -434,11 +558,13 @@ class FeaturePipeline:
         else:
             compute_mode = ComputeMode.PARALLEL
             if self.config.use_gpu and not CUDF_AVAILABLE:
-                logger.warning("GPU requested but cuDF not available, using parallel CPU")
+                _log_gpu_fallback_once(
+                    "GPU feature acceleration requested but cuDF is unavailable; using parallel CPU."
+                )
 
         opt_config = OptimizedPipelineConfig(
             compute_mode=compute_mode,
-            num_workers=self.config.parallel_workers,
+            max_workers=self.config.parallel_workers,
             use_numba=True,
             use_gpu=use_gpu,
             gpu_min_batch_size=self.config.gpu_min_batch_size,
@@ -648,8 +774,14 @@ class FeaturePipeline:
         all_features: dict[str, np.ndarray] = {}
         all_metadata: dict[str, FeatureMetadata] = {}
 
-        # Use optimized pipeline for basic technical features if available
-        if self._optimized_pipeline is not None and len(df) >= 100:
+        groups_to_compute = self._get_groups_to_compute()
+
+        # Use optimized pipeline only when the technical group is explicitly requested.
+        if (
+            self._optimized_pipeline is not None
+            and FeatureGroup.TECHNICAL in groups_to_compute
+            and len(df) >= 100
+        ):
             optimized_features = self._compute_optimized_features(df, symbol)
             for name, values in optimized_features.items():
                 if self._validate_feature(values):
@@ -657,8 +789,6 @@ class FeaturePipeline:
                     all_metadata[name] = self._compute_metadata(
                         name, values, FeatureGroup.TECHNICAL
                     )
-
-        groups_to_compute = self._get_groups_to_compute()
 
         for group in groups_to_compute:
             group_features = self._compute_group(df, group, universe_data)
@@ -826,7 +956,8 @@ class FeaturePipeline:
         if method == NormalizationMethod.NONE:
             return values
 
-        result = np.full_like(values, np.nan)
+        values = np.asarray(values, dtype=float)
+        result = np.full(values.shape, np.nan, dtype=float)
         n = len(values)
 
         # CRITICAL FIX: Start from window index and use values[i - window : i]
@@ -980,9 +1111,19 @@ class FeaturePipeline:
             return features, metadata
 
         valid_matrix = feature_matrix[valid_mask]
+        column_std = np.nanstd(valid_matrix, axis=0)
+        non_constant_mask = np.isfinite(column_std) & (column_std > 1e-12)
+        if int(np.count_nonzero(non_constant_mask)) < 2:
+            return features, metadata
 
         # Compute correlation matrix
-        corr_matrix = np.corrcoef(valid_matrix.T)
+        corr_matrix = np.eye(len(feature_names), dtype=float)
+        corr_subset = np.corrcoef(valid_matrix[:, non_constant_mask].T)
+        corr_subset = np.atleast_2d(np.nan_to_num(corr_subset, nan=0.0, posinf=0.0, neginf=0.0))
+        active_indices = np.flatnonzero(non_constant_mask)
+        for row_offset, row_idx in enumerate(active_indices):
+            for col_offset, col_idx in enumerate(active_indices):
+                corr_matrix[row_idx, col_idx] = corr_subset[row_offset, col_offset]
 
         # Find features to remove (highly correlated with earlier features)
         to_remove = set()

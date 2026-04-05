@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -543,6 +545,7 @@ def persist_dataset_snapshot_bundle(
     holdout_sample_weights: np.ndarray | None = None,
     cv_splits: list[tuple[np.ndarray, np.ndarray]] | None = None,
     label_diagnostics: dict[str, Any] | None = None,
+    feature_selection_summary: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Persist immutable training dataset artifacts for deterministic replay."""
     snapshot_id = str(snapshot_manifest.get("snapshot_id") or "").strip()
@@ -613,6 +616,7 @@ def persist_dataset_snapshot_bundle(
         "feature_names": sorted({str(name) for name in feature_names}),
         "data_quality_report": dict(data_quality_report or {}),
         "label_diagnostics": dict(label_diagnostics or {}),
+        "feature_selection_summary": dict(feature_selection_summary or {}),
         "artifacts": artifacts,
         "development_rows": int(len(development_frame)),
         "holdout_rows": int(len(holdout_frame)) if holdout_frame is not None else 0,
@@ -626,6 +630,7 @@ def persist_dataset_snapshot_bundle(
             "feature_names": bundle_manifest["feature_names"],
             "data_quality_report": bundle_manifest["data_quality_report"],
             "label_diagnostics": bundle_manifest["label_diagnostics"],
+            "feature_selection_summary": bundle_manifest["feature_selection_summary"],
             "artifacts": bundle_manifest["artifacts"],
             "development_rows": bundle_manifest["development_rows"],
             "holdout_rows": bundle_manifest["holdout_rows"],
@@ -756,6 +761,43 @@ def _resolve_git_commit_hash(project_root: Path) -> str:
     return candidate
 
 
+def _resolve_git_branch(project_root: Path) -> str:
+    """Resolve current git branch name, or 'unknown' outside git environments."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return "unknown"
+
+    candidate = (result.stdout or "").strip()
+    if result.returncode != 0 or not candidate:
+        return "unknown"
+    return candidate
+
+
+def _resolve_git_dirty(project_root: Path) -> bool | None:
+    """Resolve whether the working tree is dirty, or None outside git environments."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "status", "--porcelain", "--untracked-files=no"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+    return bool((result.stdout or "").strip())
+
+
 def _dependency_lock_hash(project_root: Path) -> str:
     """Hash dependency lock inputs used for training reproducibility."""
     dependency_files = [
@@ -846,10 +888,28 @@ def register_training_model_version(
     version_id = f"{model_version}_{version_stamp}"
 
     root = project_root or Path.cwd()
+    commit_hash = _resolve_git_commit_hash(root)
+    branch_name = _resolve_git_branch(root)
+    dirty_state = _resolve_git_dirty(root)
+    host_name = (
+        os.environ.get("COMPUTERNAME")
+        or os.environ.get("HOSTNAME")
+        or socket.gethostname()
+        or "unknown"
+    )
+    wsl_distro = os.environ.get("WSL_DISTRO_NAME", "").strip() or None
+    dependency_hash = _dependency_lock_hash(root)
     lineage: dict[str, Any] = {
-        "code_commit_hash": _resolve_git_commit_hash(root),
-        "dependency_lock_hash": _dependency_lock_hash(root),
+        "code_commit_hash": commit_hash,
+        "git_commit": commit_hash,
+        "git_branch": branch_name,
+        "git_dirty": dirty_state,
+        "dependency_lock_hash": dependency_hash,
+        "environment_lock_hash": dependency_hash,
+        "training_host": host_name,
+        "wsl_distro": wsl_distro,
         "python_version": sys.version.split()[0],
+        "platform": sys.platform,
     }
 
     if isinstance(snapshot_manifest, dict):

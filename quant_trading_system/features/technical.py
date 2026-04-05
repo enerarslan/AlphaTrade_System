@@ -29,6 +29,17 @@ import numpy as np
 import polars as pl
 
 
+def _safe_divide(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+    *,
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    """Vectorized divide that avoids invalid-value warnings on zero denominators."""
+    result = np.full(np.broadcast_shapes(np.shape(numerator), np.shape(denominator)), fill_value)
+    return np.divide(numerator, denominator, out=result, where=denominator != 0)
+
+
 # =============================================================================
 # MEMOIZATION CACHE FOR INDICATOR CALCULATIONS
 # =============================================================================
@@ -1720,8 +1731,10 @@ class AccumulationDistribution(TechnicalIndicator):
         close = df["close"].to_numpy().astype(np.float64)
         volume = df["volume"].to_numpy().astype(np.float64)
 
-        clv = np.where(
-            high != low, ((close - low) - (high - close)) / (high - low), 0
+        clv = _safe_divide(
+            ((close - low) - (high - close)),
+            (high - low),
+            fill_value=0.0,
         )
         mf_volume = clv * volume
         ad = np.cumsum(mf_volume)
@@ -1743,8 +1756,10 @@ class ChaikinMoneyFlow(TechnicalIndicator):
         close = df["close"].to_numpy().astype(np.float64)
         volume = df["volume"].to_numpy().astype(np.float64)
 
-        clv = np.where(
-            high != low, ((close - low) - (high - close)) / (high - low), 0
+        clv = _safe_divide(
+            ((close - low) - (high - close)),
+            (high - low),
+            fill_value=0.0,
         )
         mf_volume = clv * volume
 

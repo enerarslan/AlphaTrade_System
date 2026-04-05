@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from quant_trading_system.monitoring.dashboard import (
+    _get_audit_secret,
     app,
     DashboardState,
     ConnectionManager,
@@ -27,6 +28,19 @@ from quant_trading_system.monitoring.dashboard import (
 
 class TestDashboardState:
     """Tests for DashboardState class."""
+
+    def test_get_audit_secret_uses_dev_fallback_outside_production(self, monkeypatch):
+        monkeypatch.delenv("DASHBOARD_AUDIT_SECRET", raising=False)
+        monkeypatch.setenv("APP_ENV", "development")
+
+        assert _get_audit_secret() == "DEV_ONLY_AUDIT_SECRET_CHANGE_ME"
+
+    def test_get_audit_secret_requires_secret_in_production(self, monkeypatch):
+        monkeypatch.delenv("DASHBOARD_AUDIT_SECRET", raising=False)
+        monkeypatch.setenv("APP_ENV", "production")
+
+        with pytest.raises(RuntimeError, match="DASHBOARD_AUDIT_SECRET must be set"):
+            _get_audit_secret()
 
     def test_create_state(self):
         """Test creating dashboard state."""

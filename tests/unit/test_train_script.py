@@ -29,7 +29,7 @@ def _base_args(**overrides):
     args = {
         "model": "xgboost",
         "name": "",
-        "training_profile": "promotion",
+        "training_profile": "research",
         "symbols": [],
         "symbols_file": None,
         "start": "",
@@ -54,6 +54,7 @@ def _base_args(**overrides):
         "nested_inner_splits": 2,
         "nested_outer_stability_ratio_cap": 1.25,
         "nested_outer_stability_min_trials": 8,
+        "allow_unstable_outer_fold_fallback": False,
         "disable_nested_walk_forward": False,
         "objective_weight_sharpe": 1.0,
         "objective_weight_drawdown": 0.5,
@@ -62,6 +63,7 @@ def _base_args(**overrides):
         "objective_weight_trade_activity": 1.0,
         "objective_weight_cvar": 0.4,
         "objective_weight_skew": 0.1,
+        "objective_skew_penalty_cap": 1.5,
         "objective_weight_tail_risk": 0.35,
         "objective_weight_symbol_concentration": 0.20,
         "objective_expected_shortfall_cap": 0.012,
@@ -73,6 +75,7 @@ def _base_args(**overrides):
         "gpu": False,
         "use_gpu": False,
         "require_gpu": False,
+        "require_feature_gpu": False,
         "no_database": False,
         "no_redis_cache": False,
         "no_shap": False,
@@ -88,6 +91,7 @@ def _base_args(**overrides):
         "disable_meta_dynamic_threshold": False,
         "disable_meta_labeling": False,
         "disable_probability_calibration": False,
+        "enable_ranker_probability_calibration": False,
         "probability_calibration_method": "isotonic",
         "holdout_pct": 0.15,
         "min_holdout_sharpe": 0.0,
@@ -139,6 +143,8 @@ def _base_args(**overrides):
         "execution_cooldown_bars": 2,
         "execution_max_symbol_entry_share": 0.68,
         "min_confidence_position_scale": 0.20,
+        "enable_expected_edge_symbol_priors": False,
+        "expected_edge_min_coverage": 0.55,
         "warm_start_model": None,
         "min_accuracy": 0.45,
         "min_trades": 100,
@@ -157,6 +163,20 @@ def test_extract_base_symbol():
     assert train_script.ModelTrainer._extract_base_symbol("AAPL_15MIN") == "AAPL"
     assert train_script.ModelTrainer._extract_base_symbol("BRK.B_15MIN") == "BRK.B"
     assert train_script.ModelTrainer._extract_base_symbol("MSFT") == "MSFT"
+
+
+def test_model_trainer_records_training_provenance():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+
+    provenance = trainer.training_metrics["training_provenance"]
+
+    assert isinstance(provenance, dict)
+    assert "git_commit" in provenance
+    assert "dependency_lock_hash" in provenance
+    assert "environment_lock_hash" in provenance
+    assert "git_commit_hash" in provenance
+    assert trainer.training_metrics["environment_lock_hash"] == provenance["environment_lock_hash"]
+    assert trainer.training_metrics["training_host"]
 
 
 def test_verify_gpu_stack_allows_tree_gpu_without_torch_cuda(monkeypatch):
@@ -183,6 +203,77 @@ def test_verify_gpu_stack_allows_tree_gpu_without_torch_cuda(monkeypatch):
     monkeypatch.setitem(sys.modules, "lightgbm", _FakeLightGBMModule())
 
     assert train_script._verify_gpu_stack(["lightgbm"]) is True
+
+
+def test_build_feature_quality_audit_records_null_finite_and_clipped_rates():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+
+    matrix = pd.DataFrame(
+        {
+            "alpha_signal": [0.0, 0.1, np.nan, 0.2, 50.0, -40.0],
+            "beta_flow": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        }
+    )
+
+    audit = trainer._build_feature_quality_audit(matrix, ["alpha_signal", "beta_flow"])
+
+    assert audit["feature_count"] == 2
+    assert audit["by_feature"]["alpha_signal"]["null_rate"] == pytest.approx(1.0 / 6.0)
+    assert audit["by_feature"]["alpha_signal"]["finite_rate"] == pytest.approx(5.0 / 6.0)
+    assert audit["by_feature"]["alpha_signal"]["clipped_rate"] >= 0.0
+    assert "alpha" in audit["family_summary"]
+
+
+def test_record_feature_gpu_contract_records_partial_acceleration_without_feature_gpu_requirement(
+    monkeypatch,
+):
+    from quant_trading_system.features import feature_pipeline as feature_pipeline_module
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            use_gpu=True,
+            require_gpu=True,
+        )
+    )
+
+    monkeypatch.setattr(feature_pipeline_module, "CUDF_AVAILABLE", True)
+
+    trainer._record_feature_gpu_contract(
+        groups_to_compute=[
+            feature_pipeline_module.FeatureGroup.TECHNICAL,
+            feature_pipeline_module.FeatureGroup.STATISTICAL,
+        ],
+        disable_optimized_technical=False,
+    )
+
+    payload = trainer.training_metrics["feature_gpu_contract"]
+
+    assert trainer.training_metrics["feature_gpu_fully_ready"] == pytest.approx(0.0)
+    assert payload["partially_gpu_accelerated_groups"] == ["technical"]
+    assert payload["cpu_materialized_groups"] == ["technical", "statistical"]
+    assert payload["feature_gpu_required"] is False
+
+
+def test_record_feature_gpu_contract_requires_complete_feature_gpu_when_requested(monkeypatch):
+    from quant_trading_system.features import feature_pipeline as feature_pipeline_module
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            use_gpu=True,
+            require_gpu=True,
+            require_feature_gpu=True,
+        )
+    )
+
+    monkeypatch.setattr(feature_pipeline_module, "CUDF_AVAILABLE", True)
+
+    with pytest.raises(RuntimeError, match="Feature GPU contract failed"):
+        trainer._record_feature_gpu_contract(
+            groups_to_compute=[feature_pipeline_module.FeatureGroup.TECHNICAL],
+            disable_optimized_technical=False,
+        )
 
 
 def test_verify_gpu_stack_requires_cuda_for_deep_models(monkeypatch):
@@ -229,6 +320,15 @@ def test_training_config_requires_enabled_gpu_when_gpu_is_mandatory():
             model_type="lightgbm",
             use_gpu=False,
             require_gpu=True,
+        )
+
+
+def test_training_config_requires_enabled_gpu_when_feature_gpu_is_mandatory():
+    with pytest.raises(ValueError, match="require_feature_gpu=True requires use_gpu=True"):
+        train_script.TrainingConfig(
+            model_type="lightgbm",
+            use_gpu=False,
+            require_feature_gpu=True,
         )
 
 
@@ -1143,8 +1243,48 @@ def test_run_training_rejects_optional_disable_flags():
 
 
 def test_run_training_promotion_profile_rejects_optional_governance_disables():
-    assert train_script.run_training(_base_args(no_shap=True)) == 1
-    assert train_script.run_training(_base_args(disable_meta_labeling=True)) == 1
+    assert train_script.run_training(_base_args(training_profile="promotion", no_shap=True)) == 1
+    assert train_script.run_training(
+        _base_args(training_profile="promotion", disable_meta_labeling=True)
+    ) == 1
+
+
+def test_run_training_promotion_profile_requires_git_checkout(monkeypatch):
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+    monkeypatch.setattr(train_script, "_promotion_repo_provenance_ready", lambda _root: False)
+
+    class DummyModelTrainer:
+        def __init__(self, _config):
+            raise AssertionError("promotion provenance gate should block before trainer construction")
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+
+    args = _base_args(model="lightgbm_ranker", training_profile="promotion")
+    assert train_script.run_training(args) == 1
+
+
+def test_run_training_promotion_profile_requires_snapshot_bundle(monkeypatch):
+    monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+    monkeypatch.setattr(train_script, "_promotion_repo_provenance_ready", lambda _root: True)
+
+    class DummyModelTrainer:
+        def __init__(self, _config):
+            raise AssertionError("promotion snapshot gate should block before trainer construction")
+
+    monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
+
+    args = _base_args(model="lightgbm_ranker", training_profile="promotion")
+    assert train_script.run_training(args) == 1
+
+
+def test_training_config_blocks_promotion_unstable_outer_fold_fallback():
+    with pytest.raises(ValueError, match="Promotion profile cannot allow unstable outer-fold"):
+        train_script.TrainingConfig(
+            training_profile="promotion",
+            allow_unstable_outer_fold_fallback=True,
+        )
 
 
 def test_run_training_blocks_strict_snapshot_promotion_without_ready_research_candidate(
@@ -1214,6 +1354,7 @@ def test_run_training_blocks_strict_snapshot_promotion_without_ready_research_ca
 
     args = _base_args(
         model="lightgbm_ranker",
+        training_profile="promotion",
         output_dir=str(tmp_path),
         dataset_snapshot_bundle=str(bundle_path),
         strict_snapshot_replay=True,
@@ -1227,6 +1368,7 @@ def test_run_training_allows_bypassed_strict_snapshot_promotion_precheck(monkeyp
     captured = {}
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
+    monkeypatch.setattr(train_script, "_promotion_repo_provenance_ready", lambda _root: True)
 
     class DummyModelTrainer:
         def __init__(self, config):
@@ -1252,6 +1394,7 @@ def test_run_training_allows_bypassed_strict_snapshot_promotion_precheck(monkeyp
 
     args = _base_args(
         model="lightgbm_ranker",
+        training_profile="promotion",
         output_dir=str(tmp_path),
         dataset_snapshot_bundle=str(bundle_path),
         strict_snapshot_replay=True,
@@ -1416,8 +1559,35 @@ def test_run_training_auto_reuses_matching_snapshot_bundle(monkeypatch, tmp_path
     monkeypatch.setattr(train_script, "_verify_institutional_infra", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(train_script, "_verify_gpu_stack", lambda _model_list: True)
 
+    parser = train_script.build_parser()
+    argv = [
+        "--training-profile",
+        "research",
+        "--model",
+        "lightgbm",
+        "--output-dir",
+        str(tmp_path),
+        "--n-trials",
+        "100",
+        "--n-splits",
+        "5",
+        "--nested-outer-splits",
+        "4",
+        "--nested-inner-splits",
+        "3",
+        "--feature-selection-stability-iterations",
+        "16",
+    ]
+    args = parser.parse_args(argv)
+    train_script._attach_explicit_profile_overrides(parser, args, argv)
+
     scope = train_script._build_snapshot_training_scope(
-        train_script.TrainingConfig(model_type="lightgbm", output_dir=str(tmp_path))
+        train_script.TrainingConfig(
+            model_type="lightgbm",
+            output_dir=str(tmp_path),
+            training_profile="research",
+            feature_selection_stability_iterations=16,
+        )
     )
     bundle_path = tmp_path / "snapshots" / "snap_123" / "dataset_bundle.manifest.json"
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1434,15 +1604,6 @@ def test_run_training_auto_reuses_matching_snapshot_bundle(monkeypatch, tmp_path
         encoding="utf-8",
     )
 
-    args = _base_args(
-        model="lightgbm",
-        output_dir=str(tmp_path),
-        n_trials=100,
-        n_splits=5,
-        nested_outer_splits=4,
-        nested_inner_splits=3,
-        feature_selection_stability_iterations=16,
-    )
     exit_code = train_script.run_training(args)
 
     assert exit_code == 0
@@ -2065,6 +2226,50 @@ def test_apply_feature_selection_records_detailed_audit(monkeypatch):
     assert trainer.training_metrics["feature_selection_binding"] == pytest.approx(1.0)
 
 
+def test_apply_feature_selection_preserves_upstream_snapshot_binding(monkeypatch):
+    import quant_trading_system.models.feature_selection as feature_selection_module
+
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    trainer.dataset_snapshot_bundle_manifest = {
+        "feature_selection_summary": {
+            "development_binding": 1.0,
+            "development_initial_feature_count": 320.0,
+            "development_selected_feature_count": 103.0,
+        }
+    }
+    trainer.features = pd.DataFrame(
+        {
+            "momentum_10": [0.1, 0.2, 0.3, 0.4],
+            "rsi_14": [40.0, 42.0, 39.0, 43.0],
+        }
+    )
+    trainer.labels = np.array([0, 1, 0, 1], dtype=int)
+    trainer.feature_names = trainer.features.columns.tolist()
+
+    monkeypatch.setattr(
+        feature_selection_module,
+        "select_training_features",
+        lambda features, labels, config: SimpleNamespace(
+            selected_features=list(features.columns),
+            diagnostics={
+                "initial_feature_count": len(features.columns),
+                "selected_feature_count": len(features.columns),
+                "correlation_pruned_count": 0,
+                "stability_selected_count": len(features.columns),
+            },
+            information_coefficients={name: 0.05 for name in features.columns},
+            correlation_pruned_features=[],
+            stability_scores={name: 1.0 for name in features.columns},
+        ),
+    )
+
+    trainer._apply_feature_selection()
+
+    assert trainer.training_metrics["feature_selection_upstream_binding"] == pytest.approx(1.0)
+    assert trainer.training_metrics["feature_selection_current_stage_binding"] == pytest.approx(0.0)
+    assert trainer.training_metrics["feature_selection_binding"] == pytest.approx(1.0)
+
+
 def test_aggregate_fold_objective_penalizes_instability_and_downside():
     stable_score = train_script.ModelTrainer._aggregate_fold_objective(
         [0.9, 1.0, 0.8],
@@ -2172,6 +2377,34 @@ def test_compute_objective_components_disables_ranker_calibration_penalty():
     )
 
     assert components["objective_calibration_penalty"] == pytest.approx(0.0)
+
+
+def test_compute_objective_components_caps_skew_penalty():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            objective_weight_skew=0.5,
+            objective_skew_penalty_cap=1.25,
+        )
+    )
+
+    components = trainer._compute_objective_components(
+        sharpe=0.2,
+        max_drawdown=0.05,
+        turnover=0.1,
+        brier_score=0.20,
+        trade_count=15,
+        cvar=-0.02,
+        skew=-9.0,
+        expected_shortfall=0.04,
+        symbol_concentration_hhi=0.50,
+        equity_break=0.0,
+        evaluation_size=120,
+    )
+
+    assert components["objective_skew_penalty_raw"] == pytest.approx(-4.5)
+    assert components["objective_skew_penalty"] == pytest.approx(-1.25)
+    assert components["objective_skew_penalty_cap"] == pytest.approx(1.25)
 
 
 def test_compute_objective_components_penalizes_negative_symbol_tail():
@@ -3377,6 +3610,58 @@ def test_compute_features_full_pipeline_allows_wave1_cross_sectional_row_budget(
     assert len(trainer.features) == row_count
 
 
+def test_compute_symbol_feature_frame_reuses_group_pipelines(monkeypatch):
+    from quant_trading_system.features import feature_pipeline as feature_pipeline_module
+
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    constructor_calls = {"count": 0}
+
+    class _FakeFeatureSet:
+        def __init__(self, feature_name: str, length: int):
+            self.features = {feature_name: np.ones(length, dtype=np.float32)}
+
+    class _FakePipeline:
+        def __init__(self, config):
+            constructor_calls["count"] += 1
+            self.config = config
+
+        def compute(self, df, symbol, universe_data=None, use_cache=False):
+            group = self.config.groups[0]
+            return _FakeFeatureSet(f"{group.value}_feature", len(df))
+
+    monkeypatch.setattr(feature_pipeline_module, "FeaturePipeline", _FakePipeline)
+
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC"),
+            "open": [1.0, 1.0, 1.0, 1.0],
+            "high": [1.0, 1.0, 1.0, 1.0],
+            "low": [1.0, 1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0, 1.0],
+            "volume": [100.0, 110.0, 120.0, 130.0],
+        }
+    )
+
+    from quant_trading_system.features.feature_pipeline import FeatureGroup
+
+    trainer._compute_symbol_feature_frame(
+        df=df,
+        symbol="AAPL",
+        groups_to_compute=[FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL],
+        universe_data=None,
+        disable_optimized_technical=False,
+    )
+    trainer._compute_symbol_feature_frame(
+        df=df,
+        symbol="MSFT",
+        groups_to_compute=[FeatureGroup.TECHNICAL, FeatureGroup.STATISTICAL],
+        universe_data=None,
+        disable_optimized_technical=False,
+    )
+
+    assert constructor_calls["count"] == 2
+
+
 def test_training_config_defaults_cross_sectional_row_budget_to_wave1_scope():
     config = train_script.TrainingConfig(model_type="xgboost")
 
@@ -3563,6 +3848,12 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     trainer.feature_names = ["feat_a", "feat_b"]
     trainer.expected_edge_model = object()
     trainer.training_metrics = {
+        "git_commit": "abc1234",
+        "git_commit_hash": "abc1234",
+        "environment_lock_hash": "lockhash",
+        "training_host": "trainer-1",
+        "training_wsl_distro": "Ubuntu",
+        "training_repo_provenance_ready": 1.0,
         "holdout_long_threshold": 0.61,
         "holdout_short_threshold": 0.39,
         "holdout_side_policy": {
@@ -3581,6 +3872,15 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
         "symbol_quality_universe": ["AAPL", "MSFT"],
         "symbol_quality_dropped_list": ["TSLA"],
         "symbol_quality_report": {"AAPL": {"passes": True, "quality_score": 0.92}},
+        "feature_selection_development_binding": 1.0,
+        "feature_selection_final_refit_binding": 0.0,
+        "feature_selection_development_initial_feature_count": 10.0,
+        "feature_selection_development_selected_feature_count": 2.0,
+        "feature_selection_final_refit_initial_feature_count": 2.0,
+        "feature_selection_final_refit_selected_feature_count": 2.0,
+        "holdout_signal_activity_summary": {"effective_gate_active_rate": 0.14},
+        "feature_quality_summary": {"mean_null_rate": 0.01, "min_finite_rate": 0.99},
+        "feature_quality_family_summary": {"alpha": {"feature_count": 1.0}},
     }
     trainer.validation_results = {"all_passed": True}
     trainer.snapshot_manifest = {"feature_schema_version": "schema-1", "snapshot_id": "snap-1"}
@@ -3605,6 +3905,12 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     ] == pytest.approx(0.75)
     assert payload["universe_quality_policy"]["selected_symbols"] == ["AAPL", "MSFT"]
     assert payload["universe_quality_policy"]["dropped_symbols"] == ["TSLA"]
+    assert payload["training_provenance"]["git_commit"] == "abc1234"
+    assert payload["training_provenance"]["environment_lock_hash"] == "lockhash"
+    assert payload["feature_selection_contract"]["development_binding"] == pytest.approx(1.0)
+    assert payload["feature_selection_contract"]["final_refit_binding"] == pytest.approx(0.0)
+    assert payload["signal_activity_contract"]["effective_gate_active_rate"] == pytest.approx(0.14)
+    assert payload["feature_quality_contract"]["summary"]["min_finite_rate"] == pytest.approx(0.99)
 
 
 def test_write_promotion_package_persists_ranker_runtime_contract(tmp_path):
@@ -4518,6 +4824,29 @@ def test_build_parser_supports_horizon_sweep_and_meta_threshold_flags():
     assert args.min_confidence_position_scale == pytest.approx(0.3)
 
 
+def test_build_parser_supports_ranker_calibration_and_outer_fallback_flags():
+    parser = train_script.build_parser()
+    args = parser.parse_args(
+        [
+            "--enable-ranker-probability-calibration",
+            "--allow-unstable-outer-fold-fallback",
+            "--require-model-gpu",
+            "--require-feature-gpu",
+            "--objective-skew-penalty-cap",
+            "1.75",
+            "--expected-edge-min-coverage",
+            "0.25",
+        ]
+    )
+
+    assert args.enable_ranker_probability_calibration is True
+    assert args.allow_unstable_outer_fold_fallback is True
+    assert args.require_gpu is True
+    assert args.require_feature_gpu is True
+    assert args.objective_skew_penalty_cap == pytest.approx(1.75)
+    assert args.expected_edge_min_coverage == pytest.approx(0.25)
+
+
 def test_build_parser_supports_market_session_flags():
     parser = train_script.build_parser()
     args = parser.parse_args(["--include-premarket", "--include-postmarket"])
@@ -4854,6 +5183,41 @@ def test_fit_ranker_model_uses_model_eval_at_without_duplicate_fit_kwarg():
     assert captured["kwargs"]["eval_group"] == [np.array([2])]
 
 
+def test_ranker_eval_at_supports_alphatrade_cached_attr():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+
+    class DummyRanker:
+        _alphatrade_eval_at = [1, 3, 5]
+
+        def get_params(self, deep=False):
+            del deep
+            return {}
+
+    assert trainer._ranker_eval_at(DummyRanker()) == [1, 3, 5]
+
+
+def test_create_base_model_strips_ranker_eval_at_from_constructor(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class DummyRanker:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setitem(sys.modules, "lightgbm", SimpleNamespace(LGBMRanker=DummyRanker))
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            model_params={"eval_at": [1, 5, 10], "n_estimators": 12},
+        )
+    )
+
+    model = trainer._create_base_model()
+
+    assert "eval_at" not in captured["kwargs"]
+    assert getattr(model, "_alphatrade_eval_at") == [1, 5, 10]
+
+
 def test_build_ranking_groups_segments_by_timestamp():
     trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
     timestamps = np.array(
@@ -4937,6 +5301,51 @@ def test_ranker_probability_calibration_is_disabled():
     )
 
     assert trainer._supports_probability_calibration() is False
+
+
+def test_ranker_probability_calibration_can_be_enabled():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            enable_probability_calibration=True,
+            enable_ranker_probability_calibration=True,
+        )
+    )
+
+    assert trainer._supports_probability_calibration() is True
+
+
+def test_select_nested_outer_candidates_requires_stable_candidates_in_promotion():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            training_profile="promotion",
+        )
+    )
+
+    with pytest.raises(ValueError, match="unstable fallback is disabled"):
+        trainer._select_nested_outer_candidates(
+            [],
+            [(0.9, 0.8, 1.0, {"eta": 0.1}, 100, 2.0)],
+        )
+
+
+def test_select_nested_outer_candidates_allows_research_unstable_fallback():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            training_profile="research",
+            allow_unstable_outer_fold_fallback=True,
+        )
+    )
+
+    selected, fallback_used = trainer._select_nested_outer_candidates(
+        [],
+        [(0.9, 0.8, 1.0, {"eta": 0.1}, 100, 2.0)],
+    )
+
+    assert fallback_used is True
+    assert len(selected) == 1
 
 
 def test_ranker_fold_metrics_use_probability_proxy_for_scoring():
@@ -5131,6 +5540,24 @@ def test_auto_select_champion_requires_ready_plan_and_promotion_package(tmp_path
     assert snapshot["promoted"] is False
     assert snapshot["champion"] is None
     assert not (tmp_path / "active_model.json").exists()
+
+
+def test_register_training_model_version_includes_provenance_aliases(tmp_path):
+    entry = register_training_model_version(
+        registry_root=tmp_path / "registry",
+        model_name="xgboost",
+        model_version="xgb_alias",
+        model_type="xgboost",
+        model_path=str(tmp_path / "xgb_alias.pkl"),
+        metrics={"mean_accuracy": 0.6},
+        is_active=False,
+        project_root=Path.cwd(),
+    )
+
+    lineage = entry["lineage"]
+    assert "git_commit" in lineage
+    assert "environment_lock_hash" in lineage
+    assert "training_host" in lineage
 
 
 def test_multiple_testing_correction_adds_deflated_sharpe_and_pbo_metrics():

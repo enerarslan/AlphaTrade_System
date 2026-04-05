@@ -16,6 +16,7 @@ This layer abstracts the underlying data sources and provides:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -183,6 +184,19 @@ class DataAccessConfig:
         self.data_dir = data_dir or Path("data/raw")
         self.training_data_dir = training_data_dir or Path("data/training")
         self.max_missing_symbols = max(0, int(max_missing_symbols))
+        environment = os.environ.get("APP_ENV", "development").strip().lower()
+        explicit_override = os.environ.get("ALLOW_FILE_FALLBACK_IN_PRODUCTION", "").strip().lower()
+        if (
+            self.use_database
+            and self.fallback_to_files
+            and environment in {"production", "staging"}
+            and explicit_override not in {"1", "true", "yes"}
+        ):
+            raise ValueError(
+                "File fallback is disabled for production/staging runtime. "
+                "Unset fallback_to_files or set ALLOW_FILE_FALLBACK_IN_PRODUCTION=true for an "
+                "explicit temporary override."
+            )
 
 
 class DataAccessLayer:

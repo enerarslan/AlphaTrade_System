@@ -55,7 +55,7 @@ command=(
   --execution-turnover-cap 0.60
   --min-confidence-position-scale 0.20
   --probability-calibration-method isotonic
-  --require-gpu
+  --require-model-gpu
   "$@"
 )
 

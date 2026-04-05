@@ -10,6 +10,7 @@ run_suffix="$1"
 shift
 
 symbols_file="${ALPHATRADE_SYMBOLS_FILE:-data/training/universes/wave1_clean_core11_20260402.json}"
+training_profile="${ALPHATRADE_TRAINING_PROFILE:-research}"
 blocked_overrides=(
   "--dataset-snapshot-bundle"
   "--symbols"
@@ -28,7 +29,24 @@ for arg in "$@"; do
   done
 done
 
-cd ~/AlphaTrade_wsl
+case "$training_profile" in
+  research|promotion)
+    ;;
+  *)
+    echo "Unsupported ALPHATRADE_TRAINING_PROFILE: ${training_profile}. Use 'research' or 'promotion'." >&2
+    exit 1
+    ;;
+esac
+
+workspace_dir="${ALPHATRADE_WSL_WORKSPACE:-$HOME/AlphaTrade_wsl}"
+cd "$workspace_dir"
+
+if [[ "$training_profile" == "promotion" ]]; then
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Promotion launcher requires a real Git checkout/worktree. Current workspace is not a Git repository: ${workspace_dir}" >&2
+    exit 1
+  fi
+fi
 
 if [[ ! -f "$symbols_file" ]]; then
   echo "Approved clean universe file not found: $symbols_file" >&2
@@ -41,8 +59,8 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONFAULTHANDLER=1
 
-log_file="logs/train_wave1_ranker_research_${run_suffix}.stdout.log"
-model_name="wave1_ranker_research_20260402_${run_suffix}"
+log_file="logs/train_wave1_ranker_${training_profile}_${run_suffix}.stdout.log"
+model_name="wave1_ranker_${training_profile}_20260402_${run_suffix}"
 snapshot_prep_name="${model_name}_snapshotprep"
 session_name="alphatrade_${run_suffix}"
 launcher_script="$(dirname "$0")/wsl_tmux_launcher.sh"
@@ -53,7 +71,7 @@ common_args=(
   main.py
   train
   --model lightgbm_ranker
-  --training-profile research
+  --training-profile "$training_profile"
   --symbols-file "$symbols_file"
   --timeframe 15Min
   --cv-method purged_kfold
@@ -84,7 +102,6 @@ common_args=(
   --execution-turnover-cap 0.60
   --min-confidence-position-scale 0.20
   --probability-calibration-method isotonic
-  --require-gpu
   --max-cross-sectional-rows 500000
   "$@"
 )

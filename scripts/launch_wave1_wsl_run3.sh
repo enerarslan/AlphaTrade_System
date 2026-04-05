@@ -56,7 +56,7 @@ command=(
   --min-confidence-position-scale 0.20
   --probability-calibration-method isotonic
   --meta-label-min-confidence 0.55
-  --require-gpu
+  --require-model-gpu
   "$@"
 )
 

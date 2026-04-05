@@ -21,6 +21,115 @@ import numpy as np
 import polars as pl
 
 
+def _safe_divide(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+    *,
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    """Vectorized divide that avoids invalid-value warnings on zero denominators."""
+    result = np.full(np.broadcast_shapes(np.shape(numerator), np.shape(denominator)), fill_value)
+    return np.divide(numerator, denominator, out=result, where=denominator != 0)
+
+
+def _rolling_sum(arr: np.ndarray, window: int) -> np.ndarray:
+    """Compute rolling sums for a 1D array."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    if window <= 0 or window > values.size:
+        return result
+    sums = np.cumsum(values, dtype=np.float64)
+    out = sums[int(window) - 1 :].copy()
+    if int(window) < values.size:
+        out[1:] -= sums[: -int(window)]
+    result[int(window) - 1 :] = out
+    return result
+
+
+def _rolling_mean(arr: np.ndarray, window: int) -> np.ndarray:
+    """Compute rolling means for a 1D array."""
+    sums = _rolling_sum(arr, window)
+    result = sums.copy()
+    valid = np.isfinite(result)
+    if np.any(valid):
+        result[valid] = result[valid] / float(window)
+    return result
+
+
+def _rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
+    """Compute rolling standard deviation for a 1D array."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    if window <= 1 or window > values.size:
+        return result
+    sums = np.cumsum(values, dtype=np.float64)
+    sums_sq = np.cumsum(values * values, dtype=np.float64)
+    sum_w = sums[int(window) - 1 :].copy()
+    sum_sq_w = sums_sq[int(window) - 1 :].copy()
+    if int(window) < values.size:
+        sum_w[1:] -= sums[: -int(window)]
+        sum_sq_w[1:] -= sums_sq[: -int(window)]
+    numerator = sum_sq_w - ((sum_w**2) / float(window))
+    numerator = np.maximum(numerator, 0.0)
+    result[int(window) - 1 :] = np.sqrt(numerator / float(max(window - 1, 1)))
+    return result
+
+
+def _rolling_lagged_correlation(arr: np.ndarray, window: int, lag: int) -> np.ndarray:
+    """Compute rolling correlation between a series and its lagged copy."""
+    values = np.asarray(arr, dtype=np.float64).reshape(-1)
+    result = np.full(values.size, np.nan, dtype=np.float64)
+    if lag <= 0 or lag >= values.size:
+        return result
+    current = values[lag:]
+    previous = values[:-lag]
+    n = current.size
+    if window <= 1 or window > n:
+        return result
+
+    current_mean = _rolling_mean(current, window)
+    previous_mean = _rolling_mean(previous, window)
+    current_std = _rolling_std(current, window)
+    previous_std = _rolling_std(previous, window)
+    cross_mean = _rolling_mean(current * previous, window)
+
+    cov = cross_mean - (current_mean * previous_mean)
+    denom = current_std * previous_std
+    corr = np.full(n, np.nan, dtype=np.float64)
+    valid = np.isfinite(cov) & np.isfinite(denom) & (denom > 1e-18)
+    if np.any(valid):
+        corr[valid] = np.clip(cov[valid] / denom[valid], -1.0, 1.0)
+    result[lag:] = corr
+    return result
+
+
+def _rolling_beta(numerator_series: np.ndarray, denominator_series: np.ndarray, window: int) -> np.ndarray:
+    """Compute rolling slope coefficient for y = beta * x."""
+    y_values = np.asarray(numerator_series, dtype=np.float64).reshape(-1)
+    x_values = np.asarray(denominator_series, dtype=np.float64).reshape(-1)
+    n = min(y_values.size, x_values.size)
+    result = np.full(n, np.nan, dtype=np.float64)
+    if window <= 1 or window > n:
+        return result
+
+    y_values = y_values[:n]
+    x_values = x_values[:n]
+    sum_x = _rolling_sum(x_values, window)
+    sum_y = _rolling_sum(y_values, window)
+    sum_xy = _rolling_sum(x_values * y_values, window)
+    sum_x2 = _rolling_sum(x_values * x_values, window)
+    valid = np.isfinite(sum_x) & np.isfinite(sum_y) & np.isfinite(sum_xy) & np.isfinite(sum_x2)
+    if np.any(valid):
+        cov_num = sum_xy[valid] - ((sum_x[valid] * sum_y[valid]) / float(window))
+        var_x_num = sum_x2[valid] - ((sum_x[valid] ** 2) / float(window))
+        beta = np.full(cov_num.shape[0], np.nan, dtype=np.float64)
+        valid_var = var_x_num > 1e-18
+        if np.any(valid_var):
+            beta[valid_var] = cov_num[valid_var] / var_x_num[valid_var]
+        result[np.flatnonzero(valid)] = beta
+    return result
+
+
 @dataclass
 class MicrostructureResult:
     """Result container for microstructure feature calculations."""
@@ -159,28 +268,23 @@ class OrderBookImbalance(MicrostructureFeature):
         # Rolling imbalance metrics
         for window in self.windows:
             # Rolling mean imbalance
-            rolling_imb = np.full(n, np.nan)
-            for i in range(window - 1, n):
-                rolling_imb[i] = np.mean(l1_imbalance[i - window + 1: i + 1])
+            rolling_imb = _rolling_mean(l1_imbalance, window)
             results[f"obi_ma_{window}"] = rolling_imb
 
             # Imbalance momentum (change in imbalance)
             imb_mom = np.full(n, np.nan)
             if window > 1:
-                for i in range(window, n):
-                    imb_mom[i] = rolling_imb[i] - rolling_imb[i - window]
+                current = rolling_imb[window:]
+                previous = rolling_imb[:-window]
+                valid = np.isfinite(current) & np.isfinite(previous)
+                if np.any(valid):
+                    window_indices = np.flatnonzero(valid) + window
+                    imb_mom[window_indices] = current[valid] - previous[valid]
             results[f"obi_momentum_{window}"] = imb_mom
 
             # Imbalance persistence (autocorrelation)
-            imb_persist = np.full(n, np.nan)
             lag = min(window // 2, 5)
-            for i in range(window + lag - 1, n):
-                recent = l1_imbalance[i - window + 1: i + 1]
-                lagged = l1_imbalance[i - window + 1 - lag: i + 1 - lag]
-                if len(recent) == len(lagged) and len(recent) > 2:
-                    corr = np.corrcoef(recent, lagged)
-                    if not np.isnan(corr[0, 1]):
-                        imb_persist[i] = corr[0, 1]
+            imb_persist = _rolling_lagged_correlation(l1_imbalance, window, lag)
             results[f"obi_persistence_{window}"] = imb_persist
 
         # Imbalance pressure (signed by price direction)
@@ -246,7 +350,7 @@ class OrderBookImbalance(MicrostructureFeature):
 
         # Approximate imbalance using Close Location Value (CLV)
         hl_range = high - low
-        clv = np.where(hl_range > 0, (2 * close - high - low) / hl_range, 0.0)
+        clv = _safe_divide((2 * close - high - low), hl_range, fill_value=0.0)
         results["obi_approx"] = clv
 
         # Volume-weighted CLV
@@ -255,21 +359,13 @@ class OrderBookImbalance(MicrostructureFeature):
 
         # Rolling approximations
         for window in self.windows:
-            rolling_clv = np.full(n, np.nan)
-            for i in range(window - 1, n):
-                rolling_clv[i] = np.mean(clv[i - window + 1: i + 1])
+            rolling_clv = _rolling_mean(clv, window)
             results[f"obi_approx_ma_{window}"] = rolling_clv
 
             # Volume-weighted rolling
-            rolling_vw = np.full(n, np.nan)
-            rolling_vol = np.full(n, np.nan)
-            for i in range(window - 1, n):
-                vol_sum = np.sum(volume[i - window + 1: i + 1])
-                if vol_sum > 0:
-                    rolling_vw[i] = (
-                        np.sum(vw_clv[i - window + 1: i + 1]) / vol_sum
-                    )
-                rolling_vol[i] = vol_sum
+            rolling_vw_sum = _rolling_sum(vw_clv, window)
+            rolling_vol = _rolling_sum(volume, window)
+            rolling_vw = _safe_divide(rolling_vw_sum, rolling_vol, fill_value=np.nan)
             results[f"obi_vw_ma_{window}"] = rolling_vw
 
         return results
@@ -334,7 +430,7 @@ class OrderBookPressure(MicrostructureFeature):
 
         # Pressure ratio: bid_pressure / (bid_pressure + ask_pressure)
         total = bid_size + ask_size
-        pressure_ratio = np.where(total > 0, bid_size / total, 0.5)
+        pressure_ratio = _safe_divide(bid_size, total, fill_value=0.5)
         results["obp_ratio"] = pressure_ratio
 
         # Centered pressure (-1 to 1 scale)
@@ -344,9 +440,7 @@ class OrderBookPressure(MicrostructureFeature):
         # Rolling pressure metrics
         for window in self.windows:
             # Rolling mean pressure
-            rolling_press = np.full(n, np.nan)
-            for i in range(window - 1, n):
-                rolling_press[i] = np.mean(centered_pressure[i - window + 1: i + 1])
+            rolling_press = _rolling_mean(centered_pressure, window)
             results[f"obp_ma_{window}"] = rolling_press
 
             # Pressure acceleration
@@ -412,7 +506,7 @@ class QuoteImbalanceVelocity(MicrostructureFeature):
             bid_size = df["bid_size_1"].to_numpy().astype(np.float64)
             ask_size = df["ask_size_1"].to_numpy().astype(np.float64)
             total = bid_size + ask_size
-            imbalance = np.where(total > 0, (bid_size - ask_size) / total, 0.0)
+            imbalance = _safe_divide((bid_size - ask_size), total, fill_value=0.0)
         else:
             # Fallback to CLV
             self.validate_input(df, ["high", "low", "close"])
@@ -435,9 +529,7 @@ class QuoteImbalanceVelocity(MicrostructureFeature):
         # Rolling velocities
         for window in self.windows:
             # Average velocity over window
-            rolling_vel = np.full(n, np.nan)
-            for i in range(window - 1, n):
-                rolling_vel[i] = np.mean(velocity[i - window + 1: i + 1])
+            rolling_vel = _rolling_mean(velocity, window)
             results[f"qiv_vel_ma_{window}"] = rolling_vel
 
             # Velocity magnitude (absolute)
@@ -451,11 +543,15 @@ class QuoteImbalanceVelocity(MicrostructureFeature):
 
             # Velocity persistence
             persist = np.full(n, np.nan)
-            for i in range(window, n):
-                prev_vel = rolling_vel[i - window]
-                curr_vel = rolling_vel[i]
-                if not np.isnan(prev_vel) and not np.isnan(curr_vel):
-                    persist[i] = 1 if np.sign(prev_vel) == np.sign(curr_vel) else 0
+            if window < n:
+                prev_vel = rolling_vel[:-window]
+                curr_vel = rolling_vel[window:]
+                valid = np.isfinite(prev_vel) & np.isfinite(curr_vel)
+                if np.any(valid):
+                    persist_indices = np.flatnonzero(valid) + window
+                    persist[persist_indices] = (
+                        np.sign(prev_vel[valid]) == np.sign(curr_vel[valid])
+                    ).astype(float)
             results[f"qiv_persist_{window}"] = persist
 
         return results
@@ -485,9 +581,7 @@ class BuySellVolumeImbalance(MicrostructureFeature):
 
         # Estimate buy ratio using close location value (CLV)
         hl_range = high - low
-        buy_ratio = np.where(
-            hl_range > 0, (close - low) / hl_range, 0.5
-        )
+        buy_ratio = _safe_divide((close - low), hl_range, fill_value=0.5)
 
         buy_volume = volume * buy_ratio
         sell_volume = volume * (1 - buy_ratio)
@@ -495,18 +589,15 @@ class BuySellVolumeImbalance(MicrostructureFeature):
         results = {}
 
         # Raw imbalance
-        raw_imbalance = (buy_volume - sell_volume) / np.where(volume == 0, 1, volume)
+        raw_imbalance = _safe_divide((buy_volume - sell_volume), volume, fill_value=0.0)
         results["volume_imbalance_raw"] = raw_imbalance
 
         # Rolling imbalance
         for window in self.windows:
-            imbalance = np.full(len(close), np.nan)
-            for i in range(window - 1, len(close)):
-                buy_sum = np.sum(buy_volume[i - window + 1 : i + 1])
-                sell_sum = np.sum(sell_volume[i - window + 1 : i + 1])
-                total = buy_sum + sell_sum
-                if total > 0:
-                    imbalance[i] = (buy_sum - sell_sum) / total
+            buy_sum = _rolling_sum(buy_volume, window)
+            sell_sum = _rolling_sum(sell_volume, window)
+            total = buy_sum + sell_sum
+            imbalance = _safe_divide((buy_sum - sell_sum), total, fill_value=np.nan)
             results[f"volume_imbalance_{window}"] = imbalance
 
         return results
@@ -526,16 +617,14 @@ class VolumeAcceleration(MicrostructureFeature):
 
         for window in self.windows:
             # Rolling mean volume
-            vol_ma = np.full(len(volume), np.nan)
-            for i in range(window - 1, len(volume)):
-                vol_ma[i] = np.mean(volume[i - window + 1 : i + 1])
+            vol_ma = _rolling_mean(volume, window)
 
             # Acceleration (change in MA)
             accel = np.full(len(volume), np.nan)
             accel[1:] = np.diff(vol_ma)
 
             # Normalize by average volume
-            norm_accel = accel / np.where(vol_ma == 0, 1, vol_ma)
+            norm_accel = _safe_divide(accel, vol_ma, fill_value=0.0)
 
             results[f"volume_accel_{window}"] = norm_accel
 
@@ -558,18 +647,22 @@ class UnusualVolume(MicrostructureFeature):
         n = len(volume)
         vol_zscore = np.full(n, np.nan)
         unusual_flag = np.full(n, np.nan)
-
-        for i in range(self.window - 1, n):
-            window_vol = volume[i - self.window + 1 : i]  # Exclude current
-            mean_vol = np.mean(window_vol)
-            std_vol = np.std(window_vol, ddof=1)
-
-            if std_vol > 0:
-                vol_zscore[i] = (volume[i] - mean_vol) / std_vol
-                unusual_flag[i] = 1 if vol_zscore[i] > self.threshold else 0
-            else:
-                vol_zscore[i] = 0
-                unusual_flag[i] = 0
+        lookback = max(int(self.window) - 1, 1)
+        mean_prev = _rolling_mean(volume, lookback)
+        std_prev = _rolling_std(volume, lookback)
+        if lookback < n:
+            mean_prev = np.roll(mean_prev, 1)
+            std_prev = np.roll(std_prev, 1)
+            mean_prev[:lookback] = np.nan
+            std_prev[:lookback] = np.nan
+        valid = np.isfinite(mean_prev) & np.isfinite(std_prev) & (std_prev > 1e-18)
+        if np.any(valid):
+            vol_zscore[valid] = (volume[valid] - mean_prev[valid]) / std_prev[valid]
+            unusual_flag[valid] = (vol_zscore[valid] > self.threshold).astype(float)
+        zero_std = np.isfinite(mean_prev) & np.isfinite(std_prev) & ~valid
+        if np.any(zero_std):
+            vol_zscore[zero_std] = 0.0
+            unusual_flag[zero_std] = 0.0
 
         results[f"volume_zscore_{self.window}"] = vol_zscore
         results[f"unusual_volume_flag_{self.window}"] = unusual_flag
@@ -597,7 +690,7 @@ class VolumeMomentum(MicrostructureFeature):
         slow_ema = self._ema(volume, self.slow)
 
         # Volume momentum
-        vol_mom = fast_ema / np.where(slow_ema == 0, 1, slow_ema)
+        vol_mom = _safe_divide(fast_ema, slow_ema, fill_value=0.0)
 
         results["volume_momentum"] = vol_mom
         results["volume_ema_fast"] = fast_ema
@@ -646,15 +739,7 @@ class KylesLambda(MicrostructureFeature):
 
         # Signed volume (using price direction)
         signed_volume = np.where(price_change >= 0, volume, -volume)
-
-        for i in range(self.window - 1, n):
-            dP = price_change[i - self.window + 1 : i + 1]
-            dV = signed_volume[i - self.window + 1 : i + 1]
-
-            # Regression: dP = lambda * dV
-            var_dV = np.var(dV)
-            if var_dV > 0:
-                kyles_lambda[i] = np.cov(dP, dV)[0, 1] / var_dV
+        kyles_lambda = _rolling_beta(price_change, signed_volume, self.window)
 
         results[f"kyles_lambda_{self.window}"] = kyles_lambda
 
@@ -687,12 +772,10 @@ class AmihudIlliquidity(MicrostructureFeature):
         dollar_volume = close * volume
 
         # Daily Amihud
-        daily_amihud = np.abs(returns) / np.where(dollar_volume == 0, 1, dollar_volume)
+        daily_amihud = _safe_divide(np.abs(returns), dollar_volume, fill_value=0.0)
 
         # Rolling average
-        amihud = np.full(n, np.nan)
-        for i in range(self.window - 1, n):
-            amihud[i] = np.mean(daily_amihud[i - self.window + 1 : i + 1])
+        amihud = _rolling_mean(daily_amihud, self.window)
 
         results[f"amihud_{self.window}"] = amihud
         results["amihud_daily"] = daily_amihud
@@ -724,17 +807,13 @@ class RollSpread(MicrostructureFeature):
         # Price changes
         delta_p = np.diff(close, prepend=close[0])
 
-        for i in range(self.window, n):
-            dp = delta_p[i - self.window + 1 : i + 1]
-            dp_lag = delta_p[i - self.window : i]
-
-            cov = np.cov(dp, dp_lag)[0, 1]
-
-            # Roll spread = 2 * sqrt(-cov) if cov < 0
-            if cov < 0:
-                roll_spread[i] = 2 * np.sqrt(-cov)
-            else:
-                roll_spread[i] = 0
+        lagged_corr = _rolling_lagged_correlation(delta_p, self.window, 1)
+        delta_std = _rolling_std(delta_p, self.window)
+        valid = np.isfinite(lagged_corr) & np.isfinite(delta_std)
+        if np.any(valid):
+            cov = lagged_corr[valid] * (delta_std[valid] ** 2)
+            spread = np.where(cov < 0.0, 2.0 * np.sqrt(np.maximum(-cov, 0.0)), 0.0)
+            roll_spread[valid] = spread
 
         results[f"roll_spread_{self.window}"] = roll_spread
 
@@ -998,33 +1077,20 @@ class OrderFlowToxicity(MicrostructureFeature):
 
         # Compute buy/sell volume using CLV
         hl_range = high - low
-        buy_ratio = np.where(hl_range > 0, (close - low) / hl_range, 0.5)
+        buy_ratio = _safe_divide((close - low), hl_range, fill_value=0.5)
 
         buy_volume = volume * buy_ratio
         sell_volume = volume * (1 - buy_ratio)
 
         # Volume imbalance
         total_vol = buy_volume + sell_volume
-        imbalance = (buy_volume - sell_volume) / np.where(total_vol == 0, 1, total_vol)
+        imbalance = _safe_divide((buy_volume - sell_volume), total_vol, fill_value=0.0)
 
         # Toxicity = rolling autocorrelation of imbalance (persistence)
-        toxicity = np.full(n, np.nan)
-
-        for i in range(self.window + self.persistence_window - 1, n):
-            imb_window = imbalance[i - self.window + 1 : i + 1]
-
-            # Autocorrelation
-            mean_imb = np.mean(imb_window)
-            var_imb = np.var(imb_window)
-
-            if var_imb > 0:
-                acf = np.corrcoef(
-                    imb_window[: -self.persistence_window],
-                    imb_window[self.persistence_window :],
-                )[0, 1]
-                toxicity[i] = acf if not np.isnan(acf) else 0
-            else:
-                toxicity[i] = 0
+        toxicity = _rolling_lagged_correlation(imbalance, self.window, self.persistence_window)
+        zero_var = np.isnan(toxicity) & np.isfinite(_rolling_std(imbalance, self.window))
+        if np.any(zero_var):
+            toxicity[zero_var] = 0.0
 
         results[f"flow_toxicity_{self.window}"] = toxicity
 

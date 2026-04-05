@@ -222,6 +222,29 @@ class TestDataAccessLayer:
         assert config.fallback_to_files is False
         assert config.max_missing_symbols == 0
 
+    def test_data_access_blocks_file_fallback_in_production_without_override(self, monkeypatch):
+        """Production/staging runtime should require an explicit override for file fallback."""
+        from quant_trading_system.data.data_access import DataAccessConfig
+
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.delenv("ALLOW_FILE_FALLBACK_IN_PRODUCTION", raising=False)
+
+        with pytest.raises(ValueError, match="File fallback is disabled for production/staging"):
+            DataAccessConfig(fallback_to_files=True)
+
+    def test_data_access_allows_file_fallback_in_production_with_explicit_override(
+        self,
+        monkeypatch,
+    ):
+        """Explicit override keeps emergency fallback opt-in instead of silent."""
+        from quant_trading_system.data.data_access import DataAccessConfig
+
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("ALLOW_FILE_FALLBACK_IN_PRODUCTION", "true")
+
+        config = DataAccessConfig(fallback_to_files=True)
+        assert config.fallback_to_files is True
+
     def test_get_ohlcv_bars_multi_fails_fast_on_missing_symbols(self, monkeypatch):
         """Multi-symbol access should fail by default when the requested universe is incomplete."""
         from quant_trading_system.core.exceptions import DataError, DataNotFoundError

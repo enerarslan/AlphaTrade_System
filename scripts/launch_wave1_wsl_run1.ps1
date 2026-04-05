@@ -39,7 +39,7 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_TH
   --execution-turnover-cap 0.60 \
   --min-confidence-position-scale 0.20 \
   --probability-calibration-method isotonic \
-  --require-gpu \
+  --require-model-gpu \
   --max-cross-sectional-rows 500000 \
   --disable-auto-snapshot-reuse \
   2>&1 | tee $logFile

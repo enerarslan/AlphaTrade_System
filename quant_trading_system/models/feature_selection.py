@@ -19,6 +19,8 @@ class FeatureSelectionConfig:
     stability_iterations: int = 16
     stability_subsample_ratio: float = 0.65
     min_stability_support: float = 0.55
+    group_aware_ic: bool = False
+    min_group_size: int = 3
     random_state: int = 42
 
 
@@ -40,21 +42,87 @@ def _finite_feature_matrix(
     return numeric
 
 
+def _is_effectively_constant(values: pd.Series | np.ndarray) -> bool:
+    array = np.asarray(values, dtype=float).reshape(-1)
+    finite = array[np.isfinite(array)]
+    if finite.size <= 1:
+        return True
+    return bool((np.nanmax(finite) - np.nanmin(finite)) <= 1e-12)
+
+
+def _groupwise_information_coefficient(
+    values: pd.Series,
+    label: pd.Series,
+    groups: pd.Series,
+    *,
+    min_group_size: int,
+) -> float:
+    working = pd.DataFrame(
+        {
+            "feature": pd.to_numeric(values, errors="coerce"),
+            "label": pd.to_numeric(label, errors="coerce"),
+            "group": groups,
+        }
+    ).dropna(subset=["feature", "label", "group"])
+    if len(working) < 20:
+        return 0.0
+
+    group_scores: list[float] = []
+    group_weights: list[int] = []
+    for _, group_frame in working.groupby("group", sort=False):
+        if len(group_frame) < max(3, int(min_group_size)):
+            continue
+        feature_values = group_frame["feature"].to_numpy(dtype=float)
+        label_values = group_frame["label"].to_numpy(dtype=float)
+        if _is_effectively_constant(feature_values) or _is_effectively_constant(label_values):
+            continue
+        ic = stats.spearmanr(feature_values, label_values, nan_policy="omit")[0]
+        if np.isfinite(ic):
+            group_scores.append(abs(float(ic)))
+            group_weights.append(int(len(group_frame)))
+
+    if not group_scores:
+        return 0.0
+    return float(np.average(group_scores, weights=group_weights))
+
+
 def compute_information_coefficients(
     features: pd.DataFrame,
     target: pd.Series | np.ndarray,
+    *,
+    groups: pd.Series | np.ndarray | None = None,
+    min_group_size: int = 3,
 ) -> pd.Series:
     numeric = _finite_feature_matrix(features)
     label = pd.Series(pd.to_numeric(target, errors="coerce"), index=numeric.index)
+    group_series = (
+        pd.Series(groups, index=numeric.index, dtype="object") if groups is not None else None
+    )
     scores: dict[str, float] = {}
     for column in numeric.columns:
         values = numeric[column]
         valid = values.notna() & label.notna()
+        if group_series is not None:
+            valid = valid & group_series.notna()
         if int(valid.sum()) < 20:
             scores[column] = 0.0
             continue
-        ic = stats.spearmanr(values.loc[valid], label.loc[valid], nan_policy="omit")[0]
-        scores[column] = float(abs(ic)) if np.isfinite(ic) else 0.0
+        if group_series is not None:
+            ic_value = _groupwise_information_coefficient(
+                values.loc[valid],
+                label.loc[valid],
+                group_series.loc[valid],
+                min_group_size=min_group_size,
+            )
+        else:
+            feature_values = values.loc[valid].to_numpy(dtype=float)
+            label_values = label.loc[valid].to_numpy(dtype=float)
+            if _is_effectively_constant(feature_values) or _is_effectively_constant(label_values):
+                scores[column] = 0.0
+                continue
+            ic = stats.spearmanr(feature_values, label_values, nan_policy="omit")[0]
+            ic_value = float(abs(ic)) if np.isfinite(ic) else 0.0
+        scores[column] = float(ic_value)
     return pd.Series(scores, dtype=float).sort_values(ascending=False)
 
 
@@ -123,9 +191,8 @@ def _stability_selection_scores(
             (
                 "selector",
                 LogisticRegression(
-                    penalty="elasticnet",
-                    l1_ratio=1.0,
                     solver="saga",
+                    l1_ratio=1.0,
                     C=0.15,
                     max_iter=2000,
                     random_state=config.random_state,
@@ -160,8 +227,16 @@ def select_training_features(
     features: pd.DataFrame,
     target: pd.Series | np.ndarray,
     config: FeatureSelectionConfig,
+    *,
+    groups: pd.Series | np.ndarray | None = None,
 ) -> FeatureSelectionResult:
-    ranked = compute_information_coefficients(features, target)
+    use_group_aware_ic = bool(config.group_aware_ic and groups is not None)
+    ranked = compute_information_coefficients(
+        features,
+        target,
+        groups=(groups if use_group_aware_ic else None),
+        min_group_size=int(config.min_group_size),
+    )
     screened = ranked[ranked >= float(config.min_information_coefficient)]
     if screened.empty:
         screened = ranked.head(min(int(config.max_features), len(ranked)))
@@ -214,5 +289,6 @@ def select_training_features(
             "correlation_pruned_count": float(len(corr_pruned)),
             "stability_selected_count": float(len(stable_selected)),
             "selected_feature_count": float(len(final_selected)),
+            "group_aware_ic_enabled": float(use_group_aware_ic),
         },
     )

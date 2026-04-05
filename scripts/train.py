@@ -24,7 +24,7 @@ Model Types Supported:
 Usage:
     python main.py train --model xgboost --symbols AAPL MSFT
     python main.py train --model ensemble --n-trials 100
-    python main.py train --model lstm --use-gpu --epochs 100
+    python main.py train --model lstm --require-model-gpu --epochs 100
     python main.py train --model all --n-trials 50
 
 Author: AlphaTrade System
@@ -42,6 +42,8 @@ import os
 import pickle
 import random
 import re
+import socket
+import subprocess
 import sys
 import time
 import warnings
@@ -158,6 +160,7 @@ TRAINING_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "n_trials": 30,
         "nested_outer_splits": 2,
         "nested_inner_splits": 2,
+        "allow_unstable_outer_fold_fallback": True,
         "use_meta_labeling": False,
         "compute_shap": False,
         "auto_live_profile_enabled": False,
@@ -264,12 +267,93 @@ def _running_in_wsl() -> bool:
         return False
 
 
+def _run_git_command(project_root: Path, *args: str) -> tuple[int, str]:
+    """Run a short git command and return exit code plus trimmed stdout."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return 1, ""
+    return int(result.returncode), str(result.stdout or "").strip()
+
+
+def _resolve_dependency_lock_hash(project_root: Path) -> str:
+    """Hash dependency lock inputs used for reproducible training runs."""
+    dependency_files = [
+        project_root / "pyproject.toml",
+        project_root / "requirements.txt",
+    ]
+    hasher = hashlib.sha256()
+    found = False
+    for file_path in dependency_files:
+        if not file_path.exists():
+            continue
+        found = True
+        hasher.update(file_path.name.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(file_path.read_bytes())
+        hasher.update(b"\0")
+    return hasher.hexdigest() if found else "unknown"
+
+
+def _resolve_training_provenance(project_root: Path) -> dict[str, Any]:
+    """Collect lightweight provenance for artifact and promotion audits."""
+    commit_rc, commit_hash = _run_git_command(project_root, "rev-parse", "HEAD")
+    branch_rc, branch_name = _run_git_command(project_root, "rev-parse", "--abbrev-ref", "HEAD")
+    status_rc, status_output = _run_git_command(
+        project_root,
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+    )
+    has_git_repo = bool(commit_rc == 0 and len(commit_hash) >= 7)
+    dirty_state = None if status_rc != 0 else bool(status_output)
+    host_name = (
+        os.environ.get("COMPUTERNAME")
+        or os.environ.get("HOSTNAME")
+        or socket.gethostname()
+        or "unknown"
+    )
+    wsl_distro = os.environ.get("WSL_DISTRO_NAME", "").strip() or None
+    app_env = os.environ.get("APP_ENV", "").strip().lower() or "development"
+    provenance = {
+        "git_commit_hash": commit_hash if has_git_repo else "unknown",
+        "git_branch": branch_name if branch_rc == 0 and branch_name else "unknown",
+        "git_dirty": dirty_state,
+        "git_repo_available": bool(has_git_repo),
+        "dependency_lock_hash": _resolve_dependency_lock_hash(project_root),
+        "python_version": sys.version.split()[0],
+        "host": host_name,
+        "cwd": os.getcwd(),
+        "project_root": str(project_root),
+        "platform": sys.platform,
+        "running_in_wsl": bool(_running_in_wsl()),
+        "wsl_distro": wsl_distro,
+        "app_env": app_env,
+    }
+    provenance["git_commit"] = provenance["git_commit_hash"]
+    provenance["environment_lock_hash"] = provenance["dependency_lock_hash"]
+    provenance["training_host"] = provenance["host"]
+    return provenance
+
+
+def _promotion_repo_provenance_ready(project_root: Path) -> bool:
+    """Return whether promotion training is running from a real Git checkout/worktree."""
+    provenance = _resolve_training_provenance(project_root)
+    return bool(provenance.get("git_repo_available", False))
+
+
 def _log_training_environment_guidance(profile: str) -> None:
     """Emit filesystem/runtime guidance aligned with the training execution plan."""
     try:
-        cwd = Path.cwd().resolve()
+        cwd = os.path.abspath(os.getcwd())
     except OSError:
-        cwd = Path.cwd()
+        cwd = os.getcwd()
 
     if os.name == "nt":
         logger.warning(
@@ -279,7 +363,7 @@ def _log_training_environment_guidance(profile: str) -> None:
         )
         return
 
-    if _running_in_wsl() and cwd.as_posix().startswith("/mnt/"):
+    if _running_in_wsl() and str(cwd).startswith("/mnt/"):
         logger.warning(
             "Training is running from %s inside WSL. Move the repo under ~/AlphaTrade or another "
             "Linux-native path to avoid Windows mount filesystem overhead.",
@@ -1131,11 +1215,13 @@ class TrainingConfig:
     objective_weight_trade_activity: float = 1.0
     objective_weight_cvar: float = 0.4
     objective_weight_skew: float = 0.1
+    objective_skew_penalty_cap: float = 1.5
     objective_weight_tail_risk: float = 0.35
     objective_weight_symbol_concentration: float = 0.20
     objective_expected_shortfall_cap: float = 0.012
     nested_outer_stability_ratio_cap: float = 1.25
     nested_outer_stability_min_trials: int = 8
+    allow_unstable_outer_fold_fallback: bool = False
 
     # Model-specific parameters
     model_params: dict = field(default_factory=dict)
@@ -1193,6 +1279,7 @@ class TrainingConfig:
     meta_label_min_confidence: float = 0.55
     meta_label_dynamic_threshold: bool = True
     enable_probability_calibration: bool = True
+    enable_ranker_probability_calibration: bool = False
     probability_calibration_method: str = "isotonic"
     probability_calibration_guardrail_enabled: bool = True
     probability_calibration_min_dispersion_ratio: float = 0.05
@@ -1216,6 +1303,7 @@ class TrainingConfig:
     # GPU acceleration
     use_gpu: bool = True
     require_gpu: bool = False
+    require_feature_gpu: bool = False
     gpu_device: int = 0
 
     # Database integration
@@ -1318,8 +1406,11 @@ class TrainingConfig:
         self.include_postmarket = bool(self.include_postmarket)
         self.use_gpu = bool(self.use_gpu)
         self.require_gpu = bool(self.require_gpu)
+        self.require_feature_gpu = bool(self.require_feature_gpu)
         if self.require_gpu and not self.use_gpu:
             raise ValueError("require_gpu=True requires use_gpu=True.")
+        if self.require_feature_gpu and not self.use_gpu:
+            raise ValueError("require_feature_gpu=True requires use_gpu=True.")
         self.cross_sectional_user_locked = bool(self.cross_sectional_user_locked)
         self.feature_set_id = str(self.feature_set_id or "default").strip() or "default"
         self.snapshot_only = bool(self.snapshot_only)
@@ -1334,6 +1425,7 @@ class TrainingConfig:
         )
         self.objective_weight_cvar = max(0.0, float(self.objective_weight_cvar))
         self.objective_weight_skew = max(0.0, float(self.objective_weight_skew))
+        self.objective_skew_penalty_cap = max(0.0, float(self.objective_skew_penalty_cap))
         self.objective_weight_tail_risk = max(0.0, float(self.objective_weight_tail_risk))
         self.objective_weight_symbol_concentration = max(
             0.0,
@@ -1348,6 +1440,7 @@ class TrainingConfig:
             float(self.nested_outer_stability_ratio_cap),
         )
         self.nested_outer_stability_min_trials = max(3, int(self.nested_outer_stability_min_trials))
+        self.allow_unstable_outer_fold_fallback = bool(self.allow_unstable_outer_fold_fallback)
         self.primary_horizon_sweep = sorted(
             {
                 int(h)
@@ -1360,6 +1453,9 @@ class TrainingConfig:
         )
         self.meta_label_dynamic_threshold = bool(self.meta_label_dynamic_threshold)
         self.enable_probability_calibration = bool(self.enable_probability_calibration)
+        self.enable_ranker_probability_calibration = bool(
+            self.enable_ranker_probability_calibration
+        )
         calibration_method = str(self.probability_calibration_method or "isotonic").strip().lower()
         if calibration_method not in {"isotonic", "sigmoid"}:
             raise ValueError("probability_calibration_method must be 'isotonic' or 'sigmoid'")
@@ -1414,6 +1510,10 @@ class TrainingConfig:
         self.execution_max_symbol_entry_share = float(
             np.clip(float(self.execution_max_symbol_entry_share), 0.50, 0.95)
         )
+        if self.training_profile == "promotion" and self.allow_unstable_outer_fold_fallback:
+            raise ValueError(
+                "Promotion profile cannot allow unstable outer-fold fallback candidates."
+            )
         self.min_confidence_position_scale = float(
             np.clip(float(self.min_confidence_position_scale), 0.0, 1.0)
         )
@@ -1595,15 +1695,31 @@ class ModelTrainer:
         self.run_id: str = str(self.config.model_name)
         self.run_event_index_path: Path | None = None
         self._warm_start_model_cache: Any | None = None
+        self._feature_pipeline_cache: dict[tuple[str, bool], Any] = {}
         self.feature_cache_reused: bool = False
         self.features_materialized_in_run: bool = False
         self.features_persisted_to_postgres: bool = False
 
         # Metrics
+        provenance = _resolve_training_provenance(PROJECT_ROOT)
         self.training_metrics: dict = {
             "training_profile": self.config.training_profile,
             "run_id": self.run_id,
             "snapshot_only": bool(self.config.snapshot_only),
+            "training_provenance": provenance,
+            "git_commit": provenance.get("git_commit"),
+            "git_commit_hash": provenance.get("git_commit_hash"),
+            "git_branch": provenance.get("git_branch"),
+            "git_dirty": provenance.get("git_dirty"),
+            "environment_lock_hash": provenance.get("environment_lock_hash"),
+            "dependency_lock_hash": provenance.get("dependency_lock_hash"),
+            "host": provenance.get("host"),
+            "training_host": provenance.get("host"),
+            "wsl_distro": provenance.get("wsl_distro"),
+            "training_wsl_distro": provenance.get("wsl_distro"),
+            "training_repo_provenance_ready": float(
+                bool(provenance.get("git_repo_available", False))
+            ),
         }
         self.start_time: datetime | None = None
         self.feature_pipeline_fingerprint = _compute_feature_pipeline_fingerprint()
@@ -1858,6 +1974,127 @@ class ModelTrainer:
             counts[family] = counts.get(family, 0) + 1
         return dict(sorted(counts.items(), key=lambda item: item[0]))
 
+    @staticmethod
+    def _feature_quality_clip_rate(values: np.ndarray) -> float:
+        """Estimate tail-pressure clip rate using a symmetric winsorization probe."""
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        finite = arr[np.isfinite(arr)]
+        if finite.size < 20:
+            return 0.0
+        lower, upper = np.percentile(finite, [1, 99])
+        if not np.isfinite(lower) or not np.isfinite(upper) or upper < lower:
+            return 0.0
+        return float(np.mean((finite < lower) | (finite > upper)))
+
+    def _build_feature_quality_audit(
+        self,
+        matrix: pd.DataFrame,
+        feature_names: list[str],
+    ) -> dict[str, Any]:
+        """Summarize feature-level numerical stability signals for artifact governance."""
+        if matrix is None or matrix.empty or not feature_names:
+            return {
+                "feature_count": 0,
+                "probe_clip_percentiles": [1, 99],
+                "by_feature": {},
+                "family_summary": {},
+                "worst_null_features": [],
+                "worst_clip_features": [],
+            }
+
+        by_feature: dict[str, dict[str, float]] = {}
+        family_rollup: dict[str, dict[str, float]] = {}
+
+        for feature_name in feature_names:
+            series = pd.to_numeric(matrix[feature_name], errors="coerce")
+            values = series.to_numpy(dtype=np.float64, copy=False)
+            total = max(1, int(values.size))
+            finite_mask = np.isfinite(values)
+            null_rate = float(np.mean(np.isnan(values)))
+            finite_rate = float(np.mean(finite_mask))
+            clipped_rate = self._feature_quality_clip_rate(values)
+            family = self._feature_family_name(feature_name)
+
+            by_feature[str(feature_name)] = {
+                "null_rate": null_rate,
+                "finite_rate": finite_rate,
+                "clipped_rate": clipped_rate,
+                "sample_count": float(total),
+            }
+
+            rollup = family_rollup.setdefault(
+                family,
+                {
+                    "feature_count": 0.0,
+                    "null_rate_sum": 0.0,
+                    "finite_rate_sum": 0.0,
+                    "clipped_rate_sum": 0.0,
+                    "max_null_rate": 0.0,
+                    "min_finite_rate": 1.0,
+                    "max_clipped_rate": 0.0,
+                },
+            )
+            rollup["feature_count"] += 1.0
+            rollup["null_rate_sum"] += null_rate
+            rollup["finite_rate_sum"] += finite_rate
+            rollup["clipped_rate_sum"] += clipped_rate
+            rollup["max_null_rate"] = max(float(rollup["max_null_rate"]), null_rate)
+            rollup["min_finite_rate"] = min(float(rollup["min_finite_rate"]), finite_rate)
+            rollup["max_clipped_rate"] = max(float(rollup["max_clipped_rate"]), clipped_rate)
+
+        family_summary: dict[str, dict[str, float]] = {}
+        for family, rollup in family_rollup.items():
+            count = max(1.0, float(rollup["feature_count"]))
+            family_summary[family] = {
+                "feature_count": count,
+                "mean_null_rate": float(rollup["null_rate_sum"] / count),
+                "mean_finite_rate": float(rollup["finite_rate_sum"] / count),
+                "mean_clipped_rate": float(rollup["clipped_rate_sum"] / count),
+                "max_null_rate": float(rollup["max_null_rate"]),
+                "min_finite_rate": float(rollup["min_finite_rate"]),
+                "max_clipped_rate": float(rollup["max_clipped_rate"]),
+            }
+
+        ordered_null = sorted(
+            by_feature.items(),
+            key=lambda item: (-float(item[1]["null_rate"]), str(item[0])),
+        )
+        ordered_clip = sorted(
+            by_feature.items(),
+            key=lambda item: (-float(item[1]["clipped_rate"]), str(item[0])),
+        )
+        null_rates = np.asarray([payload["null_rate"] for payload in by_feature.values()], dtype=float)
+        finite_rates = np.asarray(
+            [payload["finite_rate"] for payload in by_feature.values()],
+            dtype=float,
+        )
+        clipped_rates = np.asarray(
+            [payload["clipped_rate"] for payload in by_feature.values()],
+            dtype=float,
+        )
+        return {
+            "feature_count": int(len(by_feature)),
+            "probe_clip_percentiles": [1, 99],
+            "mean_null_rate": float(np.mean(null_rates)) if null_rates.size else 0.0,
+            "max_null_rate": float(np.max(null_rates)) if null_rates.size else 0.0,
+            "mean_finite_rate": float(np.mean(finite_rates)) if finite_rates.size else 1.0,
+            "min_finite_rate": float(np.min(finite_rates)) if finite_rates.size else 1.0,
+            "mean_clipped_rate": float(np.mean(clipped_rates)) if clipped_rates.size else 0.0,
+            "max_clipped_rate": float(np.max(clipped_rates)) if clipped_rates.size else 0.0,
+            "by_feature": by_feature,
+            "family_summary": dict(sorted(family_summary.items())),
+            "worst_null_features": [
+                {"feature": name, **payload}
+                for name, payload in ordered_null[:10]
+                if float(payload["null_rate"]) > 0.0
+            ],
+            "worst_clip_features": [
+                {"feature": name, **payload}
+                for name, payload in ordered_clip[:10]
+                if float(payload["clipped_rate"]) > 0.0
+            ],
+        }
+
     def _build_feature_selection_audit(
         self,
         *,
@@ -1931,6 +2168,51 @@ class ModelTrainer:
             ),
             "diagnostics": self._json_safe(diagnostics),
         }
+
+    def _hydrate_snapshot_feature_selection_summary(self) -> None:
+        """Restore upstream feature-selection diagnostics from a snapshot bundle when present."""
+        manifest = self.dataset_snapshot_bundle_manifest
+        if not isinstance(manifest, dict):
+            return
+        summary = manifest.get("feature_selection_summary", {})
+        if not isinstance(summary, dict) or not summary:
+            return
+
+        upstream_binding = float(
+            summary.get("development_binding", summary.get("binding", 0.0))
+        )
+        upstream_initial = float(
+            summary.get(
+                "development_initial_feature_count",
+                summary.get("initial_feature_count", 0.0),
+            )
+        )
+        upstream_selected = float(
+            summary.get(
+                "development_selected_feature_count",
+                summary.get("selected_feature_count", 0.0),
+            )
+        )
+        self.training_metrics["feature_selection_upstream_binding"] = upstream_binding
+        self.training_metrics["feature_selection_upstream_initial_feature_count"] = upstream_initial
+        self.training_metrics["feature_selection_upstream_selected_feature_count"] = (
+            upstream_selected
+        )
+        self.training_metrics.setdefault("feature_selection_development_binding", upstream_binding)
+        self.training_metrics.setdefault(
+            "feature_selection_development_initial_feature_count",
+            upstream_initial,
+        )
+        self.training_metrics.setdefault(
+            "feature_selection_development_selected_feature_count",
+            upstream_selected,
+        )
+        upstream_audit = summary.get("audit")
+        if isinstance(upstream_audit, dict) and upstream_audit:
+            self.training_metrics.setdefault(
+                "feature_selection_upstream_audit",
+                self._json_safe(upstream_audit),
+            )
 
     def _training_run_index_root(self) -> Path:
         """Return the directory that stores durable training-run events."""
@@ -2169,6 +2451,7 @@ class ModelTrainer:
                 else None
             ),
             "artifacts_path": str(self.artifacts_path) if self.artifacts_path is not None else None,
+            "provenance": self._json_safe(self.training_metrics.get("training_provenance", {})),
             "error": str(error) if error is not None else None,
             "metrics": {
                 "mean_sharpe": float(self.training_metrics.get("mean_sharpe", 0.0)),
@@ -3648,6 +3931,7 @@ class ModelTrainer:
         self.training_metrics["snapshot_bundle_path"] = str(
             self.dataset_snapshot_bundle_manifest_path
         )
+        self._hydrate_snapshot_feature_selection_summary()
         self._hydrate_snapshot_symbol_quality_metrics()
 
         self._restore_training_state_from_split_frames(
@@ -3680,6 +3964,25 @@ class ModelTrainer:
         if cached is not None and not cached.empty:
             self.features = cached
             self.feature_cache_reused = True
+            self.training_metrics["feature_gpu_contract"] = {
+                "feature_compute_skipped": True,
+                "source": "postgres_feature_cache",
+                "gpu_requested": bool(self.config.require_gpu),
+                "model_gpu_enabled": bool(self.config.use_gpu),
+                "model_gpu_required": bool(self.config.require_gpu),
+                "feature_gpu_required": bool(self.config.require_feature_gpu),
+                "cudf_available": None,
+                "fully_gpu_ready_groups": [],
+                "partially_gpu_accelerated_groups": [],
+                "gpu_accelerated_groups": [],
+                "cpu_only_groups": [],
+                "cpu_materialized_groups": [],
+                "cpu_optimized_groups": [],
+                "partial_gpu_feature_names": {},
+                "fully_gpu_ready": None,
+                "acceleration_mode": "unknown_cached",
+            }
+            self.training_metrics["feature_gpu_fully_ready"] = float("nan")
             self.logger.info("Using feature matrix loaded from PostgreSQL features table")
             return
 
@@ -3722,6 +4025,75 @@ class ModelTrainer:
         self.features_materialized_in_run = bool(
             self.features is not None and not self.features.empty
         )
+
+    def _record_feature_gpu_contract(
+        self,
+        *,
+        groups_to_compute: list[Any],
+        disable_optimized_technical: bool,
+    ) -> None:
+        """Record auditable feature GPU readiness and fail fast when strict GPU mode is impossible."""
+        from quant_trading_system.features.feature_pipeline import describe_feature_gpu_readiness
+
+        readiness = describe_feature_gpu_readiness(
+            groups_to_compute,
+            use_gpu=bool(self.config.use_gpu),
+            use_optimized_pipeline=not disable_optimized_technical,
+            disable_optimized_technical=disable_optimized_technical,
+        )
+        gpu_accelerated_groups = list(
+            dict.fromkeys(
+                readiness["fully_gpu_ready_groups"]
+                + readiness["partially_gpu_accelerated_groups"]
+            )
+        )
+        cpu_only_groups = [
+            group
+            for group in readiness["requested_groups"]
+            if group not in gpu_accelerated_groups
+        ]
+        fully_gpu_ready = bool(readiness["fully_gpu_ready"])
+        payload = {
+            "feature_compute_skipped": False,
+            "source": "materialized_in_run",
+            "gpu_requested": bool(self.config.require_gpu),
+            "model_gpu_enabled": bool(self.config.use_gpu),
+            "model_gpu_required": bool(self.config.require_gpu),
+            "feature_gpu_required": bool(self.config.require_feature_gpu),
+            "cudf_available": bool(readiness["cudf_available"]),
+            "groups_to_compute": list(readiness["requested_groups"]),
+            "fully_gpu_ready_groups": list(readiness["fully_gpu_ready_groups"]),
+            "partially_gpu_accelerated_groups": list(
+                readiness["partially_gpu_accelerated_groups"]
+            ),
+            "partial_gpu_feature_names": dict(readiness["partial_gpu_feature_names"]),
+            "gpu_accelerated_groups": list(gpu_accelerated_groups),
+            "cpu_only_groups": list(cpu_only_groups),
+            "cpu_materialized_groups": list(readiness["cpu_materialized_groups"]),
+            "cpu_optimized_groups": list(readiness["cpu_optimized_groups"]),
+            "fully_gpu_ready": bool(fully_gpu_ready),
+            "acceleration_mode": str(readiness["acceleration_mode"]),
+        }
+        self.training_metrics["feature_gpu_contract"] = payload
+        self.training_metrics["feature_gpu_fully_ready"] = 1.0 if fully_gpu_ready else 0.0
+        self.training_metrics["feature_gpu_cudf_available"] = (
+            1.0 if readiness["cudf_available"] else 0.0
+        )
+        if self.config.require_feature_gpu and not fully_gpu_ready:
+            reason = "requested feature groups still include families without complete CUDA ports."
+            if not readiness["cudf_available"]:
+                reason = (
+                    "cuDF is unavailable, so even the partial optimized technical path cannot run."
+                )
+            raise RuntimeError(
+                "Feature GPU contract failed while --require-feature-gpu was set: "
+                f"{reason} Requested groups={', '.join(readiness['requested_groups'])}; "
+                f"Fully GPU-ready groups={', '.join(readiness['fully_gpu_ready_groups']) or 'none'}; "
+                f"Partially GPU-accelerated groups="
+                f"{', '.join(readiness['partially_gpu_accelerated_groups']) or 'none'}; "
+                f"CPU-materialized groups="
+                f"{', '.join(readiness['cpu_materialized_groups']) or 'none'}."
+            )
 
     def _persist_features_to_postgres_if_needed(self) -> None:
         """Persist only freshly materialized post-selection features."""
@@ -3968,6 +4340,13 @@ class ModelTrainer:
     @staticmethod
     def _ranker_eval_at(model: Any) -> list[int]:
         """Resolve eval_at from model params when explicitly configured."""
+        cached_eval_at = getattr(model, "_alphatrade_eval_at", None)
+        if cached_eval_at is not None:
+            if isinstance(cached_eval_at, (list, tuple, set, np.ndarray)):
+                resolved = [int(value) for value in cached_eval_at]
+            else:
+                resolved = [int(cached_eval_at)]
+            return [value for value in resolved if value > 0]
         get_params = getattr(model, "get_params", None)
         if not callable(get_params):
             return []
@@ -4214,6 +4593,25 @@ class ModelTrainer:
             )
 
         working = working.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+        feature_quality_audit = self._build_feature_quality_audit(working, kept_feature_cols)
+        self.training_metrics["feature_quality_audit"] = feature_quality_audit
+        self.training_metrics["feature_quality_summary"] = {
+            key: value
+            for key, value in feature_quality_audit.items()
+            if key not in {"by_feature", "family_summary", "worst_null_features", "worst_clip_features"}
+        }
+        self.training_metrics["feature_quality_family_summary"] = feature_quality_audit.get(
+            "family_summary",
+            {},
+        )
+        self.training_metrics["feature_quality_worst_null_features"] = feature_quality_audit.get(
+            "worst_null_features",
+            [],
+        )
+        self.training_metrics["feature_quality_worst_clip_features"] = feature_quality_audit.get(
+            "worst_clip_features",
+            [],
+        )
         working[kept_feature_cols] = working.groupby("symbol", sort=False)[
             kept_feature_cols
         ].ffill()
@@ -4445,17 +4843,24 @@ class ModelTrainer:
         for group in groups_to_compute:
             group_start = time.perf_counter()
             self.logger.info("  %s: computing %s feature group...", symbol, group.value)
-            feature_config = FeatureConfig(
-                groups=[group],
-                normalization=NormalizationMethod.NONE,
-                include_targets=False,
-                use_gpu=self.config.use_gpu and group == FeatureGroup.TECHNICAL,
-                use_cache=self.config.use_redis_cache and group == FeatureGroup.TECHNICAL,
-                use_optimized_pipeline=(
-                    group == FeatureGroup.TECHNICAL and not disable_optimized_technical
-                ),
+            use_optimized_pipeline = (
+                group == FeatureGroup.TECHNICAL and not disable_optimized_technical
             )
-            pipeline = FeaturePipeline(feature_config)
+            pipeline_cache_key = (group.value, bool(use_optimized_pipeline))
+            pipeline = self._feature_pipeline_cache.get(pipeline_cache_key)
+            if pipeline is None:
+                feature_config = FeatureConfig(
+                    groups=[group],
+                    normalization=NormalizationMethod.NONE,
+                    include_targets=False,
+                    use_gpu=self.config.use_gpu and group == FeatureGroup.TECHNICAL,
+                    # Training materializes each symbol/timeframe only once, so per-pipeline
+                    # LRU caching adds key-hash overhead without real cache hits.
+                    use_cache=False,
+                    use_optimized_pipeline=use_optimized_pipeline,
+                )
+                pipeline = FeaturePipeline(feature_config)
+                self._feature_pipeline_cache[pipeline_cache_key] = pipeline
             try:
                 feature_set = pipeline.compute(
                     df_pl,
@@ -4463,7 +4868,7 @@ class ModelTrainer:
                     universe_data=(
                         universe_data if group == FeatureGroup.CROSS_SECTIONAL else None
                     ),
-                    use_cache=feature_config.use_cache,
+                    use_cache=False,
                 )
                 group_feature_count = len(feature_set.features)
                 combined_features.update(feature_set.features)
@@ -4489,9 +4894,6 @@ class ModelTrainer:
                     f"Feature pipeline failed for {symbol} group={group.value}; "
                     "institutional mode requires deterministic feature materialization."
                 ) from e
-            finally:
-                del pipeline
-                gc.collect()
 
         if not combined_features:
             raise RuntimeError(f"No features computed for symbol {symbol}")
@@ -4609,18 +5011,56 @@ class ModelTrainer:
         old_feature_names = [str(name) for name in self.feature_names]
         if len(old_feature_names) <= 1:
             return
+        self._hydrate_snapshot_feature_selection_summary()
 
+        selection_target: pd.Series | np.ndarray = self.labels
+        selection_groups: pd.Series | np.ndarray | None = None
+        feature_selection_target_mode = "classification_label"
+        group_aware_ic = False
+        effective_max_features = int(self.config.feature_selection_max_features)
+        if (
+            self.config.model_type == "lightgbm_ranker"
+            and self.development_frame is not None
+            and not self.development_frame.empty
+        ):
+            selection_groups = self.development_frame["timestamp"].to_numpy()
+            group_aware_ic = True
+            if "triple_barrier_net_return" in self.development_frame.columns:
+                rank_target = pd.to_numeric(
+                    self.development_frame["triple_barrier_net_return"],
+                    errors="coerce",
+                )
+                rank_target = rank_target.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                rank_target = rank_target.clip(lower=-0.50, upper=0.50)
+                if int(rank_target.nunique(dropna=True)) > 1:
+                    selection_target = rank_target
+                    feature_selection_target_mode = "triple_barrier_net_return"
+            adaptive_ranker_feature_cap = max(
+                24,
+                int(round(np.sqrt(len(old_feature_names)) * 6.0)),
+            )
+            effective_max_features = min(
+                effective_max_features,
+                adaptive_ranker_feature_cap,
+            )
+
+        selection_kwargs: dict[str, Any] = {}
+        if selection_groups is not None:
+            selection_kwargs["groups"] = selection_groups
         selection_result = select_training_features(
             self.features,
-            self.labels,
+            selection_target,
             FeatureSelectionConfig(
                 min_information_coefficient=self.config.feature_selection_min_ic,
                 max_correlation=self.config.feature_selection_max_corr,
-                max_features=self.config.feature_selection_max_features,
+                max_features=effective_max_features,
                 stability_iterations=self.config.feature_selection_stability_iterations,
                 min_stability_support=self.config.feature_selection_min_stability_support,
+                group_aware_ic=group_aware_ic,
+                min_group_size=3,
                 random_state=self.config.seed,
             ),
+            **selection_kwargs,
         )
         selected_features = [
             feature
@@ -4665,6 +5105,11 @@ class ModelTrainer:
         self.training_metrics["feature_selection_min_ic"] = float(
             self.config.feature_selection_min_ic
         )
+        self.training_metrics["feature_selection_target_mode"] = feature_selection_target_mode
+        self.training_metrics["feature_selection_group_aware_ic"] = float(group_aware_ic)
+        self.training_metrics["feature_selection_effective_max_features"] = float(
+            effective_max_features
+        )
         self.training_metrics["feature_selection_selected_features"] = selected_features
         self.training_metrics["feature_selection_top_information_coefficients"] = {
             str(name): float(value)
@@ -4680,9 +5125,31 @@ class ModelTrainer:
             selection_result=selection_result,
             selected_features=selected_features,
         )
-        self.training_metrics["feature_selection_binding"] = float(
-            bool(feature_selection_audit.get("selection_binding", False))
+        current_stage_binding = bool(feature_selection_audit.get("selection_binding", False))
+        upstream_binding = bool(self.training_metrics.get("feature_selection_upstream_binding", 0.0))
+        effective_binding = bool(current_stage_binding or upstream_binding)
+        self.training_metrics["feature_selection_current_stage_binding"] = float(
+            current_stage_binding
         )
+        self.training_metrics["feature_selection_current_stage_initial_feature_count"] = float(
+            len(old_feature_names)
+        )
+        self.training_metrics["feature_selection_current_stage_selected_feature_count"] = float(
+            len(selected_features)
+        )
+        self.training_metrics.setdefault(
+            "feature_selection_development_binding",
+            float(current_stage_binding),
+        )
+        self.training_metrics.setdefault(
+            "feature_selection_development_initial_feature_count",
+            float(len(old_feature_names)),
+        )
+        self.training_metrics.setdefault(
+            "feature_selection_development_selected_feature_count",
+            float(len(selected_features)),
+        )
+        self.training_metrics["feature_selection_binding"] = float(effective_binding)
         self.training_metrics["feature_selection_audit"] = feature_selection_audit
         self.logger.info(
             "Feature selection reduced development matrix from %d to %d columns",
@@ -4737,6 +5204,10 @@ class ModelTrainer:
                 "Disabling optimized technical feature pipeline on Windows; "
                 "using standard deterministic calculators to avoid runtime stalls."
             )
+        self._record_feature_gpu_contract(
+            groups_to_compute=groups_to_compute,
+            disable_optimized_technical=disable_optimized_technical,
+        )
         multi_timeframe_enabled = len(self.config.timeframes) > 1
         if multi_timeframe_enabled:
             self.logger.info("Multi-timeframe feature fusion enabled: %s", self.config.timeframes)
@@ -5857,6 +6328,29 @@ class ModelTrainer:
 
         self.logger.info("Future-leak validation passed for data and CV splits")
 
+    def _select_nested_outer_candidates(
+        self,
+        stable_candidates: list[tuple[float, float, float, dict[str, Any], int, float]],
+        unstable_candidates: list[tuple[float, float, float, dict[str, Any], int, float]],
+    ) -> tuple[list[tuple[float, float, float, dict[str, Any], int, float]], bool]:
+        """Select stable nested-CV candidates, allowing research-only unstable fallback."""
+        if stable_candidates:
+            return stable_candidates, False
+        if not unstable_candidates:
+            raise ValueError(
+                "Nested walk-forward optimization produced no valid outer-fold candidates."
+            )
+        if not bool(self.config.allow_unstable_outer_fold_fallback):
+            raise ValueError(
+                "No stable outer-fold candidates passed stability gate; unstable fallback is "
+                "disabled for this training profile."
+            )
+        self.logger.warning(
+            "No stable outer-fold candidates passed stability gate; "
+            "falling back to best unstable candidate."
+        )
+        return unstable_candidates, True
+
     def _optimize_hyperparameters(self) -> None:
         """Phase 4: Hyperparameter optimization."""
         self.logger.info(
@@ -6803,20 +7297,10 @@ class ModelTrainer:
                 }
             )
 
-        selected_outer_candidates = outer_candidates
-        stability_fallback_used = False
-        if not selected_outer_candidates:
-            if outer_unstable_candidates:
-                stability_fallback_used = True
-                selected_outer_candidates = outer_unstable_candidates
-                self.logger.warning(
-                    "No stable outer-fold candidates passed stability gate; "
-                    "falling back to best unstable candidate."
-                )
-            else:
-                raise ValueError(
-                    "Nested walk-forward optimization produced no valid outer-fold candidates."
-                )
+        selected_outer_candidates, stability_fallback_used = self._select_nested_outer_candidates(
+            outer_candidates,
+            outer_unstable_candidates,
+        )
 
         (
             best_outer_adjusted_score,
@@ -8485,12 +8969,24 @@ class ModelTrainer:
         elif self.config.model_type == "lightgbm_ranker":
             from lightgbm import LGBMRanker
 
+            raw_eval_at = params.pop("eval_at", None)
             params.setdefault("verbose", -1)
             params.setdefault("objective", "lambdarank")
             params.setdefault("metric", "ndcg")
             if self.config.use_gpu:
                 params.setdefault("device", "cuda")
-            return LGBMRanker(**params)
+            model = LGBMRanker(**params)
+            if raw_eval_at is not None:
+                if isinstance(raw_eval_at, (list, tuple, set, np.ndarray)):
+                    resolved_eval_at = [int(value) for value in raw_eval_at]
+                else:
+                    resolved_eval_at = [int(raw_eval_at)]
+                setattr(
+                    model,
+                    "_alphatrade_eval_at",
+                    [value for value in resolved_eval_at if value > 0],
+                )
+            return model
 
         elif self.config.model_type == "lightgbm_regressor":
             from lightgbm import LGBMRegressor
@@ -8866,7 +9362,7 @@ class ModelTrainer:
         if not bool(self.config.enable_probability_calibration):
             return False
         if self._is_ranker_model():
-            return False
+            return bool(self.config.enable_ranker_probability_calibration)
         if self.config.model_type in {"xgboost_regressor", "lightgbm_regressor"}:
             return False
         return True
@@ -9795,6 +10291,45 @@ class ModelTrainer:
         )
         self.training_metrics["effective_holdout_sharpe_observation_confidence"] = float(
             payload["sharpe_observation_confidence"]
+        )
+        raw_threshold_active_rate = float(
+            self.training_metrics.get(
+                "holdout_raw_threshold_hits_active_rate",
+                self.training_metrics.get("holdout_base_signal_funnel_selected_rate", 0.0),
+            )
+        )
+        execution_signal_active_rate = float(
+            self.training_metrics.get(
+                "holdout_execution_signal_activity_active_signal_rate",
+                self.training_metrics.get("holdout_execution_signal_funnel_selected_rate", 0.0),
+            )
+        )
+        portfolio_trade_active_rate = float(
+            self.training_metrics.get("holdout_active_signal_rate", 0.0)
+        )
+        expected_edge_selected_rate = float(
+            self.training_metrics.get("expected_edge_holdout_selected_rate", 0.0)
+        )
+        activity_summary = {
+            "source": payload["source"],
+            "raw_threshold_active_rate": raw_threshold_active_rate,
+            "execution_signal_active_rate": execution_signal_active_rate,
+            "effective_gate_active_rate": float(payload["active_signal_rate"]),
+            "portfolio_trade_active_rate": portfolio_trade_active_rate,
+            "expected_edge_selected_rate": expected_edge_selected_rate,
+        }
+        self.training_metrics["holdout_signal_activity_summary"] = activity_summary
+        self.training_metrics["holdout_raw_threshold_active_rate_metric"] = (
+            raw_threshold_active_rate
+        )
+        self.training_metrics["holdout_execution_signal_active_rate_metric"] = (
+            execution_signal_active_rate
+        )
+        self.training_metrics["holdout_portfolio_trade_active_rate_metric"] = (
+            portfolio_trade_active_rate
+        )
+        self.training_metrics["holdout_expected_edge_selected_rate_metric"] = (
+            expected_edge_selected_rate
         )
         return payload
 
@@ -11462,7 +11997,12 @@ class ModelTrainer:
             symbol_tail_penalty = float(
                 -self.config.objective_weight_tail_risk * min(2.0, tail_shortfall / tail_scale)
             )
-        skew_penalty = float(-self.config.objective_weight_skew * max(0.0, -float(skew)))
+        raw_skew_penalty = float(-self.config.objective_weight_skew * max(0.0, -float(skew)))
+        skew_penalty_cap = float(self.config.objective_skew_penalty_cap)
+        if skew_penalty_cap > 0.0:
+            skew_penalty = float(max(raw_skew_penalty, -skew_penalty_cap))
+        else:
+            skew_penalty = raw_skew_penalty
         equity_break_penalty = float(-2.0 * max(0.0, float(equity_break)))
         min_trades_target = self._effective_trade_target(evaluation_size)
         trade_shortfall = max(
@@ -11497,6 +12037,8 @@ class ModelTrainer:
             "objective_symbol_tail_penalty": symbol_tail_penalty,
             "objective_symbol_tail_floor": float(symbol_tail_floor),
             "objective_skew_penalty": skew_penalty,
+            "objective_skew_penalty_raw": raw_skew_penalty,
+            "objective_skew_penalty_cap": float(skew_penalty_cap),
             "objective_equity_break_penalty": equity_break_penalty,
             "objective_trade_target": float(min_trades_target),
             "objective_expected_shortfall_cap": float(expected_shortfall_cap),
@@ -12461,6 +13003,14 @@ class ModelTrainer:
                 "Dataset too small for final full-data refit; using selected fold model."
             )
             self._attach_probability_calibrator_to_model(self.model)
+            final_refit_feature_count = float(len(self.feature_names or list(self.features.columns)))
+            self.training_metrics["feature_selection_final_refit_binding"] = 0.0
+            self.training_metrics["feature_selection_final_refit_initial_feature_count"] = (
+                final_refit_feature_count
+            )
+            self.training_metrics["feature_selection_final_refit_selected_feature_count"] = (
+                final_refit_feature_count
+            )
             return
 
         weights = self.sample_weights if self.sample_weights is not None else None
@@ -12484,6 +13034,14 @@ class ModelTrainer:
                 self._summarize_lightgbm_model_structure(final_model),
             )
         self._attach_probability_calibrator_to_model(self.model)
+        final_refit_feature_count = float(len(self.feature_names or list(self.features.columns)))
+        self.training_metrics["feature_selection_final_refit_binding"] = 0.0
+        self.training_metrics["feature_selection_final_refit_initial_feature_count"] = (
+            final_refit_feature_count
+        )
+        self.training_metrics["feature_selection_final_refit_selected_feature_count"] = (
+            final_refit_feature_count
+        )
         self.training_metrics["final_refit_samples"] = float(len(X))
         self.logger.info(f"Final production model refit completed on {len(X)} samples")
 
@@ -14669,6 +15227,31 @@ class ModelTrainer:
             ),
             "artifacts_path": str(artifacts_path),
             "training_config": self.config.__dict__,
+            "training_provenance": {
+                "git_commit": self.training_metrics.get(
+                    "git_commit",
+                    self.training_metrics.get("git_commit_hash"),
+                ),
+                "git_commit_hash": self.training_metrics.get("git_commit_hash"),
+                "git_branch": self.training_metrics.get("git_branch"),
+                "git_dirty": self.training_metrics.get("git_dirty"),
+                "environment_lock_hash": self.training_metrics.get(
+                    "environment_lock_hash",
+                    self.training_metrics.get("dependency_lock_hash"),
+                ),
+                "dependency_lock_hash": self.training_metrics.get("dependency_lock_hash"),
+                "training_host": self.training_metrics.get(
+                    "training_host",
+                    self.training_metrics.get("host"),
+                ),
+                "wsl_distro": self.training_metrics.get(
+                    "training_wsl_distro",
+                    self.training_metrics.get("wsl_distro"),
+                ),
+                "repo_provenance_ready": bool(
+                    self.training_metrics.get("training_repo_provenance_ready", 0.0)
+                ),
+            },
             "feature_schema_version": (
                 str(self.snapshot_manifest.get("feature_schema_version"))
                 if isinstance(self.snapshot_manifest, dict)
@@ -14691,6 +15274,39 @@ class ModelTrainer:
                 ),
                 "timeframe": str(self.config.timeframe),
                 "timeframes": list(self.config.timeframes),
+            },
+            "feature_selection_contract": {
+                "effective_binding": float(self.training_metrics.get("feature_selection_binding", 0.0)),
+                "development_binding": float(
+                    self.training_metrics.get("feature_selection_development_binding", 0.0)
+                ),
+                "final_refit_binding": float(
+                    self.training_metrics.get("feature_selection_final_refit_binding", 0.0)
+                ),
+                "development_initial_feature_count": float(
+                    self.training_metrics.get(
+                        "feature_selection_development_initial_feature_count",
+                        self.training_metrics.get("feature_selection_initial_feature_count", 0.0),
+                    )
+                ),
+                "development_selected_feature_count": float(
+                    self.training_metrics.get(
+                        "feature_selection_development_selected_feature_count",
+                        self.training_metrics.get("feature_selection_selected_feature_count", 0.0),
+                    )
+                ),
+                "final_refit_initial_feature_count": float(
+                    self.training_metrics.get(
+                        "feature_selection_final_refit_initial_feature_count",
+                        self.training_metrics.get("feature_selection_selected_feature_count", 0.0),
+                    )
+                ),
+                "final_refit_selected_feature_count": float(
+                    self.training_metrics.get(
+                        "feature_selection_final_refit_selected_feature_count",
+                        self.training_metrics.get("feature_selection_selected_feature_count", 0.0),
+                    )
+                ),
             },
             "signal_policy": {
                 "long_threshold": self.training_metrics.get("holdout_long_threshold"),
@@ -14723,6 +15339,10 @@ class ModelTrainer:
                 ),
                 "model_source": f"promotion_package:{self.config.model_name}",
             },
+            "signal_activity_contract": self.training_metrics.get(
+                "holdout_signal_activity_summary",
+                {},
+            ),
             "execution_cost_model": {
                 "spread_bps": float(cost_model.spread_bps),
                 "slippage_bps": float(cost_model.slippage_bps),
@@ -14798,6 +15418,18 @@ class ModelTrainer:
             "objective_component_summary": self.training_metrics.get(
                 "objective_component_summary", {}
             ),
+            "feature_quality_contract": {
+                "summary": self.training_metrics.get("feature_quality_summary", {}),
+                "family_summary": self.training_metrics.get("feature_quality_family_summary", {}),
+                "worst_null_features": self.training_metrics.get(
+                    "feature_quality_worst_null_features",
+                    [],
+                ),
+                "worst_clip_features": self.training_metrics.get(
+                    "feature_quality_worst_clip_features",
+                    [],
+                ),
+            },
             "model_card": self.training_metrics.get("model_card", {}),
             "deployment_plan": self.training_metrics.get("deployment_plan", {}),
             "nested_cv_trace": self.training_metrics.get("nested_cv_trace", self.nested_cv_trace),
@@ -15007,6 +15639,49 @@ class ModelTrainer:
                 holdout_sample_weights=self.holdout_sample_weights,
                 cv_splits=self._snapshot_bundle_cv_splits(),
                 label_diagnostics=self.label_diagnostics,
+                feature_selection_summary={
+                    "binding": float(self.training_metrics.get("feature_selection_binding", 0.0)),
+                    "development_binding": float(
+                        self.training_metrics.get("feature_selection_development_binding", 0.0)
+                    ),
+                    "final_refit_binding": float(
+                        self.training_metrics.get("feature_selection_final_refit_binding", 0.0)
+                    ),
+                    "development_initial_feature_count": float(
+                        self.training_metrics.get(
+                            "feature_selection_development_initial_feature_count",
+                            self.training_metrics.get("feature_selection_initial_feature_count", 0.0),
+                        )
+                    ),
+                    "development_selected_feature_count": float(
+                        self.training_metrics.get(
+                            "feature_selection_development_selected_feature_count",
+                            self.training_metrics.get(
+                                "feature_selection_selected_feature_count",
+                                0.0,
+                            ),
+                        )
+                    ),
+                    "final_refit_initial_feature_count": float(
+                        self.training_metrics.get(
+                            "feature_selection_final_refit_initial_feature_count",
+                            self.training_metrics.get(
+                                "feature_selection_selected_feature_count",
+                                0.0,
+                            ),
+                        )
+                    ),
+                    "final_refit_selected_feature_count": float(
+                        self.training_metrics.get(
+                            "feature_selection_final_refit_selected_feature_count",
+                            self.training_metrics.get(
+                                "feature_selection_selected_feature_count",
+                                0.0,
+                            ),
+                        )
+                    ),
+                    "audit": self._json_safe(self.training_metrics.get("feature_selection_audit", {})),
+                },
             )
             self.dataset_snapshot_bundle_manifest_path = bundle_manifest_path
             self.dataset_snapshot_bundle_manifest = bundle_manifest
@@ -15457,8 +16132,20 @@ def _build_pre_promotion_checklist(payload: dict[str, Any]) -> dict[str, Any]:
         )
     if not np.isfinite(expected_edge_candidate_count):
         expected_edge_candidate_count = 0.0
-    holdout_trade_count = _payload_metric(payload, "holdout_trade_count", 0.0)
-    holdout_active_signal_rate = _payload_metric(payload, "holdout_active_signal_rate", 0.0)
+    holdout_trade_count = _payload_metric(
+        payload,
+        "effective_holdout_trade_count_metric",
+        np.nan,
+    )
+    if not np.isfinite(holdout_trade_count):
+        holdout_trade_count = _payload_metric(payload, "holdout_trade_count", 0.0)
+    holdout_active_signal_rate = _payload_metric(
+        payload,
+        "effective_holdout_active_signal_rate_metric",
+        np.nan,
+    )
+    if not np.isfinite(holdout_active_signal_rate):
+        holdout_active_signal_rate = _payload_metric(payload, "holdout_active_signal_rate", 0.0)
 
     checks = {
         "snapshot_lineage_present": {
@@ -16168,7 +16855,9 @@ def run_training(args: argparse.Namespace) -> int:
 
     try:
         if getattr(args, "gpu", False) or getattr(args, "use_gpu", False):
-            logger.warning("`--gpu/--use-gpu` is deprecated; use `--require-gpu` instead.")
+            logger.warning(
+                "`--gpu/--use-gpu` is deprecated; use `--require-model-gpu` instead."
+            )
         if getattr(args, "no_database", False) or getattr(args, "no_redis_cache", False):
             raise ValueError("Institutional mode does not allow disabling PostgreSQL or Redis.")
         if getattr(args, "disable_nested_walk_forward", False):
@@ -16243,6 +16932,10 @@ def run_training(args: argparse.Namespace) -> int:
             or getattr(args, "require_gpu", False)
             or getattr(args, "gpu", False)
             or getattr(args, "use_gpu", False)
+        )
+        require_feature_gpu_requested = bool(
+            replay_config.get("require_feature_gpu", False)
+            or getattr(args, "require_feature_gpu", False)
         )
         resolved_use_gpu = _verify_gpu_stack(model_list)
         if require_gpu_requested and not resolved_use_gpu:
@@ -16599,6 +17292,12 @@ def run_training(args: argparse.Namespace) -> int:
                         getattr(args, "objective_weight_skew", 0.1),
                     )
                 ),
+                objective_skew_penalty_cap=float(
+                    _cfg_value(
+                        "objective_skew_penalty_cap",
+                        getattr(args, "objective_skew_penalty_cap", 1.5),
+                    )
+                ),
                 objective_weight_tail_risk=float(
                     _cfg_value(
                         "objective_weight_tail_risk",
@@ -16615,6 +17314,16 @@ def run_training(args: argparse.Namespace) -> int:
                     _cfg_value(
                         "objective_expected_shortfall_cap",
                         getattr(args, "objective_expected_shortfall_cap", 0.012),
+                    )
+                ),
+                allow_unstable_outer_fold_fallback=bool(
+                    _resolve_profiled_value(
+                        replay_config=replay_config,
+                        config_key="allow_unstable_outer_fold_fallback",
+                        args=args,
+                        profile_defaults=profile_defaults,
+                        fallback=False,
+                        arg_dest="allow_unstable_outer_fold_fallback",
                     )
                 ),
                 epochs=int(_cfg_value("epochs", getattr(args, "epochs", 100))),
@@ -16642,10 +17351,22 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_probability_calibration", False)),
                     )
                 ),
+                enable_ranker_probability_calibration=bool(
+                    _cfg_value(
+                        "enable_ranker_probability_calibration",
+                        bool(getattr(args, "enable_ranker_probability_calibration", False)),
+                    )
+                ),
                 expected_edge_use_symbol_priors=bool(
                     _cfg_value(
                         "expected_edge_use_symbol_priors",
                         bool(getattr(args, "enable_expected_edge_symbol_priors", False)),
+                    )
+                ),
+                expected_edge_min_coverage=float(
+                    _cfg_value(
+                        "expected_edge_min_coverage",
+                        getattr(args, "expected_edge_min_coverage", 0.55),
                     )
                 ),
                 probability_calibration_method=str(
@@ -16658,6 +17379,7 @@ def run_training(args: argparse.Namespace) -> int:
                 correction_method="deflated_sharpe",
                 use_gpu=resolved_use_gpu,
                 require_gpu=require_gpu_requested,
+                require_feature_gpu=require_feature_gpu_requested,
                 use_database=True,
                 use_redis_cache=True,
                 compute_shap=compute_shap,
@@ -17133,6 +17855,58 @@ def run_training(args: argparse.Namespace) -> int:
                         "Auto-reusing dataset snapshot bundle for matching training scope: %s",
                         reusable_snapshot_bundle,
                     )
+            if config.training_profile == "promotion":
+                if not _promotion_repo_provenance_ready(PROJECT_ROOT):
+                    logger.error(
+                        "Promotion profile requires a real Git checkout/worktree with repository provenance."
+                    )
+                    if requested_model == "all" or is_multi_run:
+                        results.append(
+                            (
+                                model_type,
+                                {
+                                    "success": False,
+                                    "model_type": config.model_type,
+                                    "model_name": config.model_name,
+                                    "model_path": None,
+                                    "training_duration_seconds": 0.0,
+                                    "training_metrics": {},
+                                    "primary_label_horizon": int(config.primary_label_horizon),
+                                    "run_id": f"{config.model_type}_h{int(config.primary_label_horizon)}",
+                                    "error": "promotion_repo_provenance_missing",
+                                },
+                            )
+                        )
+                        overall_success = False
+                        continue
+                    return 1
+                if not config.dataset_snapshot_bundle_path:
+                    logger.error(
+                        "Promotion profile requires an immutable dataset snapshot bundle. "
+                        "Provide --dataset-snapshot-bundle or enable auto snapshot reuse from a "
+                        "matching research candidate."
+                    )
+                    if requested_model == "all" or is_multi_run:
+                        results.append(
+                            (
+                                model_type,
+                                {
+                                    "success": False,
+                                    "model_type": config.model_type,
+                                    "model_name": config.model_name,
+                                    "model_path": None,
+                                    "training_duration_seconds": 0.0,
+                                    "training_metrics": {},
+                                    "primary_label_horizon": int(config.primary_label_horizon),
+                                    "run_id": f"{config.model_type}_h{int(config.primary_label_horizon)}",
+                                    "error": "promotion_snapshot_bundle_required",
+                                },
+                            )
+                        )
+                        overall_success = False
+                        continue
+                    return 1
+                config.strict_snapshot_replay = True
             _verify_institutional_infra(config)
             _log_training_environment_guidance(config.training_profile)
 
@@ -17151,7 +17925,13 @@ def run_training(args: argparse.Namespace) -> int:
             logger.info(f"CV method: {config.cv_method} ({config.n_splits} splits)")
             logger.info(f"Embargo: {config.embargo_pct * 100:.1f}%")
             logger.info(f"GPU acceleration enabled: {config.use_gpu}")
-            logger.info(f"GPU acceleration required: {config.require_gpu}")
+            logger.info(f"Model GPU required: {config.require_gpu}")
+            logger.info(f"Feature GPU required: {config.require_feature_gpu}")
+            if config.require_gpu and not config.require_feature_gpu:
+                logger.info(
+                    "Feature materialization may still use CPU-optimized paths; "
+                    "use --require-feature-gpu only after full CUDA family coverage exists."
+                )
             logger.info(
                 "Training stack: Nested Walk-Forward + Optuna + Meta-Labeling=%s + "
                 "Multiple-Testing + SHAP=%s + Leak-Validation",
@@ -17266,6 +18046,7 @@ def run_training(args: argparse.Namespace) -> int:
                         "n_trials": config.n_trials,
                         "use_gpu": config.use_gpu,
                         "require_gpu": config.require_gpu,
+                        "require_feature_gpu": config.require_feature_gpu,
                         "use_meta_labeling": config.use_meta_labeling,
                         "compute_shap": config.compute_shap,
                         "holdout_pct": config.holdout_pct,
@@ -17652,6 +18433,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nested-outer-stability-ratio-cap", type=float, default=1.25)
     parser.add_argument("--nested-outer-stability-min-trials", type=int, default=8)
     parser.add_argument(
+        "--allow-unstable-outer-fold-fallback",
+        action="store_true",
+        help=(
+            "Allow research runs to fall back to unstable outer-fold candidates when no stable "
+            "candidate passes the Optuna surface gate."
+        ),
+    )
+    parser.add_argument(
         "--disable-nested-walk-forward",
         action="store_true",
         help="Forbidden in institutional mode; nested walk-forward is mandatory.",
@@ -17663,6 +18452,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--objective-weight-trade-activity", type=float, default=1.0)
     parser.add_argument("--objective-weight-cvar", type=float, default=0.4)
     parser.add_argument("--objective-weight-skew", type=float, default=0.1)
+    parser.add_argument("--objective-skew-penalty-cap", type=float, default=1.5)
     parser.add_argument("--objective-weight-tail-risk", type=float, default=0.35)
     parser.add_argument("--objective-weight-symbol-concentration", type=float, default=0.20)
     parser.add_argument("--objective-expected-shortfall-cap", type=float, default=0.012)
@@ -17735,12 +18525,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu",
         action="store_true",
-        help="Deprecated alias for --require-gpu.",
+        help="Deprecated alias for --require-model-gpu.",
     )
     parser.add_argument(
+        "--require-model-gpu",
         "--require-gpu",
+        dest="require_gpu",
         action="store_true",
-        help="Fail fast unless the requested model stack can run on GPU.",
+        help=(
+            "Fail fast unless the requested model stack can run on GPU. "
+            "Feature materialization may still use CPU-optimized paths unless "
+            "--require-feature-gpu is also set."
+        ),
+    )
+    parser.add_argument(
+        "--require-feature-gpu",
+        action="store_true",
+        help=(
+            "Fail fast unless all requested feature groups have complete CUDA/cuDF "
+            "materialization. Partial technical acceleration does not satisfy this flag."
+        ),
     )
     parser.add_argument(
         "--no-database",
@@ -17812,6 +18616,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-probability-calibration",
         action="store_true",
         help="Disable post-hoc probability calibration on out-of-fold predictions.",
+    )
+    parser.add_argument(
+        "--enable-ranker-probability-calibration",
+        action="store_true",
+        help="Allow post-hoc probability calibration for ranker models using normalized OOF scores.",
     )
     parser.add_argument(
         "--probability-calibration-method",
@@ -17981,6 +18790,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Opt in to symbol-level priors inside the expected-edge selector.",
     )
+    parser.add_argument("--expected-edge-min-coverage", type=float, default=0.55)
     parser.add_argument(
         "--disable-lightgbm-monotonic-constraints",
         action="store_true",

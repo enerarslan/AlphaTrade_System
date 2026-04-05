@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -59,3 +61,46 @@ def test_select_training_features_prunes_highly_correlated_duplicate() -> None:
     assert "signal_feature" in result.selected_features
     assert "duplicate_feature" in result.correlation_pruned_features
     assert "duplicate_feature" not in result.selected_features
+
+
+def test_compute_information_coefficients_skips_constant_inputs_without_warning() -> None:
+    features = pd.DataFrame(
+        {
+            "constant_feature": np.ones(64, dtype=float),
+            "signal_feature": np.linspace(-1.0, 1.0, 64),
+        }
+    )
+    target = np.linspace(-0.5, 0.5, 64)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        scores = compute_information_coefficients(features, target)
+
+    assert float(scores["constant_feature"]) == 0.0
+    assert float(scores["signal_feature"]) > 0.0
+
+
+def test_compute_information_coefficients_supports_group_aware_rank_ic() -> None:
+    rng = np.random.default_rng(123)
+    group_size = 6
+    group_count = 48
+    groups = np.repeat(np.arange(group_count), group_size)
+    signal = rng.normal(size=group_size * group_count)
+    noise = rng.normal(size=group_size * group_count)
+    target = signal + rng.normal(scale=0.15, size=group_size * group_count)
+    features = pd.DataFrame(
+        {
+            "signal_feature": signal,
+            "noise_feature": noise,
+        }
+    )
+
+    scores = compute_information_coefficients(
+        features,
+        target,
+        groups=groups,
+        min_group_size=4,
+    )
+
+    assert scores.index[0] == "signal_feature"
+    assert float(scores["signal_feature"]) > float(scores["noise_feature"])
