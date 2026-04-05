@@ -452,6 +452,7 @@ class ExpectedEdgePolicyConfig:
     min_expected_edge: float = 0.0
     min_signal_scale: float = 0.25
     max_signal_scale: float = 1.10
+    use_symbol_priors: bool = False
     random_state: int = 42
 
 
@@ -511,20 +512,20 @@ class ExpectedEdgePolicyModel:
     ) -> list[str]:
         """Select a compact high-signal context feature slice for policy learning."""
         numeric_frame = _safe_numeric_frame(feature_frame)
-        scored: list[tuple[int, float, str]] = []
+        scored: list[tuple[float, int, str]] = []
         for column in numeric_frame.columns:
             if column in _DERIVED_POLICY_COLUMNS:
                 continue
             score = self._feature_score(numeric_frame[column], target)
             token_bonus = int(any(token in column.lower() for token in _CONTEXT_TOKENS))
-            if score <= 0.0 and token_bonus <= 0:
+            if score <= 0.0:
                 continue
-            scored.append((token_bonus, score, str(column)))
+            scored.append((score, token_bonus, str(column)))
         scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
         selected = [column for _, _, column in scored[: int(self.config.max_context_features)]]
         self.feature_scores_ = {
             column: float(score)
-            for _, score, column in scored[: int(self.config.max_context_features)]
+            for score, _, column in scored[: int(self.config.max_context_features)]
         }
         return selected
 
@@ -624,7 +625,6 @@ class ExpectedEdgePolicyModel:
         if len(numeric_frame) != trade_return_values.size:
             raise ValueError("Expected-edge policy feature/target length mismatch.")
 
-        selected_context = self._select_context_features(numeric_frame, trade_return_values)
         resolved_signal = (
             _normalize_vector(signal_values, len(numeric_frame), fill_value=0.0)
             if signal_values is not None
@@ -634,12 +634,20 @@ class ExpectedEdgePolicyModel:
                 short_threshold=float(short_threshold),
             )
         )
-        normalized_symbols = _normalize_symbol_values(symbols, length=len(numeric_frame))
         candidate_mask = np.isfinite(trade_return_values) & (np.abs(resolved_signal) > 1e-8)
-        self.symbol_priors_ = self._build_symbol_priors(
-            symbols=normalized_symbols,
-            trade_returns=trade_return_values,
-            candidate_mask=candidate_mask,
+        selected_context = self._select_context_features(
+            numeric_frame.loc[candidate_mask].reset_index(drop=True),
+            trade_return_values[candidate_mask],
+        )
+        normalized_symbols = _normalize_symbol_values(symbols, length=len(numeric_frame))
+        self.symbol_priors_ = (
+            self._build_symbol_priors(
+                symbols=normalized_symbols,
+                trade_returns=trade_return_values,
+                candidate_mask=candidate_mask,
+            )
+            if bool(self.config.use_symbol_priors)
+            else {}
         )
         policy_frame = build_expected_edge_feature_frame(
             numeric_frame,
@@ -739,6 +747,7 @@ class ExpectedEdgePolicyModel:
             "selected_win_rate": float(np.mean(selected_edge > 0.0)) if selected_edge.size else 0.0,
             "edge_reference": float(self.edge_reference_),
             "selected_context_features": list(self.selected_context_features_),
+            "symbol_priors_enabled": bool(self.config.use_symbol_priors),
             "symbol_prior_summary": dict(self.symbol_priors_),
         }
         return dict(self.training_summary_)

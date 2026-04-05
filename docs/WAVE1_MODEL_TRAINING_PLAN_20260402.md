@@ -131,12 +131,12 @@ Bu asamada amac:
 | `ohlcv_bars` 1Min | %0 primer training | Sinirli/ayri calisma | Simdilik ana model icin gereksiz karmasiklik |
 | `macro_observations` + `macro_vintage_observations` | %0 primer branch | %100 ayri reference branch | Kaliteli ama mevcut reference switch cok toplu |
 | `sec_filings` | %0 primer branch | %100 ayri reference branch | Tarihsel derinlik iyi, sonra eklenmeli |
-| `news_articles` | %0 primer branch | Kontrollu ablation | Sadece son 1 yil var, primer modele erken dahil edilmemeli |
+| `news_articles` | Kontrollu challenger | Kontrollu ablation | Son 1 yil coverage var; Alpaca haberleri artik sentiment-backfilled |
 | `corporate_actions` | dolayli | dolayli | Veri temizligi/uyarlama icin onemli, alpha driver olarak simdilik degil |
 | `earnings_events` | %0 | Sonra | `reported_date` bosluklari var, once timestamp kalitesi duzelmeli |
 | `fundamental_snapshots` | %0 | Hayir, simdilik | Tek gun snapshot, training icin cok seyrek |
-| `short_sale_volumes` | %0 | Hayir, simdilik | 2 haftalik veri production candidate icin yetersiz |
-| `fails_to_deliver` | %0 | Hayir, simdilik | ~2 aylik veri production candidate icin yetersiz |
+| `short_sale_volumes` | Kontrollu challenger | Kontrollu ablation | Coverage 2023-05-11 -> 2026-04-01'a genisletildi; artan short-pressure sinyali test edilmeli |
+| `fails_to_deliver` | Kontrollu challenger | Kontrollu ablation | Coverage 2017-06-14 -> 2026-03-12'a genisletildi; point-in-time FTD pressure artik kullanilabilir |
 
 ### 2.3 Onemli veri karari
 
@@ -150,20 +150,22 @@ Guncel uygulama notu:
 
 - Source-selective reference feature policy eklenmelidir / eklendiginde kullanilmalidir.
 - **Su an acilmasi onerilen kaynaklar:** `macro`, `sec_filings`, `news`, `corporate_actions`
-- **Su an kapali kalmasi onerilen kaynaklar:** `fundamentals`, `earnings`, `short_sale`, `ftd`
+- **Su an kontrollu challenger olarak acilmasi onerilen kaynaklar:** `short_sale`, `ftd`
+- **Su an kapali kalmasi onerilen kaynaklar:** `fundamentals`, `earnings`
 
 Nedeni:
 
 - `macro` ve `sec_filings` tarihsel olarak derin ve point-in-time kullanim icin yeterli
-- `news` mevcut approved snapshot penceresini kapsiyor
+- `news` mevcut approved snapshot penceresini kapsiyor ve Alpaca haberleri local sentiment ile backfill edildi
 - `corporate_actions` veri temizligi ve event context icin guvenli
 - `fundamentals` tek-gun snapshot
 - `earnings` history var ama availability timestamp kalitesi yetersiz
-- `short_sale` ve `ftd` coverage production-grade degil
+- `short_sale` coverage artik egitim penceresine giriyor ama utility etkisi ablation ile kanitlanmali
+- `ftd` coverage artik production-candidate research icin yeterli derinlige sahip
 
 R3 sonrasi ek not:
 
-- `news_articles.sentiment` su an NULL; haber katmani sadece count/recency benzeri sinyal uretiyor
+- `news_articles.sentiment` artik dolu; `alpaca` source icin `38,041/38,041` satir local sentiment ile skorlendi
 - `r3` final selected feature set'inde `macro` ve `news` feature'lari secilmedi
 - secilen `ref_` feature'lar fiilen `sec_filings + corporate_actions` tarafindan geldi
 
@@ -171,7 +173,10 @@ Bu yuzden:
 
 - sonraki kontrollu ablation'da once `price-only` kosulacak
 - sonra `sec_filings + corporate_actions` only kosulacak
-- `macro + news` ancak bagimsiz fayda gostermeden ana candidate stack'e zorla eklenmeyecek
+- sonra `news`
+- sonra `short_sale + ftd`
+- sonra `news + short_sale + ftd`
+- `macro` ancak bagimsiz fayda gostermeden ana candidate stack'e zorla eklenmeyecek
 
 ### 2.4 Feature store notu
 

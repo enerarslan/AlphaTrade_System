@@ -40,6 +40,7 @@ AAPL, ABBV, AMD, AMZN, BA, BAC, BLK, C, CAT, COP, CRM, CVX, DIS, GE, GLD, GOOGL,
 - **Boyut:** 52 MB | **Satir:** 38,041
 - **Aralik:** 2025-03-14 → 2026-03-14 (son 1 yil)
 - Icerik: headline, summary, URL, sentiment skoru, symbols (JSONB), kaynak
+- Not: `alpaca` source icin `38,041/38,041` satir local sentiment ile backfill edildi
 
 ### Corporate Actions (`corporate_actions`)
 - **Boyut:** 6.5 MB | **Satir:** 25,884
@@ -48,15 +49,15 @@ AAPL, ABBV, AMD, AMZN, BA, BAC, BLK, C, CAT, COP, CRM, CVX, DIS, GE, GLD, GOOGL,
 - Icerik: dividendlar, split'ler, ex-date bazli
 
 ### Short Sale Volumes (`short_sale_volumes`)
-- **Boyut:** 1.7 MB | **Satir:** 9,914
-- **Aralik:** 2026-03-02 → 2026-03-13 (sadece son 2 hafta)
-- **Sembol:** 248
+- **Boyut:** 1.7 MB+ | **Satir:** 703,512
+- **Aralik:** 2023-05-11 → 2026-04-01
+- **Sembol:** 250
 - Icerik: short_volume, short_exempt_volume, total_volume, market
 
 ### Fails to Deliver (`fails_to_deliver`)
-- **Boyut:** 720 KB | **Satir:** 3,536
-- **Aralik:** 2025-12-15 → 2026-02-13 (son ~2 ay)
-- **Sembol:** 248
+- **Boyut:** 720 KB+ | **Satir:** 220,930
+- **Aralik:** 2017-06-14 → 2026-03-12
+- **Sembol:** 250
 - Icerik: settlement_date, CUSIP, quantity, price
 
 ### Earnings Events (`earnings_events`)

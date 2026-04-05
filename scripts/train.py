@@ -1207,6 +1207,7 @@ class TrainingConfig:
     expected_edge_min_expected_edge: float = 0.0
     expected_edge_min_signal_scale: float = 0.25
     expected_edge_max_signal_scale: float = 1.10
+    expected_edge_use_symbol_priors: bool = False
 
     # Multiple testing correction (P1-3.1)
     apply_multiple_testing: bool = True
@@ -1405,6 +1406,7 @@ class TrainingConfig:
                 1.25,
             )
         )
+        self.expected_edge_use_symbol_priors = bool(self.expected_edge_use_symbol_priors)
         self.holdout_pct = min(max(float(self.holdout_pct), 0.05), 0.35)
         self.execution_vol_target_daily = max(float(self.execution_vol_target_daily), 1e-4)
         self.execution_turnover_cap = min(max(float(self.execution_turnover_cap), 0.05), 1.0)
@@ -1572,6 +1574,8 @@ class ModelTrainer:
         self.oof_primary_proba_raw: np.ndarray | None = None
         self.cv_return_series: list[np.ndarray] = []
         self.cv_active_return_series: list[np.ndarray] = []
+        self.expected_edge_cv_return_series: list[np.ndarray] = []
+        self.expected_edge_cv_active_return_series: list[np.ndarray] = []
         self.sample_weights: np.ndarray | None = None
         self.label_diagnostics: dict[str, Any] = {}
         self.data_quality_report: dict[str, Any] | None = None
@@ -9356,15 +9360,15 @@ class ModelTrainer:
         )
         return filtered_values, resolved_confidence, summary
 
-    def _summarize_policy_adjusted_signal_stream(
-        self,
+    @staticmethod
+    def _align_policy_stream_inputs(
         *,
         signal_values: np.ndarray,
         trade_returns: np.ndarray,
         timestamps: np.ndarray | None = None,
         policy_frame: pd.DataFrame | None = None,
-    ) -> dict[str, Any]:
-        """Summarize the realized holdout stream after expected-edge admission and sizing."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, pd.DataFrame | None, int]:
+        """Align policy-stream arrays to a common trailing window."""
         signal = np.asarray(signal_values, dtype=float).reshape(-1)
         realized = np.asarray(trade_returns, dtype=float).reshape(-1)
         target_len = min(len(signal), len(realized))
@@ -9373,23 +9377,13 @@ class ModelTrainer:
         if timestamps is not None:
             target_len = min(target_len, len(np.asarray(timestamps).reshape(-1)))
         if target_len <= 0:
-            return {
-                "policy_signal_count": 0,
-                "policy_selected_count": 0,
-                "policy_selected_rate": 0.0,
-                "policy_trade_count": 0.0,
-                "policy_active_signal_rate": 0.0,
-                "policy_turnover": 0.0,
-                "policy_sharpe": 0.0,
-                "policy_max_drawdown": 0.0,
-                "policy_trade_return_observations": 0.0,
-                "policy_sharpe_observation_confidence": 0.0,
-                "policy_annual_return": 0.0,
-                "policy_calmar": 0.0,
-                "policy_underwater_ratio": 0.0,
-                "policy_selected_mean_trade_return": 0.0,
-                "policy_selected_win_rate": 0.0,
-            }
+            return (
+                np.array([], dtype=float),
+                np.array([], dtype=float),
+                None,
+                None,
+                0,
+            )
 
         signal = signal[-target_len:]
         realized = np.nan_to_num(realized[-target_len:], nan=0.0, posinf=0.0, neginf=0.0)
@@ -9401,7 +9395,15 @@ class ModelTrainer:
         aligned_timestamps = None
         if timestamps is not None:
             aligned_timestamps = np.asarray(timestamps).reshape(-1)[-target_len:]
+        return signal, realized, aligned_timestamps, policy, target_len
 
+    @staticmethod
+    def _policy_adjusted_signal_values(
+        *,
+        signal: np.ndarray,
+        policy: pd.DataFrame | None = None,
+    ) -> np.ndarray:
+        """Apply expected-edge admission and sizing to a base signal vector."""
         adjusted_signal = signal.copy()
         if policy is not None and not policy.empty:
             policy_pass = (
@@ -9419,7 +9421,40 @@ class ModelTrainer:
                 np.sign(signal) * np.abs(signal) * policy_scale,
                 0.0,
             )
+        return adjusted_signal
 
+    def _build_policy_adjusted_stream(
+        self,
+        *,
+        signal_values: np.ndarray,
+        trade_returns: np.ndarray,
+        timestamps: np.ndarray | None = None,
+        policy_frame: pd.DataFrame | None = None,
+    ) -> dict[str, Any]:
+        """Build row-level and timestamp-aggregated execution series for a policy-adjusted stream."""
+        signal, realized, aligned_timestamps, policy, target_len = self._align_policy_stream_inputs(
+            signal_values=signal_values,
+            trade_returns=trade_returns,
+            timestamps=timestamps,
+            policy_frame=policy_frame,
+        )
+        if target_len <= 0:
+            return {
+                "target_len": 0,
+                "base_signal": np.array([], dtype=float),
+                "adjusted_signal": np.array([], dtype=float),
+                "row_returns": np.array([], dtype=float),
+                "turnover_series": np.array([], dtype=float),
+                "trade_mask": np.array([], dtype=bool),
+                "entry_mask": np.array([], dtype=bool),
+                "portfolio_returns": np.array([], dtype=float),
+                "portfolio_turnover_series": np.array([], dtype=float),
+                "portfolio_trade_mask": np.array([], dtype=bool),
+                "portfolio_entry_mask": np.array([], dtype=bool),
+                "timestamps": None,
+            }
+
+        adjusted_signal = self._policy_adjusted_signal_values(signal=signal, policy=policy)
         trade_mask = np.abs(adjusted_signal) > 1e-8
         prev_signal = np.concatenate([[0.0], adjusted_signal[:-1]])
         entry_mask = trade_mask & (
@@ -9434,14 +9469,64 @@ class ModelTrainer:
             trade_mask=trade_mask,
             entry_mask=entry_mask,
         )
-        portfolio_returns = np.asarray(portfolio["portfolio_returns"], dtype=float)
-        portfolio_turnover = np.asarray(portfolio["portfolio_turnover_series"], dtype=float)
-        portfolio_trade_mask = np.asarray(portfolio["portfolio_trade_mask"], dtype=bool)
-        portfolio_entry_mask = np.asarray(portfolio["portfolio_entry_mask"], dtype=bool)
+        return {
+            "target_len": int(target_len),
+            "base_signal": np.asarray(signal, dtype=float),
+            "adjusted_signal": np.asarray(adjusted_signal, dtype=float),
+            "row_returns": np.asarray(row_returns, dtype=float),
+            "turnover_series": np.asarray(turnover_series, dtype=float),
+            "trade_mask": np.asarray(trade_mask, dtype=bool),
+            "entry_mask": np.asarray(entry_mask, dtype=bool),
+            "portfolio_returns": np.asarray(portfolio["portfolio_returns"], dtype=float),
+            "portfolio_turnover_series": np.asarray(
+                portfolio["portfolio_turnover_series"], dtype=float
+            ),
+            "portfolio_trade_mask": np.asarray(portfolio["portfolio_trade_mask"], dtype=bool),
+            "portfolio_entry_mask": np.asarray(portfolio["portfolio_entry_mask"], dtype=bool),
+            "timestamps": aligned_timestamps,
+        }
+
+    def _summarize_policy_stream_metrics(
+        self,
+        *,
+        stream: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Summarize portfolio-level diagnostics for a policy-adjusted stream."""
+        target_len = int(stream.get("target_len", 0))
+        if target_len <= 0:
+            return {
+                "policy_signal_count": 0,
+                "policy_selected_count": 0,
+                "policy_selected_rate": 0.0,
+                "policy_trade_count": 0.0,
+                "policy_active_signal_rate": 0.0,
+                "policy_turnover": 0.0,
+                "policy_sharpe": 0.0,
+                "policy_max_drawdown": 0.0,
+                "policy_trade_return_observations": 0.0,
+                "policy_sharpe_observation_confidence": 0.0,
+                "policy_annual_return": 0.0,
+                "policy_calmar": 0.0,
+                "policy_underwater_ratio": 0.0,
+                "policy_selected_mean_trade_return": 0.0,
+                "policy_selected_win_rate": 0.0,
+                "policy_pnl": 0.0,
+                "policy_loss_pnl": 0.0,
+                "policy_tail_loss_pnl": 0.0,
+                "policy_cvar_95": 0.0,
+                "policy_expected_shortfall": 0.0,
+                "policy_return_skew": 0.0,
+                "policy_risk_adjusted_score": 0.0,
+            }
+
+        base_signal = np.asarray(stream.get("base_signal", []), dtype=float)
+        adjusted_signal = np.asarray(stream.get("adjusted_signal", []), dtype=float)
+        portfolio_returns = np.asarray(stream.get("portfolio_returns", []), dtype=float)
+        portfolio_turnover = np.asarray(stream.get("portfolio_turnover_series", []), dtype=float)
+        portfolio_trade_mask = np.asarray(stream.get("portfolio_trade_mask", []), dtype=bool)
+        portfolio_entry_mask = np.asarray(stream.get("portfolio_entry_mask", []), dtype=bool)
         trade_return_series = portfolio_returns[portfolio_trade_mask]
-        performance_returns = (
-            portfolio_returns if portfolio_returns.size > 0 else trade_return_series
-        )
+        performance_returns = portfolio_returns if portfolio_returns.size > 0 else trade_return_series
 
         turnover = float(np.mean(portfolio_turnover)) if portfolio_turnover.size > 0 else 0.0
         trade_count = int(np.count_nonzero(portfolio_entry_mask))
@@ -9475,17 +9560,53 @@ class ModelTrainer:
             else 0.0
         )
         calmar = annual_return / max_dd if max_dd > 1e-9 else annual_return
+        pnl = float(np.sum(performance_returns)) if performance_returns.size > 0 else 0.0
+        loss_pnl = (
+            float(np.sum(performance_returns[performance_returns < 0.0]))
+            if performance_returns.size > 0
+            else 0.0
+        )
         if performance_returns.size > 0:
             cumulative_equity = np.cumsum(performance_returns)
             running_peak = np.maximum.accumulate(cumulative_equity)
             underwater_ratio = float(np.mean(cumulative_equity < (running_peak - 1e-12)))
+            alpha = 0.05
+            tail_cutoff = float(np.quantile(performance_returns, alpha))
+            cvar = float(np.mean(performance_returns[performance_returns <= tail_cutoff]))
+            tail_loss_cutoff = float(np.quantile(performance_returns, 0.10))
+            tail_loss_pnl = float(
+                np.sum(performance_returns[performance_returns <= tail_loss_cutoff])
+            )
+            expected_shortfall = float(abs(cvar))
+            skew = float(pd.Series(performance_returns).skew())
         else:
             underwater_ratio = 0.0
+            cvar = 0.0
+            tail_loss_pnl = 0.0
+            expected_shortfall = 0.0
+            skew = 0.0
+
+        objective_components = self._compute_objective_components(
+            sharpe=sharpe,
+            max_drawdown=max_dd,
+            turnover=turnover,
+            brier_score=0.0,
+            trade_count=trade_count,
+            cvar=cvar,
+            skew=skew,
+            expected_shortfall=expected_shortfall,
+            symbol_concentration_hhi=0.0,
+            equity_break=float(1.0 if max_dd > (self.config.max_drawdown * 1.5) else 0.0),
+            evaluation_size=int(target_len),
+            symbol_sharpe_p25=None,
+        )
 
         return {
-            "policy_signal_count": int(np.count_nonzero(np.abs(signal) > 1e-8)),
-            "policy_selected_count": int(np.count_nonzero(trade_mask)),
-            "policy_selected_rate": float(np.mean(trade_mask)) if target_len else 0.0,
+            "policy_signal_count": int(np.count_nonzero(np.abs(base_signal) > 1e-8)),
+            "policy_selected_count": int(np.count_nonzero(np.abs(adjusted_signal) > 1e-8)),
+            "policy_selected_rate": float(np.mean(np.abs(adjusted_signal) > 1e-8))
+            if target_len
+            else 0.0,
             "policy_trade_count": float(trade_count),
             "policy_active_signal_rate": float(active_signal_rate),
             "policy_turnover": float(turnover),
@@ -9502,7 +9623,110 @@ class ModelTrainer:
             "policy_selected_win_rate": (
                 float(np.mean(trade_return_series > 0.0)) if trade_return_series.size else 0.0
             ),
+            "policy_pnl": float(pnl),
+            "policy_loss_pnl": float(loss_pnl),
+            "policy_tail_loss_pnl": float(tail_loss_pnl),
+            "policy_cvar_95": float(cvar),
+            "policy_expected_shortfall": float(expected_shortfall),
+            "policy_return_skew": float(skew),
+            "policy_risk_adjusted_score": float(objective_components["risk_adjusted_score"]),
         }
+
+    def _summarize_policy_adjusted_signal_stream(
+        self,
+        *,
+        signal_values: np.ndarray,
+        trade_returns: np.ndarray,
+        timestamps: np.ndarray | None = None,
+        policy_frame: pd.DataFrame | None = None,
+    ) -> dict[str, Any]:
+        """Summarize the realized holdout stream after expected-edge admission and sizing."""
+        stream = self._build_policy_adjusted_stream(
+            signal_values=signal_values,
+            trade_returns=trade_returns,
+            timestamps=timestamps,
+            policy_frame=policy_frame,
+        )
+        return self._summarize_policy_stream_metrics(stream=stream)
+
+    def _summarize_policy_adjusted_metrics_by_group(
+        self,
+        *,
+        signal_values: np.ndarray,
+        trade_returns: np.ndarray,
+        group_labels: np.ndarray | None,
+        timestamps: np.ndarray | None = None,
+        policy_frame: pd.DataFrame | None = None,
+        min_rows: int = 1,
+    ) -> dict[str, dict[str, float]]:
+        """Summarize policy-adjusted execution diagnostics for each group."""
+        signal, realized, aligned_timestamps, policy, target_len = self._align_policy_stream_inputs(
+            signal_values=signal_values,
+            trade_returns=trade_returns,
+            timestamps=timestamps,
+            policy_frame=policy_frame,
+        )
+        if target_len <= 0 or group_labels is None:
+            return {}
+
+        labels_arr = np.asarray(group_labels, dtype=object).reshape(-1)
+        if labels_arr.size < target_len:
+            return {}
+        labels_arr = labels_arr[-target_len:]
+        normalized = (
+            pd.Series(labels_arr, dtype="object")
+            .fillna("unknown")
+            .astype(str)
+            .str.strip()
+            .replace("", "unknown")
+            .to_numpy(dtype=object)
+        )
+
+        results: dict[str, dict[str, float]] = {}
+        for group_name in sorted({str(value) for value in normalized if str(value).strip()}):
+            group_mask = normalized == group_name
+            group_rows = int(np.count_nonzero(group_mask))
+            if group_rows < int(max(1, min_rows)):
+                continue
+            group_summary = self._summarize_policy_adjusted_signal_stream(
+                signal_values=signal[group_mask],
+                trade_returns=realized[group_mask],
+                timestamps=(
+                    aligned_timestamps[group_mask]
+                    if aligned_timestamps is not None and len(aligned_timestamps) == target_len
+                    else None
+                ),
+                policy_frame=(
+                    policy.loc[group_mask].reset_index(drop=True)
+                    if policy is not None and len(policy) == target_len
+                    else None
+                ),
+            )
+            results[str(group_name)] = {
+                "rows": float(group_rows),
+                "accuracy": 0.0,
+                "sharpe": float(group_summary.get("policy_sharpe", 0.0)),
+                "max_drawdown": float(group_summary.get("policy_max_drawdown", 0.0)),
+                "trade_count": float(group_summary.get("policy_trade_count", 0.0)),
+                "win_rate": float(group_summary.get("policy_selected_win_rate", 0.0)),
+                "turnover": float(group_summary.get("policy_turnover", 0.0)),
+                "active_signal_rate": float(group_summary.get("policy_active_signal_rate", 0.0)),
+                "annual_return": float(group_summary.get("policy_annual_return", 0.0)),
+                "calmar": float(group_summary.get("policy_calmar", 0.0)),
+                "pnl": float(group_summary.get("policy_pnl", 0.0)),
+                "loss_pnl": float(group_summary.get("policy_loss_pnl", 0.0)),
+                "tail_loss_pnl": float(group_summary.get("policy_tail_loss_pnl", 0.0)),
+                "underwater_ratio": float(group_summary.get("policy_underwater_ratio", 0.0)),
+                "cvar_95": float(group_summary.get("policy_cvar_95", 0.0)),
+                "risk_adjusted_score": float(group_summary.get("policy_risk_adjusted_score", 0.0)),
+                "sharpe_observation_confidence": float(
+                    group_summary.get("policy_sharpe_observation_confidence", 0.0)
+                ),
+                "trade_return_observations": float(
+                    group_summary.get("policy_trade_return_observations", 0.0)
+                ),
+            }
+        return results
 
     def _resolve_effective_holdout_metric_payload(self) -> dict[str, Any]:
         """Resolve which holdout metrics should drive gates and overfitting diagnostics."""
@@ -10262,6 +10486,91 @@ class ModelTrainer:
             timestamps=holdout_timestamps,
             policy_frame=policy_frame,
         )
+        holdout_regime_sample_floor = max(30, int(round(0.05 * aligned_len)))
+        holdout_symbol_sample_floor = max(20, int(round(0.01 * aligned_len)))
+        policy_regime_metrics = self._summarize_policy_adjusted_metrics_by_group(
+            signal_values=holdout_signal,
+            trade_returns=holdout_trade_returns,
+            group_labels=holdout_regimes,
+            timestamps=holdout_timestamps,
+            policy_frame=policy_frame,
+            min_rows=holdout_regime_sample_floor,
+        )
+        policy_symbol_metrics = self._summarize_policy_adjusted_metrics_by_group(
+            signal_values=holdout_signal,
+            trade_returns=holdout_trade_returns,
+            group_labels=holdout_symbols,
+            timestamps=holdout_timestamps,
+            policy_frame=policy_frame,
+            min_rows=holdout_symbol_sample_floor,
+        )
+
+        def _top_tail_contributors(
+            metrics_by_group: dict[str, dict[str, float]],
+            *,
+            top_k: int = 8,
+        ) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for group_name, group_metrics in metrics_by_group.items():
+                tail_loss_pnl = float(group_metrics.get("tail_loss_pnl", 0.0))
+                pnl = float(group_metrics.get("pnl", 0.0))
+                if tail_loss_pnl >= 0.0 and pnl >= 0.0:
+                    continue
+                rows.append(
+                    {
+                        "name": str(group_name),
+                        "tail_loss_pnl": tail_loss_pnl,
+                        "pnl": pnl,
+                        "loss_pnl": float(group_metrics.get("loss_pnl", 0.0)),
+                        "underwater_ratio": float(group_metrics.get("underwater_ratio", 0.0)),
+                        "trade_count": float(group_metrics.get("trade_count", 0.0)),
+                        "sharpe": float(group_metrics.get("sharpe", 0.0)),
+                        "max_drawdown": float(group_metrics.get("max_drawdown", 0.0)),
+                    }
+                )
+            rows.sort(
+                key=lambda item: (
+                    float(item.get("tail_loss_pnl", 0.0)),
+                    float(item.get("pnl", 0.0)),
+                    -float(item.get("trade_count", 0.0)),
+                )
+            )
+            return rows[:top_k]
+
+        policy_symbol_count_total = 0.0
+        if holdout_symbols is not None:
+            policy_symbol_count_total = float(
+                len(sorted({str(s).strip() for s in holdout_symbols if str(s).strip()}))
+            )
+        policy_symbol_count_evaluated = float(len(policy_symbol_metrics))
+        policy_symbol_coverage_ratio = (
+            float(policy_symbol_count_evaluated / policy_symbol_count_total)
+            if policy_symbol_count_total > 0.0
+            else 0.0
+        )
+        policy_symbol_sharpe_median = float(policy_stream_summary.get("policy_sharpe", 0.0))
+        policy_symbol_sharpe_p25 = float(policy_symbol_sharpe_median)
+        policy_symbol_sharpe_std = 0.0
+        policy_symbol_underwater_ratio = 0.0
+        policy_symbol_worst_sharpe = float(policy_symbol_sharpe_median)
+        if policy_symbol_metrics:
+            symbol_sharpes = np.asarray(
+                [m.get("sharpe", 0.0) for m in policy_symbol_metrics.values()],
+                dtype=float,
+            )
+            policy_symbol_sharpe_median = float(np.median(symbol_sharpes))
+            policy_symbol_sharpe_p25 = float(np.quantile(symbol_sharpes, 0.25))
+            policy_symbol_sharpe_std = float(np.std(symbol_sharpes))
+            policy_symbol_underwater_ratio = float(np.mean(symbol_sharpes < 0.0))
+            policy_symbol_worst_sharpe = float(np.min(symbol_sharpes))
+
+        policy_worst_regime_sharpe = float(policy_stream_summary.get("policy_sharpe", 0.0))
+        if policy_regime_metrics:
+            policy_worst_regime_sharpe = float(
+                min(v.get("sharpe", 0.0) for v in policy_regime_metrics.values())
+            )
+        policy_tail_loss_contributors_by_symbol = _top_tail_contributors(policy_symbol_metrics)
+        policy_tail_loss_contributors_by_regime = _top_tail_contributors(policy_regime_metrics)
 
         return {
             "source": "holdout",
@@ -10289,6 +10598,24 @@ class ModelTrainer:
             "regime_count": float(
                 len(regime_policy.get("regimes", {})) if isinstance(regime_policy, dict) else 0
             ),
+            "worst_regime_sharpe": float(policy_worst_regime_sharpe),
+            "regime_count_evaluated": float(len(policy_regime_metrics)),
+            "symbol_count_total": float(policy_symbol_count_total),
+            "symbol_count_evaluated": float(policy_symbol_count_evaluated),
+            "symbol_coverage_ratio": float(policy_symbol_coverage_ratio),
+            "symbol_sharpe_median": float(policy_symbol_sharpe_median),
+            "symbol_sharpe_p25": float(policy_symbol_sharpe_p25),
+            "symbol_sharpe_std": float(policy_symbol_sharpe_std),
+            "symbol_underwater_ratio": float(policy_symbol_underwater_ratio),
+            "symbol_worst_sharpe": float(policy_symbol_worst_sharpe),
+            "regime_metrics": self._json_safe(policy_regime_metrics),
+            "symbol_metrics": self._json_safe(policy_symbol_metrics),
+            "tail_loss_contributors_by_symbol": self._json_safe(
+                policy_tail_loss_contributors_by_symbol
+            ),
+            "tail_loss_contributors_by_regime": self._json_safe(
+                policy_tail_loss_contributors_by_regime
+            ),
             **policy_stream_summary,
         }
 
@@ -10296,6 +10623,8 @@ class ModelTrainer:
         """Train the second-stage expected-edge policy from OOF-safe predictions."""
         self.logger.info("Phase 8.5: Training expected-edge policy...")
         self.training_metrics["expected_edge_policy_enabled"] = 0.0
+        self.expected_edge_cv_return_series = []
+        self.expected_edge_cv_active_return_series = []
 
         if self.features is None or self.features.empty:
             self.training_metrics["expected_edge_policy_reason"] = "missing_features"
@@ -10408,6 +10737,7 @@ class ModelTrainer:
                 min_expected_edge=float(self.config.expected_edge_min_expected_edge),
                 min_signal_scale=float(self.config.expected_edge_min_signal_scale),
                 max_signal_scale=float(self.config.expected_edge_max_signal_scale),
+                use_symbol_priors=bool(self.config.expected_edge_use_symbol_priors),
                 random_state=int(self.config.seed),
             )
         )
@@ -10443,6 +10773,9 @@ class ModelTrainer:
         )
         self.training_metrics["expected_edge_max_signal_scale"] = float(
             self.config.expected_edge_max_signal_scale
+        )
+        self.training_metrics["expected_edge_use_symbol_priors"] = float(
+            bool(self.config.expected_edge_use_symbol_priors)
         )
         self._record_expected_edge_metrics("expected_edge_training", training_summary)
         training_policy_frame = policy_model.predict_policy(
@@ -10494,6 +10827,48 @@ class ModelTrainer:
                     else []
                 )
             )
+        training_runtime_policy_frame = policy_model.predict_policy(
+            feature_frame,
+            probabilities=probabilities,
+            long_threshold=float(long_threshold),
+            short_threshold=float(short_threshold),
+            signal_values=signal_values,
+            confidence=signal_confidence,
+            symbols=aligned_symbols,
+            regimes=aligned_regimes,
+            regime_policy=regime_policy,
+        )
+        training_policy_stream = self._build_policy_adjusted_stream(
+            signal_values=signal_values,
+            trade_returns=trade_returns,
+            timestamps=(
+                np.asarray(self.timestamps)[-target_len:]
+                if self.timestamps is not None and len(self.timestamps) >= target_len
+                else None
+            ),
+            policy_frame=training_runtime_policy_frame,
+        )
+        training_policy_stream_summary = self._summarize_policy_stream_metrics(
+            stream=training_policy_stream
+        )
+        self._record_expected_edge_metrics(
+            "expected_edge_training_policy",
+            training_policy_stream_summary,
+        )
+        training_policy_returns = np.asarray(
+            training_policy_stream.get("portfolio_returns", []),
+            dtype=float,
+        )
+        if training_policy_returns.size > 0:
+            self.expected_edge_cv_return_series = [training_policy_returns.astype(float)]
+        training_policy_trade_mask = np.asarray(
+            training_policy_stream.get("portfolio_trade_mask", []),
+            dtype=bool,
+        )
+        if training_policy_returns.size == training_policy_trade_mask.size:
+            active_returns = training_policy_returns[training_policy_trade_mask]
+            if active_returns.size > 0:
+                self.expected_edge_cv_active_return_series = [active_returns.astype(float)]
         holdout_summary = self._evaluate_expected_edge_policy_holdout(
             policy_model,
             long_threshold=float(long_threshold),
@@ -10501,6 +10876,15 @@ class ModelTrainer:
             regime_policy=regime_policy,
         )
         self._record_expected_edge_metrics("expected_edge_holdout", holdout_summary)
+        for summary_key in (
+            "regime_metrics",
+            "symbol_metrics",
+            "tail_loss_contributors_by_symbol",
+            "tail_loss_contributors_by_regime",
+        ):
+            summary_value = holdout_summary.get(summary_key)
+            if summary_value:
+                self.training_metrics[f"expected_edge_holdout_{summary_key}"] = summary_value
         self.logger.info(
             "Expected-edge policy trained: selected_rate=%.2f%% holdout_lift=%.6f regimes=%d",
             float(training_summary.get("selected_rate", 0.0)) * 100.0,
@@ -12713,8 +13097,98 @@ class ModelTrainer:
             )
             return rows[:top_k]
 
+        base_holdout_metrics = self._json_safe(dict(holdout_metrics))
+        base_holdout_regime_metrics = self._json_safe(holdout_regime_metrics)
+        base_holdout_symbol_metrics = self._json_safe(holdout_symbol_metrics)
+        effective_holdout_group_source = "base"
+        expected_edge_holdout_available = bool(
+            self.training_metrics.get("expected_edge_policy_enabled", 0.0)
+        ) and np.isfinite(
+            float(
+                self.training_metrics.get(
+                    "expected_edge_holdout_policy_sharpe",
+                    np.nan,
+                )
+            )
+        )
+        if expected_edge_holdout_available:
+            effective_holdout_group_source = "expected_edge_policy"
+            holdout_metrics = dict(holdout_metrics)
+            for metric_key, training_key in (
+                ("sharpe", "expected_edge_holdout_policy_sharpe"),
+                ("trade_count", "expected_edge_holdout_policy_trade_count"),
+                ("active_signal_rate", "expected_edge_holdout_policy_active_signal_rate"),
+                ("max_drawdown", "expected_edge_holdout_policy_max_drawdown"),
+                ("trade_return_observations", "expected_edge_holdout_policy_trade_return_observations"),
+                (
+                    "sharpe_observation_confidence",
+                    "expected_edge_holdout_policy_sharpe_observation_confidence",
+                ),
+                ("annual_return", "expected_edge_holdout_policy_annual_return"),
+                ("calmar", "expected_edge_holdout_policy_calmar"),
+                ("underwater_ratio", "expected_edge_holdout_policy_underwater_ratio"),
+                ("win_rate", "expected_edge_holdout_policy_selected_win_rate"),
+                ("pnl", "expected_edge_holdout_policy_pnl"),
+                ("loss_pnl", "expected_edge_holdout_policy_loss_pnl"),
+                ("tail_loss_pnl", "expected_edge_holdout_policy_tail_loss_pnl"),
+                ("cvar_95", "expected_edge_holdout_policy_cvar_95"),
+                ("expected_shortfall", "expected_edge_holdout_policy_expected_shortfall"),
+                ("return_skew", "expected_edge_holdout_policy_return_skew"),
+                ("risk_adjusted_score", "expected_edge_holdout_policy_risk_adjusted_score"),
+            ):
+                if training_key in self.training_metrics:
+                    holdout_metrics[metric_key] = float(self.training_metrics.get(training_key, 0.0))
+
+            expected_edge_regime_metrics = self.training_metrics.get(
+                "expected_edge_holdout_regime_metrics",
+                {},
+            )
+            if isinstance(expected_edge_regime_metrics, dict):
+                holdout_regime_metrics = self._json_safe(expected_edge_regime_metrics)
+            holdout_worst_regime_sharpe = float(
+                self.training_metrics.get(
+                    "expected_edge_holdout_worst_regime_sharpe",
+                    holdout_worst_regime_sharpe,
+                )
+            )
+
+            expected_edge_symbol_metrics = self.training_metrics.get(
+                "expected_edge_holdout_symbol_metrics",
+                {},
+            )
+            if isinstance(expected_edge_symbol_metrics, dict):
+                holdout_symbol_metrics = self._json_safe(expected_edge_symbol_metrics)
+            holdout_symbol_count_total = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_count_total", 0.0)
+            )
+            holdout_symbol_count_evaluated = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_count_evaluated", 0.0)
+            )
+            holdout_symbol_coverage_ratio = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_coverage_ratio", 0.0)
+            )
+            holdout_symbol_sharpe_median = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_sharpe_median", 0.0)
+            )
+            holdout_symbol_sharpe_p25 = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_sharpe_p25", 0.0)
+            )
+            holdout_symbol_sharpe_std = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_sharpe_std", 0.0)
+            )
+            holdout_symbol_underwater_ratio = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_underwater_ratio", 0.0)
+            )
+            holdout_symbol_worst_sharpe = float(
+                self.training_metrics.get("expected_edge_holdout_symbol_worst_sharpe", 0.0)
+            )
+
         holdout_tail_loss_contributors_by_symbol = _top_tail_contributors(holdout_symbol_metrics)
         holdout_tail_loss_contributors_by_regime = _top_tail_contributors(holdout_regime_metrics)
+        self.training_metrics["holdout_base_metrics"] = base_holdout_metrics
+        self.training_metrics["holdout_base_regime_metrics"] = base_holdout_regime_metrics
+        self.training_metrics["holdout_base_symbol_metrics"] = base_holdout_symbol_metrics
+        self.training_metrics["effective_holdout_group_metric_source"] = effective_holdout_group_source
 
         self.training_metrics["holdout_worst_regime_sharpe"] = float(holdout_worst_regime_sharpe)
         self.training_metrics["holdout_regime_count_evaluated"] = float(len(holdout_regime_metrics))
@@ -12849,26 +13323,61 @@ class ModelTrainer:
             holdout_active_signal_rate_metric = (
                 1.0 if holdout_available and holdout_trade_count_metric > 0.0 else 0.0
             )
+        holdout_group_source = str(
+            self.training_metrics.get(
+                "effective_holdout_group_metric_source",
+                effective_holdout.get("source", "base"),
+            )
+        ).strip() or "base"
+        self.training_metrics["effective_holdout_group_metric_source"] = holdout_group_source
         holdout_worst_regime_sharpe = float(
-            self.training_metrics.get("holdout_worst_regime_sharpe", holdout_sharpe)
+            self.training_metrics.get(
+                (
+                    "expected_edge_holdout_worst_regime_sharpe"
+                    if holdout_group_source == "expected_edge_policy"
+                    else "holdout_worst_regime_sharpe"
+                ),
+                self.training_metrics.get("holdout_worst_regime_sharpe", holdout_sharpe),
+            )
         )
         holdout_drawdown = float(effective_holdout.get("max_drawdown", 1.0))
         holdout_symbol_coverage = float(
             self.training_metrics.get(
-                "holdout_symbol_coverage_ratio",
-                self.config.min_holdout_symbol_coverage,
+                (
+                    "expected_edge_holdout_symbol_coverage_ratio"
+                    if holdout_group_source == "expected_edge_policy"
+                    else "holdout_symbol_coverage_ratio"
+                ),
+                self.training_metrics.get(
+                    "holdout_symbol_coverage_ratio",
+                    self.config.min_holdout_symbol_coverage,
+                ),
             )
         )
         holdout_symbol_sharpe_p25 = float(
             self.training_metrics.get(
-                "holdout_symbol_sharpe_p25",
-                self.config.min_holdout_symbol_p25_sharpe,
+                (
+                    "expected_edge_holdout_symbol_sharpe_p25"
+                    if holdout_group_source == "expected_edge_policy"
+                    else "holdout_symbol_sharpe_p25"
+                ),
+                self.training_metrics.get(
+                    "holdout_symbol_sharpe_p25",
+                    self.config.min_holdout_symbol_p25_sharpe,
+                ),
             )
         )
         holdout_symbol_underwater_ratio = float(
             self.training_metrics.get(
-                "holdout_symbol_underwater_ratio",
-                self.config.max_holdout_symbol_underwater_ratio,
+                (
+                    "expected_edge_holdout_symbol_underwater_ratio"
+                    if holdout_group_source == "expected_edge_policy"
+                    else "holdout_symbol_underwater_ratio"
+                ),
+                self.training_metrics.get(
+                    "holdout_symbol_underwater_ratio",
+                    self.config.max_holdout_symbol_underwater_ratio,
+                ),
             )
         )
         self.training_metrics["effective_holdout_symbol_coverage_metric"] = holdout_symbol_coverage
@@ -13573,21 +14082,47 @@ class ModelTrainer:
         """
         self.logger.info(f"Phase 8: Applying {self.config.correction_method} correction...")
 
-        sharpe = float(self.training_metrics.get("mean_sharpe", 0))
-        active_returns = (
-            np.concatenate(self.cv_active_return_series)
-            if self.cv_active_return_series
-            else np.array([], dtype=float)
+        use_expected_edge_returns = bool(self.training_metrics.get("expected_edge_policy_enabled", 0.0)) and (
+            bool(self.expected_edge_cv_active_return_series) or bool(self.expected_edge_cv_return_series)
         )
-        full_returns = (
-            np.concatenate(self.cv_return_series)
-            if self.cv_return_series
-            else np.array([], dtype=float)
-        )
+        if use_expected_edge_returns:
+            sharpe = float(
+                self.training_metrics.get(
+                    "expected_edge_training_policy_sharpe",
+                    self.training_metrics.get("mean_sharpe", 0.0),
+                )
+            )
+            active_returns = (
+                np.concatenate(self.expected_edge_cv_active_return_series)
+                if self.expected_edge_cv_active_return_series
+                else np.array([], dtype=float)
+            )
+            full_returns = (
+                np.concatenate(self.expected_edge_cv_return_series)
+                if self.expected_edge_cv_return_series
+                else np.array([], dtype=float)
+            )
+            return_source_prefix = "expected_edge_policy_"
+        else:
+            sharpe = float(self.training_metrics.get("mean_sharpe", 0.0))
+            active_returns = (
+                np.concatenate(self.cv_active_return_series)
+                if self.cv_active_return_series
+                else np.array([], dtype=float)
+            )
+            full_returns = (
+                np.concatenate(self.cv_return_series)
+                if self.cv_return_series
+                else np.array([], dtype=float)
+            )
+            return_source_prefix = ""
         use_active_returns = int(active_returns.size) >= 30
         returns = active_returns if use_active_returns else full_returns
+        self.training_metrics["multiple_testing_strategy_source"] = (
+            "expected_edge_policy" if use_expected_edge_returns else "base"
+        )
         self.training_metrics["multiple_testing_return_source"] = (
-            "active_returns" if use_active_returns else "all_returns"
+            f"{return_source_prefix}{'active_returns' if use_active_returns else 'all_returns'}"
         )
         self.training_metrics["multiple_testing_return_observations"] = float(returns.size)
         n_trials = max(
@@ -14206,6 +14741,7 @@ class ModelTrainer:
                 "min_expected_edge": float(self.config.expected_edge_min_expected_edge),
                 "min_signal_scale": float(self.config.expected_edge_min_signal_scale),
                 "max_signal_scale": float(self.config.expected_edge_max_signal_scale),
+                "use_symbol_priors": bool(self.config.expected_edge_use_symbol_priors),
                 "selected_context_features": list(
                     self.training_metrics.get(
                         "expected_edge_training_selected_context_features", []
@@ -16106,6 +16642,12 @@ def run_training(args: argparse.Namespace) -> int:
                         not bool(getattr(args, "disable_probability_calibration", False)),
                     )
                 ),
+                expected_edge_use_symbol_priors=bool(
+                    _cfg_value(
+                        "expected_edge_use_symbol_priors",
+                        bool(getattr(args, "enable_expected_edge_symbol_priors", False)),
+                    )
+                ),
                 probability_calibration_method=str(
                     _cfg_value(
                         "probability_calibration_method",
@@ -17433,6 +17975,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.20,
         help="Minimum fractional position scale for lower-confidence signals (default: 0.20).",
+    )
+    parser.add_argument(
+        "--enable-expected-edge-symbol-priors",
+        action="store_true",
+        help="Opt in to symbol-level priors inside the expected-edge selector.",
     )
     parser.add_argument(
         "--disable-lightgbm-monotonic-constraints",

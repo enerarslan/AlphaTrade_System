@@ -17,6 +17,7 @@ import os
 import re
 import time
 import zipfile
+from csv import reader as csv_reader
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
@@ -77,6 +78,8 @@ MICROSTRUCTURE_PRIORITY = [
     "CVX",
     "UNH",
 ]
+
+FINRA_MARKET_CODES = ("CNMS", "FNQC", "FNRA", "FNSQ", "FNYX", "FORF")
 
 
 @dataclass
@@ -595,6 +598,7 @@ class FreeGapDataBootstrapper:
             "daily-short-sale-volume-files"
         )
         html = self._request_text(page_url, provider="finra")
+        discovered: dict[tuple[str, date], str] = {}
         matches = sorted(
             set(
                 re.findall(
@@ -608,8 +612,67 @@ class FreeGapDataBootstrapper:
             trade_date = _parse_date(datestr)
             if trade_date is None:
                 continue
+            discovered[(market, trade_date)] = url
+
+        for trade_date in self._recent_trading_dates(self.config.short_sale_days):
+            for market in FINRA_MARKET_CODES:
+                key = (market, trade_date)
+                if key in discovered:
+                    continue
+                url = (
+                    "https://cdn.finra.org/equity/regsho/daily/"
+                    f"{market}shvol{trade_date.strftime('%Y%m%d')}.txt"
+                )
+                if self._finra_short_sale_url_exists(url):
+                    discovered[key] = url
+
+        for (market, trade_date), url in sorted(discovered.items(), key=lambda item: item[0][1:]):
             links.append((url, trade_date, market))
         return links
+
+    def _finra_short_sale_url_exists(self, url: str) -> bool:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                self._pace("finra")
+                response = self.session.head(url, headers=self.session.headers, timeout=30)
+                if response.status_code == 200:
+                    return True
+                if response.status_code in {403, 404}:
+                    return False
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    raise requests.HTTPError(
+                        f"HTTP {response.status_code} from finra: {url}",
+                        response=response,
+                    )
+                return False
+            except Exception as exc:
+                last_error = exc
+                if attempt >= 2:
+                    break
+                time.sleep(min(5.0, 1.0 * (attempt + 1)))
+        if last_error is not None:
+            logger.warning("FINRA short-sale probe failed for %s: %s", url, last_error)
+        return False
+
+    def _parse_ftd_rows(self, text: str) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        header: list[str] | None = None
+        for raw_fields in csv_reader(io.StringIO(text), delimiter="|"):
+            if not raw_fields:
+                continue
+            fields = [str(value).strip().lstrip("\ufeff") for value in raw_fields]
+            if not any(fields):
+                continue
+            if header is None:
+                header = fields[:6]
+                continue
+            if len(fields) < 6:
+                continue
+            if len(fields) > 6:
+                fields = fields[:4] + [" | ".join(fields[4:-1]).strip(), fields[-1]]
+            rows.append(dict(zip(header[:6], fields[:6], strict=False)))
+        return rows
 
     def download_short_sale_volume(self, broad_symbol_set: set[str]) -> list[dict[str, Any]]:
         """Download recent FINRA Reg SHO short-sale volume files."""
@@ -696,8 +759,7 @@ class FreeGapDataBootstrapper:
                         text = content.decode("utf-8")
                     except UnicodeDecodeError:
                         text = content.decode("latin-1")
-                    frame = pd.read_csv(io.StringIO(text), sep="|", dtype=str)
-                    for _, row in frame.iterrows():
+                    for row in self._parse_ftd_rows(text):
                         symbol = _safe_symbol(row.get("SYMBOL"))
                         if not symbol or symbol not in broad_symbol_set:
                             continue

@@ -5179,6 +5179,39 @@ def test_multiple_testing_correction_sets_effective_pbo_gate_and_source():
     assert float(trainer.training_metrics["effective_max_pbo_gate"]) >= 0.45
 
 
+def test_multiple_testing_correction_prefers_expected_edge_policy_returns_when_available():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            correction_method="deflated_sharpe",
+            n_trials=12,
+        )
+    )
+    trainer.training_metrics = {
+        "mean_sharpe": 0.4,
+        "expected_edge_policy_enabled": 1.0,
+        "expected_edge_training_policy_sharpe": 0.9,
+    }
+    trainer.cv_results = [{"fold": 1}, {"fold": 2}]
+    trainer.cv_return_series = [np.zeros(64, dtype=float)]
+    trainer.cv_active_return_series = [np.zeros(32, dtype=float)]
+    trainer.expected_edge_cv_return_series = [
+        np.random.default_rng(7).normal(0.0006, 0.01, size=160),
+    ]
+    trainer.expected_edge_cv_active_return_series = [
+        np.random.default_rng(8).normal(0.0012, 0.012, size=64),
+    ]
+
+    trainer._apply_multiple_testing_correction()
+
+    assert trainer.training_metrics["multiple_testing_strategy_source"] == "expected_edge_policy"
+    assert (
+        trainer.training_metrics["multiple_testing_return_source"]
+        == "expected_edge_policy_active_returns"
+    )
+    assert trainer.training_metrics["multiple_testing_return_observations"] == pytest.approx(64.0)
+
+
 def test_multiple_testing_correction_uses_timeframe_annualization(monkeypatch):
     captured: dict[str, float] = {}
 
@@ -5498,10 +5531,10 @@ def test_validate_model_prefers_expected_edge_holdout_metrics_when_available():
         "holdout_trade_count": 0.0,
         "holdout_active_signal_rate": 0.0,
         "holdout_max_drawdown": 0.40,
-        "holdout_worst_regime_sharpe": 0.05,
-        "holdout_symbol_coverage_ratio": 0.80,
-        "holdout_symbol_sharpe_p25": 0.00,
-        "holdout_symbol_underwater_ratio": 0.20,
+        "holdout_worst_regime_sharpe": -0.40,
+        "holdout_symbol_coverage_ratio": 0.40,
+        "holdout_symbol_sharpe_p25": -0.60,
+        "holdout_symbol_underwater_ratio": 0.80,
         "expected_edge_policy_enabled": 1.0,
         "expected_edge_holdout_policy_sharpe": 0.35,
         "expected_edge_holdout_policy_trade_count": 30.0,
@@ -5509,15 +5542,29 @@ def test_validate_model_prefers_expected_edge_holdout_metrics_when_available():
         "expected_edge_holdout_policy_max_drawdown": 0.10,
         "expected_edge_holdout_policy_trade_return_observations": 30.0,
         "expected_edge_holdout_policy_sharpe_observation_confidence": 1.0,
+        "expected_edge_holdout_worst_regime_sharpe": 0.12,
+        "expected_edge_holdout_symbol_coverage_ratio": 0.80,
+        "expected_edge_holdout_symbol_sharpe_p25": 0.05,
+        "expected_edge_holdout_symbol_underwater_ratio": 0.20,
+        "expected_edge_holdout_symbol_sharpe_median": 0.15,
+        "expected_edge_holdout_symbol_sharpe_std": 0.04,
+        "expected_edge_holdout_symbol_worst_sharpe": -0.02,
+        "expected_edge_holdout_symbol_count_total": 4.0,
+        "expected_edge_holdout_symbol_count_evaluated": 4.0,
     }
 
     passed = trainer._validate_model()
 
     assert passed is True
     assert trainer.training_metrics["effective_holdout_metric_source"] == "expected_edge_policy"
+    assert trainer.training_metrics["effective_holdout_group_metric_source"] == "expected_edge_policy"
     assert trainer.validation_results["gates"]["min_holdout_sharpe"][0] is True
     assert trainer.validation_results["gates"]["holdout_trade_count_positive"][0] is True
     assert trainer.validation_results["gates"]["holdout_active_signal_rate_positive"][0] is True
+    assert trainer.validation_results["gates"]["min_holdout_regime_sharpe"][0] is True
+    assert trainer.validation_results["gates"]["min_holdout_symbol_coverage"][0] is True
+    assert trainer.validation_results["gates"]["min_holdout_symbol_p25_sharpe"][0] is True
+    assert trainer.validation_results["gates"]["max_holdout_symbol_underwater_ratio"][0] is True
 
 
 def test_validate_model_fails_dead_lightgbm_structure_and_score_dispersion():
