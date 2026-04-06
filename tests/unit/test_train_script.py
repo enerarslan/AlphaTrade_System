@@ -2270,6 +2270,121 @@ def test_apply_feature_selection_preserves_upstream_snapshot_binding(monkeypatch
     assert trainer.training_metrics["feature_selection_binding"] == pytest.approx(1.0)
 
 
+def test_apply_feature_selection_skips_when_snapshot_replay_already_supplies_selected_frame(
+    monkeypatch,
+    tmp_path,
+):
+    import quant_trading_system.models.feature_selection as feature_selection_module
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="xgboost",
+            output_dir=str(tmp_path),
+        )
+    )
+    trainer.snapshot_replay_loaded = True
+    trainer.dataset_snapshot_bundle_manifest = {
+        "training_scope": {
+            "feature_selection_signature": trainer._feature_selection_schema_signature(),
+        },
+        "feature_selection_summary": {
+            "development_binding": 1.0,
+            "development_initial_feature_count": 320.0,
+            "development_selected_feature_count": 2.0,
+        },
+    }
+    trainer.features = pd.DataFrame(
+        {
+            "momentum_10": [0.1, 0.2, 0.3, 0.4],
+            "rsi_14": [40.0, 42.0, 39.0, 43.0],
+        }
+    )
+    trainer.labels = np.array([0, 1, 0, 1], dtype=int)
+    trainer.feature_names = trainer.features.columns.tolist()
+
+    monkeypatch.setattr(
+        feature_selection_module,
+        "select_training_features",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("snapshot replay should skip feature selection")
+        ),
+    )
+
+    trainer._apply_feature_selection()
+
+    assert trainer.training_metrics["feature_selection_reused_from_snapshot"] == pytest.approx(1.0)
+    assert trainer.training_metrics["feature_selection_binding"] == pytest.approx(1.0)
+    assert trainer.feature_names == ["momentum_10", "rsi_14"]
+
+
+def test_apply_feature_selection_reuses_exact_snapshot_cache(monkeypatch, tmp_path):
+    import quant_trading_system.models.feature_selection as feature_selection_module
+
+    def _build_trainer() -> train_script.ModelTrainer:
+        trainer = train_script.ModelTrainer(
+            train_script.TrainingConfig(
+                model_type="xgboost",
+                output_dir=str(tmp_path),
+                snapshot_only=True,
+            )
+        )
+        trainer.features = pd.DataFrame(
+            {
+                "signal_feature": [0.1, 0.2, 0.3, 0.4],
+                "duplicate_feature": [0.1, 0.21, 0.31, 0.41],
+                "noise_feature": [1.0, 0.5, -0.2, 0.1],
+            }
+        )
+        trainer.labels = np.array([0, 1, 1, 0], dtype=int)
+        trainer.feature_names = trainer.features.columns.tolist()
+        return trainer
+
+    monkeypatch.setattr(
+        feature_selection_module,
+        "select_training_features",
+        lambda features, labels, config, **kwargs: SimpleNamespace(
+            selected_features=["signal_feature", "noise_feature"],
+            diagnostics={
+                "initial_feature_count": 3,
+                "selected_feature_count": 2,
+                "correlation_pruned_count": 1,
+                "stability_selected_count": 2,
+            },
+            information_coefficients={
+                "signal_feature": 0.15,
+                "duplicate_feature": 0.14,
+                "noise_feature": 0.03,
+            },
+            correlation_pruned_features=["duplicate_feature"],
+            stability_scores={
+                "signal_feature": 1.0,
+                "duplicate_feature": 0.9,
+                "noise_feature": 0.7,
+            },
+        ),
+    )
+
+    trainer = _build_trainer()
+    trainer._apply_feature_selection()
+
+    cache_files = list((tmp_path / "feature_selection_cache").glob("*.json"))
+    assert cache_files
+
+    monkeypatch.setattr(
+        feature_selection_module,
+        "select_training_features",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("feature selection should reuse exact cache")
+        ),
+    )
+
+    cached_trainer = _build_trainer()
+    cached_trainer._apply_feature_selection()
+
+    assert cached_trainer.training_metrics["feature_selection_cache_hit"] == pytest.approx(1.0)
+    assert cached_trainer.feature_names == ["signal_feature", "noise_feature"]
+
+
 def test_aggregate_fold_objective_penalizes_instability_and_downside():
     stable_score = train_script.ModelTrainer._aggregate_fold_objective(
         [0.9, 1.0, 0.8],
@@ -6519,6 +6634,28 @@ def test_load_training_dataset_snapshot_restores_state(tmp_path):
     assert trainer.training_metrics["symbol_quality_selected_symbols"] == pytest.approx(1.0)
     assert trainer.training_metrics["symbol_quality_universe"] == ["AAPL"]
     assert trainer.training_metrics["symbol_quality_report"]["AAPL"]["passes"] is True
+
+
+def test_generate_cv_splits_caches_newly_generated_splits(monkeypatch):
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="xgboost"))
+    expected_splits = [(np.array([0, 1]), np.array([2, 3]))]
+
+    monkeypatch.setattr(trainer, "_get_cv_splitter", lambda n_samples=None: object())
+    monkeypatch.setattr(
+        trainer,
+        "_split_with_optional_times",
+        lambda cv, X, y, times=None: expected_splits,
+    )
+
+    splits = trainer._generate_cv_splits(
+        np.zeros((4, 2), dtype=float),
+        np.array([0, 1, 0, 1], dtype=int),
+    )
+
+    assert len(splits) == 1
+    assert len(trainer.cached_cv_splits) == 1
+    assert np.array_equal(trainer.cached_cv_splits[0][0], np.array([0, 1]))
+    assert np.array_equal(trainer.cached_cv_splits[0][1], np.array([2, 3]))
 
 
 def test_load_training_dataset_snapshot_strict_rejects_scope_mismatch(tmp_path):

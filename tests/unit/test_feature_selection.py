@@ -6,12 +6,14 @@ import warnings
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from quant_trading_system.models.feature_selection import (
     FeatureSelectionConfig,
     compute_information_coefficients,
     select_training_features,
 )
+import quant_trading_system.models.feature_selection as feature_selection_module
 
 
 def test_compute_information_coefficients_ranks_signal_above_noise() -> None:
@@ -104,6 +106,50 @@ def test_compute_information_coefficients_supports_group_aware_rank_ic() -> None
 
     assert scores.index[0] == "signal_feature"
     assert float(scores["signal_feature"]) > float(scores["noise_feature"])
+
+
+def test_group_aware_information_coefficients_match_reference_with_missing_values() -> None:
+    rng = np.random.default_rng(9)
+    group_size = 5
+    group_count = 24
+    groups = np.repeat(np.arange(group_count), group_size)
+    base_signal = rng.normal(size=group_size * group_count)
+    features = pd.DataFrame(
+        {
+            "signal_feature": base_signal,
+            "partially_missing_feature": base_signal * 0.6 + rng.normal(scale=0.2, size=base_signal.size),
+            "noise_feature": rng.normal(size=base_signal.size),
+        }
+    )
+    features.loc[features.index % 7 == 0, "partially_missing_feature"] = np.nan
+    target = base_signal + rng.normal(scale=0.25, size=base_signal.size)
+
+    scores = compute_information_coefficients(
+        features,
+        target,
+        groups=groups,
+        min_group_size=3,
+    )
+
+    numeric = feature_selection_module._finite_feature_matrix(features)
+    label = pd.Series(pd.to_numeric(target, errors="coerce"), index=numeric.index)
+    group_series = pd.Series(groups, index=numeric.index, dtype="object")
+    reference_scores: dict[str, float] = {}
+    for column in numeric.columns:
+        values = numeric[column]
+        valid = values.notna() & label.notna() & group_series.notna()
+        if int(valid.sum()) < 20:
+            reference_scores[str(column)] = 0.0
+            continue
+        reference_scores[str(column)] = feature_selection_module._groupwise_information_coefficient(
+            values.loc[valid],
+            label.loc[valid],
+            group_series.loc[valid],
+            min_group_size=3,
+        )
+
+    for feature_name, expected in reference_scores.items():
+        assert float(scores[feature_name]) == pytest.approx(float(expected), abs=1e-12)
 
 
 def test_select_training_features_emits_progress_callbacks() -> None:

@@ -4662,6 +4662,206 @@ class ModelTrainer:
         """Serialize feature-selection knobs that change the persisted cache contract."""
         return _build_snapshot_feature_selection_signature(self.config)
 
+    def _feature_selection_cache_enabled(self) -> bool:
+        """Enable feature-selection reuse only for snapshot-centric workflows."""
+        return bool(
+            self.config.snapshot_only
+            or self.snapshot_replay_loaded
+            or str(self.config.dataset_snapshot_bundle_path or "").strip()
+        )
+
+    def _feature_selection_cache_root(self) -> Path:
+        """Return the directory that stores exact-match feature-selection caches."""
+        return Path(self.config.output_dir) / "feature_selection_cache"
+
+    def _feature_selection_hash_series(
+        self,
+        column_name: str,
+        values: pd.Series | np.ndarray | None,
+    ) -> str:
+        """Hash a one-dimensional selection input deterministically."""
+        if values is None:
+            return compute_frame_content_hash(None, columns=[column_name])
+        return compute_frame_content_hash(
+            pd.DataFrame({column_name: pd.Series(values)}),
+            columns=[column_name],
+        )
+
+    def _feature_selection_dataset_fingerprint(self, feature_names: list[str]) -> str:
+        """Fingerprint the exact feature matrix that enters selection."""
+        if self.snapshot_replay_loaded and isinstance(self.dataset_snapshot_bundle_manifest, dict):
+            bundle_hash = str(self.dataset_snapshot_bundle_manifest.get("bundle_hash") or "").strip()
+            if bundle_hash:
+                return bundle_hash
+        return compute_frame_content_hash(self.features, columns=feature_names)
+
+    def _build_feature_selection_cache_key(
+        self,
+        *,
+        feature_names: list[str],
+        selection_target: pd.Series | np.ndarray,
+        selection_groups: pd.Series | np.ndarray | None,
+        target_mode: str,
+        group_aware_ic: bool,
+    ) -> str:
+        """Build an exact-match cache key for feature selection reuse."""
+        payload = {
+            "schema_version": "1.0.0",
+            "model_type": str(self.config.model_type),
+            "feature_selection_signature": self._feature_selection_schema_signature(),
+            "target_mode": str(target_mode),
+            "group_aware_ic": bool(group_aware_ic),
+            "holdout_pct": float(self.config.holdout_pct),
+            "feature_names": [str(name) for name in feature_names],
+            "dataset_fingerprint": self._feature_selection_dataset_fingerprint(feature_names),
+            "target_hash": self._feature_selection_hash_series("target", selection_target),
+            "group_hash": (
+                self._feature_selection_hash_series("group", selection_groups)
+                if selection_groups is not None
+                else ""
+            ),
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _load_feature_selection_cache(
+        self,
+        *,
+        cache_key: str,
+        feature_names: list[str],
+    ) -> Any | None:
+        """Load a cached feature-selection result when the exact inputs match."""
+        if not self._feature_selection_cache_enabled():
+            return None
+        cache_path = self._feature_selection_cache_root() / f"{cache_key}.json"
+        if not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.logger.warning("Failed to read feature-selection cache %s: %s", cache_path, exc)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        cached_features = [
+            str(name)
+            for name in payload.get("initial_feature_names", [])
+            if isinstance(name, str) and str(name).strip()
+        ]
+        if cached_features != [str(name) for name in feature_names]:
+            return None
+        selected_features = [
+            str(name)
+            for name in payload.get("selected_features", [])
+            if isinstance(name, str) and str(name).strip()
+        ]
+        if not selected_features:
+            return None
+        from quant_trading_system.models.feature_selection import FeatureSelectionResult
+
+        self.training_metrics["feature_selection_cache_hit"] = 1.0
+        self.logger.info(
+            "Feature selection cache hit: selected=%d key=%s",
+            len(selected_features),
+            cache_key[:12],
+        )
+        return FeatureSelectionResult(
+            selected_features=selected_features,
+            information_coefficients={
+                str(name): float(value)
+                for name, value in payload.get("information_coefficients", {}).items()
+            },
+            correlation_pruned_features=[
+                str(name)
+                for name in payload.get("correlation_pruned_features", [])
+                if isinstance(name, str) and str(name).strip()
+            ],
+            stability_scores={
+                str(name): float(value)
+                for name, value in payload.get("stability_scores", {}).items()
+            },
+            diagnostics={
+                str(name): value
+                for name, value in payload.get("diagnostics", {}).items()
+            },
+        )
+
+    def _persist_feature_selection_cache(
+        self,
+        *,
+        cache_key: str,
+        feature_names: list[str],
+        selection_result: Any,
+        target_mode: str,
+        group_aware_ic: bool,
+    ) -> None:
+        """Persist a feature-selection result for future exact-match reuse."""
+        if not self._feature_selection_cache_enabled():
+            return
+        cache_root = self._feature_selection_cache_root()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_root / f"{cache_key}.json"
+        payload = {
+            "schema_version": "1.0.0",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "model_type": str(self.config.model_type),
+            "target_mode": str(target_mode),
+            "group_aware_ic": bool(group_aware_ic),
+            "feature_selection_signature": self._feature_selection_schema_signature(),
+            "initial_feature_names": [str(name) for name in feature_names],
+            "selected_features": [str(name) for name in selection_result.selected_features],
+            "information_coefficients": {
+                str(name): float(value)
+                for name, value in selection_result.information_coefficients.items()
+            },
+            "correlation_pruned_features": [
+                str(name) for name in selection_result.correlation_pruned_features
+            ],
+            "stability_scores": {
+                str(name): float(value)
+                for name, value in selection_result.stability_scores.items()
+            },
+            "diagnostics": {
+                str(name): value
+                for name, value in selection_result.diagnostics.items()
+            },
+        }
+        try:
+            tmp_path = cache_path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
+            tmp_path.replace(cache_path)
+        except Exception as exc:
+            self.logger.warning("Failed to persist feature-selection cache %s: %s", cache_path, exc)
+
+    def _can_reuse_snapshot_feature_selection(self, feature_names: list[str]) -> bool:
+        """Return True when snapshot replay already supplied a post-selection feature frame."""
+        if not self.snapshot_replay_loaded or not isinstance(self.dataset_snapshot_bundle_manifest, dict):
+            return False
+        training_scope = self.dataset_snapshot_bundle_manifest.get("training_scope", {})
+        if not isinstance(training_scope, dict):
+            return False
+        if training_scope.get("feature_selection_signature") != self._feature_selection_schema_signature():
+            return False
+        summary = self.dataset_snapshot_bundle_manifest.get("feature_selection_summary", {})
+        if not isinstance(summary, dict):
+            return False
+        selected_count = summary.get(
+            "development_selected_feature_count",
+            summary.get("selected_feature_count"),
+        )
+        try:
+            return int(round(float(selected_count))) == len(feature_names)
+        except (TypeError, ValueError):
+            return False
+
     def _current_ohlcv_fingerprint(self) -> str:
         """Fingerprint current OHLCV panel for safe feature-cache reuse."""
         if self.data is None or self.data.empty:
@@ -5055,6 +5255,37 @@ class ModelTrainer:
             feature_selection_target_mode,
             group_aware_ic,
         )
+        self.training_metrics["feature_selection_cache_hit"] = 0.0
+        if self._can_reuse_snapshot_feature_selection(old_feature_names):
+            self._apply_model_priors()
+            self.training_metrics["feature_selection_current_stage_binding"] = 0.0
+            self.training_metrics["feature_selection_current_stage_initial_feature_count"] = float(
+                len(old_feature_names)
+            )
+            self.training_metrics["feature_selection_current_stage_selected_feature_count"] = float(
+                len(old_feature_names)
+            )
+            self.training_metrics["feature_selection_binding"] = float(
+                self.training_metrics.get("feature_selection_upstream_binding", 0.0)
+            )
+            self.training_metrics["feature_selection_reused_from_snapshot"] = 1.0
+            self.logger.info(
+                "Skipping feature selection because snapshot replay already supplied the "
+                "post-selection development frame"
+            )
+            return
+
+        cache_key = self._build_feature_selection_cache_key(
+            feature_names=old_feature_names,
+            selection_target=selection_target,
+            selection_groups=selection_groups,
+            target_mode=feature_selection_target_mode,
+            group_aware_ic=group_aware_ic,
+        )
+        selection_result = self._load_feature_selection_cache(
+            cache_key=cache_key,
+            feature_names=old_feature_names,
+        )
 
         def _feature_selection_progress(stage: str, payload: dict[str, Any]) -> None:
             if stage == "information_coefficient_start":
@@ -5116,22 +5347,30 @@ class ModelTrainer:
                     int(payload.get("selected_feature_count", 0)),
                 )
 
-        selection_result = select_training_features(
-            self.features,
-            selection_target,
-            FeatureSelectionConfig(
-                min_information_coefficient=self.config.feature_selection_min_ic,
-                max_correlation=self.config.feature_selection_max_corr,
-                max_features=effective_max_features,
-                stability_iterations=self.config.feature_selection_stability_iterations,
-                min_stability_support=self.config.feature_selection_min_stability_support,
+        if selection_result is None:
+            selection_result = select_training_features(
+                self.features,
+                selection_target,
+                FeatureSelectionConfig(
+                    min_information_coefficient=self.config.feature_selection_min_ic,
+                    max_correlation=self.config.feature_selection_max_corr,
+                    max_features=effective_max_features,
+                    stability_iterations=self.config.feature_selection_stability_iterations,
+                    min_stability_support=self.config.feature_selection_min_stability_support,
+                    group_aware_ic=group_aware_ic,
+                    min_group_size=3,
+                    random_state=self.config.seed,
+                ),
+                progress_callback=_feature_selection_progress,
+                **selection_kwargs,
+            )
+            self._persist_feature_selection_cache(
+                cache_key=cache_key,
+                feature_names=old_feature_names,
+                selection_result=selection_result,
+                target_mode=feature_selection_target_mode,
                 group_aware_ic=group_aware_ic,
-                min_group_size=3,
-                random_state=self.config.seed,
-            ),
-            progress_callback=_feature_selection_progress,
-            **selection_kwargs,
-        )
+            )
         selected_features = [
             feature
             for feature in selection_result.selected_features
@@ -6259,6 +6498,10 @@ class ModelTrainer:
         if self.timestamps is None or len(self.timestamps) != len(X):
             cv = self._get_cv_splitter(n_samples=len(X))
             candidate_splits = self._split_with_optional_times(cv, X, y, times=None)
+            self.cached_cv_splits = [
+                (np.asarray(train_idx, dtype=int).copy(), np.asarray(test_idx, dtype=int).copy())
+                for train_idx, test_idx in candidate_splits
+            ]
             return candidate_splits
 
         ts_series = pd.Series(pd.to_datetime(self.timestamps, utc=True, errors="coerce"))
@@ -6279,6 +6522,10 @@ class ModelTrainer:
             candidate_splits = self._panelize_timestamp_splits(cv, ts_series.to_numpy())
 
         if self.regimes is None or len(self.regimes) != len(X):
+            self.cached_cv_splits = [
+                (np.asarray(train_idx, dtype=int).copy(), np.asarray(test_idx, dtype=int).copy())
+                for train_idx, test_idx in candidate_splits
+            ]
             return candidate_splits
 
         filtered_splits: list[tuple[np.ndarray, np.ndarray]] = []
@@ -6296,12 +6543,20 @@ class ModelTrainer:
         if filtered_splits:
             self.training_metrics["cv_regime_shift_mean"] = float(np.mean(accepted_shift_scores))
             self.training_metrics["cv_regime_shift_max"] = float(np.max(accepted_shift_scores))
+            self.cached_cv_splits = [
+                (np.asarray(train_idx, dtype=int).copy(), np.asarray(test_idx, dtype=int).copy())
+                for train_idx, test_idx in filtered_splits
+            ]
             return filtered_splits
 
         self.logger.warning(
             "No CV split satisfied regime soft-limit %.3f; using unfiltered candidate splits.",
             soft_limit,
         )
+        self.cached_cv_splits = [
+            (np.asarray(train_idx, dtype=int).copy(), np.asarray(test_idx, dtype=int).copy())
+            for train_idx, test_idx in candidate_splits
+        ]
         return candidate_splits
 
     def _leakage_validation_order_vector(self) -> np.ndarray:

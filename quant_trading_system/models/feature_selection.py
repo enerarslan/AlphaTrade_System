@@ -91,6 +91,146 @@ def _groupwise_information_coefficient(
     return float(np.average(group_scores, weights=group_weights))
 
 
+def _groupwise_information_coefficients_chunked(
+    numeric: pd.DataFrame,
+    label: pd.Series,
+    groups: pd.Series,
+    *,
+    min_group_size: int,
+    progress_callback: FeatureSelectionProgressCallback | None = None,
+) -> pd.Series:
+    """Compute group-aware Spearman IC in feature chunks to avoid per-feature groupby overhead."""
+    columns = list(numeric.columns)
+    total_features = int(len(columns))
+    if total_features <= 0:
+        return pd.Series(dtype=float)
+
+    base_valid = label.notna() & groups.notna()
+    if int(base_valid.sum()) <= 0:
+        return pd.Series(0.0, index=columns, dtype=float)
+
+    numeric_values = numeric.loc[base_valid, columns].to_numpy(dtype=float, copy=True)
+    label_values = label.loc[base_valid].to_numpy(copy=False)
+    group_values = groups.loc[base_valid].to_numpy(dtype=object, copy=False)
+    total_valid_counts = np.sum(np.isfinite(numeric_values), axis=0)
+
+    if group_values.size <= 0:
+        return pd.Series(0.0, index=columns, dtype=float)
+
+    group_codes, _ = pd.factorize(group_values, sort=False)
+    order = np.argsort(group_codes, kind="stable")
+    numeric_values = numeric_values[order]
+    label_values = label_values[order]
+    sorted_codes = group_codes[order]
+
+    group_counts = np.bincount(sorted_codes)
+    group_offsets = np.concatenate(([0], np.cumsum(group_counts)))
+    progress_step = max(1, total_features // 6) if total_features > 0 else 1
+    chunk_size = max(1, progress_step)
+    scores = np.zeros(total_features, dtype=float)
+
+    for chunk_start in range(0, total_features, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, total_features)
+        chunk_width = chunk_end - chunk_start
+        weighted_sum = np.zeros(chunk_width, dtype=float)
+        weight_sum = np.zeros(chunk_width, dtype=float)
+
+        for group_idx, group_size in enumerate(group_counts):
+            if int(group_size) < max(3, int(min_group_size)):
+                continue
+
+            row_start = int(group_offsets[group_idx])
+            row_end = int(group_offsets[group_idx + 1])
+            group_labels = np.asarray(label_values[row_start:row_end], dtype=float)
+            group_matrix = numeric_values[row_start:row_end, chunk_start:chunk_end]
+            valid_mask = np.isfinite(group_matrix)
+            valid_counts = np.sum(valid_mask, axis=0)
+            eligible = valid_counts >= max(3, int(min_group_size))
+            if not np.any(eligible):
+                continue
+
+            if not _is_effectively_constant(group_labels):
+                full_cols = np.flatnonzero(eligible & (valid_counts == int(group_size)))
+                if full_cols.size > 0:
+                    label_ranks = np.asarray(
+                        stats.rankdata(group_labels, method="average", nan_policy="omit"),
+                        dtype=float,
+                    )
+                    label_centered = label_ranks - float(np.mean(label_ranks))
+                    label_scale = float(np.sum(label_centered**2))
+                    if label_scale > 0.0:
+                        full_matrix = group_matrix[:, full_cols]
+                        try:
+                            full_ranks = np.asarray(
+                                stats.rankdata(
+                                    full_matrix,
+                                    method="average",
+                                    axis=0,
+                                    nan_policy="omit",
+                                ),
+                                dtype=float,
+                            )
+                        except TypeError:
+                            full_ranks = np.apply_along_axis(
+                                lambda values: stats.rankdata(
+                                    values,
+                                    method="average",
+                                    nan_policy="omit",
+                                ),
+                                0,
+                                full_matrix,
+                            ).astype(float, copy=False)
+                        feature_centered = full_ranks - np.mean(
+                            full_ranks,
+                            axis=0,
+                            keepdims=True,
+                        )
+                        feature_scale = np.sum(feature_centered**2, axis=0)
+                        denom = np.sqrt(feature_scale * label_scale)
+                        non_constant = denom > 0.0
+                        if np.any(non_constant):
+                            feature_idx = full_cols[non_constant]
+                            correlations = np.sum(
+                                feature_centered[:, non_constant] * label_centered[:, None],
+                                axis=0,
+                            ) / denom[non_constant]
+                            weighted_sum[feature_idx] += np.abs(correlations) * float(group_size)
+                            weight_sum[feature_idx] += float(group_size)
+
+            partial_cols = np.flatnonzero(eligible & (valid_counts < int(group_size)))
+            for local_idx in partial_cols.tolist():
+                current_valid = valid_mask[:, local_idx]
+                feature_values = group_matrix[current_valid, local_idx]
+                label_subset = group_labels[current_valid]
+                if _is_effectively_constant(feature_values) or _is_effectively_constant(
+                    label_subset
+                ):
+                    continue
+                ic_value = stats.spearmanr(feature_values, label_subset, nan_policy="omit")[0]
+                if np.isfinite(ic_value):
+                    current_weight = int(valid_counts[local_idx])
+                    weighted_sum[local_idx] += abs(float(ic_value)) * current_weight
+                    weight_sum[local_idx] += float(current_weight)
+
+        chunk_scores = np.zeros(chunk_width, dtype=float)
+        chunk_valid = total_valid_counts[chunk_start:chunk_end] >= 20
+        usable = (weight_sum > 0.0) & chunk_valid
+        if np.any(usable):
+            chunk_scores[usable] = weighted_sum[usable] / weight_sum[usable]
+        scores[chunk_start:chunk_end] = chunk_scores
+
+        if progress_callback is not None:
+            progress_callback(
+                "information_coefficient_progress",
+                {
+                    "processed_features": int(chunk_end),
+                    "total_features": int(total_features),
+                },
+            )
+
+    return pd.Series(scores, index=columns, dtype=float)
+
+
 def compute_information_coefficients(
     features: pd.DataFrame,
     target: pd.Series | np.ndarray,
@@ -115,6 +255,22 @@ def compute_information_coefficients(
                 "group_aware": bool(group_series is not None),
             },
         )
+    if group_series is not None:
+        ranked = _groupwise_information_coefficients_chunked(
+            numeric,
+            label,
+            group_series,
+            min_group_size=min_group_size,
+            progress_callback=progress_callback,
+        ).sort_values(ascending=False)
+        if progress_callback is not None:
+            progress_callback(
+                "information_coefficient_complete",
+                {
+                    "ranked_feature_count": int(len(ranked)),
+                },
+            )
+        return ranked
     for idx, column in enumerate(numeric.columns, start=1):
         values = numeric[column]
         valid = values.notna() & label.notna()
