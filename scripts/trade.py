@@ -28,6 +28,7 @@ from quant_trading_system.backtest.promotion import (
 )
 from quant_trading_system.config.settings import get_settings
 from quant_trading_system.core.data_types import Direction, OHLCVBar, TradeSignal
+from quant_trading_system.data.data_access import DataAccessConfig, DataAccessLayer
 from quant_trading_system.monitoring.logger import (
     LogCategory,
     LogFormat,
@@ -64,14 +65,31 @@ class PromotionPackageSignalSource:
         *,
         use_gpu: bool = False,
         max_bars: int = 4096,
+        use_database_liquidity: bool = False,
     ) -> None:
         self.contract = contract
         self.adapter = PromotionSignalAdapter(contract, use_gpu=use_gpu, logger_=logger)
         self.max_bars = max_bars
+        self.use_database_liquidity = bool(use_database_liquidity)
         self._history: dict[str, deque[dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=self.max_bars)
         )
         self._last_bar_timestamp: dict[str, datetime] = {}
+        self._last_batch_metrics: dict[str, Any] = {
+            "raw_candidates": 0,
+            "meta_passed": 0,
+            "edge_passed": 0,
+        }
+        self._data_access = (
+            DataAccessLayer(
+                DataAccessConfig(
+                    use_database=True,
+                    fallback_to_files=False,
+                )
+            )
+            if self.use_database_liquidity
+            else None
+        )
 
     @staticmethod
     def _bar_to_record(bar: OHLCVBar) -> dict[str, Any]:
@@ -113,6 +131,17 @@ class PromotionPackageSignalSource:
             frames[symbol] = frame.loc[:, ["open", "high", "low", "close", "volume"]]
         return frames
 
+    def get_last_batch_metrics(self) -> dict[str, Any]:
+        """Expose the latest per-bar candidate telemetry for paper/live parity."""
+        return dict(self._last_batch_metrics)
+
+    def _reset_last_batch_metrics(self) -> None:
+        self._last_batch_metrics = {
+            "raw_candidates": 0,
+            "meta_passed": 0,
+            "edge_passed": 0,
+        }
+
     def generate(
         self,
         bars: dict[str, OHLCVBar],
@@ -123,10 +152,12 @@ class PromotionPackageSignalSource:
         """Generate fresh signals only for genuinely new bars."""
         updated_symbols = self._append_new_bars(bars)
         if not updated_symbols:
+            self._reset_last_batch_metrics()
             return []
 
         history_frames = self._build_history_frames()
         if not history_frames:
+            self._reset_last_batch_metrics()
             return []
 
         try:
@@ -134,12 +165,19 @@ class PromotionPackageSignalSource:
             signal_frames = self.adapter.generate_signal_frames(history_frames, feature_frames)
         except ValueError as exc:
             logger.debug("Promotion package warm-up incomplete, skipping signal batch: %s", exc)
+            self._reset_last_batch_metrics()
             return []
         except Exception as exc:
             logger.warning("Promotion package signal generation failed: %s", exc)
+            self._reset_last_batch_metrics()
             return []
 
         generated: list[TradeSignal] = []
+        batch_metrics = {
+            "raw_candidates": 0,
+            "meta_passed": 0,
+            "edge_passed": 0,
+        }
         for symbol in updated_symbols:
             signal_frame = signal_frames.get(symbol)
             current_timestamp = self._last_bar_timestamp.get(symbol)
@@ -152,7 +190,25 @@ class PromotionPackageSignalSource:
             ]
             if matches.empty:
                 continue
-            signal_row = matches.iloc[-1]
+            signal_row = matches.iloc[-1].copy()
+            batch_metrics["raw_candidates"] += int(bool(signal_row.get("raw_candidate", False)))
+            batch_metrics["meta_passed"] += int(bool(signal_row.get("meta_passed", False)))
+            batch_metrics["edge_passed"] += int(bool(signal_row.get("edge_passed", False)))
+
+            if self._data_access is not None:
+                try:
+                    liquidity_metrics = self._data_access.get_trailing_liquidity_metrics(
+                        symbol,
+                        end_time=current_timestamp,
+                        lookback_days=int(getattr(self.contract, "adv_lookback_days", 20)),
+                        timeframe=str(getattr(self.contract, "timeframe", "15Min")),
+                    )
+                except Exception as exc:
+                    logger.debug("Database liquidity lookup failed for %s: %s", symbol, exc)
+                    liquidity_metrics = {}
+                for key in ("avg_daily_volume", "avg_daily_dollar_volume", "spread_bps"):
+                    if key in liquidity_metrics:
+                        signal_row[key] = liquidity_metrics[key]
             signal_value = float(signal_row.get("signal", 0.0) or 0.0)
             if abs(signal_value) <= 0.0:
                 continue
@@ -184,6 +240,7 @@ class PromotionPackageSignalSource:
                 )
             )
 
+        self._last_batch_metrics = batch_metrics
         return generated
 
 
@@ -239,7 +296,8 @@ def _configure_engine(
             contract.min_confidence_position_scale
         )
         engine.portfolio_manager.rebalance_config.method = RebalanceMethod.SIGNAL_DRIVEN
-        source = PromotionPackageSignalSource(contract)
+        source = PromotionPackageSignalSource(contract, use_database_liquidity=True)
+        engine._signal_batch_metrics_provider = source
         engine.signal_generator.add_external_source(
             f"promotion_package:{contract.model_name}",
             source.generate,

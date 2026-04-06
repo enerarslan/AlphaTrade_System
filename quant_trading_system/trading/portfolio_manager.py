@@ -660,6 +660,48 @@ class PortfolioManager:
                 )
 
             metadata.setdefault("expected_price", str(trade.current_price))
+            metadata.setdefault(
+                "exit_policy",
+                {
+                    "style": "synthetic_contract",
+                    "supports_brackets": trade.reason in {"buy_long", "short_sell"},
+                },
+            )
+
+            if trade.reason in {"buy_long", "short_sell"} and trade.current_price > 0:
+                take_profit_pct = metadata.get("take_profit_pct")
+                stop_loss_pct = metadata.get("stop_loss_pct")
+                try:
+                    take_profit_pct_decimal = (
+                        Decimal(str(take_profit_pct)) if take_profit_pct is not None else Decimal("0")
+                    )
+                except Exception:
+                    take_profit_pct_decimal = Decimal("0")
+                try:
+                    stop_loss_pct_decimal = (
+                        Decimal(str(stop_loss_pct)) if stop_loss_pct is not None else Decimal("0")
+                    )
+                except Exception:
+                    stop_loss_pct_decimal = Decimal("0")
+
+                if take_profit_pct_decimal > 0:
+                    if trade.reason == "buy_long":
+                        take_profit = trade.current_price * (Decimal("1") + take_profit_pct_decimal)
+                    else:
+                        take_profit = trade.current_price * (Decimal("1") - take_profit_pct_decimal)
+                if stop_loss_pct_decimal > 0:
+                    if trade.reason == "buy_long":
+                        stop_loss = trade.current_price * (Decimal("1") - stop_loss_pct_decimal)
+                    else:
+                        stop_loss = trade.current_price * (Decimal("1") + stop_loss_pct_decimal)
+
+                if take_profit is not None or stop_loss is not None:
+                    metadata["exit_policy"] = {
+                        "style": "bracket_if_supported_else_synthetic_exit",
+                        "supports_brackets": True,
+                        "take_profit_pct": float(take_profit_pct_decimal),
+                        "stop_loss_pct": float(stop_loss_pct_decimal),
+                    }
 
             request = OrderRequest(
                 symbol=trade.symbol,

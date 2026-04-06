@@ -55,6 +55,7 @@ def _base_args(**overrides):
         "nested_outer_stability_ratio_cap": 1.25,
         "nested_outer_stability_min_trials": 8,
         "allow_unstable_outer_fold_fallback": False,
+        "disable_unstable_outer_fold_fallback": False,
         "disable_nested_walk_forward": False,
         "objective_weight_sharpe": 1.0,
         "objective_weight_drawdown": 0.5,
@@ -1244,9 +1245,12 @@ def test_run_training_rejects_optional_disable_flags():
 
 def test_run_training_promotion_profile_rejects_optional_governance_disables():
     assert train_script.run_training(_base_args(training_profile="promotion", no_shap=True)) == 1
-    assert train_script.run_training(
-        _base_args(training_profile="promotion", disable_meta_labeling=True)
-    ) == 1
+    assert (
+        train_script.run_training(
+            _base_args(training_profile="promotion", disable_meta_labeling=True)
+        )
+        == 1
+    )
 
 
 def test_run_training_promotion_profile_requires_git_checkout(monkeypatch):
@@ -1256,7 +1260,9 @@ def test_run_training_promotion_profile_requires_git_checkout(monkeypatch):
 
     class DummyModelTrainer:
         def __init__(self, _config):
-            raise AssertionError("promotion provenance gate should block before trainer construction")
+            raise AssertionError(
+                "promotion provenance gate should block before trainer construction"
+            )
 
     monkeypatch.setattr(train_script, "ModelTrainer", DummyModelTrainer)
 
@@ -2016,6 +2022,34 @@ def test_prepare_optuna_study_uses_sqlite_storage_for_resume(tmp_path):
     assert info["remaining_trials"] == 11
     assert Path(info["manifest_path"]).exists()
     assert str(info["storage_path"]).endswith(".sqlite3")
+
+
+def test_enqueue_optuna_seed_trials_filters_to_searchable_params():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            model_params={
+                "n_estimators": 280,
+                "learning_rate": 0.025,
+                "num_leaves": 40,
+                "feature_selection_max_features": 72,
+            },
+        )
+    )
+    queued: list[dict[str, object]] = []
+
+    class DummyStudy:
+        def enqueue_trial(self, params):
+            queued.append(dict(params))
+
+    count = trainer._enqueue_optuna_seed_trials(
+        DummyStudy(),
+        trainer.config.model_params,
+        {"n_estimators": 280.0, "learning_rate": 0.025, "num_leaves": 40},
+    )
+
+    assert count == 1
+    assert queued == [{"learning_rate": 0.025, "n_estimators": 280, "num_leaves": 40}]
 
 
 def test_fold_reliability_weight_penalizes_low_support():
@@ -4011,6 +4045,16 @@ def test_write_promotion_package_includes_position_sizing_policy(tmp_path):
     assert payload["position_sizing_policy"]["use_portfolio_target_sizing"] is True
     assert payload["position_sizing_policy"]["max_position_pct"] == pytest.approx(0.10)
     assert payload["position_sizing_policy"]["max_total_positions"] == 20
+    assert payload["score_semantics"] == "probability_up"
+    assert payload["candidate_selection_policy"]["mode"] == "cross_sectional_long_short"
+    assert payload["candidate_selection_policy"]["max_total_positions"] == 20
+    assert payload["holding_horizon_bars"] == 5
+    assert payload["meta_model_enabled"] is False
+    assert payload["meta_threshold"] is None
+    assert payload["short_policy"]["enabled"] is True
+    assert payload["borrow_check_required"] is False
+    assert payload["adv_lookback_days"] == 20
+    assert payload["exit_policy"]["holding_horizon_bars"] == 5
     assert payload["signal_policy"]["long_side_policy"]["signal_scale"] == pytest.approx(1.10)
     assert payload["signal_policy"]["short_side_policy"]["enabled"] is False
     assert payload["expected_edge_policy"]["enabled"] is True
@@ -4051,9 +4095,40 @@ def test_write_promotion_package_persists_ranker_runtime_contract(tmp_path):
     )
     payload = json.loads(package_path.read_text(encoding="utf-8"))
 
+    assert payload["score_semantics"] == "cross_sectional_rank_percentile"
+    assert payload["candidate_selection_policy"]["selection"] == "top_bottom_by_score"
     assert payload["ranker_scoring"]["normalization"] == "query_percentile"
     assert payload["ranker_scoring"]["query_key"] == "timestamp"
     assert payload["ranker_scoring"]["requires_cross_sectional_panel"] is True
+
+
+def test_validate_promotion_package_payload_rejects_missing_meta_threshold():
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            model_name="pkg_ranker",
+            save_artifacts=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="meta_threshold is required"):
+        trainer._validate_promotion_package_payload(
+            {
+                "score_semantics": "ranker_cross_sectional_score",
+                "candidate_selection_policy": {"mode": "cross_sectional_long_short"},
+                "holding_horizon_bars": 5,
+                "meta_model_enabled": True,
+                "meta_threshold": None,
+                "short_policy": {"enabled": True},
+                "borrow_check_required": False,
+                "adv_lookback_days": 20,
+                "exit_policy": {"holding_horizon_bars": 5},
+                "ranker_scoring": {
+                    "normalization": "query_percentile",
+                    "query_key": "timestamp",
+                },
+            }
+        )
 
 
 def test_train_expected_edge_policy_records_training_and_holdout_metrics():
@@ -4913,6 +4988,13 @@ def test_build_parser_supports_advanced_risk_and_execution_flags():
     assert args.disable_lightgbm_monotonic_constraints is True
 
 
+def test_build_parser_supports_disabling_unstable_outer_fold_fallback():
+    parser = train_script.build_parser()
+    args = parser.parse_args(["train", "--disable-unstable-outer-fold-fallback"])
+
+    assert args.disable_unstable_outer_fold_fallback is True
+
+
 def test_build_parser_supports_horizon_sweep_and_meta_threshold_flags():
     parser = train_script.build_parser()
     args = parser.parse_args(
@@ -5298,6 +5380,62 @@ def test_fit_ranker_model_uses_model_eval_at_without_duplicate_fit_kwarg():
     assert captured["kwargs"]["eval_group"] == [np.array([2])]
 
 
+def test_fit_ranker_model_native_lightgbm_uses_early_stopping_callbacks(monkeypatch):
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    trainer.feature_names = ["feat_a", "feat_b"]
+
+    captured: dict[str, object] = {}
+
+    class LGBMRanker:
+        __module__ = "lightgbm.sklearn"
+        _alphatrade_eval_at = [1, 5, 10]
+        _alphatrade_early_stopping_rounds = 17
+
+        def fit(self, X, y, **kwargs):
+            del y
+            captured["X_type"] = type(X)
+            captured["kwargs"] = kwargs
+            return self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "lightgbm",
+        SimpleNamespace(
+            early_stopping=lambda rounds, verbose=False: {
+                "rounds": rounds,
+                "verbose": verbose,
+            }
+        ),
+    )
+
+    trainer._fit_ranker_model(
+        LGBMRanker(),
+        X_train=np.array([[0.1, 0.0], [0.2, 0.0], [0.3, 0.0], [0.4, 0.0]], dtype=float),
+        y_train=np.array([0.0, 1.0, 0.0, 1.0], dtype=float),
+        X_val=np.array([[0.5, 0.0], [0.6, 0.0]], dtype=float),
+        y_val=np.array([1.0, 0.0], dtype=float),
+        train_timestamps=np.array(
+            [
+                "2024-01-01T10:00:00",
+                "2024-01-01T10:00:00",
+                "2024-01-01T10:01:00",
+                "2024-01-01T10:01:00",
+            ],
+            dtype="datetime64[ns]",
+        ),
+        val_timestamps=np.array(
+            ["2024-01-01T10:02:00", "2024-01-01T10:02:00"],
+            dtype="datetime64[ns]",
+        ),
+    )
+
+    assert captured["X_type"] is np.ndarray
+    assert captured["kwargs"]["feature_name"] == ["feat_a", "feat_b"]
+    assert "eval_at" not in captured["kwargs"]
+    assert captured["kwargs"]["callbacks"] == [{"rounds": 17, "verbose": False}]
+    assert captured["kwargs"]["eval_group"] == [np.array([2])]
+
+
 def test_ranker_eval_at_supports_alphatrade_cached_attr():
     trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
 
@@ -5333,6 +5471,29 @@ def test_create_base_model_strips_ranker_eval_at_from_constructor(monkeypatch):
     assert getattr(model, "_alphatrade_eval_at") == [1, 5, 10]
 
 
+def test_create_model_strips_ranker_eval_at_from_constructor(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class DummyRanker:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setitem(sys.modules, "lightgbm", SimpleNamespace(LGBMRanker=DummyRanker))
+
+    trainer = train_script.ModelTrainer(
+        train_script.TrainingConfig(
+            model_type="lightgbm_ranker",
+            model_params={"eval_at": [1, 5, 10], "early_stopping_rounds": 12, "n_estimators": 12},
+        )
+    )
+
+    model = trainer._create_model()
+
+    assert "eval_at" not in captured["kwargs"]
+    assert getattr(model, "_alphatrade_eval_at") == [1, 5, 10]
+    assert getattr(model, "_alphatrade_early_stopping_rounds") == 12
+
+
 def test_build_ranking_groups_segments_by_timestamp():
     trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
     timestamps = np.array(
@@ -5348,6 +5509,48 @@ def test_build_ranking_groups_segments_by_timestamp():
     )
     groups = trainer._build_ranking_groups(timestamps)
     assert groups.tolist() == [2, 1, 3]
+
+
+def test_build_nested_inner_fold_payloads_caches_ranker_groups_and_slices():
+    trainer = train_script.ModelTrainer(train_script.TrainingConfig(model_type="lightgbm_ranker"))
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    y = np.array([0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=float)
+    timestamps = np.array(
+        [
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:01:00",
+            "2024-01-01T10:01:00",
+            "2024-01-01T10:02:00",
+            "2024-01-01T10:02:00",
+        ],
+        dtype="datetime64[ns]",
+    )
+
+    payloads = trainer._build_nested_inner_fold_payloads(
+        X_outer_train=X,
+        y_outer_train=y,
+        inner_splits=[(np.array([0, 1, 2, 3]), np.array([4, 5]))],
+        w_outer_train=np.array([1, 2, 3, 4, 5, 6], dtype=float),
+        forward_outer_train=np.linspace(0.1, 0.6, 6, dtype=float),
+        event_outer_train=np.linspace(0.2, 0.7, 6, dtype=float),
+        signal_outer_train=np.array([1, 1, -1, -1, 1, -1], dtype=float),
+        regimes_outer_train=np.array(
+            ["bull", "bull", "bear", "bear", "bull", "bear"], dtype=object
+        ),
+        symbols_outer_train=np.array(["A", "B", "A", "B", "A", "B"], dtype=object),
+        ts_outer_train=timestamps,
+    )
+
+    assert len(payloads) == 1
+    payload = payloads[0]
+    np.testing.assert_array_equal(payload["X_train"], X[[0, 1, 2, 3]])
+    np.testing.assert_array_equal(payload["X_val"], X[[4, 5]])
+    np.testing.assert_array_equal(payload["train_group"], np.array([2, 2]))
+    np.testing.assert_array_equal(payload["val_group"], np.array([2]))
+    np.testing.assert_allclose(payload["train_returns"], np.array([0.1, 0.2, 0.3, 0.4]))
+    np.testing.assert_array_equal(payload["val_event_directions"], np.array([1.0, -1.0]))
+    assert payload["train_size"] == 4
 
 
 def test_ranker_raw_predictions_are_normalized_within_timestamp_queries():
@@ -6099,7 +6302,9 @@ def test_validate_model_prefers_expected_edge_holdout_metrics_when_available():
 
     assert passed is True
     assert trainer.training_metrics["effective_holdout_metric_source"] == "expected_edge_policy"
-    assert trainer.training_metrics["effective_holdout_group_metric_source"] == "expected_edge_policy"
+    assert (
+        trainer.training_metrics["effective_holdout_group_metric_source"] == "expected_edge_policy"
+    )
     assert trainer.validation_results["gates"]["min_holdout_sharpe"][0] is True
     assert trainer.validation_results["gates"]["holdout_trade_count_positive"][0] is True
     assert trainer.validation_results["gates"]["holdout_active_signal_rate_positive"][0] is True

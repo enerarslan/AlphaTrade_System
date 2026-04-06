@@ -800,6 +800,7 @@ class TestPreTradeRiskChecker:
 
         assert result.result == CheckResult.FAILED
         assert "participation" in result.message.lower()
+        assert result.reason_code == "CAPACITY_EXCEEDED"
 
     def test_liquidity_required_blocks_when_market_data_missing(self, portfolio):
         """When configured, missing liquidity inputs should hard-fail pre-trade checks."""
@@ -817,6 +818,44 @@ class TestPreTradeRiskChecker:
         liquidity_result = next(result for result in results if result.check_name == "liquidity")
         assert liquidity_result.result == CheckResult.FAILED
         assert "required" in liquidity_result.message.lower()
+
+    def test_short_sale_eligibility_rejects_non_shortable_asset(self, checker, portfolio):
+        order = Order(
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            quantity=Decimal("10"),
+            order_type=OrderType.MARKET,
+        )
+
+        result = checker.check_short_sale_eligibility(
+            order,
+            portfolio,
+            market_data={"shortable": False},
+        )
+
+        assert result.result == CheckResult.FAILED
+        assert result.reason_code == "NOT_SHORTABLE"
+
+    def test_short_sale_eligibility_requires_borrow_metadata_when_requested(
+        self,
+        checker,
+        portfolio,
+    ):
+        order = Order(
+            symbol="AAPL",
+            side=OrderSide.SELL,
+            quantity=Decimal("10"),
+            order_type=OrderType.MARKET,
+        )
+
+        result = checker.check_short_sale_eligibility(
+            order,
+            portfolio,
+            market_data={"borrow_check_required": True},
+        )
+
+        assert result.result == CheckResult.FAILED
+        assert result.reason_code == "BORROW_UNKNOWN"
 
 
 class TestKillSwitch:

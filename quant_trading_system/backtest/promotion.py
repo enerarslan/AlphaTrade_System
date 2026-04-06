@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from quant_trading_system.data.data_access import filter_ohlcv_frame_to_market_session
 from quant_trading_system.data.timeframe import DEFAULT_TIMEFRAME, normalize_timeframe
 from quant_trading_system.features.feature_pipeline import (
     FeatureConfig,
@@ -209,6 +210,15 @@ class PromotionPackageContract:
     min_confidence_position_scale: float
     expected_edge_policy_enabled: bool
     expected_edge_policy: dict[str, Any]
+    score_semantics: str
+    candidate_selection_policy: dict[str, Any]
+    holding_horizon_bars: int
+    meta_model_enabled: bool
+    meta_threshold: float | None
+    short_policy: dict[str, Any]
+    borrow_check_required: bool
+    adv_lookback_days: int
+    exit_policy: dict[str, Any]
     ranker_score_normalization: str | None
     ranker_query_key: str | None
     ranker_requires_cross_sectional_panel: bool
@@ -272,6 +282,15 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
     universe_quality_policy = raw_payload.get("universe_quality_policy", {})
     if not isinstance(universe_quality_policy, dict):
         universe_quality_policy = {}
+    candidate_selection_policy = raw_payload.get("candidate_selection_policy", {})
+    if not isinstance(candidate_selection_policy, dict):
+        candidate_selection_policy = {}
+    short_policy = raw_payload.get("short_policy", {})
+    if not isinstance(short_policy, dict):
+        short_policy = {}
+    exit_policy = raw_payload.get("exit_policy", {})
+    if not isinstance(exit_policy, dict):
+        exit_policy = {}
 
     raw_feature_names = _coalesce(
         feature_contract.get("selected_features"),
@@ -456,10 +475,83 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         bool(_coalesce(expected_edge_policy.get("enabled"), expected_edge_model_path is not None))
         and expected_edge_model_path is not None
     )
+    holding_horizon_bars = max(
+        1,
+        int(
+            float(
+                _coalesce(
+                    raw_payload.get("holding_horizon_bars"),
+                    exit_policy.get("holding_horizon_bars"),
+                    signal_policy.get("max_holding_bars"),
+                    max_holding_bars,
+                )
+            )
+        ),
+    )
+    meta_model_enabled = (
+        bool(_coalesce(raw_payload.get("meta_model_enabled"), meta_label_enabled))
+        and meta_model_path is not None
+    )
+    meta_threshold = _coalesce(
+        raw_payload.get("meta_threshold"),
+        meta_label_threshold,
+    )
+    meta_threshold = None if meta_threshold is None else float(meta_threshold)
+    borrow_check_required = bool(
+        _coalesce(
+            raw_payload.get("borrow_check_required"),
+            short_policy.get("borrow_check_required"),
+            False,
+        )
+    )
+    adv_lookback_days = max(
+        1,
+        int(
+            float(
+                _coalesce(
+                    raw_payload.get("adv_lookback_days"),
+                    raw_cost_model.get("adv_lookback_days"),
+                    20,
+                )
+            )
+        ),
+    )
+    if not candidate_selection_policy:
+        candidate_selection_policy = {
+            "mode": "cross_sectional_long_short",
+            "selection": "top_bottom_by_score",
+            "universe": "promoted_symbols",
+            "max_total_positions": max_total_positions,
+        }
+    if not short_policy:
+        short_policy = {
+            "enabled": True,
+            "mode": "long_short",
+            "borrow_check_required": borrow_check_required,
+        }
+    if not exit_policy:
+        exit_policy = {
+            "style": "horizon_stop_take_profit",
+            "holding_horizon_bars": holding_horizon_bars,
+            "prediction_horizon_bars": horizon_bars,
+            "take_profit_pct": take_profit_pct,
+            "stop_loss_pct": stop_loss_pct,
+        }
     model_name = str(_coalesce(raw_payload.get("model_name"), model_path.stem)).strip()
     model_type = str(
         _coalesce(raw_payload.get("model_type"), training_config.get("model_type"), "")
     ).strip()
+    score_semantics = str(
+        _coalesce(
+            raw_payload.get("score_semantics"),
+            ranker_scoring.get("score_semantics"),
+            "cross_sectional_rank_percentile"
+            if "rank" in model_type.lower()
+            else "probability_up",
+        )
+    ).strip() or (
+        "cross_sectional_rank_percentile" if "rank" in model_type.lower() else "probability_up"
+    )
     ranker_score_normalization = _coalesce(
         ranker_scoring.get("normalization"),
         "query_percentile" if "rank" in model_type.lower() else None,
@@ -548,6 +640,15 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         min_confidence_position_scale=min_confidence_position_scale,
         expected_edge_policy_enabled=expected_edge_policy_enabled,
         expected_edge_policy=expected_edge_policy,
+        score_semantics=score_semantics,
+        candidate_selection_policy=candidate_selection_policy,
+        holding_horizon_bars=holding_horizon_bars,
+        meta_model_enabled=meta_model_enabled,
+        meta_threshold=meta_threshold,
+        short_policy=short_policy,
+        borrow_check_required=borrow_check_required,
+        adv_lookback_days=adv_lookback_days,
+        exit_policy=exit_policy,
         ranker_score_normalization=(
             None
             if ranker_score_normalization is None
@@ -560,6 +661,79 @@ def load_promotion_package(package_path: str | Path) -> PromotionPackageContract
         enable_universe_quality_gate=enable_universe_quality_gate,
         universe_quality_policy=universe_quality_policy,
     )
+
+
+def _estimate_trailing_liquidity_frame(
+    frame: pd.DataFrame | None,
+    *,
+    timeframe: str | None,
+    lookback_days: int,
+) -> pd.DataFrame:
+    """Estimate trailing ADV/ADDV and per-bar spread telemetry aligned by timestamp."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["timestamp", "avg_daily_volume", "avg_daily_dollar_volume", "spread_bps"])
+
+    normalized = _to_pandas_frame(frame)
+    filtered, _ = filter_ohlcv_frame_to_market_session(
+        normalized,
+        timeframe=timeframe,
+        include_premarket=False,
+        include_postmarket=False,
+    )
+    if filtered.empty:
+        filtered = normalized.copy()
+    working = filtered.copy()
+    if "timestamp" not in working.columns:
+        return pd.DataFrame(columns=["timestamp", "avg_daily_volume", "avg_daily_dollar_volume", "spread_bps"])
+
+    working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
+    working["close"] = pd.to_numeric(working.get("close"), errors="coerce")
+    working["high"] = pd.to_numeric(working.get("high"), errors="coerce")
+    working["low"] = pd.to_numeric(working.get("low"), errors="coerce")
+    working["volume"] = pd.to_numeric(working.get("volume"), errors="coerce")
+    working = working.dropna(subset=["timestamp", "close", "volume"])
+    if working.empty:
+        return pd.DataFrame(columns=["timestamp", "avg_daily_volume", "avg_daily_dollar_volume", "spread_bps"])
+
+    working = working.sort_values("timestamp").reset_index(drop=True)
+    eastern_timestamps = working["timestamp"].dt.tz_convert("America/New_York")
+    working["trade_date"] = eastern_timestamps.dt.normalize()
+    working["dollar_volume"] = working["close"] * working["volume"]
+
+    daily = (
+        working.groupby("trade_date", sort=True)
+        .agg(
+            day_volume=("volume", "sum"),
+            day_dollar_volume=("dollar_volume", "sum"),
+        )
+        .sort_index()
+    )
+    if daily.empty:
+        return pd.DataFrame(columns=["timestamp", "avg_daily_volume", "avg_daily_dollar_volume", "spread_bps"])
+
+    trailing = daily.shift(1).rolling(max(1, int(lookback_days)), min_periods=1).mean()
+    fallback = daily.rolling(max(1, int(lookback_days)), min_periods=1).mean()
+    trailing = trailing.where(trailing.notna(), fallback)
+    trailing = trailing.rename(
+        columns={
+            "day_volume": "avg_daily_volume",
+            "day_dollar_volume": "avg_daily_dollar_volume",
+        }
+    )
+
+    metrics = working.loc[:, ["timestamp", "trade_date", "high", "low", "close"]].copy()
+    metrics = metrics.merge(trailing, left_on="trade_date", right_index=True, how="left")
+    spread_bps = np.full(len(metrics), np.nan, dtype=float)
+    valid_spread = pd.to_numeric(metrics["close"], errors="coerce").to_numpy(dtype=float)
+    valid_high = pd.to_numeric(metrics["high"], errors="coerce").to_numpy(dtype=float)
+    valid_low = pd.to_numeric(metrics["low"], errors="coerce").to_numpy(dtype=float)
+    positive_close_mask = np.isfinite(valid_spread) & (valid_spread > 0.0)
+    spread_bps[positive_close_mask] = (
+        (valid_high[positive_close_mask] - valid_low[positive_close_mask])
+        / valid_spread[positive_close_mask]
+    ) * 10000.0
+    metrics["spread_bps"] = spread_bps
+    return metrics.loc[:, ["timestamp", "avg_daily_volume", "avg_daily_dollar_volume", "spread_bps"]]
 
 
 def resolve_feature_groups(contract: PromotionPackageContract) -> list[FeatureGroup]:
@@ -1276,6 +1450,56 @@ class PromotionSignalAdapter:
                 {"passes": True, "quality_score": 1.0, "reasons": []},
             )
             timestamps = _extract_timestamps(raw_frame)
+            liquidity_frame = _estimate_trailing_liquidity_frame(
+                raw_frame,
+                timeframe=getattr(self.contract, "timeframe", DEFAULT_TIMEFRAME),
+                lookback_days=max(1, int(getattr(self.contract, "adv_lookback_days", 20))),
+            )
+            aligned_liquidity = pd.DataFrame({"timestamp": timestamps}).merge(
+                liquidity_frame,
+                on="timestamp",
+                how="left",
+            )
+            avg_daily_volume_series = aligned_liquidity.get("avg_daily_volume")
+            if avg_daily_volume_series is None:
+                avg_daily_volume_series = pd.Series(np.nan, index=aligned_liquidity.index)
+            avg_daily_volume = pd.to_numeric(
+                avg_daily_volume_series,
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            avg_daily_dollar_volume_series = aligned_liquidity.get("avg_daily_dollar_volume")
+            if avg_daily_dollar_volume_series is None:
+                avg_daily_dollar_volume_series = pd.Series(np.nan, index=aligned_liquidity.index)
+            avg_daily_dollar_volume = pd.to_numeric(
+                avg_daily_dollar_volume_series,
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            spread_bps_series = aligned_liquidity.get("spread_bps")
+            if spread_bps_series is None:
+                spread_bps_series = pd.Series(np.nan, index=aligned_liquidity.index)
+            spread_bps = pd.to_numeric(
+                spread_bps_series,
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            candidate_selection_values = np.full(
+                len(timestamps),
+                dict(getattr(self.contract, "candidate_selection_policy", {})),
+                dtype=object,
+            )
+            short_policy_values = np.full(
+                len(timestamps),
+                dict(getattr(self.contract, "short_policy", {})),
+                dtype=object,
+            )
+            exit_policy_values = np.full(
+                len(timestamps),
+                dict(getattr(self.contract, "exit_policy", {})),
+                dtype=object,
+            )
+            raw_meta_threshold = getattr(self.contract, "meta_threshold", None)
+            meta_threshold_value = (
+                float(raw_meta_threshold) if raw_meta_threshold is not None else np.nan
+            )
             if not bool(quality.get("passes", True)):
                 signal_frames[symbol] = pd.DataFrame(
                     {
@@ -1294,6 +1518,9 @@ class PromotionSignalAdapter:
                         "take_profit_pct": float(self.contract.take_profit_pct),
                         "stop_loss_pct": float(self.contract.stop_loss_pct),
                         "max_holding_bars": int(self.contract.max_holding_bars),
+                        "holding_horizon_bars": int(
+                            getattr(self.contract, "holding_horizon_bars", self.contract.max_holding_bars)
+                        ),
                         "universe_eligible": False,
                         "universe_quality_score": float(quality.get("quality_score", 0.0)),
                         "universe_quality_reasons": "|".join(
@@ -1318,6 +1545,38 @@ class PromotionSignalAdapter:
                         "edge_policy_scale": np.zeros(len(timestamps), dtype=float),
                         "edge_policy_confidence_scale": np.zeros(len(timestamps), dtype=float),
                         "edge_policy_enabled": bool(expected_edge_model is not None),
+                        "score_semantics": np.full(
+                            len(timestamps),
+                            str(getattr(self.contract, "score_semantics", "probability_up")),
+                            dtype=object,
+                        ),
+                        "candidate_selection_policy": candidate_selection_values,
+                        "short_policy": short_policy_values,
+                        "exit_policy": exit_policy_values,
+                        "meta_model_enabled": bool(getattr(self.contract, "meta_model_enabled", False)),
+                        "meta_threshold": np.full(
+                            len(timestamps),
+                            meta_threshold_value,
+                            dtype=float,
+                        ),
+                        "borrow_check_required": np.full(
+                            len(timestamps),
+                            bool(getattr(self.contract, "borrow_check_required", False)),
+                            dtype=bool,
+                        ),
+                        "adv_lookback_days": np.full(
+                            len(timestamps),
+                            int(getattr(self.contract, "adv_lookback_days", 20)),
+                            dtype=int,
+                        ),
+                        "raw_candidate": np.zeros(len(timestamps), dtype=bool),
+                        "meta_passed": np.zeros(len(timestamps), dtype=bool),
+                        "edge_passed": np.zeros(len(timestamps), dtype=bool),
+                        "regime_blocked": np.zeros(len(timestamps), dtype=bool),
+                        "candidate_direction": np.full(len(timestamps), "", dtype=object),
+                        "avg_daily_volume": avg_daily_volume,
+                        "avg_daily_dollar_volume": avg_daily_dollar_volume,
+                        "spread_bps": spread_bps,
                     }
                 )
                 continue
@@ -1404,8 +1663,17 @@ class PromotionSignalAdapter:
                 regime_short_threshold,
             )
 
-            long_mask = regime_enabled & (probability >= regime_long_threshold)
-            short_mask = regime_enabled & (probability <= regime_short_threshold)
+            candidate_long_mask = probability >= regime_long_threshold
+            candidate_short_mask = probability <= regime_short_threshold
+            regime_blocked = (~regime_enabled) & (candidate_long_mask | candidate_short_mask)
+            raw_candidate = valid_mask.to_numpy(dtype=bool) & (
+                candidate_long_mask | candidate_short_mask
+            )
+            candidate_direction = np.full(len(X_df), "", dtype=object)
+            candidate_direction[candidate_long_mask] = "long"
+            candidate_direction[candidate_short_mask] = "short"
+            long_mask = regime_enabled & candidate_long_mask
+            short_mask = regime_enabled & candidate_short_mask
             signal_values = np.zeros(len(X_df), dtype=float)
             long_scale = np.maximum(1e-6, 1.0 - regime_long_threshold)
             short_scale = np.maximum(1e-6, regime_short_threshold)
@@ -1489,6 +1757,7 @@ class PromotionSignalAdapter:
                     0.0,
                     1.0,
                 )
+            meta_passed = raw_candidate & (np.abs(signal_values) > 0.0)
 
             expected_edge = np.zeros(len(X_df), dtype=float)
             edge_pass_probability = np.zeros(len(X_df), dtype=float)
@@ -1602,11 +1871,16 @@ class PromotionSignalAdapter:
                     .fillna(1.0)
                     .to_numpy(dtype=float)
                 )
+                regime_confidence_scale_payload = edge_policy.get("regime_policy_confidence_scale")
+                if regime_confidence_scale_payload is None:
+                    regime_confidence_scale_payload = edge_policy.get(
+                        "edge_policy_confidence_scale"
+                    )
                 regime_confidence_scale = (
                     pd.to_numeric(
                         pd.Series(
                             _align_vector(
-                                edge_policy.get("edge_policy_confidence_scale"),
+                                regime_confidence_scale_payload,
                                 len(X_df),
                                 1.0,
                             )
@@ -1636,6 +1910,7 @@ class PromotionSignalAdapter:
                     "confidence_scale",
                     pd.Series(np.ones(len(X_df), dtype=float)),
                 ).to_numpy(dtype=float)
+            edge_passed = meta_passed & edge_policy_pass & (np.abs(signal_values) > 0.0)
 
             timestamps = pd.to_datetime(symbol_frame.get("timestamp"), utc=True, errors="coerce")
             signal_frames[symbol] = pd.DataFrame(
@@ -1655,6 +1930,9 @@ class PromotionSignalAdapter:
                     "take_profit_pct": float(self.contract.take_profit_pct),
                     "stop_loss_pct": float(self.contract.stop_loss_pct),
                     "max_holding_bars": int(self.contract.max_holding_bars),
+                    "holding_horizon_bars": int(
+                        getattr(self.contract, "holding_horizon_bars", self.contract.max_holding_bars)
+                    ),
                     "universe_eligible": True,
                     "universe_quality_score": float(quality.get("quality_score", 1.0)),
                     "universe_quality_reasons": "|".join(
@@ -1675,6 +1953,38 @@ class PromotionSignalAdapter:
                     "edge_policy_scale": edge_policy_scale,
                     "edge_policy_confidence_scale": edge_policy_confidence_scale,
                     "edge_policy_enabled": bool(expected_edge_model is not None),
+                    "score_semantics": np.full(
+                        len(X_df),
+                        str(getattr(self.contract, "score_semantics", "probability_up")),
+                        dtype=object,
+                    ),
+                    "candidate_selection_policy": candidate_selection_values[: len(X_df)],
+                    "short_policy": short_policy_values[: len(X_df)],
+                    "exit_policy": exit_policy_values[: len(X_df)],
+                    "meta_model_enabled": bool(getattr(self.contract, "meta_model_enabled", False)),
+                    "meta_threshold": np.full(
+                        len(X_df),
+                        meta_threshold_value,
+                        dtype=float,
+                    ),
+                    "borrow_check_required": np.full(
+                        len(X_df),
+                        bool(getattr(self.contract, "borrow_check_required", False)),
+                        dtype=bool,
+                    ),
+                    "adv_lookback_days": np.full(
+                        len(X_df),
+                        int(getattr(self.contract, "adv_lookback_days", 20)),
+                        dtype=int,
+                    ),
+                    "raw_candidate": raw_candidate,
+                    "meta_passed": meta_passed,
+                    "edge_passed": edge_passed,
+                    "regime_blocked": regime_blocked,
+                    "candidate_direction": candidate_direction,
+                    "avg_daily_volume": avg_daily_volume[: len(X_df)],
+                    "avg_daily_dollar_volume": avg_daily_dollar_volume[: len(X_df)],
+                    "spread_bps": spread_bps[: len(X_df)],
                 }
             )
         return signal_frames

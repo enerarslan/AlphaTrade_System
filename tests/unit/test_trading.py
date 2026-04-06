@@ -1013,6 +1013,46 @@ class TestPortfolioManager:
         assert requests[0].metadata["signal_direction"] == Direction.LONG.value
         assert requests[0].metadata["signal_timestamp"] == signal.signal.timestamp.isoformat()
 
+    def test_create_order_requests_sets_bracket_exit_contract_for_entries(self):
+        manager = PortfolioManager()
+        signal = EnrichedSignal(
+            signal=TradeSignal(
+                symbol="AAPL",
+                direction=Direction.LONG,
+                strength=0.7,
+                confidence=0.8,
+                horizon=5,
+                model_source="promotion_package:test",
+                metadata={
+                    "take_profit_pct": 0.05,
+                    "stop_loss_pct": 0.02,
+                },
+            )
+        )
+        trades = [
+            Trade(
+                symbol="AAPL",
+                side=OrderSide.BUY,
+                quantity=Decimal("10"),
+                current_price=Decimal("150"),
+                reason="buy_long",
+                target_position=TargetPosition(
+                    symbol="AAPL",
+                    target_weight=0.1,
+                    target_shares=Decimal("10"),
+                    target_value=Decimal("1500"),
+                    signal=signal,
+                ),
+            )
+        ]
+
+        request = manager.create_order_requests(trades, strategy_id="engine")[0]
+
+        assert request.take_profit_price == Decimal("157.50")
+        assert request.stop_loss_price == Decimal("147.00")
+        assert request.metadata["exit_policy"]["style"] == "bracket_if_supported_else_synthetic_exit"
+        assert request.metadata["exit_policy"]["supports_brackets"] is True
+
 
 class TestPortfolioOptimizer:
     """Tests for PortfolioOptimizer."""

@@ -2063,7 +2063,9 @@ class ModelTrainer:
             by_feature.items(),
             key=lambda item: (-float(item[1]["clipped_rate"]), str(item[0])),
         )
-        null_rates = np.asarray([payload["null_rate"] for payload in by_feature.values()], dtype=float)
+        null_rates = np.asarray(
+            [payload["null_rate"] for payload in by_feature.values()], dtype=float
+        )
         finite_rates = np.asarray(
             [payload["finite_rate"] for payload in by_feature.values()],
             dtype=float,
@@ -2178,9 +2180,7 @@ class ModelTrainer:
         if not isinstance(summary, dict) or not summary:
             return
 
-        upstream_binding = float(
-            summary.get("development_binding", summary.get("binding", 0.0))
-        )
+        upstream_binding = float(summary.get("development_binding", summary.get("binding", 0.0)))
         upstream_initial = float(
             summary.get(
                 "development_initial_feature_count",
@@ -2365,6 +2365,119 @@ class ModelTrainer:
         if manifest_path is not None:
             study_info["manifest_path"] = manifest_path
         return study, study_info
+
+    def _optuna_search_param_spec(self) -> tuple[set[str], set[str]]:
+        """Return searchable Optuna parameter names and the integer-valued subset."""
+        if self.config.model_type in {"lightgbm", "lightgbm_ranker", "lightgbm_regressor"}:
+            names = {
+                "n_estimators",
+                "max_depth",
+                "learning_rate",
+                "num_leaves",
+                "feature_fraction",
+                "bagging_fraction",
+                "bagging_freq",
+                "min_data_in_leaf",
+                "lambda_l1",
+                "lambda_l2",
+                "min_gain_to_split",
+                "max_bin",
+            }
+            if self.config.model_type == "lightgbm":
+                names.add("scale_pos_weight")
+            int_names = {
+                "n_estimators",
+                "max_depth",
+                "num_leaves",
+                "bagging_freq",
+                "min_data_in_leaf",
+                "max_bin",
+            }
+            return names, int_names
+        if self.config.model_type in {"xgboost", "xgboost_regressor"}:
+            names = {
+                "n_estimators",
+                "max_depth",
+                "learning_rate",
+                "subsample",
+                "colsample_bytree",
+                "min_child_weight",
+                "reg_alpha",
+                "reg_lambda",
+                "gamma",
+            }
+            if self.config.model_type == "xgboost":
+                names.update({"scale_pos_weight", "max_delta_step"})
+            int_names = {"n_estimators", "max_depth", "min_child_weight"}
+            return names, int_names
+        if self.config.model_type == "random_forest":
+            return (
+                {
+                    "n_estimators",
+                    "max_depth",
+                    "min_samples_split",
+                    "min_samples_leaf",
+                    "max_features",
+                    "class_weight",
+                },
+                {"n_estimators", "max_depth", "min_samples_split", "min_samples_leaf"},
+            )
+        if self.config.model_type == "elastic_net":
+            return ({"C", "l1_ratio", "max_iter", "class_weight"}, {"max_iter"})
+        return set(), set()
+
+    def _sanitize_optuna_seed_params(self, params: dict[str, Any] | None) -> dict[str, Any]:
+        """Filter seed candidates down to the active Optuna search space."""
+        if not isinstance(params, dict) or not params:
+            return {}
+        allowed_names, int_names = self._optuna_search_param_spec()
+        if not allowed_names:
+            return {}
+
+        sanitized: dict[str, Any] = {}
+        for name in sorted(allowed_names):
+            if name not in params:
+                continue
+            value = params.get(name)
+            if value is None:
+                continue
+            if name in int_names:
+                try:
+                    sanitized[name] = int(round(float(value)))
+                except (TypeError, ValueError):
+                    continue
+                continue
+            if isinstance(value, (str, bool)):
+                sanitized[name] = value
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(numeric):
+                continue
+            sanitized[name] = numeric
+        return sanitized
+
+    def _enqueue_optuna_seed_trials(self, study: Any, *seed_candidates: dict[str, Any]) -> int:
+        """Queue deterministic seed trials before Optuna explores new regions."""
+        enqueue_trial = getattr(study, "enqueue_trial", None)
+        if not callable(enqueue_trial):
+            return 0
+
+        queued = 0
+        seen: set[tuple[tuple[str, Any], ...]] = set()
+        for candidate in seed_candidates:
+            sanitized = self._sanitize_optuna_seed_params(candidate)
+            if not sanitized:
+                continue
+            signature = tuple(sorted(sanitized.items()))
+            if signature in seen:
+                continue
+            enqueue_trial(sanitized)
+            seen.add(signature)
+            queued += 1
+        return queued
 
     def _record_optuna_study_metrics(
         self,
@@ -3820,9 +3933,7 @@ class ModelTrainer:
                 bundle_path,
             )
             self.training_metrics["snapshot_bundle_scope_validated"] = False
-            self.training_metrics["snapshot_bundle_scope_issues"] = [
-                f"manifest_parse_error: {exc}"
-            ]
+            self.training_metrics["snapshot_bundle_scope_issues"] = [f"manifest_parse_error: {exc}"]
             return False
 
         bundle_scope_issues = (
@@ -3840,8 +3951,7 @@ class ModelTrainer:
             self.training_metrics["snapshot_bundle_scope_issues"] = list(bundle_scope_issues)
             if self.config.strict_snapshot_replay:
                 raise ValueError(
-                    message
-                    + ". Rebuild a scope-matched bundle with --snapshot-only and rerun."
+                    message + ". Rebuild a scope-matched bundle with --snapshot-only and rerun."
                 )
             self.logger.warning("%s; rebuilding from live data instead.", message)
             return False
@@ -4043,14 +4153,11 @@ class ModelTrainer:
         )
         gpu_accelerated_groups = list(
             dict.fromkeys(
-                readiness["fully_gpu_ready_groups"]
-                + readiness["partially_gpu_accelerated_groups"]
+                readiness["fully_gpu_ready_groups"] + readiness["partially_gpu_accelerated_groups"]
             )
         )
         cpu_only_groups = [
-            group
-            for group in readiness["requested_groups"]
-            if group not in gpu_accelerated_groups
+            group for group in readiness["requested_groups"] if group not in gpu_accelerated_groups
         ]
         fully_gpu_ready = bool(readiness["fully_gpu_ready"])
         payload = {
@@ -4063,9 +4170,7 @@ class ModelTrainer:
             "cudf_available": bool(readiness["cudf_available"]),
             "groups_to_compute": list(readiness["requested_groups"]),
             "fully_gpu_ready_groups": list(readiness["fully_gpu_ready_groups"]),
-            "partially_gpu_accelerated_groups": list(
-                readiness["partially_gpu_accelerated_groups"]
-            ),
+            "partially_gpu_accelerated_groups": list(readiness["partially_gpu_accelerated_groups"]),
             "partial_gpu_feature_names": dict(readiness["partial_gpu_feature_names"]),
             "gpu_accelerated_groups": list(gpu_accelerated_groups),
             "cpu_only_groups": list(cpu_only_groups),
@@ -4366,6 +4471,38 @@ class ModelTrainer:
         return [value for value in resolved if value > 0]
 
     @staticmethod
+    def _ranker_early_stopping_rounds(model: Any) -> int:
+        """Resolve LightGBM ranker early-stopping patience from cached or constructor params."""
+        cached_rounds = getattr(model, "_alphatrade_early_stopping_rounds", None)
+        if cached_rounds is not None:
+            try:
+                return max(0, int(cached_rounds))
+            except (TypeError, ValueError):
+                return 0
+
+        get_params = getattr(model, "get_params", None)
+        if not callable(get_params):
+            return 0
+        try:
+            params = get_params(deep=False)
+        except TypeError:
+            params = get_params()
+        except Exception:
+            return 0
+        try:
+            return max(0, int(params.get("early_stopping_rounds", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _is_native_lightgbm_ranker_model(model: Any) -> bool:
+        """Return True when the fitted ranker exposes the native LightGBM sklearn interface."""
+        candidate = getattr(model, "_model", model)
+        module_name = str(getattr(candidate.__class__, "__module__", "")).lower()
+        class_name = str(getattr(candidate.__class__, "__name__", "")).lower()
+        return "lightgbm" in module_name and "ranker" in class_name
+
+    @staticmethod
     def _summarize_lightgbm_model_structure(model: Any) -> dict[str, Any]:
         """Summarize LightGBM booster structure for dead-model detection."""
         estimator = getattr(model, "_model", model)
@@ -4598,7 +4735,8 @@ class ModelTrainer:
         self.training_metrics["feature_quality_summary"] = {
             key: value
             for key, value in feature_quality_audit.items()
-            if key not in {"by_feature", "family_summary", "worst_null_features", "worst_clip_features"}
+            if key
+            not in {"by_feature", "family_summary", "worst_null_features", "worst_clip_features"}
         }
         self.training_metrics["feature_quality_family_summary"] = feature_quality_audit.get(
             "family_summary",
@@ -4690,7 +4828,9 @@ class ModelTrainer:
     def _feature_selection_dataset_fingerprint(self, feature_names: list[str]) -> str:
         """Fingerprint the exact feature matrix that enters selection."""
         if self.snapshot_replay_loaded and isinstance(self.dataset_snapshot_bundle_manifest, dict):
-            bundle_hash = str(self.dataset_snapshot_bundle_manifest.get("bundle_hash") or "").strip()
+            bundle_hash = str(
+                self.dataset_snapshot_bundle_manifest.get("bundle_hash") or ""
+            ).strip()
             if bundle_hash:
                 return bundle_hash
         return compute_frame_content_hash(self.features, columns=feature_names)
@@ -4786,8 +4926,7 @@ class ModelTrainer:
                 for name, value in payload.get("stability_scores", {}).items()
             },
             diagnostics={
-                str(name): value
-                for name, value in payload.get("diagnostics", {}).items()
+                str(name): value for name, value in payload.get("diagnostics", {}).items()
             },
         )
 
@@ -4823,12 +4962,10 @@ class ModelTrainer:
                 str(name) for name in selection_result.correlation_pruned_features
             ],
             "stability_scores": {
-                str(name): float(value)
-                for name, value in selection_result.stability_scores.items()
+                str(name): float(value) for name, value in selection_result.stability_scores.items()
             },
             "diagnostics": {
-                str(name): value
-                for name, value in selection_result.diagnostics.items()
+                str(name): value for name, value in selection_result.diagnostics.items()
             },
         }
         try:
@@ -4843,12 +4980,17 @@ class ModelTrainer:
 
     def _can_reuse_snapshot_feature_selection(self, feature_names: list[str]) -> bool:
         """Return True when snapshot replay already supplied a post-selection feature frame."""
-        if not self.snapshot_replay_loaded or not isinstance(self.dataset_snapshot_bundle_manifest, dict):
+        if not self.snapshot_replay_loaded or not isinstance(
+            self.dataset_snapshot_bundle_manifest, dict
+        ):
             return False
         training_scope = self.dataset_snapshot_bundle_manifest.get("training_scope", {})
         if not isinstance(training_scope, dict):
             return False
-        if training_scope.get("feature_selection_signature") != self._feature_selection_schema_signature():
+        if (
+            training_scope.get("feature_selection_signature")
+            != self._feature_selection_schema_signature()
+        ):
             return False
         summary = self.dataset_snapshot_bundle_manifest.get("feature_selection_summary", {})
         if not isinstance(summary, dict):
@@ -5435,7 +5577,9 @@ class ModelTrainer:
             selected_features=selected_features,
         )
         current_stage_binding = bool(feature_selection_audit.get("selection_binding", False))
-        upstream_binding = bool(self.training_metrics.get("feature_selection_upstream_binding", 0.0))
+        upstream_binding = bool(
+            self.training_metrics.get("feature_selection_upstream_binding", 0.0)
+        )
         effective_binding = bool(current_stage_binding or upstream_binding)
         self.training_metrics["feature_selection_current_stage_binding"] = float(
             current_stage_binding
@@ -6653,6 +6797,93 @@ class ModelTrainer:
 
         self.logger.info("Future-leak validation passed for data and CV splits")
 
+    def _build_nested_inner_fold_payloads(
+        self,
+        *,
+        X_outer_train: np.ndarray,
+        y_outer_train: np.ndarray,
+        inner_splits: list[tuple[np.ndarray, np.ndarray]],
+        w_outer_train: np.ndarray | None = None,
+        forward_outer_train: np.ndarray | None = None,
+        event_outer_train: np.ndarray | None = None,
+        signal_outer_train: np.ndarray | None = None,
+        regimes_outer_train: np.ndarray | None = None,
+        symbols_outer_train: np.ndarray | None = None,
+        ts_outer_train: np.ndarray | None = None,
+    ) -> list[dict[str, Any]]:
+        """Materialize inner-fold slices once per outer fold to avoid repeated trial slicing."""
+        fold_payloads: list[dict[str, Any]] = []
+        ranker_mode = self._is_ranker_model()
+
+        for inner_train_idx, inner_val_idx in inner_splits:
+            train_timestamps = (
+                np.asarray(ts_outer_train[inner_train_idx], dtype="datetime64[ns]")
+                if ts_outer_train is not None
+                else None
+            )
+            val_timestamps = (
+                np.asarray(ts_outer_train[inner_val_idx], dtype="datetime64[ns]")
+                if ts_outer_train is not None
+                else None
+            )
+            fold_payloads.append(
+                {
+                    "X_train": X_outer_train[inner_train_idx],
+                    "X_val": X_outer_train[inner_val_idx],
+                    "y_train": y_outer_train[inner_train_idx],
+                    "y_val": y_outer_train[inner_val_idx],
+                    "w_train": (
+                        np.asarray(w_outer_train[inner_train_idx], dtype=float)
+                        if w_outer_train is not None
+                        else None
+                    ),
+                    "train_timestamps": train_timestamps,
+                    "val_timestamps": val_timestamps,
+                    "train_group": (
+                        self._build_ranking_groups(train_timestamps)
+                        if ranker_mode and train_timestamps is not None
+                        else None
+                    ),
+                    "val_group": (
+                        self._build_ranking_groups(val_timestamps)
+                        if ranker_mode and val_timestamps is not None
+                        else None
+                    ),
+                    "train_returns": (
+                        np.asarray(forward_outer_train[inner_train_idx], dtype=float)
+                        if forward_outer_train is not None
+                        else None
+                    ),
+                    "val_returns": (
+                        np.asarray(forward_outer_train[inner_val_idx], dtype=float)
+                        if forward_outer_train is not None
+                        else None
+                    ),
+                    "val_event_returns": (
+                        np.asarray(event_outer_train[inner_val_idx], dtype=float)
+                        if event_outer_train is not None
+                        else None
+                    ),
+                    "val_event_directions": (
+                        np.asarray(signal_outer_train[inner_val_idx], dtype=float)
+                        if signal_outer_train is not None
+                        else None
+                    ),
+                    "train_regimes": (
+                        np.asarray(regimes_outer_train[inner_train_idx], dtype=object)
+                        if regimes_outer_train is not None
+                        else None
+                    ),
+                    "val_symbols": (
+                        np.asarray(symbols_outer_train[inner_val_idx], dtype=object)
+                        if symbols_outer_train is not None
+                        else None
+                    ),
+                    "train_size": int(len(inner_train_idx)),
+                }
+            )
+        return fold_payloads
+
     def _select_nested_outer_candidates(
         self,
         stable_candidates: list[tuple[float, float, float, dict[str, Any], int, float]],
@@ -7056,6 +7287,7 @@ class ModelTrainer:
         outer_candidates: list[tuple[float, float, float, dict[str, Any], int, float]] = []
         outer_unstable_candidates: list[tuple[float, float, float, dict[str, Any], int, float]] = []
         outer_stability_ratios: list[float] = []
+        prior_outer_seed_params: list[dict[str, Any]] = []
 
         for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(outer_splits, start=1):
             X_outer_train = X[outer_train_idx]
@@ -7161,18 +7393,22 @@ class ModelTrainer:
                     f"Outer fold {outer_fold}: no valid inner splits, skipping fold."
                 )
                 continue
+            inner_fold_payloads = self._build_nested_inner_fold_payloads(
+                X_outer_train=X_outer_train,
+                y_outer_train=y_outer_train,
+                inner_splits=inner_splits,
+                w_outer_train=w_outer_train,
+                forward_outer_train=forward_outer_train,
+                event_outer_train=event_outer_train,
+                signal_outer_train=signal_outer_train,
+                regimes_outer_train=regimes_outer_train,
+                symbols_outer_train=symbols_outer_train,
+                ts_outer_train=ts_outer_train,
+            )
 
             def objective(
                 trial: "optuna.Trial",
-                _inner_splits: list[tuple[np.ndarray, np.ndarray]] = inner_splits,
-                _X_outer_train: np.ndarray = X_outer_train,
-                _y_outer_train: np.ndarray = y_outer_train,
-                _w_outer_train: np.ndarray | None = w_outer_train,
-                _forward_outer_train: np.ndarray | None = forward_outer_train,
-                _event_outer_train: np.ndarray | None = event_outer_train,
-                _regimes_outer_train: np.ndarray | None = regimes_outer_train,
-                _symbols_outer_train: np.ndarray | None = symbols_outer_train,
-                _ts_outer_train: np.ndarray | None = ts_outer_train,
+                _inner_fold_payloads: list[dict[str, Any]] = inner_fold_payloads,
             ) -> float:
                 params = search_space(trial)
                 param_robustness_penalty = self._parameter_robustness_penalty(
@@ -7184,41 +7420,32 @@ class ModelTrainer:
                 component_samples: list[dict[str, float]] = []
 
                 try:
-                    for inner_idx, (inner_train_idx, inner_val_idx) in enumerate(_inner_splits):
-                        X_train = _X_outer_train[inner_train_idx]
-                        X_val = _X_outer_train[inner_val_idx]
-                        y_train = _y_outer_train[inner_train_idx]
-                        y_val = _y_outer_train[inner_val_idx]
+                    for inner_idx, fold_payload in enumerate(_inner_fold_payloads):
+                        X_train = fold_payload["X_train"]
+                        X_val = fold_payload["X_val"]
+                        y_train = fold_payload["y_train"]
+                        y_val = fold_payload["y_val"]
                         if (
                             self._requires_binary_class_support()
                             and not self._has_binary_class_support(y_train)
                         ):
                             continue
                         fold_params = self._prepare_params_for_train_size(
-                            params, len(inner_train_idx)
+                            params, int(fold_payload["train_size"])
                         )
                         fold_params = self._augment_params_for_train_labels(fold_params, y_train)
                         model = self._create_model(params=fold_params)
-                        w_train = (
-                            _w_outer_train[inner_train_idx] if _w_outer_train is not None else None
-                        )
                         self._fit_model(
                             model=model,
                             X_train=X_train,
                             y_train=y_train,
                             X_val=X_val,
                             y_val=y_val,
-                            sample_weights=w_train,
-                            train_timestamps=(
-                                np.asarray(_ts_outer_train[inner_train_idx], dtype="datetime64[ns]")
-                                if _ts_outer_train is not None
-                                else None
-                            ),
-                            val_timestamps=(
-                                np.asarray(_ts_outer_train[inner_val_idx], dtype="datetime64[ns]")
-                                if _ts_outer_train is not None
-                                else None
-                            ),
+                            sample_weights=fold_payload["w_train"],
+                            train_timestamps=fold_payload["train_timestamps"],
+                            val_timestamps=fold_payload["val_timestamps"],
+                            train_group=fold_payload["train_group"],
+                            val_group=fold_payload["val_group"],
                         )
 
                         y_pred = np.asarray(self._predict_with_model(model, X_val))
@@ -7226,43 +7453,21 @@ class ModelTrainer:
                             self._get_predictions_proba(
                                 model,
                                 X_val,
-                                timestamps=(
-                                    np.asarray(
-                                        _ts_outer_train[inner_val_idx], dtype="datetime64[ns]"
-                                    )
-                                    if _ts_outer_train is not None
-                                    else None
-                                ),
+                                timestamps=fold_payload["val_timestamps"],
                             )
                         )
                         train_proba = np.asarray(
                             self._get_predictions_proba(
                                 model,
                                 X_train,
-                                timestamps=(
-                                    np.asarray(
-                                        _ts_outer_train[inner_train_idx], dtype="datetime64[ns]"
-                                    )
-                                    if _ts_outer_train is not None
-                                    else None
-                                ),
+                                timestamps=fold_payload["train_timestamps"],
                             )
-                        )
-                        train_forward_returns = (
-                            np.asarray(_forward_outer_train[inner_train_idx], dtype=float)
-                            if _forward_outer_train is not None
-                            else None
-                        )
-                        train_regimes = (
-                            np.asarray(_regimes_outer_train[inner_train_idx], dtype=object)
-                            if _regimes_outer_train is not None
-                            else None
                         )
                         long_threshold, short_threshold = self._derive_signal_thresholds(
                             train_proba,
                             train_labels=y_train,
-                            train_returns=train_forward_returns,
-                            train_regimes=train_regimes,
+                            train_returns=fold_payload["train_returns"],
+                            train_regimes=fold_payload["train_regimes"],
                         )
                         y_eval = np.asarray(y_val)
                         eval_len = min(len(y_eval), len(y_pred), len(y_proba))
@@ -7276,28 +7481,28 @@ class ModelTrainer:
                             long_threshold=long_threshold,
                             short_threshold=short_threshold,
                             realized_forward_returns=(
-                                _forward_outer_train[inner_val_idx][-eval_len:]
-                                if _forward_outer_train is not None
+                                fold_payload["val_returns"][-eval_len:]
+                                if fold_payload["val_returns"] is not None
                                 else None
                             ),
                             event_net_returns=(
-                                _event_outer_train[inner_val_idx][-eval_len:]
-                                if _event_outer_train is not None
+                                fold_payload["val_event_returns"][-eval_len:]
+                                if fold_payload["val_event_returns"] is not None
                                 else None
                             ),
                             event_directions=(
-                                signal_outer_train[inner_val_idx][-eval_len:]
-                                if signal_outer_train is not None
+                                fold_payload["val_event_directions"][-eval_len:]
+                                if fold_payload["val_event_directions"] is not None
                                 else None
                             ),
                             timestamps=(
-                                _ts_outer_train[inner_val_idx][-eval_len:]
-                                if _ts_outer_train is not None
+                                fold_payload["val_timestamps"][-eval_len:]
+                                if fold_payload["val_timestamps"] is not None
                                 else None
                             ),
                             symbols=(
-                                _symbols_outer_train[inner_val_idx][-eval_len:]
-                                if _symbols_outer_train is not None
+                                fold_payload["val_symbols"][-eval_len:]
+                                if fold_payload["val_symbols"] is not None
                                 else None
                             ),
                         )
@@ -7410,6 +7615,18 @@ class ModelTrainer:
                 )
             remaining_trials = int(study_info.get("remaining_trials", self.config.n_trials))
             if remaining_trials > 0:
+                if int(study_info.get("existing_trials", 0)) <= 0:
+                    seed_trial_count = self._enqueue_optuna_seed_trials(
+                        study,
+                        self.config.model_params,
+                        *(prior_outer_seed_params[-2:]),
+                    )
+                    if seed_trial_count > 0:
+                        self.logger.info(
+                            "Outer fold %s: queued %d Optuna seed trial(s) from prior stable defaults.",
+                            outer_fold,
+                            seed_trial_count,
+                        )
                 study.optimize(
                     objective,
                     n_trials=remaining_trials,
@@ -7462,6 +7679,7 @@ class ModelTrainer:
             )
             outer_stability_ratios.append(float(outer_stability_ratio))
             best_params = dict(best_trial.params)
+            prior_outer_seed_params.append(best_params)
             best_fold_params = self._prepare_params_for_train_size(
                 best_params, len(outer_train_idx)
             )
@@ -9391,12 +9609,34 @@ class ModelTrainer:
             elif self.config.model_type == "lightgbm_ranker":
                 from lightgbm import LGBMRanker
 
+                raw_eval_at = model_params.pop("eval_at", None)
                 model_params.setdefault("verbose", -1)
                 model_params.setdefault("objective", "lambdarank")
                 model_params.setdefault("metric", "ndcg")
                 if self.config.use_gpu:
                     model_params.setdefault("device", "cuda")
-                return LGBMRanker(**model_params)
+                model = LGBMRanker(**model_params)
+                if raw_eval_at is not None:
+                    if isinstance(raw_eval_at, (list, tuple, set, np.ndarray)):
+                        resolved_eval_at = [int(value) for value in raw_eval_at]
+                    else:
+                        resolved_eval_at = [int(raw_eval_at)]
+                    setattr(
+                        model,
+                        "_alphatrade_eval_at",
+                        [value for value in resolved_eval_at if value > 0],
+                    )
+                early_stopping_rounds = model_params.get("early_stopping_rounds")
+                if early_stopping_rounds is not None:
+                    try:
+                        setattr(
+                            model,
+                            "_alphatrade_early_stopping_rounds",
+                            max(0, int(early_stopping_rounds)),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                return model
 
             elif self.config.model_type == "random_forest":
                 from quant_trading_system.models.classical_ml import RandomForestModel
@@ -9471,6 +9711,8 @@ class ModelTrainer:
         sample_weights: np.ndarray | None = None,
         train_timestamps: np.ndarray | None = None,
         val_timestamps: np.ndarray | None = None,
+        train_group: np.ndarray | None = None,
+        val_group: np.ndarray | None = None,
         warm_start_model: Any | None = None,
     ) -> None:
         """Fit model with best-effort support for sample weights and validation sets."""
@@ -9488,6 +9730,8 @@ class ModelTrainer:
                 sample_weights=sample_weights,
                 train_timestamps=train_timestamps,
                 val_timestamps=val_timestamps,
+                train_group=train_group,
+                val_group=val_group,
             )
             return
 
@@ -9565,26 +9809,31 @@ class ModelTrainer:
         sample_weights: np.ndarray | None = None,
         train_timestamps: np.ndarray | None = None,
         val_timestamps: np.ndarray | None = None,
+        train_group: np.ndarray | None = None,
+        val_group: np.ndarray | None = None,
     ) -> None:
         """Fit learning-to-rank models with timestamp query grouping."""
-        if train_timestamps is None:
-            raise ValueError("Ranker training requires train_timestamps for query grouping.")
+        if train_timestamps is None and train_group is None:
+            raise ValueError("Ranker training requires train_timestamps or precomputed groups.")
 
         fit_feature_names = (
             [str(name) for name in self.feature_names]
             if self.feature_names and len(self.feature_names) == int(X_train.shape[1])
             else []
         )
-        X_train_fit: Any = (
-            pd.DataFrame(X_train, columns=fit_feature_names) if fit_feature_names else X_train
-        )
-        X_val_fit: Any = (
-            pd.DataFrame(X_val, columns=fit_feature_names)
-            if fit_feature_names and X_val is not None
-            else X_val
-        )
+        native_lightgbm_ranker = self._is_native_lightgbm_ranker_model(model)
+        X_train_fit: Any = X_train
+        X_val_fit: Any = X_val
+        if fit_feature_names and not native_lightgbm_ranker:
+            X_train_fit = pd.DataFrame(X_train, columns=fit_feature_names)
+            if X_val is not None:
+                X_val_fit = pd.DataFrame(X_val, columns=fit_feature_names)
 
-        train_group = self._build_ranking_groups(train_timestamps)
+        train_group = (
+            np.asarray(train_group, dtype=int).reshape(-1)
+            if train_group is not None
+            else self._build_ranking_groups(train_timestamps)
+        )
         if train_group.size == 0:
             train_group = np.array([int(len(X_train_fit))], dtype=int)
         if int(np.sum(train_group)) != int(len(X_train_fit)):
@@ -9594,18 +9843,47 @@ class ModelTrainer:
             X_val is not None
             and y_val is not None
             and len(X_val) > 0
-            and val_timestamps is not None
-            and len(val_timestamps) == len(X_val)
+            and (
+                (
+                    val_group is not None
+                    and int(np.sum(np.asarray(val_group, dtype=int).reshape(-1))) == int(len(X_val))
+                )
+                or (val_timestamps is not None and len(val_timestamps) == len(X_val))
+            )
         )
         eval_group = (
-            self._build_ranking_groups(val_timestamps) if use_eval else np.array([], dtype=int)
+            np.asarray(val_group, dtype=int).reshape(-1)
+            if use_eval and val_group is not None
+            else self._build_ranking_groups(val_timestamps) if use_eval else np.array([], dtype=int)
         )
-        if use_eval and eval_group.size == 0:
+        if use_eval and (eval_group.size == 0 or int(np.sum(eval_group)) != int(len(X_val))):
             use_eval = False
 
         eval_at = self._ranker_eval_at(model)
         fit_eval_at = eval_at if eval_at else [1, 3, 5, 10]
         include_eval_at_kwarg = not bool(eval_at)
+
+        if native_lightgbm_ranker:
+            fit_kwargs: dict[str, Any] = {"group": train_group}
+            if sample_weights is not None:
+                fit_kwargs["sample_weight"] = sample_weights
+            if fit_feature_names:
+                fit_kwargs["feature_name"] = fit_feature_names
+            if use_eval:
+                fit_kwargs["eval_set"] = [(X_val_fit, y_val)]
+                fit_kwargs["eval_group"] = [eval_group]
+                if include_eval_at_kwarg:
+                    fit_kwargs["eval_at"] = fit_eval_at
+                early_stopping_rounds = self._ranker_early_stopping_rounds(model)
+                if early_stopping_rounds > 0:
+                    import lightgbm as lgb
+
+                    fit_kwargs["callbacks"] = [
+                        lgb.early_stopping(early_stopping_rounds, verbose=False)
+                    ]
+            model.fit(X_train_fit, y_train, **fit_kwargs)
+            self._attach_ranker_runtime_metadata(model)
+            return
 
         candidate_calls: list[dict[str, Any]] = []
         if use_eval and sample_weights is not None:
@@ -10347,7 +10625,9 @@ class ModelTrainer:
         portfolio_trade_mask = np.asarray(stream.get("portfolio_trade_mask", []), dtype=bool)
         portfolio_entry_mask = np.asarray(stream.get("portfolio_entry_mask", []), dtype=bool)
         trade_return_series = portfolio_returns[portfolio_trade_mask]
-        performance_returns = portfolio_returns if portfolio_returns.size > 0 else trade_return_series
+        performance_returns = (
+            portfolio_returns if portfolio_returns.size > 0 else trade_return_series
+        )
 
         turnover = float(np.mean(portfolio_turnover)) if portfolio_turnover.size > 0 else 0.0
         trade_count = int(np.count_nonzero(portfolio_entry_mask))
@@ -10425,9 +10705,9 @@ class ModelTrainer:
         return {
             "policy_signal_count": int(np.count_nonzero(np.abs(base_signal) > 1e-8)),
             "policy_selected_count": int(np.count_nonzero(np.abs(adjusted_signal) > 1e-8)),
-            "policy_selected_rate": float(np.mean(np.abs(adjusted_signal) > 1e-8))
-            if target_len
-            else 0.0,
+            "policy_selected_rate": (
+                float(np.mean(np.abs(adjusted_signal) > 1e-8)) if target_len else 0.0
+            ),
             "policy_trade_count": float(trade_count),
             "policy_active_signal_rate": float(active_signal_rate),
             "policy_turnover": float(turnover),
@@ -13328,7 +13608,9 @@ class ModelTrainer:
                 "Dataset too small for final full-data refit; using selected fold model."
             )
             self._attach_probability_calibrator_to_model(self.model)
-            final_refit_feature_count = float(len(self.feature_names or list(self.features.columns)))
+            final_refit_feature_count = float(
+                len(self.feature_names or list(self.features.columns))
+            )
             self.training_metrics["feature_selection_final_refit_binding"] = 0.0
             self.training_metrics["feature_selection_final_refit_initial_feature_count"] = (
                 final_refit_feature_count
@@ -14002,7 +14284,10 @@ class ModelTrainer:
                 ("trade_count", "expected_edge_holdout_policy_trade_count"),
                 ("active_signal_rate", "expected_edge_holdout_policy_active_signal_rate"),
                 ("max_drawdown", "expected_edge_holdout_policy_max_drawdown"),
-                ("trade_return_observations", "expected_edge_holdout_policy_trade_return_observations"),
+                (
+                    "trade_return_observations",
+                    "expected_edge_holdout_policy_trade_return_observations",
+                ),
                 (
                     "sharpe_observation_confidence",
                     "expected_edge_holdout_policy_sharpe_observation_confidence",
@@ -14020,7 +14305,9 @@ class ModelTrainer:
                 ("risk_adjusted_score", "expected_edge_holdout_policy_risk_adjusted_score"),
             ):
                 if training_key in self.training_metrics:
-                    holdout_metrics[metric_key] = float(self.training_metrics.get(training_key, 0.0))
+                    holdout_metrics[metric_key] = float(
+                        self.training_metrics.get(training_key, 0.0)
+                    )
 
             expected_edge_regime_metrics = self.training_metrics.get(
                 "expected_edge_holdout_regime_metrics",
@@ -14071,7 +14358,9 @@ class ModelTrainer:
         self.training_metrics["holdout_base_metrics"] = base_holdout_metrics
         self.training_metrics["holdout_base_regime_metrics"] = base_holdout_regime_metrics
         self.training_metrics["holdout_base_symbol_metrics"] = base_holdout_symbol_metrics
-        self.training_metrics["effective_holdout_group_metric_source"] = effective_holdout_group_source
+        self.training_metrics["effective_holdout_group_metric_source"] = (
+            effective_holdout_group_source
+        )
 
         self.training_metrics["holdout_worst_regime_sharpe"] = float(holdout_worst_regime_sharpe)
         self.training_metrics["holdout_regime_count_evaluated"] = float(len(holdout_regime_metrics))
@@ -14206,12 +14495,15 @@ class ModelTrainer:
             holdout_active_signal_rate_metric = (
                 1.0 if holdout_available and holdout_trade_count_metric > 0.0 else 0.0
             )
-        holdout_group_source = str(
-            self.training_metrics.get(
-                "effective_holdout_group_metric_source",
-                effective_holdout.get("source", "base"),
-            )
-        ).strip() or "base"
+        holdout_group_source = (
+            str(
+                self.training_metrics.get(
+                    "effective_holdout_group_metric_source",
+                    effective_holdout.get("source", "base"),
+                )
+            ).strip()
+            or "base"
+        )
         self.training_metrics["effective_holdout_group_metric_source"] = holdout_group_source
         holdout_worst_regime_sharpe = float(
             self.training_metrics.get(
@@ -14965,8 +15257,11 @@ class ModelTrainer:
         """
         self.logger.info(f"Phase 8: Applying {self.config.correction_method} correction...")
 
-        use_expected_edge_returns = bool(self.training_metrics.get("expected_edge_policy_enabled", 0.0)) and (
-            bool(self.expected_edge_cv_active_return_series) or bool(self.expected_edge_cv_return_series)
+        use_expected_edge_returns = bool(
+            self.training_metrics.get("expected_edge_policy_enabled", 0.0)
+        ) and (
+            bool(self.expected_edge_cv_active_return_series)
+            or bool(self.expected_edge_cv_return_series)
         )
         if use_expected_edge_returns:
             sharpe = float(
@@ -15513,6 +15808,90 @@ class ModelTrainer:
         self.logger.info(f"Replay manifest saved to: {replay_path}")
         return replay_path
 
+    def _promotion_score_semantics(self) -> str:
+        """Resolve promoted score semantics for downstream parity contracts."""
+        model_type = str(self.config.model_type).strip().lower()
+        if "rank" in model_type:
+            return "cross_sectional_rank_percentile"
+        if "regressor" in model_type:
+            return "expected_return_score"
+        return "probability_up"
+
+    def _promotion_candidate_selection_policy(self) -> dict[str, Any]:
+        """Build the promoted candidate selection policy contract."""
+        raw_max_total_positions = getattr(self.config, "max_total_positions", None)
+        if raw_max_total_positions is None:
+            raw_max_total_positions = 20
+        return {
+            "mode": "cross_sectional_long_short",
+            "selection": "top_bottom_by_score",
+            "universe": "promoted_symbols",
+            "target_universe_size": int(self.config.target_universe_size),
+            "universe_selection_buffer_size": int(self.config.universe_selection_buffer_size),
+            "execution_cooldown_bars": int(self.config.execution_cooldown_bars),
+            "execution_turnover_cap": float(self.config.execution_turnover_cap),
+            "execution_max_symbol_entry_share": float(self.config.execution_max_symbol_entry_share),
+            "max_total_positions": int(max(1, raw_max_total_positions)),
+        }
+
+    def _validate_promotion_package_payload(self, payload: dict[str, Any]) -> None:
+        """Hard-fail promotion packaging when runtime contract fields are incomplete."""
+        required_fields = (
+            "score_semantics",
+            "candidate_selection_policy",
+            "holding_horizon_bars",
+            "meta_model_enabled",
+            "meta_threshold",
+            "short_policy",
+            "borrow_check_required",
+            "adv_lookback_days",
+            "exit_policy",
+        )
+        missing = [field for field in required_fields if field not in payload]
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(
+                f"Promotion package missing required runtime contract fields: {joined}"
+            )
+
+        score_semantics = str(payload.get("score_semantics") or "").strip()
+        if not score_semantics:
+            raise ValueError("Promotion package score_semantics must be defined")
+
+        candidate_selection_policy = payload.get("candidate_selection_policy")
+        if not isinstance(candidate_selection_policy, dict) or not candidate_selection_policy:
+            raise ValueError(
+                "Promotion package candidate_selection_policy must be a non-empty object"
+            )
+
+        short_policy = payload.get("short_policy")
+        if not isinstance(short_policy, dict) or not short_policy:
+            raise ValueError("Promotion package short_policy must be a non-empty object")
+
+        exit_policy = payload.get("exit_policy")
+        if not isinstance(exit_policy, dict) or not exit_policy:
+            raise ValueError("Promotion package exit_policy must be a non-empty object")
+
+        if bool(payload.get("meta_model_enabled")) and payload.get("meta_threshold") is None:
+            raise ValueError(
+                "Promotion package meta_threshold is required when meta_model_enabled is true"
+            )
+
+        if self._is_ranker_model():
+            ranker_scoring = payload.get("ranker_scoring")
+            if not isinstance(ranker_scoring, dict) or not ranker_scoring:
+                raise ValueError(
+                    "Promotion package ranker_scoring is required for ranker promotion"
+                )
+            if not str(ranker_scoring.get("normalization") or "").strip():
+                raise ValueError(
+                    "Promotion package ranker_scoring.normalization must be defined for rankers"
+                )
+            if not str(ranker_scoring.get("query_key") or "").strip():
+                raise ValueError(
+                    "Promotion package ranker_scoring.query_key must be defined for rankers"
+                )
+
     def _write_promotion_package(
         self,
         output_dir: Path,
@@ -15539,6 +15918,27 @@ class ModelTrainer:
             )
         )
         cost_model = self.config.to_trading_cost_model()
+        score_semantics = self._promotion_score_semantics()
+        candidate_selection_policy = self._promotion_candidate_selection_policy()
+        meta_model_enabled = bool(self.meta_model is not None)
+        meta_threshold = (
+            self.training_metrics.get("meta_label_min_confidence") if meta_model_enabled else None
+        )
+        short_policy = {
+            "enabled": True,
+            "mode": "long_short",
+            "borrow_check_required": False,
+            "long_close_reason_code": "reduce_long",
+            "short_open_reason_code": "short_sell",
+        }
+        holding_horizon_bars = int(self.config.primary_label_horizon)
+        exit_policy = {
+            "style": "horizon_stop_take_profit",
+            "prediction_horizon_bars": int(self.config.primary_label_horizon),
+            "holding_horizon_bars": holding_horizon_bars,
+            "take_profit_pct": float(self.config.label_profit_taking_threshold),
+            "stop_loss_pct": float(abs(self.config.label_stop_loss_threshold)),
+        }
 
         payload = {
             "schema_version": PROMOTION_PACKAGE_SCHEMA_VERSION,
@@ -15601,7 +16001,9 @@ class ModelTrainer:
                 "timeframes": list(self.config.timeframes),
             },
             "feature_selection_contract": {
-                "effective_binding": float(self.training_metrics.get("feature_selection_binding", 0.0)),
+                "effective_binding": float(
+                    self.training_metrics.get("feature_selection_binding", 0.0)
+                ),
                 "development_binding": float(
                     self.training_metrics.get("feature_selection_development_binding", 0.0)
                 ),
@@ -15633,15 +16035,24 @@ class ModelTrainer:
                     )
                 ),
             },
+            "score_semantics": score_semantics,
+            "candidate_selection_policy": candidate_selection_policy,
+            "holding_horizon_bars": holding_horizon_bars,
+            "meta_model_enabled": meta_model_enabled,
+            "meta_threshold": meta_threshold,
+            "short_policy": short_policy,
+            "borrow_check_required": False,
+            "adv_lookback_days": 20,
+            "exit_policy": exit_policy,
             "signal_policy": {
                 "long_threshold": self.training_metrics.get("holdout_long_threshold"),
                 "short_threshold": self.training_metrics.get("holdout_short_threshold"),
                 "horizon_bars": int(self.config.primary_label_horizon),
-                "max_holding_bars": int(self.config.label_max_holding_period),
+                "max_holding_bars": holding_horizon_bars,
                 "take_profit_pct": float(self.config.label_profit_taking_threshold),
                 "stop_loss_pct": float(abs(self.config.label_stop_loss_threshold)),
-                "meta_label_enabled": bool(self.meta_model is not None),
-                "meta_label_threshold": self.training_metrics.get("meta_label_min_confidence"),
+                "meta_label_enabled": meta_model_enabled,
+                "meta_label_threshold": meta_threshold,
                 "meta_label_dynamic_threshold": bool(
                     self.training_metrics.get("meta_label_dynamic_threshold", 0.0)
                 ),
@@ -15663,6 +16074,8 @@ class ModelTrainer:
                     else {}
                 ),
                 "model_source": f"promotion_package:{self.config.model_name}",
+                "score_semantics": score_semantics,
+                "holding_horizon_bars": holding_horizon_bars,
             },
             "signal_activity_contract": self.training_metrics.get(
                 "holdout_signal_activity_summary",
@@ -15672,6 +16085,7 @@ class ModelTrainer:
                 "spread_bps": float(cost_model.spread_bps),
                 "slippage_bps": float(cost_model.slippage_bps),
                 "impact_bps": float(cost_model.impact_bps),
+                "adv_lookback_days": 20,
             },
             "position_sizing_policy": {
                 "use_portfolio_target_sizing": True,
@@ -15702,7 +16116,14 @@ class ModelTrainer:
                     "expected_edge_regime_policy", {}
                 ),
             },
-            "ranker_scoring": (self._ranker_scoring_contract() if self._is_ranker_model() else {}),
+            "ranker_scoring": (
+                {
+                    **self._ranker_scoring_contract(),
+                    "score_semantics": score_semantics,
+                }
+                if self._is_ranker_model()
+                else {}
+            ),
             "promotion_passed": bool(self.validation_results.get("all_passed", False)),
             "snapshot_id": (
                 self.snapshot_manifest.get("snapshot_id")
@@ -15791,6 +16212,7 @@ class ModelTrainer:
             },
             "replay_manifest_path": str(replay_manifest_path) if replay_manifest_path else None,
         }
+        self._validate_promotion_package_payload(payload)
 
         package_path = package_dir / f"{self.config.model_name}.promotion_package.json"
         with package_path.open("w", encoding="utf-8") as f:
@@ -15975,7 +16397,9 @@ class ModelTrainer:
                     "development_initial_feature_count": float(
                         self.training_metrics.get(
                             "feature_selection_development_initial_feature_count",
-                            self.training_metrics.get("feature_selection_initial_feature_count", 0.0),
+                            self.training_metrics.get(
+                                "feature_selection_initial_feature_count", 0.0
+                            ),
                         )
                     ),
                     "development_selected_feature_count": float(
@@ -16005,7 +16429,9 @@ class ModelTrainer:
                             ),
                         )
                     ),
-                    "audit": self._json_safe(self.training_metrics.get("feature_selection_audit", {})),
+                    "audit": self._json_safe(
+                        self.training_metrics.get("feature_selection_audit", {})
+                    ),
                 },
             )
             self.dataset_snapshot_bundle_manifest_path = bundle_manifest_path
@@ -17180,9 +17606,7 @@ def run_training(args: argparse.Namespace) -> int:
 
     try:
         if getattr(args, "gpu", False) or getattr(args, "use_gpu", False):
-            logger.warning(
-                "`--gpu/--use-gpu` is deprecated; use `--require-model-gpu` instead."
-            )
+            logger.warning("`--gpu/--use-gpu` is deprecated; use `--require-model-gpu` instead.")
         if getattr(args, "no_database", False) or getattr(args, "no_redis_cache", False):
             raise ValueError("Institutional mode does not allow disabling PostgreSQL or Redis.")
         if getattr(args, "disable_nested_walk_forward", False):
@@ -17218,6 +17642,12 @@ def run_training(args: argparse.Namespace) -> int:
             raise ValueError("Promotion profile requires SHAP explainability.")
         if getattr(args, "disable_meta_labeling", False) and training_profile == "promotion":
             raise ValueError("Promotion profile requires meta-labeling.")
+        if bool(getattr(args, "allow_unstable_outer_fold_fallback", False)) and bool(
+            getattr(args, "disable_unstable_outer_fold_fallback", False)
+        ):
+            raise ValueError(
+                "Cannot enable and disable unstable outer-fold fallback in the same run."
+            )
 
         requested_model = str(
             replay_config.get("model_type") or getattr(args, "model", DEFAULT_PRIMARY_MODEL)
@@ -17642,7 +18072,9 @@ def run_training(args: argparse.Namespace) -> int:
                     )
                 ),
                 allow_unstable_outer_fold_fallback=bool(
-                    _resolve_profiled_value(
+                    False
+                    if bool(getattr(args, "disable_unstable_outer_fold_fallback", False))
+                    else _resolve_profiled_value(
                         replay_config=replay_config,
                         config_key="allow_unstable_outer_fold_fallback",
                         args=args,
@@ -18763,6 +19195,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow research runs to fall back to unstable outer-fold candidates when no stable "
             "candidate passes the Optuna surface gate."
+        ),
+    )
+    parser.add_argument(
+        "--disable-unstable-outer-fold-fallback",
+        action="store_true",
+        help=(
+            "Force research runs to fail when no stable outer-fold candidate passes the Optuna "
+            "surface gate."
         ),
     )
     parser.add_argument(

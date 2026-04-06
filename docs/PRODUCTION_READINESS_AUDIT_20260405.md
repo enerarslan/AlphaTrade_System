@@ -57,11 +57,11 @@ Asagidaki tablo WSL artefaktlarindan okunmustur. `Gate Active Rate`, validation 
 
 ### 1. Promotion adayi zannedilen run'lar research profile ile calismis
 
-`scripts/launch_wave1_wsl_clean_ranker_scope_safe_h12.sh` icinde `--training-profile research` hardcoded. Bu da tum bu WSL run'larini dogal olarak hizli iterasyon moduna sokuyor.
+Eski `scripts/launch_wave1_wsl_clean_ranker_scope_safe_h12.sh` launcher'inda `--training-profile research` hardcoded idi. Bu da o donemdeki WSL run'larini dogal olarak hizli iterasyon moduna sokuyordu. Bu launcher ailesi artik kaldirildi; yerine `scripts/run_wave1_ranker.ps1` tek giris noktasi kullanilmalidir.
 
 Kod referanslari:
 
-- `scripts/launch_wave1_wsl_clean_ranker_scope_safe_h12.sh:56`
+- `scripts/run_wave1_ranker.ps1`
 - `scripts/train.py:154-166`
 
 Etkisi:

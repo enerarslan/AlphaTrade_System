@@ -490,12 +490,75 @@ def test_promotion_signal_adapter_applies_expected_edge_policy_gate_and_scale():
     assert signal_frame.loc[0, "edge_policy_scale"] == pytest.approx(0.5)
     assert signal_frame.loc[0, "expected_edge"] == pytest.approx(0.012)
     assert signal_frame.loc[0, "runtime_regime"] == "normal_range"
+    assert signal_frame.loc[0, "regime_policy_confidence_scale"] == pytest.approx(1.0)
     assert signal_frame.loc[1, "runtime_regime"] == "high_vol"
     assert signal_frame.loc[1, "long_threshold"] == pytest.approx(0.65)
     assert signal_frame.loc[1, "signal"] == pytest.approx(0.0)
     assert signal_frame.loc[1, "confidence"] == pytest.approx(0.0)
     assert bool(signal_frame.loc[1, "edge_policy_pass"]) is False
     assert signal_frame.loc[1, "regime_policy_signal_scale"] == pytest.approx(0.30)
+
+
+def test_promotion_signal_adapter_uses_regime_policy_confidence_scale():
+    adapter = PromotionSignalAdapter(
+        SimpleNamespace(
+            model_type="lightgbm",
+            feature_names=("feat_a",),
+            timeframe="15Min",
+            long_threshold=0.60,
+            short_threshold=0.40,
+            horizon_bars=5,
+            model_source="promotion_package:test_model",
+            meta_label_enabled=False,
+            meta_label_threshold=None,
+            take_profit_pct=0.03,
+            stop_loss_pct=0.02,
+            max_holding_bars=6,
+            long_side_policy={},
+            short_side_policy={},
+            expected_edge_policy_enabled=True,
+            expected_edge_policy={
+                "regime_conditioned_policy": {
+                    "enabled": True,
+                    "regimes": {
+                        "high_vol": {
+                            "signal_scale": 0.30,
+                            "confidence_scale": 0.60,
+                        }
+                    },
+                }
+            },
+            enable_universe_quality_gate=False,
+            universe_quality_policy={},
+        )
+    )
+    adapter._model = DummyProbabilityModel()
+    adapter._load_expected_edge_model = lambda: DummyExpectedEdgeModel()
+    timestamps = pd.to_datetime(["2025-01-02T14:30:00Z"], utc=True)
+    features = {
+        "AAPL": pd.DataFrame(
+            {
+                "timestamp": timestamps,
+                "feat_a": [0.70],
+                "regime": ["high_vol"],
+            }
+        )
+    }
+    raw_frame = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.5],
+            "close": [100.5],
+            "volume": [1000.0],
+        },
+        index=pd.DatetimeIndex(timestamps),
+    )
+
+    signal_frame = adapter.generate_signal_frames({"AAPL": raw_frame}, features=features)["AAPL"]
+
+    assert bool(signal_frame.loc[0, "edge_policy_pass"]) is True
+    assert signal_frame.loc[0, "regime_policy_confidence_scale"] == pytest.approx(0.60)
 
 
 def test_performance_attribution_compute_attribution_accepts_backtest_state():
@@ -761,6 +824,19 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
         "model_name": "test_model",
         "model_type": "lightgbm",
         "model_path": str(model_path),
+        "score_semantics": "probability_up",
+        "candidate_selection_policy": {
+            "mode": "cross_sectional_long_short",
+            "selection": "top_bottom_by_score",
+            "max_total_positions": 8,
+        },
+        "holding_horizon_bars": 5,
+        "meta_model_enabled": False,
+        "meta_threshold": None,
+        "short_policy": {"enabled": True, "borrow_check_required": True},
+        "borrow_check_required": True,
+        "adv_lookback_days": 15,
+        "exit_policy": {"holding_horizon_bars": 5, "stop_loss_pct": 0.02},
         "signal_policy": {
             "long_side_policy": {"enabled": True, "signal_scale": 1.1},
             "short_side_policy": {"enabled": False, "signal_scale": 0.0},
@@ -807,6 +883,15 @@ def test_load_promotion_package_uses_artifacts_fallback(tmp_path: Path):
     assert package.max_position_pct == 0.12
     assert package.max_total_positions == 8
     assert package.min_confidence_position_scale == 0.15
+    assert package.score_semantics == "probability_up"
+    assert package.candidate_selection_policy["selection"] == "top_bottom_by_score"
+    assert package.holding_horizon_bars == 5
+    assert package.meta_model_enabled is False
+    assert package.meta_threshold == 0.70
+    assert package.short_policy["borrow_check_required"] is True
+    assert package.borrow_check_required is True
+    assert package.adv_lookback_days == 15
+    assert package.exit_policy["holding_horizon_bars"] == 5
     assert package.long_side_policy["signal_scale"] == pytest.approx(1.1)
     assert package.short_side_policy["enabled"] is False
     assert package.expected_edge_policy_enabled is True

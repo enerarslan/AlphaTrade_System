@@ -242,6 +242,11 @@ class SignalBasedStrategy(Strategy):
         self.confidence_column = confidence_column
         self.horizon_column = horizon_column
         self.source_column = source_column
+        self._last_batch_metrics: dict[str, int] = {
+            "raw_candidates": 0,
+            "meta_passed": 0,
+            "edge_passed": 0,
+        }
         for raw_symbol, frame in signals.items():
             symbol = str(raw_symbol).strip().upper()
             signal_df = frame.copy()
@@ -258,6 +263,10 @@ class SignalBasedStrategy(Strategy):
                 signal_df = signal_df[~signal_df.index.duplicated(keep="last")].sort_index()
             self.signals[symbol] = signal_df
 
+    def get_last_batch_metrics(self) -> dict[str, int]:
+        """Expose per-bar candidate telemetry for backtest parity reporting."""
+        return dict(self._last_batch_metrics)
+
     def generate_signals(
         self,
         data_handler: PandasDataHandler,
@@ -273,6 +282,11 @@ class SignalBasedStrategy(Strategy):
             List of trading signals.
         """
         trade_signals = []
+        batch_metrics = {
+            "raw_candidates": 0,
+            "meta_passed": 0,
+            "edge_passed": 0,
+        }
 
         current_symbols = (
             data_handler.get_updated_symbols()
@@ -301,6 +315,9 @@ class SignalBasedStrategy(Strategy):
             signal_row = signal_df.loc[bar_timestamp]
             if isinstance(signal_row, pd.DataFrame):
                 signal_row = signal_row.iloc[-1]
+            batch_metrics["raw_candidates"] += int(bool(signal_row.get("raw_candidate", False)))
+            batch_metrics["meta_passed"] += int(bool(signal_row.get("meta_passed", False)))
+            batch_metrics["edge_passed"] += int(bool(signal_row.get("edge_passed", False)))
             signal_value = float(signal_row[self.signal_column])
             confidence_value = float(
                 signal_row.get(self.confidence_column, min(abs(signal_value), 1.0))
@@ -349,6 +366,7 @@ class SignalBasedStrategy(Strategy):
             )
             trade_signals.append(trade_signal)
 
+        self._last_batch_metrics = batch_metrics
         return trade_signals
 
     def on_bar(self, symbol: str, bar: OHLCVBar) -> None:

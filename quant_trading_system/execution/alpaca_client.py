@@ -206,6 +206,33 @@ class AlpacaPosition:
 
 
 @dataclass
+class AssetMetadata:
+    """Normalized Alpaca asset metadata used for short-sale gating."""
+
+    symbol: str
+    shortable: bool | None
+    easy_to_borrow: bool | None
+    tradable: bool | None
+    marginable: bool | None
+    fractionable: bool | None
+    status: str | None
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_alpaca(cls, data: dict[str, Any]) -> "AssetMetadata":
+        return cls(
+            symbol=str(data.get("symbol") or "").upper(),
+            shortable=data.get("shortable"),
+            easy_to_borrow=data.get("easy_to_borrow"),
+            tradable=data.get("tradable"),
+            marginable=data.get("marginable"),
+            fractionable=data.get("fractionable"),
+            status=data.get("status"),
+            raw_payload=dict(data),
+        )
+
+
+@dataclass
 class AlpacaOrder:
     """Alpaca order data."""
 
@@ -549,6 +576,11 @@ class AlpacaClient:
         """
         data = await self._request("GET", "/v2/account")
         return AccountInfo.from_alpaca(data)
+
+    async def get_asset_metadata(self, symbol: str) -> AssetMetadata:
+        """Get normalized asset metadata for tradability and short-sale checks."""
+        data = await self._request("GET", f"/v2/assets/{symbol.upper()}")
+        return AssetMetadata.from_alpaca(data)
 
     async def get_portfolio_history(
         self,

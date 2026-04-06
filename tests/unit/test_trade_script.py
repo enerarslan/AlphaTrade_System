@@ -45,7 +45,7 @@ def test_configure_engine_uses_promotion_package_runtime_settings(monkeypatch):
     monkeypatch.setattr(
         trade_script,
         "PromotionPackageSignalSource",
-        lambda contract: source_sentinel,
+        lambda contract, **kwargs: source_sentinel,
     )
 
     args = SimpleNamespace(
@@ -80,6 +80,7 @@ def test_configure_engine_uses_promotion_package_runtime_settings(monkeypatch):
         engine.portfolio_manager.position_sizer.config.min_confidence_position_scale == 0.25
     )
     assert engine.portfolio_manager.rebalance_config.method == RebalanceMethod.SIGNAL_DRIVEN
+    assert engine._signal_batch_metrics_provider is source_sentinel
     engine.signal_generator.add_external_source.assert_called_once_with(
         "promotion_package:pkg_model",
         source_sentinel.generate,
@@ -172,3 +173,37 @@ def test_promotion_package_signal_source_dedupes_bars_and_sets_hold_contract_met
     assert signal.metadata["edge_policy_scale"] == 0.5
 
     assert source.generate({"AAPL": bar}) == []
+
+
+def test_promotion_package_signal_source_resets_batch_metrics_on_empty_batch(monkeypatch):
+    class _Adapter:
+        def __init__(self, contract, use_gpu=False, logger_=None):
+            self.contract = contract
+
+        def compute_features(self, data):
+            raise AssertionError("compute_features should not be called for an empty batch")
+
+        def generate_signal_frames(self, data, features=None):
+            raise AssertionError("generate_signal_frames should not be called for an empty batch")
+
+    monkeypatch.setattr(trade_script, "PromotionSignalAdapter", _Adapter)
+
+    source = trade_script.PromotionPackageSignalSource(
+        SimpleNamespace(
+            symbols=("AAPL",),
+            model_source="promotion_package:pkg_model",
+            model_name="pkg_model",
+        )
+    )
+    source._last_batch_metrics = {
+        "raw_candidates": 3,
+        "meta_passed": 2,
+        "edge_passed": 1,
+    }
+
+    assert source.generate({}) == []
+    assert source.get_last_batch_metrics() == {
+        "raw_candidates": 0,
+        "meta_passed": 0,
+        "edge_passed": 0,
+    }

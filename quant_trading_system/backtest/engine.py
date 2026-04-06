@@ -608,6 +608,12 @@ class BacktestEngine:
         # Execution quality telemetry for capacity and hard gating.
         self._orders_submitted_total: int = 0
         self._orders_rejected_total: int = 0
+        self._raw_candidates_total: int = 0
+        self._meta_passed_total: int = 0
+        self._edge_passed_total: int = 0
+        self._short_rejected_total: int = 0
+        self._long_orders_submitted_total: int = 0
+        self._short_orders_submitted_total: int = 0
         self._recent_slippage_bps: deque[float] = deque(maxlen=250)
         self._deferred_fill_results: dict[str, FillResult] = {}
 
@@ -807,6 +813,12 @@ class BacktestEngine:
         self._annualization_periods = self._estimate_annualization_periods()
         self._orders_submitted_total = 0
         self._orders_rejected_total = 0
+        self._raw_candidates_total = 0
+        self._meta_passed_total = 0
+        self._edge_passed_total = 0
+        self._short_rejected_total = 0
+        self._long_orders_submitted_total = 0
+        self._short_orders_submitted_total = 0
         self._recent_slippage_bps.clear()
         self._deferred_fill_results.clear()
 
@@ -868,6 +880,7 @@ class BacktestEngine:
             self.data_handler,
             self._get_portfolio(),
         )
+        self._record_signal_batch_metrics(signals)
 
         # Process signals
         if signals:
@@ -883,6 +896,144 @@ class BacktestEngine:
 
         # Update equity curve
         self._update_equity(processed_symbols)
+
+    def _resolve_signal_batch_metrics(self, signals: list[TradeSignal]) -> dict[str, int]:
+        """Resolve candidate telemetry from the strategy when available."""
+        getter = getattr(self.strategy, "get_last_batch_metrics", None)
+        if callable(getter):
+            try:
+                payload = getter() or {}
+                return {
+                    "raw_candidates": int(payload.get("raw_candidates", 0)),
+                    "meta_passed": int(payload.get("meta_passed", 0)),
+                    "edge_passed": int(payload.get("edge_passed", 0)),
+                }
+            except Exception:
+                pass
+
+        return {
+            "raw_candidates": len(signals),
+            "meta_passed": sum(1 for signal in signals if bool(signal.metadata.get("meta_passed", True))),
+            "edge_passed": sum(1 for signal in signals if bool(signal.metadata.get("edge_passed", True))),
+        }
+
+    def _record_signal_batch_metrics(self, signals: list[TradeSignal]) -> None:
+        """Accumulate per-bar candidate telemetry for parity reporting."""
+        batch_metrics = self._resolve_signal_batch_metrics(signals)
+        self._raw_candidates_total += int(batch_metrics.get("raw_candidates", 0))
+        self._meta_passed_total += int(batch_metrics.get("meta_passed", 0))
+        self._edge_passed_total += int(batch_metrics.get("edge_passed", 0))
+
+    def _resolve_bar_interval_minutes(self) -> int:
+        """Infer the active bar interval in minutes from recently observed data."""
+        for symbol in self.data_handler.get_symbols():
+            bars = self.data_handler.get_latest_bars(symbol, n=2)
+            if len(bars) < 2:
+                continue
+            delta = bars[-1].timestamp - bars[-2].timestamp
+            minutes = max(1, int(delta.total_seconds() // 60))
+            if minutes > 0:
+                return minutes
+        return 1
+
+    def _estimate_trailing_liquidity_metrics(
+        self,
+        symbol: str,
+        bar: OHLCVBar,
+        lookback_days: int,
+    ) -> dict[str, float]:
+        """Estimate trailing ADV/ADDV from already-seen historical bars only."""
+        bars_per_day = max(1, int(US_EQUITY_REGULAR_SESSION_MINUTES / max(1, self._resolve_bar_interval_minutes())))
+        history = self.data_handler.get_latest_bars(
+            symbol,
+            n=max(bars_per_day * max(1, int(lookback_days + 1)), bars_per_day),
+        )
+        if not history:
+            return {}
+
+        rows = []
+        for history_bar in history:
+            eastern_ts = to_eastern(history_bar.timestamp)
+            rows.append(
+                {
+                    "timestamp": history_bar.timestamp,
+                    "trade_date": pd.Timestamp(eastern_ts.date()),
+                    "close": float(history_bar.close),
+                    "high": float(history_bar.high),
+                    "low": float(history_bar.low),
+                    "volume": float(history_bar.volume),
+                    "dollar_volume": float(history_bar.close * Decimal(str(history_bar.volume))),
+                }
+            )
+        history_frame = pd.DataFrame(rows)
+        if history_frame.empty:
+            return {}
+
+        daily = (
+            history_frame.groupby("trade_date", sort=True)
+            .agg(
+                day_volume=("volume", "sum"),
+                day_dollar_volume=("dollar_volume", "sum"),
+            )
+            .sort_index()
+        )
+        trailing = daily.shift(1).tail(max(1, int(lookback_days)))
+        if trailing.dropna(how="all").empty:
+            trailing = daily.tail(max(1, int(lookback_days)))
+        trailing = trailing.dropna(how="all")
+        if trailing.empty:
+            return {}
+
+        return {
+            "avg_daily_volume": float(trailing["day_volume"].mean()),
+            "avg_daily_dollar_volume": float(trailing["day_dollar_volume"].mean()),
+        }
+
+    def _build_market_data_for_signal(self, signal: TradeSignal, bar: OHLCVBar) -> dict[str, Any]:
+        """Build the pre-trade market-data payload using signal metadata first."""
+        market_data: dict[str, Any] = {}
+        for key in (
+            "avg_daily_volume",
+            "average_daily_volume",
+            "adv",
+            "avg_daily_dollar_volume",
+            "average_daily_dollar_volume",
+            "addv",
+            "spread_bps",
+            "bid_ask_spread_bps",
+            "allow_short_sales",
+            "borrow_check_required",
+            "shortable",
+            "easy_to_borrow",
+        ):
+            if key in signal.metadata:
+                market_data[key] = signal.metadata[key]
+
+        if "allow_short_sales" not in market_data:
+            short_policy = signal.metadata.get("short_policy")
+            if isinstance(short_policy, dict):
+                market_data["allow_short_sales"] = bool(short_policy.get("enabled", True))
+        if "borrow_check_required" not in market_data:
+            market_data["borrow_check_required"] = bool(signal.metadata.get("borrow_check_required", False))
+
+        if not any(
+            key in market_data for key in ("avg_daily_volume", "average_daily_volume", "adv", "addv", "avg_daily_dollar_volume", "average_daily_dollar_volume")
+        ):
+            market_data.update(
+                self._estimate_trailing_liquidity_metrics(
+                    signal.symbol,
+                    bar,
+                    lookback_days=int(signal.metadata.get("adv_lookback_days", 20) or 20),
+                )
+            )
+
+        return market_data
+
+    @staticmethod
+    def _count_short_rejections(results: list[RiskCheckResult]) -> int:
+        """Count canonical short-gate failures."""
+        short_reason_codes = {"SHORT_NOT_ALLOWED", "NOT_SHORTABLE", "BORROW_UNKNOWN"}
+        return sum(1 for result in results if result.reason_code in short_reason_codes)
 
     def _update_position_prices(self, symbol: str, bar: OHLCVBar) -> None:
         """Update position with current price."""
@@ -1649,11 +1800,7 @@ class BacktestEngine:
             updated_at=bar.timestamp,
         )
 
-        adv_proxy = max(int(self.config.avg_daily_volume), int(bar.volume))
-        market_data = {
-            "avg_daily_volume": adv_proxy,
-            "avg_daily_dollar_volume": float(Decimal(str(adv_proxy)) * bar.close),
-        }
+        market_data = self._build_market_data_for_signal(signal, bar)
         can_submit, risk_results = self._evaluate_pre_trade_risk(
             order,
             bar.close,
@@ -1665,6 +1812,7 @@ class BacktestEngine:
                 logger.debug(
                     f"Order rejected by pre-trade risk for {order.symbol}: {'; '.join(failures)}"
                 )
+            self._short_rejected_total += self._count_short_rejections(risk_results)
             return
 
         for result in risk_results:
@@ -1673,6 +1821,10 @@ class BacktestEngine:
 
         self._risk_limits_manager.on_order_submitted(order, bar.close)
         self._orders_submitted_total += 1
+        if signal.direction == Direction.LONG:
+            self._long_orders_submitted_total += 1
+        elif signal.direction == Direction.SHORT:
+            self._short_orders_submitted_total += 1
         self._state.pending_orders.append(order)
         self._pending_signal_context[str(order.order_id)] = signal
 
@@ -1783,14 +1935,40 @@ class BacktestEngine:
         """Expose execution/risk SLO telemetry for replay and operations gates."""
         avg_slippage_bps, rejection_rate = self._execution_quality_metrics()
         playbook_metrics = self._risk_limits_manager.get_playbook_metrics()
+        trades = self._state.trades if self._state is not None else []
+        gross_pnl = float(sum((trade.gross_pnl for trade in trades), Decimal("0")))
+        net_pnl = float(sum((trade.pnl for trade in trades), Decimal("0")))
+        turnover = float(
+            sum((abs(trade.entry_price * trade.quantity) for trade in trades), Decimal("0"))
+            / max(Decimal("1"), self.config.initial_capital)
+        )
+        avg_hold_bars = (
+            float(sum(trade.holding_period_bars for trade in trades) / len(trades))
+            if trades
+            else 0.0
+        )
         return {
             "orders_submitted": self._orders_submitted_total,
             "orders_rejected": self._orders_rejected_total,
             "rejection_rate": rejection_rate,
             "avg_slippage_bps": avg_slippage_bps,
+            "slippage_bps": avg_slippage_bps,
             "orders_filled": self._state.orders_filled if self._state is not None else 0,
+            "fills": self._state.orders_filled if self._state is not None else 0,
             "trades_closed": len(self._state.trades) if self._state is not None else 0,
             "bars_processed": self._state.bars_processed if self._state is not None else 0,
+            "raw_candidates": self._raw_candidates_total,
+            "meta_passed": self._meta_passed_total,
+            "edge_passed": self._edge_passed_total,
+            "short_rejected": self._short_rejected_total,
+            "gross_pnl": gross_pnl,
+            "net_pnl": net_pnl,
+            "turnover": turnover,
+            "avg_hold_bars": avg_hold_bars,
+            "long_short_split": {
+                "long": self._long_orders_submitted_total,
+                "short": self._short_orders_submitted_total,
+            },
             "risk_playbook": playbook_metrics,
         }
 

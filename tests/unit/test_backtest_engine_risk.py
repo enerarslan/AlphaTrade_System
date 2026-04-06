@@ -762,3 +762,27 @@ def test_backtest_engine_partial_remainder_not_reprocessed_same_bar():
     assert simulator.calls == 1
     assert engine._state.orders_filled == 1
     assert len(engine._state.pending_orders) == 1
+
+
+def test_backtest_engine_execution_slo_snapshot_exposes_candidate_and_direction_metrics():
+    engine = BacktestEngine(
+        data_handler=_sample_handler(),
+        strategy=NoSignalStrategy(),
+        config=BacktestConfig(use_market_simulator=False),
+    )
+    engine._initialize()
+    engine._raw_candidates_total = 4
+    engine._meta_passed_total = 3
+    engine._edge_passed_total = 2
+    engine._short_rejected_total = 1
+    engine._long_orders_submitted_total = 2
+    engine._short_orders_submitted_total = 1
+
+    snapshot = engine.get_execution_slo_snapshot()
+
+    assert snapshot["raw_candidates"] == 4
+    assert snapshot["meta_passed"] == 3
+    assert snapshot["edge_passed"] == 2
+    assert snapshot["short_rejected"] == 1
+    assert snapshot["fills"] == 0
+    assert snapshot["long_short_split"] == {"long": 2, "short": 1}

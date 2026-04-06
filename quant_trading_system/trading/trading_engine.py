@@ -152,9 +152,16 @@ class EngineMetrics:
     uptime_seconds: float = 0.0
     bars_processed: int = 0
     signals_generated: int = 0
+    raw_candidates: int = 0
+    meta_passed: int = 0
+    edge_passed: int = 0
     orders_submitted: int = 0
     orders_filled: int = 0
+    fills: int = 0
     orders_rejected: int = 0
+    short_rejected: int = 0
+    long_orders_submitted: int = 0
+    short_orders_submitted: int = 0
     total_pnl: Decimal = Decimal("0")
     max_drawdown: float = 0.0  # Peak-to-trough drawdown (updated continuously)
     current_drawdown: float = 0.0  # Current drawdown from peak
@@ -225,6 +232,8 @@ class TradingEngine:
         self._prices: dict[str, Decimal] = {}
         self._updated_symbols: list[str] | None = None
         self._position_contracts: dict[str, dict[str, Any]] = {}
+        self._signal_batch_metrics_provider: Any | None = None
+        self._asset_metadata_cache: dict[str, dict[str, Any]] = {}
 
         # Callbacks
         self._bar_callbacks: list[Callable[[dict[str, OHLCVBar]], None]] = []
@@ -685,6 +694,7 @@ class TradingEngine:
                 )
                 if self.runtime_governor is not None:
                     signals = self.runtime_governor.govern_signals(signals)
+                self._record_signal_batch_metrics(signals)
 
                 if self._session:
                     self._session.signals_generated += len(signals)
@@ -901,6 +911,152 @@ class TradingEngine:
         }
         return max(1, int(interval_map.get(self.config.bar_interval, 1)))
 
+    def _resolve_signal_batch_metrics(self, signals: list[Any]) -> dict[str, int]:
+        """Resolve per-bar candidate telemetry from the bound signal source when available."""
+        provider = getattr(self, "_signal_batch_metrics_provider", None)
+        if provider is not None:
+            getter = getattr(provider, "get_last_batch_metrics", None)
+            if callable(getter):
+                try:
+                    payload = getter() or {}
+                    return {
+                        "raw_candidates": int(payload.get("raw_candidates", 0)),
+                        "meta_passed": int(payload.get("meta_passed", 0)),
+                        "edge_passed": int(payload.get("edge_passed", 0)),
+                    }
+                except Exception:
+                    pass
+
+        return {
+            "raw_candidates": len(signals),
+            "meta_passed": sum(
+                1
+                for signal in signals
+                if bool(getattr(signal, "metadata", {}).get("meta_passed", True))
+            ),
+            "edge_passed": sum(
+                1
+                for signal in signals
+                if bool(getattr(signal, "metadata", {}).get("edge_passed", True))
+            ),
+        }
+
+    def _record_signal_batch_metrics(self, signals: list[Any]) -> None:
+        """Accumulate signal-batch telemetry into engine metrics."""
+        batch_metrics = self._resolve_signal_batch_metrics(signals)
+        self._metrics.raw_candidates += int(batch_metrics.get("raw_candidates", 0))
+        self._metrics.meta_passed += int(batch_metrics.get("meta_passed", 0))
+        self._metrics.edge_passed += int(batch_metrics.get("edge_passed", 0))
+
+    def _is_short_entry_request(self, request: OrderRequest, portfolio: Portfolio) -> bool:
+        """Return whether the request opens or extends short exposure."""
+        if request.side != OrderSide.SELL:
+            return False
+        position = portfolio.get_position(request.symbol)
+        if position is None or position.is_flat or position.is_short:
+            return True
+        return request.quantity > position.quantity
+
+    async def _get_asset_metadata(self, symbol: str) -> dict[str, Any]:
+        """Fetch and cache broker asset metadata for short-sale admission checks."""
+        normalized_symbol = str(symbol).strip().upper()
+        cached = self._asset_metadata_cache.get(normalized_symbol)
+        if cached is not None:
+            return dict(cached)
+
+        getter = getattr(self.client, "get_asset_metadata", None)
+        if getter is None or not callable(getter):
+            return {}
+
+        try:
+            payload = await getter(normalized_symbol)
+        except Exception as exc:
+            logger.debug("Asset metadata lookup failed for %s: %s", normalized_symbol, exc)
+            return {}
+
+        if hasattr(payload, "__dict__"):
+            cached_payload = dict(payload.__dict__)
+        elif isinstance(payload, dict):
+            cached_payload = dict(payload)
+        else:
+            cached_payload = {}
+        self._asset_metadata_cache[normalized_symbol] = cached_payload
+        return dict(cached_payload)
+
+    async def _build_market_data_for_order(
+        self,
+        request: OrderRequest,
+        portfolio: Portfolio,
+        current_price: Decimal | None,
+    ) -> dict[str, Any]:
+        """Build a parity-focused market-data payload for pre-trade risk checks."""
+        market_data: dict[str, Any] = {}
+        latest_bar = self._latest_bars.get(request.symbol)
+        if latest_bar is not None:
+            bars_per_day = max(1, int(390 / max(self._resolve_bar_interval_minutes(), 1)))
+            adv_proxy = max(int(latest_bar.volume), int(latest_bar.volume) * bars_per_day)
+            market_data["avg_daily_volume"] = adv_proxy
+            price_for_addv = current_price or latest_bar.close
+            market_data["avg_daily_dollar_volume"] = float(
+                Decimal(str(adv_proxy)) * price_for_addv
+            )
+            if latest_bar.close > 0:
+                market_data["spread_bps"] = float(
+                    ((latest_bar.high - latest_bar.low) / latest_bar.close) * Decimal("10000")
+                )
+
+        for key in (
+            "avg_daily_volume",
+            "average_daily_volume",
+            "adv",
+            "avg_daily_dollar_volume",
+            "average_daily_dollar_volume",
+            "addv",
+            "spread_bps",
+            "bid_ask_spread_bps",
+            "allow_short_sales",
+            "borrow_check_required",
+            "shortable",
+            "easy_to_borrow",
+        ):
+            if key in request.metadata:
+                market_data[key] = request.metadata[key]
+
+        if "allow_short_sales" not in market_data:
+            short_policy = request.metadata.get("short_policy")
+            if isinstance(short_policy, dict):
+                market_data["allow_short_sales"] = bool(short_policy.get("enabled", True))
+        if "borrow_check_required" not in market_data:
+            market_data["borrow_check_required"] = bool(
+                request.metadata.get("borrow_check_required", False)
+            )
+
+        if self._is_short_entry_request(request, portfolio):
+            asset_metadata = await self._get_asset_metadata(request.symbol)
+            if "shortable" in asset_metadata and "shortable" not in market_data:
+                market_data["shortable"] = asset_metadata.get("shortable")
+            if "easy_to_borrow" in asset_metadata and "easy_to_borrow" not in market_data:
+                market_data["easy_to_borrow"] = asset_metadata.get("easy_to_borrow")
+
+        return market_data
+
+    @staticmethod
+    def _count_short_rejections(results: list[Any]) -> int:
+        """Count short-gate failures using canonical reason codes."""
+        short_reason_codes = {"SHORT_NOT_ALLOWED", "NOT_SHORTABLE", "BORROW_UNKNOWN"}
+        return sum(
+            1
+            for result in results
+            if getattr(result, "reason_code", None) in short_reason_codes
+        )
+
+    def _record_submitted_order_direction(self, request: OrderRequest) -> None:
+        """Track long-vs-short entry submissions for operator reporting."""
+        if request.notes == "buy_long":
+            self._metrics.long_orders_submitted += 1
+        elif request.notes == "short_sell":
+            self._metrics.short_orders_submitted += 1
+
     def _has_active_order_for_symbol(self, symbol: str) -> bool:
         """Check whether the OMS already has an active order for a symbol."""
         getter = getattr(self.order_manager, "get_active_orders", None)
@@ -992,32 +1148,11 @@ class TradingEngine:
         )
 
         with self._risk_checker.portfolio_lock:
-            market_data: dict[str, Any] = {}
-            latest_bar = self._latest_bars.get(request.symbol)
-            if latest_bar is not None:
-                bars_per_day = max(
-                    1,
-                    int(390 / max(self._resolve_bar_interval_minutes(), 1)),
-                )
-                adv_proxy = max(int(latest_bar.volume), int(latest_bar.volume) * bars_per_day)
-                market_data["avg_daily_volume"] = adv_proxy
-                market_data["avg_daily_dollar_volume"] = float(
-                    Decimal(str(adv_proxy)) * latest_bar.close
-                )
-
-            for key in (
-                "avg_daily_volume",
-                "average_daily_volume",
-                "adv",
-                "avg_daily_dollar_volume",
-                "average_daily_dollar_volume",
-                "addv",
-                "spread_bps",
-                "bid_ask_spread_bps",
-            ):
-                if key in managed.request.metadata:
-                    market_data[key] = managed.request.metadata[key]
-
+            market_data = await self._build_market_data_for_order(
+                managed.request,
+                portfolio,
+                current_price,
+            )
             can_submit, risk_results = self._risk_limits_manager.pre_trade_check(
                 managed.order,
                 portfolio,
@@ -1032,6 +1167,7 @@ class TradingEngine:
                 logger.warning(
                     f"Order rejected by PreTradeRiskChecker: {request.symbol} - {reasons}"
                 )
+                self._metrics.short_rejected += self._count_short_rejections(failed_checks)
                 return False
             if warning_checks:
                 warning_text = "; ".join(w.message for w in warning_checks if w.message)
@@ -1048,6 +1184,7 @@ class TradingEngine:
             if self._session:
                 self._session.orders_submitted += 1
         self._metrics.orders_submitted += 1
+        self._record_submitted_order_direction(request)
         return True
 
     async def _submit_position_exit_order(
@@ -1236,6 +1373,7 @@ class TradingEngine:
                 self._session.orders_filled += 1
                 self._session.trades_today += 1
             self._metrics.orders_filled += 1
+            self._metrics.fills += 1
 
         # Update position tracker (has its own thread safety)
         self.position_tracker.update_from_fill(
@@ -1677,6 +1815,22 @@ class TradingEngine:
 
     def get_statistics(self) -> dict[str, Any]:
         """Get engine statistics."""
+        gross_pnl = float(self._session.daily_pnl) if self._session is not None else 0.0
+        avg_hold_bars = (
+            float(
+                sum(int(contract.get("bars_held", 0)) for contract in self._position_contracts.values())
+                / max(1, len(self._position_contracts))
+            )
+            if self._position_contracts
+            else 0.0
+        )
+        long_total = self._metrics.long_orders_submitted
+        short_total = self._metrics.short_orders_submitted
+        turnover = float(
+            self.portfolio_manager.get_statistics().get("expected_turnover", 0.0)
+            if hasattr(self.portfolio_manager, "get_statistics")
+            else 0.0
+        )
         return {
             "state": self._state.value,
             "mode": self.config.mode.value,
@@ -1693,14 +1847,28 @@ class TradingEngine:
             "metrics": {
                 "bars_processed": self._metrics.bars_processed,
                 "signals_generated": self._metrics.signals_generated,
+                "raw_candidates": self._metrics.raw_candidates,
+                "meta_passed": self._metrics.meta_passed,
+                "edge_passed": self._metrics.edge_passed,
                 "orders_submitted": self._metrics.orders_submitted,
                 "orders_filled": self._metrics.orders_filled,
+                "fills": self._metrics.fills,
                 "orders_rejected": self._metrics.orders_rejected,
+                "short_rejected": self._metrics.short_rejected,
                 "avg_latency_ms": self._metrics.avg_latency_ms,
+                "slippage_bps": 0.0,
                 "errors_count": self._metrics.errors_count,
                 "max_drawdown": self._metrics.max_drawdown,
                 "current_drawdown": self._metrics.current_drawdown,
                 "peak_equity": str(self._metrics.peak_equity),
+                "gross_pnl": gross_pnl,
+                "net_pnl": gross_pnl,
+                "turnover": turnover,
+                "avg_hold_bars": avg_hold_bars,
+                "long_short_split": {
+                    "long": long_total,
+                    "short": short_total,
+                },
             },
             "components": {
                 "order_manager": self.order_manager.get_statistics(),

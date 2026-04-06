@@ -66,6 +66,7 @@ class RiskCheckResult:
     check_name: str
     result: CheckResult
     message: str
+    reason_code: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -80,6 +81,7 @@ class RiskCheckResult:
             "check_name": self.check_name,
             "result": self.result.value,
             "message": self.message,
+            "reason_code": self.reason_code,
             "details": self.details,
             "timestamp": self.timestamp.isoformat(),
         }
@@ -512,6 +514,7 @@ class PreTradeRiskChecker:
         with self._portfolio_lock:
             results = [
                 self.check_buying_power(order, portfolio, current_price),
+                self.check_short_sale_eligibility(order, portfolio, market_data=market_data),
                 self.check_position_limit(order, portfolio, current_price),
                 self.check_concentration(order, portfolio, current_price),
                 self.check_blacklist(order),
@@ -552,6 +555,7 @@ class PreTradeRiskChecker:
                         **base_details,
                         "result": result.result.value,
                         "message": result.message,
+                        "reason_code": result.reason_code,
                         "details": result.details,
                     },
                     order_id=order_id,
@@ -563,13 +567,24 @@ class PreTradeRiskChecker:
                         limit_value=0.0,
                         action_taken="order_rejected",
                         order_id=order_id,
-                        details=result.details,
+                        details={**result.details, "reason_code": result.reason_code},
                         reason=result.message,
                     )
             except Exception as exc:
                 logger.warning(
                     f"Failed to audit risk check '{result.check_name}' for {order_id}: {exc}"
                 )
+
+    @staticmethod
+    def _is_opening_or_extending_short(order: Order, portfolio: Portfolio) -> bool:
+        """Return whether an order increases net short exposure."""
+        if order.side != OrderSide.SELL:
+            return False
+
+        position = portfolio.get_position(order.symbol)
+        if position is None or position.is_flat or position.is_short:
+            return True
+        return order.quantity > position.quantity
 
     def check_buying_power(
         self,
@@ -579,6 +594,13 @@ class PreTradeRiskChecker:
     ) -> RiskCheckResult:
         """Check if there's sufficient buying power."""
         if order.side == OrderSide.SELL:
+            if self._is_opening_or_extending_short(order, portfolio):
+                return RiskCheckResult(
+                    check_name="buying_power",
+                    result=CheckResult.PASSED,
+                    message="Sell order may open or extend a short position",
+                )
+
             # Check if we have the position to sell
             position = portfolio.get_position(order.symbol)
             if position is None or position.quantity < order.quantity:
@@ -608,6 +630,64 @@ class PreTradeRiskChecker:
             check_name="buying_power",
             result=CheckResult.PASSED,
             message="Sufficient buying power",
+        )
+
+    def check_short_sale_eligibility(
+        self,
+        order: Order,
+        portfolio: Portfolio,
+        market_data: dict[str, Any] | None = None,
+    ) -> RiskCheckResult:
+        """Validate short-sale admission separately from long-position reductions."""
+        if not self._is_opening_or_extending_short(order, portfolio):
+            return RiskCheckResult(
+                check_name="short_sale_eligibility",
+                result=CheckResult.PASSED,
+                message="Order does not increase short exposure",
+            )
+
+        payload = market_data or {}
+        allow_short_sales = bool(payload.get("allow_short_sales", True))
+        if not allow_short_sales:
+            return RiskCheckResult(
+                check_name="short_sale_eligibility",
+                result=CheckResult.FAILED,
+                message="Short selling is disabled by runtime policy",
+                reason_code="SHORT_NOT_ALLOWED",
+            )
+
+        borrow_check_required = bool(payload.get("borrow_check_required", False))
+        shortable = payload.get("shortable")
+        easy_to_borrow = payload.get("easy_to_borrow")
+        details = {
+            "borrow_check_required": borrow_check_required,
+            "shortable": shortable,
+            "easy_to_borrow": easy_to_borrow,
+        }
+
+        if shortable is False:
+            return RiskCheckResult(
+                check_name="short_sale_eligibility",
+                result=CheckResult.FAILED,
+                message="Asset is not shortable",
+                reason_code="NOT_SHORTABLE",
+                details=details,
+            )
+
+        if borrow_check_required and shortable is None and easy_to_borrow is None:
+            return RiskCheckResult(
+                check_name="short_sale_eligibility",
+                result=CheckResult.FAILED,
+                message="Borrow metadata is required but unavailable",
+                reason_code="BORROW_UNKNOWN",
+                details=details,
+            )
+
+        return RiskCheckResult(
+            check_name="short_sale_eligibility",
+            result=CheckResult.PASSED,
+            message="Short-sale eligibility check passed",
+            details=details,
         )
 
     def check_position_limit(
@@ -930,6 +1010,7 @@ class PreTradeRiskChecker:
                 check_name="liquidity",
                 result=CheckResult.FAILED,
                 message="; ".join(failures),
+                reason_code="CAPACITY_EXCEEDED",
                 details=details,
             )
 

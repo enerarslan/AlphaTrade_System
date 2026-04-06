@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -281,6 +281,7 @@ class DataAccessLayer:
         symbol: str,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
     ) -> pl.DataFrame:
         """
         Get OHLCV data from database or files.
@@ -301,7 +302,12 @@ class DataAccessLayer:
         # Try database first if configured
         if self.config.use_database and self._is_db_available():
             try:
-                return self._get_db_loader().load_symbol(symbol, start_date, end_date)
+                return self._get_db_loader().load_symbol(
+                    symbol,
+                    start_date,
+                    end_date,
+                    timeframe=timeframe,
+                )
             except DataNotFoundError:
                 logger.info(f"No database data for {symbol}")
             except Exception as e:
@@ -310,7 +316,12 @@ class DataAccessLayer:
         # Try file-based fallback
         if self.config.fallback_to_files:
             try:
-                return self._get_file_loader().load_symbol(symbol, start_date, end_date)
+                return self._get_file_loader().load_symbol(
+                    symbol,
+                    start_date,
+                    end_date,
+                    timeframe=timeframe,
+                )
             except DataNotFoundError:
                 pass
             except Exception as e:
@@ -342,6 +353,7 @@ class DataAccessLayer:
         symbols: list[str],
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        timeframe: str = DEFAULT_TIMEFRAME,
     ) -> dict[str, pl.DataFrame]:
         """
         Get OHLCV data for multiple symbols.
@@ -361,7 +373,7 @@ class DataAccessLayer:
 
         for symbol in normalized_symbols:
             try:
-                df = self.get_ohlcv_bars(symbol, start_date, end_date)
+                df = self.get_ohlcv_bars(symbol, start_date, end_date, timeframe=timeframe)
                 results[symbol] = df
             except DataNotFoundError as exc:
                 failed_symbols.append(symbol)
@@ -497,6 +509,90 @@ class DataAccessLayer:
         """Refresh database availability status."""
         self._db_available = None
         return self._is_db_available()
+
+    def get_trailing_liquidity_metrics(
+        self,
+        symbol: str,
+        *,
+        end_time: datetime,
+        lookback_days: int = 20,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> dict[str, float]:
+        """Return trailing ADV/ADDV and spread telemetry sourced from the primary datastore."""
+        safe_lookback_days = max(1, int(lookback_days))
+        start_time = end_time - timedelta(days=max(safe_lookback_days * 3, safe_lookback_days + 5))
+        frame = self.get_ohlcv_bars(
+            symbol,
+            start_date=start_time,
+            end_date=end_time,
+            timeframe=timeframe,
+        )
+        if frame.is_empty():
+            return {}
+
+        pdf = frame.to_pandas()
+        if "timestamp" not in pdf.columns:
+            pdf = pdf.reset_index()
+        if "timestamp" not in pdf.columns:
+            return {}
+
+        filtered, _ = filter_ohlcv_frame_to_market_session(
+            pdf,
+            timeframe=timeframe,
+            include_premarket=False,
+            include_postmarket=False,
+        )
+        working = filtered.copy() if not filtered.empty else pdf.copy()
+        working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
+        working["close"] = pd.to_numeric(working.get("close"), errors="coerce")
+        working["high"] = pd.to_numeric(working.get("high"), errors="coerce")
+        working["low"] = pd.to_numeric(working.get("low"), errors="coerce")
+        working["volume"] = pd.to_numeric(working.get("volume"), errors="coerce")
+        working = working.dropna(subset=["timestamp", "close", "volume"]).sort_values("timestamp")
+        if working.empty:
+            return {}
+
+        current_ts = pd.Timestamp(end_time)
+        if current_ts.tzinfo is None:
+            current_ts = current_ts.tz_localize("UTC")
+        else:
+            current_ts = current_ts.tz_convert("UTC")
+
+        upto_now = working.loc[working["timestamp"] <= current_ts].copy()
+        if upto_now.empty:
+            return {}
+
+        eastern = upto_now["timestamp"].dt.tz_convert("America/New_York")
+        upto_now["trade_date"] = eastern.dt.normalize()
+        upto_now["dollar_volume"] = upto_now["close"] * upto_now["volume"]
+        daily = (
+            upto_now.groupby("trade_date", sort=True)
+            .agg(
+                day_volume=("volume", "sum"),
+                day_dollar_volume=("dollar_volume", "sum"),
+            )
+            .sort_index()
+        )
+        if daily.empty:
+            return {}
+
+        trailing = daily.shift(1).tail(safe_lookback_days)
+        if trailing.dropna(how="all").empty:
+            trailing = daily.tail(safe_lookback_days)
+        trailing = trailing.dropna(how="all")
+        if trailing.empty:
+            return {}
+
+        latest_row = upto_now.iloc[-1]
+        spread_bps = float(
+            ((float(latest_row["high"]) - float(latest_row["low"])) / float(latest_row["close"])) * 10000.0
+        ) if float(latest_row["close"]) > 0.0 else 0.0
+        return {
+            "avg_daily_volume": float(trailing["day_volume"].mean()),
+            "avg_daily_dollar_volume": float(trailing["day_dollar_volume"].mean()),
+            "spread_bps": float(max(0.0, spread_bps)),
+            "lookback_days": float(safe_lookback_days),
+        }
 
 
 # Singleton instance
