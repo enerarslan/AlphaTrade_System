@@ -41,8 +41,8 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 function Quote-Bash {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    return "'" + ($Value -replace "'", "'\"'\"'") + "'"
+    param([AllowEmptyString()][string]$Value)
+    return "'" + $Value.Replace("'", "'`"`'`"`'") + "'"
 }
 
 function Join-BashArgs {

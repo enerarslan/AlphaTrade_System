@@ -2024,7 +2024,7 @@ def test_prepare_optuna_study_uses_sqlite_storage_for_resume(tmp_path):
     assert str(info["storage_path"]).endswith(".sqlite3")
 
 
-def test_enqueue_optuna_seed_trials_filters_to_searchable_params():
+def test_enqueue_optuna_seed_trials_filters_and_clamps_to_searchable_params():
     trainer = train_script.ModelTrainer(
         train_script.TrainingConfig(
             model_type="lightgbm_ranker",
@@ -2032,6 +2032,7 @@ def test_enqueue_optuna_seed_trials_filters_to_searchable_params():
                 "n_estimators": 280,
                 "learning_rate": 0.025,
                 "num_leaves": 40,
+                "min_data_in_leaf": 24,
                 "feature_selection_max_features": 72,
             },
         )
@@ -2045,11 +2046,19 @@ def test_enqueue_optuna_seed_trials_filters_to_searchable_params():
     count = trainer._enqueue_optuna_seed_trials(
         DummyStudy(),
         trainer.config.model_params,
-        {"n_estimators": 280.0, "learning_rate": 0.025, "num_leaves": 40},
+        {"n_estimators": 280.0, "learning_rate": 0.025, "num_leaves": 40, "min_data_in_leaf": 24},
+        min_train_size=60_000,
     )
 
     assert count == 1
-    assert queued == [{"learning_rate": 0.025, "n_estimators": 280, "num_leaves": 40}]
+    assert queued == [
+        {
+            "learning_rate": 0.025,
+            "min_data_in_leaf": 32,
+            "n_estimators": 280,
+            "num_leaves": 40,
+        }
+    ]
 
 
 def test_fold_reliability_weight_penalizes_low_support():

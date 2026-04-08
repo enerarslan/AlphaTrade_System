@@ -2426,13 +2426,92 @@ class ModelTrainer:
             return ({"C", "l1_ratio", "max_iter", "class_weight"}, {"max_iter"})
         return set(), set()
 
-    def _sanitize_optuna_seed_params(self, params: dict[str, Any] | None) -> dict[str, Any]:
+    def _optuna_seed_param_bounds(self, min_train_size: int | None = None) -> dict[str, Any]:
+        """Return dynamic Optuna bounds/categories for seed-trial sanitization."""
+        bounds: dict[str, Any] = {}
+        if self.config.model_type in {"xgboost", "xgboost_regressor"}:
+            effective_train = max(128, int(min_train_size if min_train_size is not None else 1024))
+            estimators_low = max(180, min(320, int(np.ceil(float(effective_train) * 0.28))))
+            estimators_high = max(360, min(760, int(np.ceil(float(effective_train) * 0.95))))
+            if estimators_high <= estimators_low:
+                estimators_high = estimators_low + 40
+            max_depth_high = 6 if effective_train <= 1200 else 7
+            min_child_high = max(6, min(10, int(np.ceil(np.sqrt(float(effective_train)) * 0.24))))
+            bounds.update(
+                {
+                    "n_estimators": (estimators_low, estimators_high),
+                    "max_depth": (3, max_depth_high),
+                    "learning_rate": (0.012, 0.08),
+                    "subsample": (0.72, 0.92),
+                    "colsample_bytree": (0.72, 0.92),
+                    "min_child_weight": (3, min_child_high),
+                    "reg_alpha": (1e-4, 2.5),
+                    "reg_lambda": (0.3, 4.0),
+                    "gamma": (0.0, 1.25),
+                }
+            )
+            if self.config.model_type == "xgboost":
+                bounds["scale_pos_weight"] = (0.9, 3.0)
+                bounds["max_delta_step"] = (0.0, 1.5)
+            return bounds
+
+        if self._is_lightgbm_family_model():
+            effective_train = max(128, int(min_train_size if min_train_size is not None else 1024))
+            leaf_floor, leaf_ceiling = self._resolve_lightgbm_leaf_bounds(effective_train)
+            num_leaves_high = max(24, min(96, int(np.ceil(np.sqrt(float(effective_train)) * 2.0))))
+            estimators_high = max(260, min(520, int(np.ceil(float(effective_train) * 0.60))))
+            bounds.update(
+                {
+                    "n_estimators": (180, estimators_high),
+                    "max_depth": (3, 6),
+                    "learning_rate": (0.01, 0.05),
+                    "num_leaves": (16, num_leaves_high),
+                    "feature_fraction": (0.75, 0.90),
+                    "bagging_fraction": (0.76, 0.92),
+                    "bagging_freq": (1, 4),
+                    "min_data_in_leaf": (leaf_floor, leaf_ceiling),
+                    "lambda_l1": (0.05, 8.0),
+                    "lambda_l2": (0.5, 10.0),
+                    "min_gain_to_split": (0.03, 0.35),
+                    "max_bin": (127, 191),
+                }
+            )
+            if self.config.model_type == "lightgbm":
+                bounds["scale_pos_weight"] = (0.95, 1.15)
+            return bounds
+
+        if self.config.model_type == "random_forest":
+            return {
+                "n_estimators": (200, 700),
+                "max_depth": (4, 16),
+                "min_samples_split": (3, 16),
+                "min_samples_leaf": (1, 6),
+                "max_features": {"sqrt", "log2"},
+                "class_weight": {None, "balanced", "balanced_subsample"},
+            }
+
+        if self.config.model_type == "elastic_net":
+            return {
+                "C": (1e-2, 5.0),
+                "l1_ratio": (0.10, 0.90),
+                "max_iter": (1800, 3200),
+                "class_weight": {None, "balanced"},
+            }
+        return bounds
+
+    def _sanitize_optuna_seed_params(
+        self,
+        params: dict[str, Any] | None,
+        *,
+        min_train_size: int | None = None,
+    ) -> dict[str, Any]:
         """Filter seed candidates down to the active Optuna search space."""
         if not isinstance(params, dict) or not params:
             return {}
         allowed_names, int_names = self._optuna_search_param_spec()
         if not allowed_names:
             return {}
+        dynamic_bounds = self._optuna_seed_param_bounds(min_train_size=min_train_size)
 
         sanitized: dict[str, Any] = {}
         for name in sorted(allowed_names):
@@ -2441,11 +2520,20 @@ class ModelTrainer:
             value = params.get(name)
             if value is None:
                 continue
+            bound = dynamic_bounds.get(name)
+            if isinstance(bound, set):
+                if value in bound:
+                    sanitized[name] = value
+                continue
             if name in int_names:
                 try:
-                    sanitized[name] = int(round(float(value)))
+                    numeric = int(round(float(value)))
                 except (TypeError, ValueError):
                     continue
+                if isinstance(bound, tuple) and len(bound) == 2:
+                    low, high = int(bound[0]), int(bound[1])
+                    numeric = int(np.clip(numeric, low, high))
+                sanitized[name] = numeric
                 continue
             if isinstance(value, (str, bool)):
                 sanitized[name] = value
@@ -2456,10 +2544,18 @@ class ModelTrainer:
                 continue
             if not np.isfinite(numeric):
                 continue
+            if isinstance(bound, tuple) and len(bound) == 2:
+                low, high = float(bound[0]), float(bound[1])
+                numeric = float(np.clip(numeric, low, high))
             sanitized[name] = numeric
         return sanitized
 
-    def _enqueue_optuna_seed_trials(self, study: Any, *seed_candidates: dict[str, Any]) -> int:
+    def _enqueue_optuna_seed_trials(
+        self,
+        study: Any,
+        *seed_candidates: dict[str, Any],
+        min_train_size: int | None = None,
+    ) -> int:
         """Queue deterministic seed trials before Optuna explores new regions."""
         enqueue_trial = getattr(study, "enqueue_trial", None)
         if not callable(enqueue_trial):
@@ -2468,7 +2564,10 @@ class ModelTrainer:
         queued = 0
         seen: set[tuple[tuple[str, Any], ...]] = set()
         for candidate in seed_candidates:
-            sanitized = self._sanitize_optuna_seed_params(candidate)
+            sanitized = self._sanitize_optuna_seed_params(
+                candidate,
+                min_train_size=min_train_size,
+            )
             if not sanitized:
                 continue
             signature = tuple(sorted(sanitized.items()))
@@ -7620,6 +7719,7 @@ class ModelTrainer:
                         study,
                         self.config.model_params,
                         *(prior_outer_seed_params[-2:]),
+                        min_train_size=len(outer_train_idx),
                     )
                     if seed_trial_count > 0:
                         self.logger.info(
